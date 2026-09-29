@@ -103,9 +103,51 @@ impl Display for Backend {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InputConfig {
+    pub invert_scroll: bool,
+    pub mouse_sensitivity: f64,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            invert_scroll: false,
+            mouse_sensitivity: 1.0,
+        }
+    }
+}
+
+fn post_process_event(event: Event, config: InputConfig) -> Event {
+    match event {
+        Event::Pointer(PointerEvent::Motion { time, dx, dy }) => {
+            Event::Pointer(PointerEvent::Motion {
+                time,
+                dx: dx * config.mouse_sensitivity,
+                dy: dy * config.mouse_sensitivity,
+            })
+        }
+        Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) if config.invert_scroll => {
+            Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis,
+                value: -value,
+            })
+        }
+        Event::Pointer(PointerEvent::Axis { time, axis, value }) if config.invert_scroll => {
+            Event::Pointer(PointerEvent::Axis {
+                time,
+                axis,
+                value: -value,
+            })
+        }
+        _ => event,
+    }
+}
+
 pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashMap<EmulationHandle, TrackedInput>,
+    input_config: InputConfig,
     /// Bound applied to each backend operation during cleanup.
     cleanup_timeout: Duration,
 }
@@ -137,6 +179,7 @@ impl InputEmulation {
     async fn with_backend(
         backend: Backend,
         options: EmulationOptions,
+        input_config: InputConfig,
     ) -> Result<InputEmulation, EmulationCreationError> {
         let emulation: Box<dyn Emulation> = match backend {
             #[cfg(wlroots)]
@@ -156,6 +199,7 @@ impl InputEmulation {
         Ok(Self {
             emulation,
             handles: HashMap::new(),
+            input_config,
             cleanup_timeout: DEFAULT_CLEANUP_TIMEOUT,
         })
     }
@@ -163,9 +207,10 @@ impl InputEmulation {
     pub async fn new(
         backend: Option<Backend>,
         options: EmulationOptions,
+        input_config: InputConfig,
     ) -> Result<InputEmulation, EmulationCreationError> {
         if let Some(backend) = backend {
-            let b = Self::with_backend(backend, options).await;
+            let b = Self::with_backend(backend, options, input_config).await;
             if b.is_ok() {
                 log::info!("using emulation backend: {backend}");
             }
@@ -187,7 +232,7 @@ impl InputEmulation {
             Backend::MacOs,
             Backend::Dummy,
         ] {
-            match Self::with_backend(backend, options).await {
+            match Self::with_backend(backend, options, input_config).await {
                 Ok(b) => {
                     log::info!("using emulation backend: {backend}");
                     return Ok(b);
@@ -205,6 +250,7 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        let event = post_process_event(event, self.input_config);
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // suppress duplicate presses and unmatched releases
@@ -438,6 +484,10 @@ impl InputEmulation {
             group: 0,
         });
         emulation.consume(event, handle).await
+    }
+
+    pub fn update_config(&mut self, input_config: InputConfig) {
+        self.input_config = input_config;
     }
 }
 
@@ -820,5 +870,84 @@ mod tests {
             .expect("terminate must be bounded");
         assert!(control.lock().unwrap().terminated);
         assert!(emulation.handles.is_empty());
+    }
+
+    #[test]
+    fn post_processing_scales_pointer_motion() {
+        let event = Event::Pointer(PointerEvent::Motion {
+            time: 42,
+            dx: 3.0,
+            dy: -4.0,
+        });
+        let config = InputConfig {
+            mouse_sensitivity: 1.5,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            post_process_event(event, config),
+            Event::Pointer(PointerEvent::Motion {
+                time: 42,
+                dx: 4.5,
+                dy: -6.0,
+            })
+        );
+    }
+
+    #[test]
+    fn post_processing_inverts_continuous_and_discrete_scrolling() {
+        let config = InputConfig {
+            invert_scroll: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            post_process_event(
+                Event::Pointer(PointerEvent::Axis {
+                    time: 7,
+                    axis: 0,
+                    value: 2.5,
+                }),
+                config,
+            ),
+            Event::Pointer(PointerEvent::Axis {
+                time: 7,
+                axis: 0,
+                value: -2.5,
+            })
+        );
+        assert_eq!(
+            post_process_event(
+                Event::Pointer(PointerEvent::AxisDiscrete120 {
+                    axis: 1,
+                    value: 120,
+                }),
+                config,
+            ),
+            Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 1,
+                value: -120,
+            })
+        );
+    }
+
+    #[test]
+    fn post_processing_leaves_other_events_unchanged() {
+        let event = Event::Pointer(PointerEvent::Button {
+            time: 5,
+            button: 0x110,
+            state: 1,
+        });
+
+        assert_eq!(
+            post_process_event(
+                event,
+                InputConfig {
+                    invert_scroll: true,
+                    mouse_sensitivity: 2.0,
+                },
+            ),
+            event
+        );
     }
 }

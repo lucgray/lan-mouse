@@ -1,7 +1,7 @@
 # example configuration
 
 # configure release bind
-release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
+release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
 
 # optional port (defaults to 4242)
 port = 4242
@@ -13,6 +13,13 @@ port = 4242
 # Defaults: 500 and 32.
 key_repeat_delay = 500
 key_repeat_interval = 32
+
+
+[input_post_processing]
+# scale relative pointer motion received from other devices
+mouse_sensitivity = 1.0
+# invert scroll events received from other devices
+invert_scroll = false
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic

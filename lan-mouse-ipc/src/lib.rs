@@ -228,7 +228,7 @@ pub enum FrontendEvent {
     ConnectionAttempt { fingerprint: String },
 }
 
-#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
     /// activate/deactivate client
     Activate(ClientHandle, bool),
@@ -266,6 +266,9 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// update the input post-processing settings (invert-scroll, mouse_sensitivity)
+    UpdateScrollingInversion(bool),
+    UpdateMouseSensitivity(f64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

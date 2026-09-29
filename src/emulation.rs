@@ -1,7 +1,9 @@
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
-use input_emulation::{EmulationHandle, EmulationOptions, InputEmulation, InputEmulationError};
+use input_emulation::{
+    EmulationHandle, EmulationOptions, InputConfig, InputEmulation, InputEmulationError,
+};
 use input_event::Event;
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -71,6 +73,8 @@ enum EmulationRequest {
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
+    UpdateScrollingInversion(bool),
+    UpdateMouseSensitivity(f64),
 }
 
 impl Emulation {
@@ -78,8 +82,13 @@ impl Emulation {
         backend: Option<input_emulation::Backend>,
         options: EmulationOptions,
         listener: LanMouseListener,
+        input_config: (bool, f64),
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend, options);
+        let input_config = InputConfig {
+            invert_scroll: input_config.0,
+            mouse_sensitivity: input_config.1,
+        };
+        let emulation_proxy = EmulationProxy::new(backend, options, input_config);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -111,6 +120,18 @@ impl Emulation {
     pub(crate) fn request_port_change(&self, port: u16) {
         self.request_tx
             .send(EmulationRequest::ChangePort(port))
+            .expect("channel closed")
+    }
+
+    pub(crate) fn request_scrolling_inversion(&self, invert_scroll: bool) {
+        self.request_tx
+            .send(EmulationRequest::UpdateScrollingInversion(invert_scroll))
+            .expect("channel closed")
+    }
+
+    pub(crate) fn request_mouse_sensitivity_change(&self, mouse_sensitivity: f64) {
+        self.request_tx
+            .send(EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity))
             .expect("channel closed")
     }
 
@@ -200,6 +221,14 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::UpdateScrollingInversion(invert_scroll) => {
+                        self.emulation_proxy.input_config.invert_scroll = invert_scroll;
+                        self.emulation_proxy.update_config();
+                    }
+                    EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity) => {
+                        self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
+                        self.emulation_proxy.update_config();
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -234,6 +263,7 @@ pub(crate) struct EmulationProxy {
     request_tx: Sender<ProxyRequest>,
     event_rx: Receiver<EmulationEvent>,
     task: JoinHandle<()>,
+    input_config: InputConfig,
 }
 
 enum ProxyRequest {
@@ -241,10 +271,15 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    UpdateConfig(InputConfig),
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>, options: EmulationOptions) -> Self {
+    fn new(
+        backend: Option<input_emulation::Backend>,
+        options: EmulationOptions,
+        input_config: InputConfig,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
@@ -257,6 +292,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            input_config,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -265,6 +301,7 @@ impl EmulationProxy {
             request_tx,
             task,
             event_rx,
+            input_config,
         }
     }
 
@@ -300,6 +337,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn update_config(&self) {
+        self.request_tx
+            .send(ProxyRequest::UpdateConfig(self.input_config))
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -317,6 +360,7 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    input_config: InputConfig,
 }
 
 impl EmulationTask {
@@ -335,6 +379,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::UpdateConfig(input_config) => {
+                        self.input_config = input_config;
+                    }
                 }
             }
         }
@@ -343,7 +390,7 @@ impl EmulationTask {
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend, self.options) => r?,
+            r = InputEmulation::new(self.backend, self.options, self.input_config) => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
@@ -405,6 +452,10 @@ impl EmulationTask {
                             emulation.destroy(handle).await;
                         }
                     }
+                    ProxyRequest::UpdateConfig(input_config) => {
+                        self.input_config = input_config;
+                        emulation.update_config(input_config);
+                    }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
@@ -429,6 +480,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::UpdateConfig(_) => continue,
         }
     }
 }
