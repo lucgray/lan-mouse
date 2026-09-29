@@ -20,7 +20,7 @@ use x11::xlib::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-use super::{error::X11InputCaptureCreationError, Capture, CaptureError, CaptureEvent, Position};
+use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
 
 // ── Request enum (async → thread) ────────────────────────────────────────────
 
@@ -364,11 +364,7 @@ fn handle_motion(state: &mut X11State, m: XMotionEvent) {
     if let Some(pos) = state.active_client {
         let _ = state.event_tx.try_send((
             pos,
-            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
-                time: 0,
-                dx,
-                dy,
-            })),
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy })),
         ));
     }
 }
@@ -419,24 +415,36 @@ mod tests {
 
     #[test]
     fn crosses_left_boundary() {
-        assert_eq!(crossed_boundary((5, 100), (-1, 100), 1920, 1080), Some(Position::Left));
+        assert_eq!(
+            crossed_boundary((5, 100), (-1, 100), 1920, 1080),
+            Some(Position::Left)
+        );
     }
 
     #[test]
     fn crosses_right_boundary() {
         // X11 clamps to w-1; the cursor arrives at 1919, never at 1920.
-        assert_eq!(crossed_boundary((1915, 100), (1919, 100), 1920, 1080), Some(Position::Right));
+        assert_eq!(
+            crossed_boundary((1915, 100), (1919, 100), 1920, 1080),
+            Some(Position::Right)
+        );
     }
 
     #[test]
     fn crosses_top_boundary() {
-        assert_eq!(crossed_boundary((100, 5), (100, -1), 1920, 1080), Some(Position::Top));
+        assert_eq!(
+            crossed_boundary((100, 5), (100, -1), 1920, 1080),
+            Some(Position::Top)
+        );
     }
 
     #[test]
     fn crosses_bottom_boundary() {
         // X11 clamps to h-1; the cursor arrives at 1079, never at 1080.
-        assert_eq!(crossed_boundary((100, 1075), (100, 1079), 1920, 1080), Some(Position::Bottom));
+        assert_eq!(
+            crossed_boundary((100, 1075), (100, 1079), 1920, 1080),
+            Some(Position::Bottom)
+        );
     }
 
     #[test]
