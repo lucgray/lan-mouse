@@ -2,8 +2,7 @@ use crate::error::EmulationError;
 
 use super::{Emulation, error::WlrootsEmulationCreationError};
 use async_trait::async_trait;
-use bitflags::bitflags;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
@@ -11,13 +10,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
-use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_keyboard::{self, KeymapFormat, WlKeyboard};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1 as VpManager,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1 as Vp,
 };
+use xkbcommon::xkb;
 
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1 as VkManager,
@@ -34,11 +34,15 @@ use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 
 use super::EmulationHandle;
 use super::error::WaylandBindError;
+use super::scroll_accumulator::Scroll120Accumulator;
 
 struct State {
     keymap: Option<(u32, OwnedFd, u32)>,
     /// shared by all clients, so the keymap fd is sent once instead of once per client
     keyboard: Option<Vk>,
+    /// modifier bits each modifier/lock key drives on the compositor's
+    /// keymap, probed once when it arrives
+    modmap: Option<Arc<ModMap>>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
     seat: wl_seat::WlSeat,
     qh: QueueHandle<Self>,
@@ -77,6 +81,7 @@ impl WlrootsEmulation {
             state: State {
                 keymap: None,
                 keyboard: None,
+                modmap: None,
                 input_for_client,
                 seat,
                 vpm,
@@ -88,6 +93,7 @@ impl WlrootsEmulation {
         while emulate.state.keymap.is_none() {
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
         }
+        emulate.state.modmap = Some(Arc::new(ModMap::new(&emulate.state.keymap)));
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
         // log::debug!("{:?}", &mmap[..100]);
@@ -98,6 +104,10 @@ impl WlrootsEmulation {
 impl State {
     fn add_client(&mut self, client: EmulationHandle) {
         let pointer: Vp = self.vpm.create_virtual_pointer(None, &self.qh, ());
+        let modmap = self
+            .modmap
+            .clone()
+            .unwrap_or_else(|| Arc::new(ModMap::x11()));
 
         let keyboard = match self.keyboard.as_ref() {
             Some(keyboard) => keyboard.clone(),
@@ -108,6 +118,13 @@ impl State {
                     panic!("no keymap");
                 };
                 keyboard.keymap(*format, fd.as_fd(), *size);
+                // The virtual keyboard starts with no locks held, so a
+                // receiver would report NumLock off regardless of the
+                // sender's state and the numpad would produce
+                // navigation keys instead of digits. Lock NumLock by
+                // default; senders that track lock state correct this
+                // through a Modifiers event when the pointer enters.
+                keyboard.modifiers(0, 0, modmap.default_locked, 0);
                 self.keyboard = Some(keyboard.clone());
                 keyboard
             }
@@ -116,7 +133,9 @@ impl State {
         let vinput = VirtualInput {
             pointer,
             keyboard,
-            modifiers: Arc::new(Mutex::new(XMods::empty())),
+            modifiers: Mutex::new(ModState::new(&modmap)),
+            modmap,
+            scroll_accumulator: Default::default(),
         };
 
         self.input_for_client.insert(client, vinput);
@@ -189,7 +208,9 @@ impl Emulation for WlrootsEmulation {
 struct VirtualInput {
     pointer: Vp,
     keyboard: Vk,
-    modifiers: Arc<Mutex<XMods>>,
+    modifiers: Mutex<ModState>,
+    modmap: Arc<ModMap>,
+    scroll_accumulator: Mutex<Scroll120Accumulator>,
 }
 
 impl VirtualInput {
@@ -218,11 +239,22 @@ impl VirtualInput {
                         self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
-                        self.pointer
-                            .axis_discrete(now, axis, value as f64 / 8., value / 120);
-                        self.pointer.axis_source(AxisSource::Wheel);
-                        self.pointer.frame();
+                        // High-resolution wheels send fractions of a detent
+                        // (16, 24, ...) and `value / 120` truncates every one
+                        // of them to zero, so scrolling does nothing at all.
+                        // Accumulate them into whole steps instead.
+                        let steps = self
+                            .scroll_accumulator
+                            .lock()
+                            .unwrap()
+                            .accumulate(axis, value);
+                        if steps != 0 {
+                            let axis: Axis = (axis as u32).try_into()?;
+                            self.pointer
+                                .axis_discrete(now, axis, steps as f64 * 15., steps);
+                            self.pointer.axis_source(AxisSource::Wheel);
+                            self.pointer.frame();
+                        }
                     }
                 }
                 self.pointer.frame();
@@ -231,12 +263,12 @@ impl VirtualInput {
                 KeyboardEvent::Key { time, key, state } => {
                     self.keyboard.key(time, key, state as u32);
                     if let Ok(mut mods) = self.modifiers.lock() {
-                        if mods.update_by_key_event(key, state) {
+                        if mods.update_by_key_event(&self.modmap, key, state) {
                             log::trace!("Key triggers modifier change: {mods:?}");
                             self.keyboard.modifiers(
-                                mods.mask_pressed().bits(),
+                                mods.mask_pressed(&self.modmap),
                                 0,
-                                mods.mask_locks().bits(),
+                                mods.mask_locks(&self.modmap),
                                 0,
                             );
                         }
@@ -317,73 +349,191 @@ impl Dispatch<WlSeat, ()> for State {
     }
 }
 
-// From X11/X.h
-bitflags! {
-    #[repr(C)]
-    #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    struct XMods: u32 {
-        const ShiftMask = (1<<0);
-        const LockMask = (1<<1);
-        const ControlMask = (1<<2);
-        const Mod1Mask = (1<<3);
-        const Mod2Mask = (1<<4);
-        const Mod3Mask = (1<<5);
-        const Mod4Mask = (1<<6);
-        const Mod5Mask = (1<<7);
+/// Keys that can drive a modifier bit; the mask each of them sets is
+/// layout-dependent, so it is probed from the compositor's keymap.
+const MODIFIER_KEYS: &[scancode::Linux] = &[
+    scancode::Linux::KeyLeftShift,
+    scancode::Linux::KeyRightShift,
+    scancode::Linux::KeyLeftCtrl,
+    scancode::Linux::KeyRightCtrl,
+    scancode::Linux::KeyLeftAlt,
+    scancode::Linux::KeyRightalt,
+    scancode::Linux::KeyLeftMeta,
+    scancode::Linux::KeyRightmeta,
+    scancode::Linux::KeyCapsLock,
+    scancode::Linux::KeyNumlock,
+    scancode::Linux::KeyScrollLock,
+];
+
+/// Which modifier bits each modifier/lock key drives on the keymap the
+/// compositor gave us. This is probed from the keymap rather than
+/// hardcoded because, for example, RightAlt is Mod1 (`Alt_R`) on US
+/// layouts but Mod5 (`ISO_Level3_Shift`) on layouts with
+/// `level3(ralt_switch)` — only the keymap knows which. The mask bits
+/// are raw xkb modifier indices, exactly what `wl_keyboard.modifiers`
+/// expects.
+struct ModMap {
+    /// linux keycode -> modifier bits depressed while the key is held
+    pressed: HashMap<u32, u32>,
+    /// linux keycode -> modifier bits toggled in the locked mask on press
+    locked: HashMap<u32, u32>,
+    /// union of every value in `pressed`
+    all_pressed: u32,
+    /// union of every value in `locked`
+    all_locked: u32,
+    /// locked bits a fresh virtual keyboard starts with: receivers
+    /// generally want their numpad to produce digits; senders that
+    /// track lock state correct this with a Modifiers event on entry
+    default_locked: u32,
+}
+
+impl ModMap {
+    fn new(keymap: &Option<(u32, OwnedFd, u32)>) -> Self {
+        if let Some((format, fd, size)) = keymap.as_ref() {
+            if let Some(map) = Self::probe(*format, fd, *size) {
+                return map;
+            }
+        }
+        Self::x11()
+    }
+
+    /// The conventional X11 modifier mask, used when the compositor's
+    /// keymap can't be probed.
+    fn x11() -> Self {
+        use scancode::Linux::*;
+        let pressed = HashMap::from([
+            (KeyLeftShift as u32, 1 << 0),
+            (KeyRightShift as u32, 1 << 0),
+            (KeyLeftCtrl as u32, 1 << 2),
+            (KeyRightCtrl as u32, 1 << 2),
+            (KeyLeftAlt as u32, 1 << 3),
+            (KeyRightalt as u32, 1 << 3),
+            (KeyLeftMeta as u32, 1 << 6),
+            (KeyRightmeta as u32, 1 << 6),
+        ]);
+        let locked = HashMap::from([
+            (KeyCapsLock as u32, 1 << 1),
+            (KeyNumlock as u32, 1 << 4),
+            (KeyScrollLock as u32, 1 << 5),
+        ]);
+        Self::assemble(pressed, locked)
+    }
+
+    /// Press and release each modifier key in a fresh `xkb::State` and
+    /// record which modifier bits that depresses / locks on this
+    /// keymap.
+    fn probe(format: u32, fd: &OwnedFd, size: u32) -> Option<Self> {
+        if format != KeymapFormat::XkbV1 as u32 {
+            return None;
+        }
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        // SAFETY: the fd is a fresh dup of the keymap fd handed to us by
+        // the compositor; `new_from_fd` takes ownership of the dup.
+        let keymap = unsafe {
+            xkb::Keymap::new_from_fd(
+                &context,
+                fd.try_clone().ok()?,
+                size as usize,
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+        }
+        .ok()??;
+        let mut pressed = HashMap::new();
+        let mut locked = HashMap::new();
+        for &key in MODIFIER_KEYS {
+            // xkb keycodes are evdev keycodes offset by 8
+            let keycode = xkb::Keycode::new(key as u32 + 8);
+            let mut state = xkb::State::new(&keymap);
+            state.update_key(keycode, xkb::KeyDirection::Down);
+            let pressed_bits = state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+            state.update_key(keycode, xkb::KeyDirection::Up);
+            let locked_bits = state.serialize_mods(xkb::STATE_MODS_LOCKED);
+            if pressed_bits != 0 {
+                pressed.insert(key as u32, pressed_bits);
+            }
+            if locked_bits != 0 {
+                locked.insert(key as u32, locked_bits);
+            }
+        }
+        Some(Self::assemble(pressed, locked))
+    }
+
+    fn assemble(pressed: HashMap<u32, u32>, locked: HashMap<u32, u32>) -> Self {
+        let all_pressed = pressed.values().fold(0, |a, b| a | b);
+        let all_locked = locked.values().fold(0, |a, b| a | b);
+        let default_locked = locked
+            .get(&(scancode::Linux::KeyNumlock as u32))
+            .copied()
+            .unwrap_or(0);
+        Self {
+            pressed,
+            locked,
+            all_pressed,
+            all_locked,
+            default_locked,
+        }
     }
 }
 
-impl XMods {
+/// Tracked modifier state for one virtual keyboard.
+#[derive(Debug, Default)]
+struct ModState {
+    /// depressed and locked modifier bits, packed as xkb mod indices
+    mods: u32,
+    /// lock keys currently held down; auto-repeated presses must not
+    /// toggle a lock twice
+    held_locks: HashSet<u32>,
+}
+
+impl ModState {
+    fn new(map: &ModMap) -> Self {
+        Self {
+            mods: map.default_locked,
+            held_locks: HashSet::new(),
+        }
+    }
+
     fn update_by_mods_event(&mut self, evt: KeyboardEvent) {
         if let KeyboardEvent::Modifiers {
             depressed, locked, ..
         } = evt
         {
-            *self = XMods::from_bits_truncate(depressed) | XMods::from_bits_truncate(locked);
+            self.mods = depressed | locked;
         }
     }
 
-    fn update_by_key_event(&mut self, key: u32, state: u8) -> bool {
-        if let Ok(key) = scancode::Linux::try_from(key) {
-            log::trace!("Attempting to process modifier from: {key:#?}");
-            let pressed_mask = match key {
-                scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-                scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-                scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
-                scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-                _ => XMods::empty(),
-            };
-
-            let locked_mask = match key {
-                scancode::Linux::KeyCapsLock => XMods::LockMask,
-                scancode::Linux::KeyNumlock => XMods::Mod2Mask,
-                scancode::Linux::KeyScrollLock => XMods::Mod3Mask,
-                _ => XMods::empty(),
-            };
-
-            // unchanged
-            if pressed_mask.is_empty() && locked_mask.is_empty() {
-                log::trace!("{key:#?} is not a modifier key");
-                return false;
-            }
-            match state {
-                1 => self.insert(pressed_mask),
-                _ => {
-                    self.remove(pressed_mask);
-                    self.toggle(locked_mask);
+    /// Apply a key event, returning whether the modifier mask changed.
+    fn update_by_key_event(&mut self, map: &ModMap, key: u32, state: u8) -> bool {
+        log::trace!("Attempting to process modifier from keycode: {key:#?}");
+        let pressed = map.pressed.get(&key).copied().unwrap_or(0);
+        let locked = map.locked.get(&key).copied().unwrap_or(0);
+        if pressed == 0 && locked == 0 {
+            return false;
+        }
+        let before = self.mods;
+        match state {
+            1 => {
+                self.mods |= pressed;
+                // lock keys toggle on press, once per physical press;
+                // senders can repeat the press event while the key is held
+                if locked != 0 && self.held_locks.insert(key) {
+                    self.mods ^= locked;
                 }
             }
-            true
-        } else {
-            false
+            _ => {
+                self.mods &= !pressed;
+                self.held_locks.remove(&key);
+            }
         }
+        self.mods != before
     }
 
-    fn mask_locks(&self) -> XMods {
-        *self & (XMods::LockMask | XMods::Mod2Mask | XMods::Mod3Mask)
+    fn mask_locks(&self, map: &ModMap) -> u32 {
+        self.mods & map.all_locked
     }
 
-    fn mask_pressed(&self) -> XMods {
-        *self & (XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask)
+    fn mask_pressed(&self, map: &ModMap) -> u32 {
+        self.mods & map.all_pressed
     }
 }
