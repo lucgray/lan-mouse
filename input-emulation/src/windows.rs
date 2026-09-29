@@ -8,6 +8,11 @@ use async_trait::async_trait;
 use std::io;
 use std::ops::BitOrAssign;
 use tokio::task::AbortHandle;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, GetThreadDesktop, OpenInputDesktop,
+    SetThreadDesktop,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -21,9 +26,25 @@ use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
 use super::{Emulation, EmulationHandle, EmulationOptions};
 
+// Desktop access rights for input injection
+// GENERIC_WRITE (0x40000000) + DESKTOP_CREATEWINDOW (0x0002) + DESKTOP_HOOKCONTROL (0x0008)
+// DF_ALLOWOTHERACCOUNTHOOK (0x0001) allows accessing desktops owned by other accounts
+const GENERIC_WRITE: u32 = 0x40000000;
+const DESKTOP_CREATEWINDOW: u32 = 0x0002;
+const DESKTOP_HOOKCONTROL: u32 = 0x0008;
+const DF_ALLOWOTHERACCOUNTHOOK: u32 = 0x0001;
+const DESKTOP_ACCESS_FOR_INPUT: u32 = DESKTOP_CREATEWINDOW | DESKTOP_HOOKCONTROL | GENERIC_WRITE;
+
+// Linux keycodes for modifier tracking
+const KEY_LEFT_META: u32 = 125;
+const KEY_RIGHT_META: u32 = 126;
+// Linux keycode for L
+const KEY_L: u32 = 38;
+
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
     options: EmulationOptions,
+    meta_pressed: bool,
 }
 
 impl WindowsEmulation {
@@ -31,6 +52,7 @@ impl WindowsEmulation {
         Ok(Self {
             repeat_task: None,
             options,
+            meta_pressed: false,
         })
     }
 }
@@ -61,6 +83,20 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
+                    // Track Meta/Super key state
+                    if key == KEY_LEFT_META || key == KEY_RIGHT_META {
+                        self.meta_pressed = state == 1;
+                    }
+
+                    // Intercept Win+L: LockWorkStation() cannot be triggered
+                    // via SendInput because Windows blocks it as a Secure
+                    // Attention Sequence. Instead we lock the session directly.
+                    if key == KEY_L && state == 1 && self.meta_pressed {
+                        log::info!("Win+L detected, locking workstation");
+                        lock_workstation();
+                        return Ok(());
+                    }
+
                     match state {
                         // pressed
                         0 => self.kill_repeat_task(),
@@ -133,15 +169,59 @@ fn send_input(input: INPUT) -> Result<(), EmulationError> {
     )))
 }
 
+/// Send input with desktop switching to handle UAC prompts and other secure desktops.
+/// When running in a user session (spawned by the Windows service), this allows
+/// input injection on the Secure Desktop (UAC prompts) by temporarily switching
+/// to the current input desktop.
+fn send_input_safe(input: INPUT) -> Result<(), EmulationError> {
+    unsafe {
+        // Try to open the current input desktop (may be Secure Desktop during UAC)
+        // This only works when running in the user's session, not from Session 0
+        let input_desktop = match OpenInputDesktop(
+            DESKTOP_CONTROL_FLAGS(DF_ALLOWOTHERACCOUNTHOOK),
+            true, // fInherit
+            DESKTOP_ACCESS_FLAGS(DESKTOP_ACCESS_FOR_INPUT),
+        ) {
+            Ok(desktop) => desktop,
+            Err(e) => {
+                // Desktop switching not available - fall back to direct SendInput
+                // This works for normal desktop but won't reach UAC/login screen
+                log::debug!("OpenInputDesktop failed: {} - using direct SendInput", e);
+                return send_input(input);
+            }
+        };
+
+        // Save current desktop, switch to input desktop, send input, restore
+        let old_desktop = GetThreadDesktop(GetCurrentThreadId());
+
+        if SetThreadDesktop(input_desktop).is_err() {
+            log::warn!("SetThreadDesktop failed, using direct SendInput");
+            let _ = CloseDesktop(input_desktop);
+            return send_input(input);
+        }
+
+        let result = send_input(input);
+
+        // Restore original desktop
+        if let Ok(desktop) = old_desktop {
+            if !desktop.is_invalid() {
+                let _ = SetThreadDesktop(desktop);
+            }
+        }
+        let _ = CloseDesktop(input_desktop);
+        result
+    }
+}
+
 fn send_mouse_input(mi: MOUSEINPUT) -> Result<(), EmulationError> {
-    send_input(INPUT {
+    send_input_safe(INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
     })
 }
 
 fn send_keyboard_input(ki: KEYBDINPUT) -> Result<(), EmulationError> {
-    send_input(INPUT {
+    send_input_safe(INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
     })
@@ -254,4 +334,37 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
     };
     log::trace!("windows code: {windows_scancode:?}");
     Some(windows_scancode as u16)
+}
+
+/// Lock the workstation.
+///
+/// `Win+L` is a Secure Attention Sequence that Windows blocks from being
+/// injected via `SendInput`.  When running inside a user session (Session != 0)
+/// we can call `LockWorkStation()` which is the documented public API.
+///
+/// When running in Session 0 (the service session) there is no interactive
+/// desktop to lock, so we disconnect the console session via
+/// `WTSDisconnectSession` which achieves the same visible effect (returns to
+/// the lock / login screen).
+fn lock_workstation() {
+    // Try the simple path first — works when we are in the user's session.
+    unsafe {
+        use windows::Win32::System::Shutdown::LockWorkStation;
+        if LockWorkStation().is_ok() {
+            log::info!("LockWorkStation succeeded");
+            return;
+        }
+        log::warn!("LockWorkStation failed, trying WTSDisconnectSession");
+
+        // Fallback for Session 0: disconnect the active console session.
+        use windows::Win32::System::RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTSDisconnectSession, WTSGetActiveConsoleSessionId,
+        };
+        let session_id = WTSGetActiveConsoleSessionId();
+        if WTSDisconnectSession(Some(WTS_CURRENT_SERVER_HANDLE), session_id, true).is_err() {
+            log::error!("WTSDisconnectSession also failed");
+        } else {
+            log::info!("WTSDisconnectSession succeeded (session {})", session_id);
+        }
+    }
 }
