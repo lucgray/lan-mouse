@@ -4,7 +4,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
     collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -34,11 +34,46 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
-/// wildcard listen address: `[::]` binds dual-stack on platforms with an
-/// IPv6 stack (V4-mapped included), which is what we want so both IPv4 and
-/// IPv6 peers can reach us. Callers fall back to `0.0.0.0` on error.
-fn listen_addr(port: u16) -> SocketAddr {
-    SocketAddr::new("::".parse().expect("invalid ip"), port)
+/// Create a DTLS listener per address family.
+///
+/// A socket bound to `[::]` accepts IPv4-mapped peers only on platforms
+/// with dual-stack sockets (Linux). Windows and macOS default IPv6
+/// sockets to `IPV6_V6ONLY`, so an IPv4-only peer would never be able
+/// to connect. A separate IPv4 listener is therefore always created;
+/// where `[::]` is already dual-stack its bind fails with EADDRINUSE
+/// and the attempt is skipped.
+async fn bind_dtls(
+    port: u16,
+    cfg: &Config,
+) -> Result<Vec<Box<dyn Listener>>, ListenerCreationError> {
+    let mut listeners: Vec<Box<dyn Listener>> = Vec::new();
+    let mut last_err = None;
+    for ip in [
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    ] {
+        match listen(SocketAddr::new(ip, port), cfg.clone()).await {
+            Ok(l) => listeners.push(Box::new(l)),
+            Err(e) => {
+                log::debug!("dtls listen on {ip}: {e}");
+                last_err = Some(e);
+            }
+        }
+    }
+    if listeners.is_empty() {
+        Err(last_err.expect("at least one bind attempted").into())
+    } else {
+        Ok(listeners)
+    }
+}
+
+/// Wait for an incoming connection on any of the bound listeners.
+async fn accept_any(
+    listeners: &[Box<dyn Listener>],
+) -> Result<(ArcConn, SocketAddr), webrtc_util::Error> {
+    futures::future::select_all(listeners.iter().map(|l| l.accept()))
+        .await
+        .0
 }
 
 pub(crate) enum ListenEvent {
@@ -116,16 +151,7 @@ impl LanMouseListener {
             ..Default::default()
         };
 
-        // try dual-stack `[::]` first (accepts both IPv4 and IPv6 peers),
-        // fall back to IPv4-only if the platform has no IPv6 stack
-        let mut listener = match listen(listen_addr(port), cfg.clone()).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("dual-stack listen failed ({e}), falling back to IPv4-only");
-                let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-                listen(listen_addr, cfg.clone()).await?
-            }
-        };
+        let mut listeners = bind_dtls(port, &cfg).await?;
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
@@ -140,7 +166,7 @@ impl LanMouseListener {
                     tokio::select! {
                         /* workaround for https://github.com/webrtc-rs/webrtc/issues/614 */
                         _ = sleep => continue,
-                        c = listener.accept() => match c {
+                        c = accept_any(&listeners) => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
                                 let mut conns = conns_clone.lock().await;
@@ -173,15 +199,17 @@ impl LanMouseListener {
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
-                            match listen(listen_addr(port), cfg.clone()).await {
-                                Ok(new_listener) => {
-                                    let _ = listener.close().await;
-                                    listener = new_listener;
+                            match bind_dtls(port, &cfg).await {
+                                Ok(new_listeners) => {
+                                    for l in &listeners {
+                                        let _ = l.close().await;
+                                    }
+                                    listeners = new_listeners;
                                     port_changed_tx.send(Ok(port)).expect("channel closed");
                                 }
                                 Err(e) => {
                                     log::warn!("unable to change port: {e}");
-                                    port_changed_tx.send(Err(e.into())).expect("channel closed");
+                                    port_changed_tx.send(Err(e)).expect("channel closed");
                                 }
                             };
                         },
