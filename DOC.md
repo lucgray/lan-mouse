@@ -33,7 +33,10 @@ the standardized event format.
 
 ### Dispatcher
 The dispatcher component takes events from the event receiver and passes them
-to the correct backend corresponding to the type of client.
+to the correct backend corresponding to the type of client. The libei backend
+waits for socket writability and retries `WouldBlock` instead of failing. Keys
+and buttons held for a client are released when that client is removed, with a
+time limit per step so a backed up backend cannot block cleanup forever.
 
 
 ## Requests
