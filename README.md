@@ -1,4 +1,20 @@
-# Lan Mouse
+# Lan Mouse (lucgray fork)
+
+> [!WARNING]
+> **This is an AI-maintained fork of [feschber/lan-mouse](https://github.com/feschber/lan-mouse).**
+>
+> It exists for personal use: upstream merges pull requests slowly, so this
+> fork cherry-picks and merges reviewed-but-unmerged community fix PRs.
+> Merge review and conflict resolution are done with AI assistance and are
+> necessarily rougher than upstream's own review — expect rough edges.
+>
+> For anything serious, use [upstream](https://github.com/feschber/lan-mouse).
+> Fixes merged here so far: unbounded `SendInput` retry, unreachable-peer
+> `Leave` spam, libei panic on drop, high-resolution scroll accumulation,
+> macOS display hotplug, RustSec advisories, bounded per-peer cleanup +
+> `WouldBlock` retry, libei capture-update coalescing, unified cross-OS
+> scroll direction, macOS bidirectional capture loops, inactive-window raise,
+> app relaunch, Hangul key, modifier injection (#450), Caps Lock toggle.
 
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 
