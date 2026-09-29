@@ -50,6 +50,10 @@ impl Capture for DummyInputCapture {
         Ok(())
     }
 
+    async fn release_to(&mut self, _t: f64) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -66,7 +70,7 @@ impl Stream for DummyInputCapture {
         let event = match self.start {
             None => {
                 self.start.replace(current);
-                CaptureEvent::Begin
+                CaptureEvent::Begin(0.5)
             }
             Some(start) => {
                 let elapsed = start.elapsed();

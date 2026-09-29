@@ -1,11 +1,11 @@
-use super::{Emulation, EmulationHandle, EmulationOptions, error::EmulationError};
+use super::{Emulation, EmulationHandle, EmulationOptions, Position, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::base::{CFTypeRef, TCFType};
 use core_foundation::string::CFString;
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
@@ -525,6 +525,44 @@ fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
     displays.first().copied()
 }
 
+/// Absolute coordinate for a normalized (`0.0..=1.0`) cross-axis
+/// position within `min..=max`. Inverse of the capture-side
+/// normalization in `input-capture`'s macOS backend.
+fn denormalize(t: f64, min: f64, max: f64) -> f64 {
+    min + t.clamp(0.0, 1.0) * (max - min)
+}
+
+/// The point to warp the cursor to when a peer's cursor enters this
+/// device from `pos` at normalized cross-axis position `t`, in the
+/// union bounds of all active displays. `None` if the bounds can't be
+/// determined (no active displays, or a degenerate union).
+fn warp_target(pos: Position, t: f64) -> Option<CGPoint> {
+    let ids = CGDisplay::active_displays().ok()?;
+    let (mut xmin, mut xmax, mut ymin, mut ymax) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for id in ids {
+        let bounds = CGDisplay::new(id).bounds();
+        xmin = xmin.min(bounds.origin.x);
+        xmax = xmax.max(bounds.origin.x + bounds.size.width);
+        ymin = ymin.min(bounds.origin.y);
+        ymax = ymax.max(bounds.origin.y + bounds.size.height);
+    }
+    if xmax <= xmin || ymax <= ymin {
+        return None;
+    }
+    let edge_offset = 1.0;
+    Some(match pos {
+        Position::Left => CGPoint::new(xmin + edge_offset, denormalize(t, ymin, ymax)),
+        Position::Right => CGPoint::new(xmax - edge_offset, denormalize(t, ymin, ymax)),
+        Position::Top => CGPoint::new(denormalize(t, xmin, xmax), ymin + edge_offset),
+        Position::Bottom => CGPoint::new(denormalize(t, xmin, xmax), ymax - edge_offset),
+    })
+}
+
 fn get_display_bounds(display: CGDirectDisplayID) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
     unsafe {
         let bounds = CGDisplayBounds(display);
@@ -872,6 +910,16 @@ impl Emulation for MacOSEmulation {
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
     async fn terminate(&mut self) {}
+
+    async fn warp(&mut self, _handle: EmulationHandle, pos: Position, t: f64) {
+        let Some(point) = warp_target(pos, t) else {
+            log::warn!("could not determine display bounds for cursor warp");
+            return;
+        };
+        if let Err(e) = CGDisplay::warp_mouse_cursor_position(point) {
+            log::warn!("failed to warp cursor to {pos:?} @ {t:.2}: {e:?}");
+        }
+    }
 }
 
 fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
@@ -969,7 +1017,6 @@ bitflags! {
         const Mod5Mask = (1<<7);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1066,32 @@ mod tests {
                 .all(|event| event.2 == XMods::ControlMask)
         );
         assert_eq!(events[3], (MAC_KEY_LEFT_CONTROL, 0, modifiers));
+    }
+}
+
+#[cfg(test)]
+mod warp_test {
+    use super::denormalize;
+
+    #[test]
+    fn midpoint() {
+        assert_eq!(denormalize(0.5, 0.0, 100.0), 50.0);
+    }
+
+    #[test]
+    fn extremes() {
+        assert_eq!(denormalize(0.0, 0.0, 100.0), 0.0);
+        assert_eq!(denormalize(1.0, 0.0, 100.0), 100.0);
+    }
+
+    #[test]
+    fn clamps_out_of_range_t() {
+        assert_eq!(denormalize(-0.5, 0.0, 100.0), 0.0);
+        assert_eq!(denormalize(1.5, 0.0, 100.0), 100.0);
+    }
+
+    #[test]
+    fn offset_bounds() {
+        assert_eq!(denormalize(0.5, -500.0, -300.0), -400.0);
     }
 }

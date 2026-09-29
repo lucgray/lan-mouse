@@ -133,6 +133,10 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
+    async fn release_to(&mut self, _t: f64) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         let _ = self.request_tx.send(Request::Terminate);
         Ok(())
@@ -267,7 +271,15 @@ fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
     }
     state.entry_point = entry;
     state.active_client = Some(pos);
-    let _ = state.event_tx.try_send((pos, CaptureEvent::Begin));
+    let t = match pos {
+        Position::Left | Position::Right => {
+            normalized_cross_axis(entry.1 as f64, 0.0, state.screen_h as f64)
+        }
+        Position::Top | Position::Bottom => {
+            normalized_cross_axis(entry.0 as f64, 0.0, state.screen_w as f64)
+        }
+    };
+    let _ = state.event_tx.try_send((pos, CaptureEvent::Begin(t)));
     log::debug!("x11: grabbed pointer for client {pos:?} at {entry:?}");
 }
 
@@ -370,6 +382,15 @@ fn handle_motion(state: &mut X11State, m: XMotionEvent) {
 }
 
 // ── Pure logic functions ───────────────────────────────────────────────────────
+
+/// Normalizes `coord` to `0.0..=1.0` within `min..=max`, falling back to the
+/// midpoint for degenerate bounds.
+fn normalized_cross_axis(coord: f64, min: f64, max: f64) -> f64 {
+    if max <= min {
+        return 0.5;
+    }
+    ((coord - min) / (max - min)).clamp(0.0, 1.0)
+}
 
 pub(crate) fn crossed_boundary(
     prev: (i32, i32),

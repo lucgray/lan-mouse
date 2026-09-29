@@ -115,6 +115,24 @@ impl Default for Bounds {
     }
 }
 
+/// Normalizes `coord` to `0.0..=1.0` within `min..=max`, clamping if the
+/// raw crossing point briefly ended up just outside the bounds (e.g. a
+/// fast flick past the very corner). Falls back to the midpoint if the
+/// bounds are degenerate, which should not happen in practice — active
+/// displays always have positive size.
+fn normalized_cross_axis(coord: f64, min: f64, max: f64) -> f64 {
+    if max <= min {
+        return 0.5;
+    }
+    ((coord - min) / (max - min)).clamp(0.0, 1.0)
+}
+
+/// Absolute coordinate for a normalized (`0.0..=1.0`) cross-axis
+/// position within `min..=max`. Inverse of [`normalized_cross_axis`].
+fn denormalize(t: f64, min: f64, max: f64) -> f64 {
+    min + t.clamp(0.0, 1.0) * (max - min)
+}
+
 #[derive(Debug)]
 struct InputCaptureState {
     /// active capture positions
@@ -161,6 +179,9 @@ enum InputSource {
 #[derive(Debug)]
 enum ProducerEvent {
     Release,
+    /// release, first warping the cursor to normalized cross-axis
+    /// position `t` along the edge currently captured at
+    ReleaseTo(f64),
     Create(Position),
     Destroy(Position),
     SetEnterOnly(Position, bool),
@@ -287,9 +308,32 @@ impl InputCaptureState {
     /// crossing that is the triggering mouse event's location, for an
     /// enter-bind it has to be queried separately since a key event
     /// carries no meaningful pointer location.
-    fn start_capture(&mut self, location: CGPoint, position: Position) -> Result<(), CaptureError> {
+    ///
+    /// Returns the normalized (`0.0..=1.0`) position along the crossed
+    /// edge, computed from the raw crossing location *before* it gets
+    /// clamped to the edge — so the peer can warp its cursor to
+    /// the matching spot instead of a fixed point on the edge.
+    /// normalized cross-axis position of `location` along `position`'s edge
+    fn cross_axis_t(&self, location: CGPoint, position: Position) -> f64 {
+        match position {
+            Position::Left | Position::Right => {
+                normalized_cross_axis(location.y, self.bounds.ymin, self.bounds.ymax)
+            }
+            Position::Top | Position::Bottom => {
+                normalized_cross_axis(location.x, self.bounds.xmin, self.bounds.xmax)
+            }
+        }
+    }
+
+    fn start_capture(
+        &mut self,
+        location: CGPoint,
+        position: Position,
+    ) -> Result<f64, CaptureError> {
+        let t = self.cross_axis_t(location, position);
         self.enter_position = Some(self.bounds.anchor_at_edge(position, Some(location)));
-        self.reset_cursor()
+        self.reset_cursor()?;
+        Ok(t)
     }
 
     /// resets the cursor to the position, where the capture started
@@ -297,6 +341,31 @@ impl InputCaptureState {
         let pos = self.enter_position.expect("capture active");
         log::trace!("Resetting cursor position to: {}, {}", pos.x, pos.y);
         CGDisplay::warp_mouse_cursor_position(pos).map_err(CaptureError::WarpCursor)
+    }
+
+    /// point on the currently-captured edge for normalized cross-axis
+    /// position `t`, e.g. so a peer handing control back can place the
+    /// cursor at the spot matching where its own local crossing was.
+    fn release_point(&self, t: f64) -> Option<CGPoint> {
+        let edge_offset = 1.0;
+        Some(match self.current_pos? {
+            Position::Left => CGPoint::new(
+                self.bounds.xmin + edge_offset,
+                denormalize(t, self.bounds.ymin, self.bounds.ymax),
+            ),
+            Position::Right => CGPoint::new(
+                self.bounds.xmax - edge_offset,
+                denormalize(t, self.bounds.ymin, self.bounds.ymax),
+            ),
+            Position::Top => CGPoint::new(
+                denormalize(t, self.bounds.xmin, self.bounds.xmax),
+                self.bounds.ymin + edge_offset,
+            ),
+            Position::Bottom => CGPoint::new(
+                denormalize(t, self.bounds.xmin, self.bounds.xmax),
+                self.bounds.ymax - edge_offset,
+            ),
+        })
     }
 
     fn hide_cursor(&self) -> Result<(), CaptureError> {
@@ -316,6 +385,16 @@ impl InputCaptureState {
                     self.current_pos = None;
                 }
                 self.current_source = None;
+            }
+            ProducerEvent::ReleaseTo(t) => {
+                if self.current_pos.is_some() {
+                    if let Some(point) = self.release_point(t) {
+                        CGDisplay::warp_mouse_cursor_position(point)
+                            .map_err(CaptureError::WarpCursor)?;
+                    }
+                    self.show_cursor()?;
+                    self.current_pos = None;
+                }
             }
             ProducerEvent::Grab(pos, source) => {
                 if self.current_pos.is_none() {
@@ -393,7 +472,6 @@ impl InputCaptureState {
         Ok(())
     }
 }
-
 fn is_inward_motion(position: Position, relative_x: f64, relative_y: f64) -> bool {
     match position {
         Position::Left => relative_x > 0.0,
@@ -411,6 +489,27 @@ fn is_pointer_motion_event(event_type: CGEventType) -> bool {
             | CGEventType::RightMouseDragged
             | CGEventType::OtherMouseDragged
     )
+}
+
+/// Whether `event` came from real keyboard hardware, as opposed to
+/// being synthesized by another process.
+///
+/// Vietnamese (and other) input method engines implement diacritic
+/// composition by deleting the real keystroke from the event stream
+/// and re-injecting a correction: a synthetic Backspace plus a
+/// synthetic "letter" event that carries a placeholder keycode (the
+/// actual composed character rides along in a separate Unicode-string
+/// field this capture never reads). If our tap sees these before the
+/// IME's own tap — tap ordering between two unrelated processes isn't
+/// something either controls — we'd forward that placeholder keycode
+/// to the peer as if it were what the user typed, which is wrong more
+/// often than not. Genuine hardware input reports
+/// [`CGEventSourceStateID::HIDSystemState`]; synthetic events created
+/// via `CGEventSourceCreate` with some other state (IMEs typically use
+/// `Private`) don't.
+fn is_genuine_hardware_event(event: &CGEvent) -> bool {
+    event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID)
+        == CGEventSourceStateID::HIDSystemState as i64
 }
 
 fn get_events(
@@ -733,15 +832,29 @@ fn create_event_tap<'a>(
 
             capture_position = Some(current_pos);
             drop_event = true;
-            get_events(
-                &event_type,
-                cg_ev,
-                &mut res_events,
-                &mut state.modifier_state,
-            )
-            .unwrap_or_else(|e| {
-                log::error!("Failed to get events: {e}");
-            });
+
+            let is_keyboard_event = matches!(
+                event_type,
+                CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+            );
+            if is_keyboard_event && !is_genuine_hardware_event(cg_ev) {
+                // A synthetic correction from something like a
+                // Vietnamese IME composing diacritics — see
+                // `is_genuine_hardware_event`. Consumed below
+                // (CallbackResult::Drop) same as a real key, just never
+                // translated or forwarded to the peer.
+                log::trace!("dropping non-hardware keyboard event: {event_type:?}");
+            } else {
+                get_events(
+                    &event_type,
+                    cg_ev,
+                    &mut res_events,
+                    &mut state.modifier_state,
+                )
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to get events: {e}");
+                });
+            }
 
             // Keep (hidden) cursor at the edge of the screen
             if is_pointer_motion_event(event_type) {
@@ -775,13 +888,17 @@ fn create_event_tap<'a>(
                         // that its pointer crossed back. Do not grab/hide the
                         // local cursor and do not drop the synthesized event.
                         route_enter_only = true;
-                        res_events.push(CaptureEvent::Begin);
+                        let t = state.cross_axis_t(cg_ev.location(), new_pos);
+                        res_events.push(CaptureEvent::Begin(t));
                     } else {
                         drop_event = true;
-                        state
+                        let t = state
                             .start_capture(cg_ev.location(), new_pos)
-                            .unwrap_or_else(|e| log::warn!("{e}"));
-                        res_events.push(CaptureEvent::Begin);
+                            .unwrap_or_else(|e| {
+                                log::warn!("{e}");
+                                0.5
+                            });
+                        res_events.push(CaptureEvent::Begin(t));
                         state
                             .handle_producer_event(ProducerEvent::Grab(new_pos, input_source))
                             .unwrap_or_else(|e| log::warn!("failed to grab pointer: {e}"));
@@ -855,11 +972,12 @@ fn create_event_tap<'a>(
                 // ask the window server where the cursor actually is.
                 let location = current_cursor_location().unwrap_or_else(|| cg_ev.location());
                 capture_position = Some(pos);
-                state
-                    .start_capture(location, pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
+                let t = state.start_capture(location, pos).unwrap_or_else(|e| {
+                    log::warn!("{e}");
+                    0.5
+                });
                 state.enter_binds.clear();
-                res_events.push(CaptureEvent::Begin);
+                res_events.push(CaptureEvent::Begin(t));
                 state
                     .handle_producer_event(ProducerEvent::Grab(pos, InputSource::Physical))
                     .unwrap_or_else(|e| log::warn!("failed to grab pointer: {e}"));
@@ -1157,6 +1275,15 @@ impl Capture for MacOSInputCapture {
             .handle_producer_event(ProducerEvent::Release)
     }
 
+    async fn release_to(&mut self, t: f64) -> Result<(), CaptureError> {
+        let notify_tx = self.notify_tx.clone();
+        tokio::task::spawn_local(async move {
+            log::debug!("notifying ReleaseTo({t:.2})");
+            let _ = notify_tx.send(ProducerEvent::ReleaseTo(t)).await;
+        });
+        Ok(())
+    }
+
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
@@ -1343,5 +1470,98 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod cross_axis_test {
+    use super::normalized_cross_axis;
+
+    #[test]
+    fn midpoint_of_range() {
+        assert_eq!(normalized_cross_axis(50.0, 0.0, 100.0), 0.5);
+    }
+
+    #[test]
+    fn start_and_end_of_range() {
+        assert_eq!(normalized_cross_axis(0.0, 0.0, 100.0), 0.0);
+        assert_eq!(normalized_cross_axis(100.0, 0.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn clamps_outside_bounds() {
+        assert_eq!(normalized_cross_axis(-10.0, 0.0, 100.0), 0.0);
+        assert_eq!(normalized_cross_axis(110.0, 0.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn offset_bounds() {
+        // a display union that doesn't start at the origin, e.g. a
+        // monitor placed to the left of (0, 0)
+        assert_eq!(normalized_cross_axis(-400.0, -500.0, -300.0), 0.5);
+    }
+
+    #[test]
+    fn degenerate_bounds_fall_back_to_midpoint() {
+        assert_eq!(normalized_cross_axis(5.0, 10.0, 10.0), 0.5);
+        assert_eq!(normalized_cross_axis(5.0, 10.0, 0.0), 0.5);
+    }
+}
+
+#[cfg(test)]
+mod denormalize_test {
+    use super::denormalize;
+
+    #[test]
+    fn midpoint() {
+        assert_eq!(denormalize(0.5, 0.0, 100.0), 50.0);
+    }
+
+    #[test]
+    fn extremes() {
+        assert_eq!(denormalize(0.0, 0.0, 100.0), 0.0);
+        assert_eq!(denormalize(1.0, 0.0, 100.0), 100.0);
+    }
+
+    #[test]
+    fn clamps_out_of_range_t() {
+        assert_eq!(denormalize(-0.5, 0.0, 100.0), 0.0);
+        assert_eq!(denormalize(1.5, 0.0, 100.0), 100.0);
+    }
+
+    #[test]
+    fn offset_bounds() {
+        assert_eq!(denormalize(0.5, -500.0, -300.0), -400.0);
+    }
+}
+
+#[cfg(test)]
+mod hardware_event_test {
+    use super::is_genuine_hardware_event;
+    use core_graphics::event::CGEvent;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+
+    #[test]
+    fn real_hid_source_is_genuine() {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).expect("source");
+        let event = CGEvent::new_keyboard_event(source, 0, true).expect("event");
+        assert!(is_genuine_hardware_event(&event));
+    }
+
+    #[test]
+    fn private_source_is_not_genuine() {
+        // the state an IME's own `CGEventSourceCreate` typically uses
+        // for its synthetic composition/correction events
+        let source = CGEventSource::new(CGEventSourceStateID::Private).expect("source");
+        let event = CGEvent::new_keyboard_event(source, 0, true).expect("event");
+        assert!(!is_genuine_hardware_event(&event));
+    }
+
+    #[test]
+    fn combined_session_source_is_not_genuine() {
+        let source =
+            CGEventSource::new(CGEventSourceStateID::CombinedSessionState).expect("source");
+        let event = CGEvent::new_keyboard_event(source, 0, true).expect("event");
+        assert!(!is_genuine_hardware_event(&event));
     }
 }

@@ -7,6 +7,8 @@ use crate::{
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
+    remap::KeyRemap,
+    scroll::ScrollInvert,
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
@@ -107,6 +109,11 @@ impl Service {
             config.jail_bind(),
             config.enter_binds(),
             window_identifier.clone(),
+            KeyRemap::new(config.remap_keys(), config.remap_chords()),
+            ScrollInvert::new(
+                config.invert_scroll_vertical(),
+                config.invert_scroll_horizontal(),
+            ),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(
@@ -311,6 +318,14 @@ impl Service {
         self.capture.set_enter_binds(enter_binds);
         self.update_scrolling_inversion(self.config.invert_scroll());
         self.update_mouse_sensitivity(self.config.mouse_sensitivity());
+        self.capture.set_remap(KeyRemap::new(
+            self.config.remap_keys(),
+            self.config.remap_chords(),
+        ));
+        self.capture.set_scroll_invert(ScrollInvert::new(
+            self.config.invert_scroll_vertical(),
+            self.config.invert_scroll_horizontal(),
+        ));
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -388,11 +403,11 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
-            ICaptureEvent::CaptureBegin(handle) => {
+            ICaptureEvent::CaptureBegin(handle, t) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                    self.emulation.send_leave_event(incoming.addr, t);
                 }
             }
             ICaptureEvent::CaptureDisabled => {

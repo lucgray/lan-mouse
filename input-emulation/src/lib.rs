@@ -69,6 +69,16 @@ impl Default for EmulationOptions {
     }
 }
 
+/// Edge a peer's cursor entered this device from, used by
+/// [`InputEmulation::warp`] to place the cursor on the matching edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(evdev)]
@@ -294,6 +304,15 @@ impl InputEmulation {
         true
     }
 
+    /// Warp the cursor to the normalized (`0.0..=1.0`) position `t`
+    /// along the given edge, so a cursor entering this device lands at
+    /// the same relative spot it left the peer's opposite edge at.
+    /// Backends that can't perform an absolute warp leave the cursor
+    /// wherever it already was, same as before this existed.
+    pub async fn warp(&mut self, handle: EmulationHandle, pos: Position, t: f64) {
+        self.emulation.warp(handle, pos, t).await
+    }
+
     /// Release everything tracked for `handle` and destroy the backend state.
     ///
     /// Convenience wrapper around [`destroy_bounded`](Self::destroy_bounded) that discards
@@ -512,6 +531,10 @@ trait Emulation: Send {
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+    /// Warp the cursor to the normalized cross-axis position `t` along
+    /// `pos`. Best-effort: a no-op default for backends that can't do
+    /// an absolute warp, or platforms not implemented yet.
+    async fn warp(&mut self, _handle: EmulationHandle, _pos: Position, _t: f64) {}
 }
 
 #[cfg(test)]

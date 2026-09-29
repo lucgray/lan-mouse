@@ -8,6 +8,8 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+mod remap;
+mod scroll;
 pub mod service;
 #[cfg(windows)]
 pub mod windows;
@@ -27,3 +29,5 @@ pub fn set_is_windows_service(is_service: bool) {
 pub fn is_windows_service() -> bool {
     IS_WINDOWS_SERVICE.load(std::sync::atomic::Ordering::SeqCst)
 }
+
+pub use remap::ChordRemap;
