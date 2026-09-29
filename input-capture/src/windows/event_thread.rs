@@ -127,6 +127,8 @@ thread_local! {
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
+    /// motion that could not be sent yet because the event channel was full
+    static PENDING_MOTION: Cell<(f64, f64)> = const { Cell::new((0., 0.)) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
     /// binds that enter a client without crossing a screen edge
@@ -310,6 +312,7 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* keys held now stop being observed for the duration of the
      * capture, so they must not still count as held afterwards */
     ENTER_BINDS.with_borrow_mut(|binds| binds.clear());
+    PENDING_MOTION.take();
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
@@ -337,10 +340,8 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
-    }
+    /* notify mainthread (motion is deferred, other events dropped if sending too fast) */
+    send_pointer_event(pos, pointer_event);
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -364,6 +365,7 @@ fn enter_via_bind(pos: Position) {
     ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
     PREV_POS.replace(Some(entry_point));
+    PENDING_MOTION.take();
     log::info!("entering client @ {pos}: enter-bind pressed");
     let t = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::cross_axis_position(displays, entry_point, entry_point, pos)
@@ -394,6 +396,40 @@ fn check_enter_bind(wparam: WPARAM, lparam: LPARAM) -> bool {
     // The bind keys stay physically held — see EnterBindTracker::clear
     ENTER_BINDS.with_borrow_mut(|binds| binds.clear());
     true
+}
+
+/// Sends a pointer event without blocking the hook.
+///
+/// Motion deltas are relative to the entry point, so a dropped motion event
+/// loses that movement for good. Motion that does not fit into the channel is
+/// therefore accumulated and sent along with the next event instead.
+fn send_pointer_event(pos: Position, event: PointerEvent) {
+    let event = match event {
+        PointerEvent::Motion { time, dx, dy } => {
+            let (pdx, pdy) = PENDING_MOTION.take();
+            let (dx, dy) = (dx + pdx, dy + pdy);
+            let motion = PointerEvent::Motion { time, dx, dy };
+            if try_send_event(pos, CaptureEvent::Input(Event::Pointer(motion))).is_err() {
+                log::debug!("event channel full, deferring motion ({dx}, {dy})");
+                PENDING_MOTION.set((dx, dy));
+            }
+            return;
+        }
+        event => event,
+    };
+
+    /* flush deferred motion first, so buttons and scrolling happen at the right position */
+    let (dx, dy) = PENDING_MOTION.take();
+    if dx != 0. || dy != 0. {
+        let motion = PointerEvent::Motion { time: 0, dx, dy };
+        if try_send_event(pos, CaptureEvent::Input(Event::Pointer(motion))).is_err() {
+            PENDING_MOTION.set((dx, dy));
+        }
+    }
+
+    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(event))) {
+        log::warn!("e: {e}");
+    }
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
