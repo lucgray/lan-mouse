@@ -434,7 +434,9 @@ fn route_handles(
 
 async fn create_backend(
     backend: Backend,
-    window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
+    #[cfg_attr(not(libei), allow(unused_variables))] window_identifier: Arc<
+        Mutex<Option<WindowIdentifier>>,
+    >,
 ) -> Result<
     Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
