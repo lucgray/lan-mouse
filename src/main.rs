@@ -73,6 +73,10 @@ fn run() -> Result<(), LanMouseError> {
             //  run a frontend
             #[cfg(feature = "gtk")]
             {
+                // Probe before spawning the child: once it binds the
+                // socket, an external daemon is indistinguishable from
+                // our own.
+                let owns_service = !external_service_running();
                 // Only spawn a new daemon if one isn't already running
                 let mut service = if lan_mouse_ipc::is_service_running() {
                     log::info!("daemon already running, connecting to existing instance");
@@ -80,7 +84,9 @@ fn run() -> Result<(), LanMouseError> {
                 } else {
                     Some(start_service()?)
                 };
-                let res = lan_mouse_gtk::run(config::local_commit());
+                let options =
+                    lan_mouse_gtk::RunOptions::default().with_service_ownership(owns_service);
+                let res = lan_mouse_gtk::run_with_options(config::local_commit(), options);
                 if let Some(ref mut service) = service {
                     #[cfg(unix)]
                     {
@@ -124,6 +130,22 @@ where
 
     // run async event loop
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
+}
+
+/// Whether a lan-mouse service not owned by this process is already
+/// listening on the lan-mouse socket. In that case the GUI acts as a
+/// pure client: quitting it must not suggest stopping the service.
+#[cfg(all(feature = "gtk", target_os = "linux"))]
+fn external_service_running() -> bool {
+    let Ok(path) = lan_mouse_ipc::default_socket_path() else {
+        return false;
+    };
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(all(feature = "gtk", not(target_os = "linux")))]
+fn external_service_running() -> bool {
+    false
 }
 
 fn start_service() -> Result<Child, io::Error> {
