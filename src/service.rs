@@ -105,7 +105,7 @@ impl Service {
             config.jail_bind(),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, config.emulation_options(), listener);
 
         // create dns resolver
         let resolver = DnsResolver::new()?;

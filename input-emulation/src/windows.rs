@@ -7,7 +7,6 @@ use input_event::{
 use async_trait::async_trait;
 use std::io;
 use std::ops::BitOrAssign;
-use std::time::Duration;
 use tokio::task::AbortHandle;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
@@ -20,18 +19,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-use super::{Emulation, EmulationHandle};
-
-const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
-const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
+use super::{Emulation, EmulationHandle, EmulationOptions};
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
+    options: EmulationOptions,
 }
 
 impl WindowsEmulation {
-    pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
-        Ok(Self { repeat_task: None })
+    pub(crate) fn new(options: EmulationOptions) -> Result<Self, WindowsEmulationCreationError> {
+        Ok(Self {
+            repeat_task: None,
+            options,
+        })
     }
 }
 
@@ -88,8 +88,10 @@ impl WindowsEmulation {
         // there can only be one repeating key and it's
         // always the last to be pressed
         self.kill_repeat_task();
+        let repeat_delay = self.options.key_repeat_delay;
+        let repeat_interval = self.options.key_repeat_interval;
         let repeat_task = tokio::task::spawn_local(async move {
-            tokio::time::sleep(DEFAULT_REPEAT_DELAY).await;
+            tokio::time::sleep(repeat_delay).await;
             loop {
                 if let Err(e) = key_event(key, 1) {
                     // Retrying a refused injection in a tight loop would freeze this task
@@ -97,7 +99,7 @@ impl WindowsEmulation {
                     log::warn!("stopping key repeat for key {key}: {e}");
                     break;
                 }
-                tokio::time::sleep(DEFAULT_REPEAT_INTERVAL).await;
+                tokio::time::sleep(repeat_interval).await;
             }
         });
         self.repeat_task = Some(repeat_task.abort_handle());
