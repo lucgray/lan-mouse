@@ -616,6 +616,10 @@ impl Emulation for MacOSEmulation {
     ) -> Result<(), EmulationError> {
         log::trace!("{event:?}");
         match event {
+            Event::Clipboard(_) => {
+                // Clipboard events are not emulated through this backend
+                // They are handled directly by the clipboard emulation module
+            }
             Event::Pointer(pointer_event) => {
                 match pointer_event {
                     PointerEvent::Motion { time: _, dx, dy } => {

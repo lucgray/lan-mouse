@@ -523,7 +523,7 @@ mod test {
             dx: 1.0,
             dy: 1.0,
         });
-        assert_eq!(r.apply(motion), vec![motion]);
+        assert_eq!(r.apply(motion.clone()), vec![motion]);
         assert_eq!(
             r.apply(key_ev(KeyTab, 1)),
             vec![key_ev(KeyLeftAlt, 1), mods(0), key_ev(KeyTab, 1)]
@@ -540,7 +540,7 @@ mod test {
             button: input_event::BTN_LEFT,
             state: 1,
         });
-        assert_eq!(r.apply(click), vec![key_ev(KeyLeftCtrl, 1), mods(0), click]);
+        assert_eq!(r.apply(click.clone()), vec![key_ev(KeyLeftCtrl, 1), mods(0), click]);
     }
 
     #[test]

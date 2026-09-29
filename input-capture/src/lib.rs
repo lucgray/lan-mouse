@@ -13,6 +13,7 @@ use input_event::{Event, KeyboardEvent, scancode};
 
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
+pub mod clipboard;
 pub mod error;
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -38,7 +39,7 @@ mod dummy;
 
 pub type CaptureHandle = u64;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
     /// capture on this capture handle is now active. The `f64` is the
     /// normalized (`0.0..=1.0`) position along the crossed edge, so the
@@ -356,7 +357,7 @@ impl Stream for InputCapture {
                     route_handles(
                         ids,
                         &self.enter_only_handles,
-                        event,
+                        &event,
                         event_requires_enter_only,
                     )
                 })
@@ -367,7 +368,7 @@ impl Stream for InputCapture {
                 1 => return Poll::Ready(Some(Ok((handles[0], event)))),
                 _ => {
                     for id in handles {
-                        self.pending.push_back((id, event));
+                        self.pending.push_back((id, event.clone()));
                     }
 
                     return Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))));
@@ -417,7 +418,7 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 fn route_handles(
     handles: &[CaptureHandle],
     enter_only_handles: &HashSet<CaptureHandle>,
-    event: CaptureEvent,
+    event: &CaptureEvent,
     event_requires_enter_only: bool,
 ) -> Vec<CaptureHandle> {
     if matches!(event, CaptureEvent::Begin(_)) && event_requires_enter_only {
@@ -566,7 +567,7 @@ mod tests {
     fn emulated_begin_is_routed_only_to_enter_only_handles() {
         let enter_only = HashSet::from([2]);
         assert_eq!(
-            route_handles(&[1, 2], &enter_only, CaptureEvent::Begin(0.5), true),
+            route_handles(&[1, 2], &enter_only, &CaptureEvent::Begin(0.5), true),
             vec![2]
         );
     }
@@ -575,7 +576,7 @@ mod tests {
     fn physical_begin_is_routed_to_all_handles() {
         let enter_only = HashSet::from([2]);
         assert_eq!(
-            route_handles(&[1, 2], &enter_only, CaptureEvent::Begin(0.5), false),
+            route_handles(&[1, 2], &enter_only, &CaptureEvent::Begin(0.5), false),
             vec![1, 2]
         );
     }

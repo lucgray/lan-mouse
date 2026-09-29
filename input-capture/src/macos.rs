@@ -993,7 +993,7 @@ fn create_event_tap<'a>(
             res_events.iter().for_each(|e| {
                 // error must be ignored, since the event channel
                 // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e, route_enter_only));
+                let _ = event_tx.blocking_send((pos, e.clone(), route_enter_only));
             });
             if drop_event {
                 // Returning Drop should stop the event from being processed,

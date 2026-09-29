@@ -14,7 +14,12 @@
 > macOS display hotplug, RustSec advisories, bounded per-peer cleanup +
 > `WouldBlock` retry, libei capture-update coalescing, unified cross-OS
 > scroll direction, macOS bidirectional capture loops, inactive-window raise,
-> app relaunch, Hangul key, modifier injection (#450), Caps Lock toggle.
+> app relaunch, Hangul key, modifier injection (#450), Caps Lock toggle —
+plus feature merges: per-client hotkey switching, key/chord remapping and
+scroll inversion (`[input_pre_processing]`), cross-axis warp position
+preservation, scroll-direction unification, macOS receive loops +
+hotplug/relaunch fixes, a Windows service mode with MSI packaging, and
+text clipboard sharing (`enable_clipboard`).
 
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 
@@ -629,6 +634,17 @@ invert_scroll_horizontal = false
 
 Like `remap_keys`, this happens on the *sending* side only, so scrolling on
 the local machine itself is unaffected.
+
+### Clipboard sharing
+
+Text copied to the clipboard is shared with connected peers and set on the
+receiving machine automatically. Enabled by default; disable it with:
+
+```toml
+enable_clipboard = false
+```
+
+Only plain text is shared — images and other formats are ignored.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

@@ -86,6 +86,8 @@ impl Emulation for EvdevEmulation {
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
+            // handled by the clipboard emulation module, not this backend
+            input_event::Event::Clipboard(_) => {}
         }
         Ok(())
     }

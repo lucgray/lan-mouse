@@ -131,6 +131,6 @@ mod test {
             dx: 1.0,
             dy: 1.0,
         });
-        assert_eq!(s.apply(motion), motion);
+        assert_eq!(s.apply(motion.clone()), motion);
     }
 }

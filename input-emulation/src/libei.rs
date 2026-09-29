@@ -291,6 +291,10 @@ impl Emulation for LibeiEmulation {
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
+            Event::Clipboard(_) => {
+                // Clipboard events are not supported by libei emulation
+                log::debug!("ignoring clipboard event in libei emulation");
+            }
         }
         flush_context(&self.context, &self.write_ready).await?;
         Ok(())

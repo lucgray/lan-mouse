@@ -26,6 +26,7 @@ mod evdev;
 #[cfg(target_os = "macos")]
 mod macos;
 
+pub mod clipboard;
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
@@ -590,11 +591,11 @@ mod tests {
         ) -> Result<(), EmulationError> {
             let (stall, fail) = {
                 let mut control = self.control.lock().unwrap();
-                if control.stall_on == Some(event) {
+                if control.stall_on.as_ref() == Some(&event) {
                     (true, false)
                 } else {
-                    control.consumed.push((handle, event));
-                    (false, control.fail_on == Some(event))
+                    control.consumed.push((handle, event.clone()));
+                    (false, control.fail_on.as_ref() == Some(&event))
                 }
             };
             if stall {
@@ -749,7 +750,7 @@ mod tests {
         emulation.create(0).await;
 
         let press = key_event(30, 1);
-        control.lock().unwrap().stall_on = Some(press);
+        control.lock().unwrap().stall_on = Some(press.clone());
 
         // cancel the consume future while the backend is still busy
         let cancelled =
@@ -774,28 +775,31 @@ mod tests {
         emulation.create(0).await;
 
         let press = key_event(30, 1);
-        control.lock().unwrap().stall_on = Some(press);
+        control.lock().unwrap().stall_on = Some(press.clone());
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), emulation.consume(press, 0))
+            tokio::time::timeout(Duration::from_millis(5), emulation.consume(press.clone(), 0))
                 .await
                 .is_err()
         );
 
         control.lock().unwrap().stall_on = None;
-        emulation.consume(press, 0).await.unwrap();
-        assert_eq!(consumed(&control), vec![(0, press)]);
+        emulation.consume(press.clone(), 0).await.unwrap();
+        assert_eq!(consumed(&control), vec![(0, press.clone())]);
         assert!(emulation.has_pressed_keys(0));
 
         let button_press = button_event(BTN_LEFT, 1);
-        control.lock().unwrap().stall_on = Some(button_press);
+        control.lock().unwrap().stall_on = Some(button_press.clone());
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), emulation.consume(button_press, 0))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                emulation.consume(button_press.clone(), 0)
+            )
+            .await
+            .is_err()
         );
 
         control.lock().unwrap().stall_on = None;
-        emulation.consume(button_press, 0).await.unwrap();
+        emulation.consume(button_press.clone(), 0).await.unwrap();
         assert_eq!(consumed(&control), vec![(0, press), (0, button_press)]);
     }
 
@@ -807,17 +811,20 @@ mod tests {
 
         let press = button_event(BTN_LEFT, 1);
         let release = button_event(BTN_LEFT, 0);
-        emulation.consume(press, 0).await.unwrap();
+        emulation.consume(press.clone(), 0).await.unwrap();
 
-        control.lock().unwrap().stall_on = Some(release);
+        control.lock().unwrap().stall_on = Some(release.clone());
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), emulation.consume(release, 0))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                emulation.consume(release.clone(), 0)
+            )
+            .await
+            .is_err()
         );
 
         control.lock().unwrap().stall_on = None;
-        emulation.consume(release, 0).await.unwrap();
+        emulation.consume(release.clone(), 0).await.unwrap();
         assert_eq!(consumed(&control), vec![(0, press), (0, release)]);
         assert!(emulation.destroy_bounded(0).await);
     }
@@ -829,7 +836,7 @@ mod tests {
         emulation.create(0).await;
 
         let press = key_event(30, 1);
-        control.lock().unwrap().fail_on = Some(press);
+        control.lock().unwrap().fail_on = Some(press.clone());
         assert!(emulation.consume(press, 0).await.is_err());
         assert!(
             emulation.has_pressed_keys(0),
@@ -976,7 +983,7 @@ mod tests {
 
         assert_eq!(
             post_process_event(
-                event,
+                event.clone(),
                 InputConfig {
                     invert_scroll: true,
                     mouse_sensitivity: 2.0,

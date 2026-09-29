@@ -95,6 +95,8 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     input_post_processing: Option<InputConfig>,
+    /// enable clipboard sharing between machines (default: true)
+    enable_clipboard: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -759,5 +761,13 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+
+    /// whether clipboard sharing is enabled (default: true)
+    pub fn clipboard_enabled(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.enable_clipboard)
+            .unwrap_or(true)
     }
 }

@@ -66,6 +66,8 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         commit: [u8; 8],
     },
+    /// clipboard data received from remote
+    ClipboardReceived(input_event::ClipboardEvent),
 }
 
 enum EmulationRequest {
@@ -77,6 +79,7 @@ enum EmulationRequest {
     Terminate,
     UpdateScrollingInversion(bool),
     UpdateMouseSensitivity(f64),
+    SendClipboard(SocketAddr, input_event::ClipboardEvent),
 }
 
 impl Emulation {
@@ -110,6 +113,12 @@ impl Emulation {
     pub(crate) fn send_leave_event(&self, addr: SocketAddr, t: f64) {
         self.request_tx
             .send(EmulationRequest::Release(addr, t))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn send_clipboard(&self, addr: SocketAddr, clipboard: input_event::ClipboardEvent) {
+        self.request_tx
+            .send(EmulationRequest::SendClipboard(addr, clipboard))
             .expect("channel closed");
     }
 
@@ -186,7 +195,21 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(input_event) => {
-                                self.emulation_proxy.consume(input_event, addr);
+                                // Clipboard events bypass the emulation
+                                // backend: they are handled by the service's
+                                // clipboard emulation module instead.
+                                match input_event {
+                                    input_event::Event::Clipboard(clipboard_event) => {
+                                        self.event_tx
+                                            .send(EmulationEvent::ClipboardReceived(
+                                                clipboard_event,
+                                            ))
+                                            .expect("channel closed");
+                                    }
+                                    _ => {
+                                        self.emulation_proxy.consume(input_event, addr);
+                                    }
+                                }
                             }
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
                             // Peer's version handshake. Echo our own
@@ -233,6 +256,11 @@ impl ListenTask {
                     EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity) => {
                         self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
                         self.emulation_proxy.update_config();
+                    }
+                    // send clipboard to a specific address
+                    EmulationRequest::SendClipboard(addr, clipboard_event) => {
+                        let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
+                        self.listener.reply_clipboard(addr, proto_event).await;
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);

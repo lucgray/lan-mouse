@@ -50,6 +50,8 @@ pub(crate) enum ICaptureEvent {
     /// remote `Leave`, explicit `Release` request, send
     /// failure, or destroy of the active capture).
     ClientLeft(u64),
+    /// clipboard data received from remote
+    ClipboardReceived(input_event::ClipboardEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -377,6 +379,11 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
+                    // clipboard events are accepted from any client
+                    if let ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event)) = &event {
+                        self.event_tx.send(ICaptureEvent::ClipboardReceived(clipboard_event.clone())).expect("channel closed");
+                        continue;
+                    }
                     if let Some(active) = self.active_client {
                         if handle != active {
                             // we only care about events coming from the client we are currently connected to
