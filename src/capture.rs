@@ -2,12 +2,14 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    WindowIdentifier,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
@@ -82,6 +84,7 @@ impl Capture {
         release_bind: Vec<scancode::Linux>,
         jail_bind: Vec<scancode::Linux>,
         enter_binds: HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>,
+        window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -100,6 +103,7 @@ impl Capture {
             jail: Cell::new(false),
             jail_bind: RefCell::new(jail_bind),
             jail_bind_prev_engaged: Cell::new(false),
+            window_identifier,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -203,6 +207,7 @@ struct CaptureTask {
     jail_bind: RefCell<Vec<scancode::Linux>>,
     /// last observed "jail bind engaged" state, for edge detection
     jail_bind_prev_engaged: Cell<bool>,
+    window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
 }
 
 impl CaptureTask {
@@ -256,6 +261,7 @@ impl CaptureTask {
     }
 
     async fn run(mut self) {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
             if let Err(e) = self.do_capture().await {
                 log::warn!("input capture exited: {e}");
@@ -284,7 +290,7 @@ impl CaptureTask {
     async fn do_capture(&mut self) -> Result<(), InputCaptureError> {
         /* allow cancelling capture request */
         let mut capture = tokio::select! {
-            r = InputCapture::new(self.backend) => r?,
+            r = InputCapture::new(self.backend, self.window_identifier.clone()) => r?,
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 

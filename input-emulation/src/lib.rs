@@ -603,6 +603,7 @@ mod tests {
                 control: control.clone(),
             }),
             handles: HashMap::new(),
+            input_config: InputConfig::default(),
             cleanup_timeout: Duration::from_millis(20),
         }
     }

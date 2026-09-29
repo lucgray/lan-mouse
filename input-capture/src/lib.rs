@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
+    sync::{Arc, Mutex},
     task::{Poll, ready},
 };
 
@@ -135,6 +136,24 @@ pub struct InputCapture {
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
 }
 
+#[derive(Clone, Debug)]
+pub enum WindowIdentifier {
+    Wayland(String),
+    X11(u32),
+}
+
+#[cfg(all(unix, feature = "libei"))]
+impl From<WindowIdentifier> for ashpd::WindowIdentifier {
+    fn from(identifier: WindowIdentifier) -> Self {
+        match identifier {
+            WindowIdentifier::Wayland(handle) => {
+                ashpd::WindowIdentifier::from_xdg_foreign_exported(handle)
+            }
+            WindowIdentifier::X11(_) => todo!(),
+        }
+    }
+}
+
 impl InputCapture {
     /// create a new client with the given id
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
@@ -237,8 +256,11 @@ impl InputCapture {
     }
 
     /// creates a new [`InputCapture`]
-    pub async fn new(backend: Option<Backend>) -> Result<Self, CaptureCreationError> {
-        let capture = create(backend).await?;
+    pub async fn new(
+        backend: Option<Backend>,
+        window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
+    ) -> Result<Self, CaptureCreationError> {
+        let capture = create(backend, window_identifier).await?;
         Ok(Self {
             capture,
             enter_only_handles: Default::default(),
@@ -393,13 +415,16 @@ fn route_handles(
 
 async fn create_backend(
     backend: Backend,
+    window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
 ) -> Result<
     Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
 > {
     match backend {
         #[cfg(libei)]
-        Backend::InputCapturePortal => Ok(Box::new(libei::LibeiInputCapture::new().await?)),
+        Backend::InputCapturePortal => Ok(Box::new(
+            libei::LibeiInputCapture::new(window_identifier).await?,
+        )),
         #[cfg(layer_shell)]
         Backend::LayerShell => Ok(Box::new(layer_shell::LayerShellInputCapture::new()?)),
         #[cfg(x11)]
@@ -414,12 +439,13 @@ async fn create_backend(
 
 async fn create(
     backend: Option<Backend>,
+    window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
 ) -> Result<
     Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
     CaptureCreationError,
 > {
     if let Some(backend) = backend {
-        let b = create_backend(backend).await;
+        let b = create_backend(backend, window_identifier).await;
         if b.is_ok() {
             log::info!("using capture backend: {backend}");
         }
@@ -438,7 +464,7 @@ async fn create(
         #[cfg(target_os = "macos")]
         Backend::MacOs,
     ] {
-        match create_backend(backend).await {
+        match create_backend(backend, window_identifier.clone()).await {
             Ok(b) => {
                 log::info!("using capture backend: {backend}");
                 return Ok(b);

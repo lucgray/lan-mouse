@@ -269,6 +269,14 @@ pub enum FrontendRequest {
     /// update the input post-processing settings (invert-scroll, mouse_sensitivity)
     UpdateScrollingInversion(bool),
     UpdateMouseSensitivity(f64),
+    /// window identifier used to present input-capture / remote-desktop prompts
+    WindowIdentifier(WindowIdentifier),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowIdentifier {
+    Wayland(String),
+    X11(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
