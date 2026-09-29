@@ -361,6 +361,14 @@ If no tray is available, Lan Mouse falls back to the previous behavior: closing 
 When the GUI connects to an already running daemon (e.g. the [systemd service](#systemd-service)),
 it acts as a plain client window instead: no tray icon is created and closing the window
 only quits the GUI, leaving the daemon running.
+
+#### Tray icon (Windows)
+
+On Windows, Lan Mouse runs as a notification-area application:
+Closing the window only hides it and Lan Mouse keeps running in the tray,
+where the icon offers a menu to re-open the window or quit the app entirely.
+Launching `lan-mouse` again opens a separate window.
+Set `LAN_MOUSE_HIDDEN=1` in the environment to start quietly into the tray without opening the window.
 </details>
 
 <details>

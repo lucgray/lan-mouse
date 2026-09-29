@@ -21,6 +21,11 @@ gdk4_wayland = { package = "gdk4-wayland", version="0.9.6", optional=true }
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.5", features = ["blocking"] }
 
+[target.'cfg(windows)'.dependencies]
+# default features (gtk, libxdo) only apply to the linux backend, which
+# is unreachable behind this windows-only target dependency
+tray-icon = { version = "0.24.1", default-features = false }
+
 [build-dependencies]
 glib-build-tools = { version = "0.20.0" }
 
