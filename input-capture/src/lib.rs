@@ -14,6 +14,9 @@ pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
 
+#[cfg(any(windows, target_os = "macos"))]
+mod enter_bind;
+
 #[cfg(libei)]
 mod libei;
 
@@ -252,6 +255,20 @@ impl InputCapture {
         keys.iter().all(|k| self.pressed_keys.contains(k))
     }
 
+    /// Set the key binds that begin capture at the given position
+    /// without the pointer having to cross the corresponding screen
+    /// edge.
+    ///
+    /// A bind only takes effect while capture is inactive and while a
+    /// client exists at that position — the resulting capture is
+    /// indistinguishable from one started by an edge crossing.
+    ///
+    /// Backends that cannot observe key events while capture is
+    /// inactive ignore this.
+    pub fn set_enter_binds(&mut self, binds: HashMap<Position, Vec<scancode::Linux>>) {
+        self.capture.set_enter_binds(binds);
+    }
+
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
         if let Ok(scancode) = scancode::Linux::try_from(key) {
             log::debug!("key: {key}, state: {state}, scancode: {scancode:?}");
@@ -347,6 +364,14 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
+
+    /// see [`InputCapture::set_enter_binds`]
+    ///
+    /// Implementing this is optional: a backend that cannot observe
+    /// key events while capture is inactive (e.g. the input capture
+    /// portal) keeps the default no-op, which leaves entering a
+    /// client to edge crossings only.
+    fn set_enter_binds(&mut self, _binds: HashMap<Position, Vec<scancode::Linux>>) {}
 }
 
 fn route_handles(

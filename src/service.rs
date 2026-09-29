@@ -103,6 +103,7 @@ impl Service {
             conn,
             config.release_bind(),
             config.jail_bind(),
+            config.enter_binds(),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, config.emulation_options(), listener);
@@ -266,6 +267,8 @@ impl Service {
         self.capture.set_release_bind(release_bind);
         let jail_bind = self.config.jail_bind();
         self.capture.set_jail_bind(jail_bind);
+        let enter_binds = self.config.enter_binds();
+        self.capture.set_enter_binds(enter_binds);
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
