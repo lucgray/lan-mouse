@@ -33,7 +33,9 @@ the standardized event format.
 
 ### Dispatcher
 The dispatcher component takes events from the event receiver and passes them
-to the correct backend corresponding to the type of client.
+to the correct backend corresponding to the type of client. The Windows backend
+reports an event the operating system refuses to inject as an error after a few
+attempts, instead of retrying it forever.
 
 
 ## Requests
