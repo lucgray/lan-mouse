@@ -777,9 +777,12 @@ mod tests {
         let press = key_event(30, 1);
         control.lock().unwrap().stall_on = Some(press.clone());
         assert!(
-            tokio::time::timeout(Duration::from_millis(5), emulation.consume(press.clone(), 0))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                emulation.consume(press.clone(), 0)
+            )
+            .await
+            .is_err()
         );
 
         control.lock().unwrap().stall_on = None;

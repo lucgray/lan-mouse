@@ -771,3 +771,115 @@ impl Config {
             .unwrap_or(true)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use input_event::scancode::Linux::*;
+
+    fn parse(toml: &str) -> ConfigToml {
+        toml::from_str(toml).expect("valid toml")
+    }
+
+    #[test]
+    fn empty_config_parses_with_all_defaults() {
+        let c = parse("");
+        assert_eq!(c.enable_clipboard, None);
+        assert_eq!(c.jail_bind, None);
+        assert_eq!(c.enter_binds, None);
+        assert_eq!(c.input_pre_processing, None);
+        assert_eq!(c.input_post_processing, None);
+    }
+
+    #[test]
+    fn parses_clipboard_toggle() {
+        assert_eq!(
+            parse("enable_clipboard = false").enable_clipboard,
+            Some(false)
+        );
+        assert_eq!(
+            parse("enable_clipboard = true").enable_clipboard,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parses_jail_bind() {
+        let c = parse(r#"jail_bind = ["KeyScrollLock"]"#);
+        assert_eq!(c.jail_bind, Some(vec![KeyScrollLock]));
+    }
+
+    #[test]
+    fn parses_enter_binds_per_position() {
+        let c = parse(
+            r#"
+            [enter_binds]
+            right = ["KeyRightmeta", "KeyRightalt"]
+            left = ["KeyLeftMeta"]
+            "#,
+        );
+        let binds = c.enter_binds.expect("enter_binds");
+        assert_eq!(binds[&Position::Right], vec![KeyRightmeta, KeyRightalt]);
+        assert_eq!(binds[&Position::Left], vec![KeyLeftMeta]);
+    }
+
+    #[test]
+    fn parses_input_pre_processing() {
+        let c = parse(
+            r#"
+            [input_pre_processing]
+            invert_scroll_vertical = true
+            invert_scroll_horizontal = false
+
+            [input_pre_processing.remap_keys]
+            KeyLeftMeta = "KeyLeftCtrl"
+
+            [[input_pre_processing.remap_chords]]
+            modifier = "KeyLeftMeta"
+            trigger = "KeyTab"
+            to = "KeyLeftAlt"
+            "#,
+        );
+        let pre = c.input_pre_processing.expect("pre_processing");
+        assert_eq!(pre.invert_scroll_vertical, Some(true));
+        assert_eq!(pre.invert_scroll_horizontal, Some(false));
+        assert_eq!(pre.remap_keys.as_ref().unwrap()[&KeyLeftMeta], KeyLeftCtrl);
+        let chord = &pre.remap_chords.as_ref().unwrap()[0];
+        assert_eq!(chord.modifier, KeyLeftMeta);
+        assert_eq!(chord.trigger, KeyTab);
+        assert_eq!(chord.to, KeyLeftAlt);
+    }
+
+    #[test]
+    fn parses_input_post_processing() {
+        let c = parse(
+            r#"
+            [input_post_processing]
+            invert_scroll = true
+            mouse_sensitivity = 1.5
+            "#,
+        );
+        let post = c.input_post_processing.expect("post_processing");
+        assert_eq!(post.invert_scroll, Some(true));
+        assert_eq!(post.mouse_sensitivity, Some(1.5));
+    }
+
+    #[test]
+    fn parses_key_repeat_timing() {
+        let c = parse(
+            r#"
+            key_repeat_delay = 400
+            key_repeat_interval = 25
+            "#,
+        );
+        assert_eq!(c.key_repeat_delay, Some(400));
+        assert_eq!(c.key_repeat_interval, Some(25));
+    }
+
+    #[test]
+    fn capitalized_scancode_spellings_are_accepted() {
+        // #501: config keys must accept the spellings users actually type
+        let c = parse(r#"release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]"#);
+        assert_eq!(c.release_bind, Some(vec![KeyA, KeyS, KeyD, KeyF]));
+    }
+}

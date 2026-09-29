@@ -34,6 +34,13 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
+/// wildcard listen address: `[::]` binds dual-stack on platforms with an
+/// IPv6 stack (V4-mapped included), which is what we want so both IPv4 and
+/// IPv6 peers can reach us. Callers fall back to `0.0.0.0` on error.
+fn listen_addr(port: u16) -> SocketAddr {
+    SocketAddr::new("::".parse().expect("invalid ip"), port)
+}
+
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
@@ -109,8 +116,16 @@ impl LanMouseListener {
             ..Default::default()
         };
 
-        let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-        let mut listener = listen(listen_addr, cfg.clone()).await?;
+        // try dual-stack `[::]` first (accepts both IPv4 and IPv6 peers),
+        // fall back to IPv4-only if the platform has no IPv6 stack
+        let mut listener = match listen(listen_addr(port), cfg.clone()).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("dual-stack listen failed ({e}), falling back to IPv4-only");
+                let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
+                listen(listen_addr, cfg.clone()).await?
+            }
+        };
 
         let conns: Rc<AsyncMutex<Vec<(SocketAddr, ArcConn)>>> =
             Rc::new(AsyncMutex::new(Vec::new()));
@@ -158,8 +173,7 @@ impl LanMouseListener {
                         },
                         port = request_port_change_rx.recv() => {
                             let port = port.expect("channel closed");
-                            let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-                            match listen(listen_addr, cfg.clone()).await {
+                            match listen(listen_addr(port), cfg.clone()).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
                                     listener = new_listener;

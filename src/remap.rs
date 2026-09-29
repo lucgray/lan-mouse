@@ -540,7 +540,10 @@ mod test {
             button: input_event::BTN_LEFT,
             state: 1,
         });
-        assert_eq!(r.apply(click.clone()), vec![key_ev(KeyLeftCtrl, 1), mods(0), click]);
+        assert_eq!(
+            r.apply(click.clone()),
+            vec![key_ev(KeyLeftCtrl, 1), mods(0), click]
+        );
     }
 
     #[test]

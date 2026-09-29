@@ -43,13 +43,24 @@ pub(crate) enum LanMouseConnectionError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// bind a socket matching the target's address family — an IPv4-bound
+/// socket can't send to an IPv6 peer ("address family not supported")
+fn bind_addr_for(addr: SocketAddr) -> SocketAddr {
+    if addr.is_ipv6() {
+        "[::]:0".parse().expect("invalid ip")
+    } else {
+        "0.0.0.0:0".parse().expect("invalid ip")
+    }
+}
+
 async fn connect(
     addr: SocketAddr,
     cert: Certificate,
 ) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
     log::info!("connecting to {addr} ...");
+    let bind_addr = bind_addr_for(addr);
     let conn = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
+        UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| (addr, e.into()))?,
     );
@@ -395,4 +406,17 @@ async fn disconnect(
     client_manager.set_peer_commit(handle, None);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_addr_matches_target_family() {
+        let v4: SocketAddr = "192.168.1.1:4242".parse().unwrap();
+        assert!(bind_addr_for(v4).is_ipv4());
+        let v6: SocketAddr = "[fe80::1]:4242".parse().unwrap();
+        assert!(bind_addr_for(v6).is_ipv6());
+    }
 }

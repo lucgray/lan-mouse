@@ -399,3 +399,212 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         ClipboardEvent::Text(text),
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(event: ProtoEvent) -> ProtoEvent {
+        let (buf, len) = event.into();
+        let _ = len;
+        buf.try_into().expect("decode")
+    }
+
+    fn as_input(event: ProtoEvent) -> InputEvent {
+        match event {
+            ProtoEvent::Input(e) => e,
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrips_all_fixed_size_variants() {
+        assert!(matches!(roundtrip(ProtoEvent::Ping), ProtoEvent::Ping));
+        assert!(matches!(
+            roundtrip(ProtoEvent::Pong(true)),
+            ProtoEvent::Pong(true)
+        ));
+        assert!(matches!(
+            roundtrip(ProtoEvent::Pong(false)),
+            ProtoEvent::Pong(false)
+        ));
+        assert!(matches!(
+            roundtrip(ProtoEvent::Ack(0xdeadbeef)),
+            ProtoEvent::Ack(0xdeadbeef)
+        ));
+
+        // the f64 cross-axis t added in #483 must survive the wire
+        match roundtrip(ProtoEvent::Enter(Position::Left, 0.25)) {
+            ProtoEvent::Enter(p, t) => {
+                assert!(matches!(p, Position::Left));
+                assert!((t - 0.25).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Enter, got {other:?}"),
+        }
+        match roundtrip(ProtoEvent::Leave(42, 0.75)) {
+            ProtoEvent::Leave(s, t) => {
+                assert_eq!(s, 42);
+                assert!((t - 0.75).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Leave, got {other:?}"),
+        }
+
+        let commit = *b"abc12345";
+        match roundtrip(ProtoEvent::Hello { commit }) {
+            ProtoEvent::Hello { commit: c } => assert_eq!(c, commit),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrips_pointer_events() {
+        match as_input(roundtrip(ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::Motion {
+                time: 7,
+                dx: -1.5,
+                dy: 2.5,
+            },
+        )))) {
+            InputEvent::Pointer(PointerEvent::Motion { time, dx, dy }) => {
+                assert_eq!(time, 7);
+                assert!((dx - -1.5).abs() < f64::EPSILON);
+                assert!((dy - 2.5).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Motion, got {other:?}"),
+        }
+        match as_input(roundtrip(ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::Button {
+                time: 1,
+                button: 0x110,
+                state: 1,
+            },
+        )))) {
+            InputEvent::Pointer(PointerEvent::Button { button, state, .. }) => {
+                assert_eq!(button, 0x110);
+                assert_eq!(state, 1);
+            }
+            other => panic!("expected Button, got {other:?}"),
+        }
+        match as_input(roundtrip(ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::Axis {
+                time: 3,
+                axis: 0,
+                value: -120.0,
+            },
+        )))) {
+            InputEvent::Pointer(PointerEvent::Axis { axis, value, .. }) => {
+                assert_eq!(axis, 0);
+                assert!((value - -120.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Axis, got {other:?}"),
+        }
+        match as_input(roundtrip(ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::AxisDiscrete120 { axis: 1, value: -2 },
+        )))) {
+            InputEvent::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) => {
+                assert_eq!(axis, 1);
+                assert_eq!(value, -2);
+            }
+            other => panic!("expected AxisDiscrete120, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrips_keyboard_events() {
+        match as_input(roundtrip(ProtoEvent::Input(InputEvent::Keyboard(
+            KeyboardEvent::Key {
+                time: 9,
+                key: 30,
+                state: 1,
+            },
+        )))) {
+            InputEvent::Keyboard(KeyboardEvent::Key { time, key, state }) => {
+                assert_eq!(time, 9);
+                assert_eq!(key, 30);
+                assert_eq!(state, 1);
+            }
+            other => panic!("expected Key, got {other:?}"),
+        }
+        match as_input(roundtrip(ProtoEvent::Input(InputEvent::Keyboard(
+            KeyboardEvent::Modifiers {
+                depressed: 4,
+                latched: 0,
+                locked: 2,
+                group: 1,
+            },
+        )))) {
+            InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            }) => {
+                assert_eq!(depressed, 4);
+                assert_eq!(latched, 0);
+                assert_eq!(locked, 2);
+                assert_eq!(group, 1);
+            }
+            other => panic!("expected Modifiers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_event_type() {
+        // forward-compat: a newer peer's unknown event type must fail
+        // decode (the receive loop skips it) rather than mis-parse
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = u8::MAX;
+        assert!(ProtoEvent::try_from(buf).is_err());
+    }
+
+    #[test]
+    fn clipboard_text_is_not_fixed_size_decodable() {
+        // the variable-length clipboard event must not decode via the
+        // fixed-size path, which dispatches on buf[0] first
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = EventType::ClipboardText as u8;
+        assert!(matches!(
+            ProtoEvent::try_from(buf),
+            Err(ProtocolError::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn clipboard_roundtrip() {
+        let event = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(
+            "hello clipboard".to_owned(),
+        )));
+        let buf = encode_clipboard_event(&event).expect("encode");
+        match decode_clipboard_event(&buf).expect("decode") {
+            ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(t))) => {
+                assert_eq!(t, "hello clipboard");
+            }
+            other => panic!("expected clipboard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clipboard_rejects_oversize_and_truncated() {
+        let big = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(
+            "x".repeat(MAX_CLIPBOARD_SIZE + 1),
+        )));
+        assert!(matches!(
+            encode_clipboard_event(&big),
+            Err(ProtocolError::ClipboardTooLarge(_))
+        ));
+
+        // declared length larger than the payload actually carries
+        let mut buf = vec![EventType::ClipboardText as u8];
+        buf.extend_from_slice(&10u32.to_be_bytes());
+        buf.extend_from_slice(b"hi");
+        assert!(matches!(
+            decode_clipboard_event(&buf),
+            Err(ProtocolError::BufferTooSmall)
+        ));
+
+        assert!(matches!(
+            decode_clipboard_event(&[]),
+            Err(ProtocolError::BufferTooSmall)
+        ));
+    }
+}
