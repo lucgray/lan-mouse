@@ -14,13 +14,14 @@ use windows::Win32::System::StationsAndDesktops::{
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
+    VK_CAPITAL, VK_NUMLOCK, VK_SCROLL,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
     MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_WHEEL, MOUSEINPUT,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -43,6 +44,12 @@ const KEY_LEFT_META: u32 = 125;
 const KEY_RIGHT_META: u32 = 126;
 // Linux keycode for L
 const KEY_L: u32 = 38;
+// Lock keys: real keyboards do not auto-repeat them, so the receiver
+// must not synthesize repeats either — repeating a lock key would
+// toggle it on and off for as long as it is held.
+const KEY_CAPS_LOCK: u32 = 58;
+const KEY_NUM_LOCK: u32 = 69;
+const KEY_SCROLL_LOCK: u32 = 70;
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
@@ -103,12 +110,18 @@ impl Emulation for WindowsEmulation {
                     match state {
                         // pressed
                         0 => self.kill_repeat_task(),
-                        1 => self.spawn_repeat_task(key).await,
+                        1 => {
+                            // only the most recently pressed key repeats
+                            self.kill_repeat_task();
+                            if !matches!(key, KEY_CAPS_LOCK | KEY_NUM_LOCK | KEY_SCROLL_LOCK) {
+                                self.spawn_repeat_task(key).await;
+                            }
+                        }
                         _ => {}
                     }
                     key_event(key, state)?;
                 }
-                KeyboardEvent::Modifiers { .. } => {}
+                KeyboardEvent::Modifiers { locked, .. } => sync_lock_state(locked)?,
             },
             Event::Clipboard(_) => {
                 // Clipboard events are not emulated through this backend
@@ -347,6 +360,40 @@ fn warp_target(pos: Position, t: f64) -> Option<(i32, i32)> {
         Position::Bottom => (denormalize(t, xmin, xmax), ymax - edge_offset),
     };
     Some((x as i32, y as i32))
+}
+
+/// Lock-key bits in the X-style modifier mask that
+/// `KeyboardEvent::Modifiers` events carry: CapsLock is `LockMask`,
+/// NumLock `Mod2` and ScrollLock `Mod3`.
+const LOCKED_CAPS: u32 = 1 << 1;
+const LOCKED_NUM: u32 = 1 << 4;
+const LOCKED_SCROLL: u32 = 1 << 5;
+
+/// Toggle each lock key whose state differs from the `locked` mask the
+/// sender reported. Otherwise a numpad produces navigation keys when
+/// the sender's NumLock is on but this machine's is off (and vice
+/// versa), because SendInput key events can only toggle locks, never
+/// set them directly.
+fn sync_lock_state(locked: u32) -> Result<(), EmulationError> {
+    let lock_keys = [
+        (scancode::Linux::KeyCapsLock as u32, LOCKED_CAPS, VK_CAPITAL),
+        (scancode::Linux::KeyNumlock as u32, LOCKED_NUM, VK_NUMLOCK),
+        (
+            scancode::Linux::KeyScrollLock as u32,
+            LOCKED_SCROLL,
+            VK_SCROLL,
+        ),
+    ];
+    for (key, mask, vk) in lock_keys {
+        // SAFETY: GetKeyState is always safe to call for these constants.
+        let toggled = unsafe { GetKeyState(i32::from(vk.0)) } & 1 != 0;
+        if toggled != (locked & mask != 0) {
+            log::debug!("syncing lock state for key {key}");
+            key_event(key, 1)?;
+            key_event(key, 0)?;
+        }
+    }
+    Ok(())
 }
 
 fn key_event(key: u32, state: u8) -> Result<(), EmulationError> {
