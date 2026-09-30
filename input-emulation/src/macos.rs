@@ -41,6 +41,10 @@ pub(crate) struct MacOSEmulation {
     event_source: CGEventSource,
     /// task handle for key repeats
     repeat_task: Option<JoinHandle<()>>,
+    /// macOS virtual keycode currently in the repeat slot, if any.
+    /// Only the most recently pressed key repeats (matching hardware);
+    /// other held keys keep their down state until their own release.
+    repeating_key: Option<CGKeyCode>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
     /// button previously pressed (evdev button code)
@@ -67,6 +71,27 @@ fn drag_event_type(button: u32) -> CGEventType {
     }
 }
 
+/// Maps an evdev button code to the `CGMouseButton` a drag event must
+/// carry so macOS attributes it to the button actually held.
+fn cg_mouse_button(button: u32) -> CGMouseButton {
+    match button {
+        BTN_LEFT => CGMouseButton::Left,
+        BTN_RIGHT => CGMouseButton::Right,
+        _ => CGMouseButton::Center,
+    }
+}
+
+/// `MOUSE_EVENT_BUTTON_NUMBER` for OtherMouse drag events:
+/// 2 = middle, 3 = back, 4 = forward. Left/right drags need none.
+fn cg_mouse_button_number(button: u32) -> Option<i64> {
+    match button {
+        BTN_MIDDLE => Some(2),
+        BTN_BACK => Some(3),
+        BTN_FORWARD => Some(4),
+        _ => None,
+    }
+}
+
 unsafe impl Send for MacOSEmulation {}
 
 impl MacOSEmulation {
@@ -77,6 +102,7 @@ impl MacOSEmulation {
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
         Ok(Self {
             event_source,
+            repeating_key: None,
             pressed_buttons: HashSet::new(),
             previous_button: None,
             previous_button_click: None,
@@ -95,8 +121,11 @@ impl MacOSEmulation {
 
     async fn spawn_repeat_task(&mut self, key: u16) {
         // there can only be one repeating key and it's
-        // always the last to be pressed
-        self.cancel_repeat_task().await;
+        // always the last to be pressed. Stopping the previous
+        // repeat loop must NOT release that key: it is still
+        // physically held and its release arrives as its own
+        // key-up event later (issue #365).
+        self.stop_repeat_task().await;
         // initial key event
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
         // repeat task
@@ -119,29 +148,24 @@ impl MacOSEmulation {
                     }
                 }
             }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
-            //
-            // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
-            // update_modifiers expects a Linux evdev scancode, and the two
-            // codespaces collide (e.g. Mac LeftShift=56 == Linux KeyLeftAlt=56,
-            // Mac Down=125 == Linux KeyLeftMeta=125), corrupting modifier
-            // state for chords like Shift+Option+X or Cmd+Down. Modifier state
-            // is owned by the main consume() loop, which already calls
-            // update_modifiers with the correct Linux scancode on the real key
-            // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
+            // The corresponding key-up is posted by the consume() loop when
+            // the real release event arrives — never here. Emitting it on
+            // task cancellation would release the key early whenever a
+            // *different* key took over the repeat slot while this one is
+            // still held.
         });
         self.repeat_task = Some(repeat_task);
+        self.repeating_key = Some(key);
     }
 
-    async fn cancel_repeat_task(&mut self) {
+    /// Stop the repeat loop without emitting any key event. The key's
+    /// release is signalled by its own `state: 0` event.
+    async fn stop_repeat_task(&mut self) {
         if let Some(task) = self.repeat_task.take() {
             self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
+        self.repeating_key = None;
     }
 }
 
@@ -638,18 +662,29 @@ impl Emulation for MacOSEmulation {
                         mouse_location.y = new_mouse_y;
 
                         // If any button is held, emit a drag event for it;
-                        // otherwise emit a normal mouse-moved event.
-                        let event_type = self
+                        // otherwise emit a normal mouse-moved event. The
+                        // event must carry the button that is actually held
+                        // (and, for OtherMouseDragged, its button number) —
+                        // hardcoding Left makes macOS report a left-button
+                        // drag while a middle/right button is held, which
+                        // confuses apps tracking per-button state (#331).
+                        let (event_type, mouse_button, button_number) = self
                             .pressed_buttons
                             .iter()
                             .next()
-                            .map(|&btn| drag_event_type(btn))
-                            .unwrap_or(CGEventType::MouseMoved);
+                            .map(|&btn| {
+                                (
+                                    drag_event_type(btn),
+                                    cg_mouse_button(btn),
+                                    cg_mouse_button_number(btn),
+                                )
+                            })
+                            .unwrap_or((CGEventType::MouseMoved, CGMouseButton::Left, None));
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
                             mouse_location,
-                            CGMouseButton::Left,
+                            mouse_button,
                         ) {
                             Ok(e) => e,
                             Err(_) => {
@@ -657,6 +692,12 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
+                        if let Some(btn_num) = button_number {
+                            event.set_integer_value_field(
+                                EventField::MOUSE_EVENT_BUTTON_NUMBER,
+                                btn_num,
+                            );
+                        }
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
                         event.set_integer_value_field(
@@ -761,7 +802,7 @@ impl Emulation for MacOSEmulation {
                         // are positive down/right. Posted events reportedly skip this Mac's
                         // Natural scrolling (not verified here), as intended: the sender
                         // already applied its own, and scroll follows its setting.
-                        let value = -value as i32;
+                        let value = (value as i32).saturating_neg();
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -842,7 +883,7 @@ impl Emulation for MacOSEmulation {
                     // release.
                     match key_disposition(key, state) {
                         KeyDisposition::ToggleInputSource => {
-                            self.cancel_repeat_task().await;
+                            self.stop_repeat_task().await;
                             toggle_input_source(
                                 self.event_source.clone(),
                                 self.modifier_state.get(),
@@ -883,9 +924,25 @@ impl Emulation for MacOSEmulation {
                         );
                     } else {
                         match state {
+                            // released: stop the repeat loop if this key
+                            // owns it, then post the release for THIS key.
+                            // A release can arrive for a key that is not in
+                            // the repeat slot (another key took it over
+                            // while both were held), so the key-up must be
+                            // emitted here rather than by the repeat task.
+                            0 => {
+                                if self.repeating_key == Some(code) {
+                                    self.stop_repeat_task().await;
+                                }
+                                key_event(
+                                    self.event_source.clone(),
+                                    code,
+                                    0,
+                                    self.modifier_state.get(),
+                                );
+                            }
                             // pressed
-                            1 => self.spawn_repeat_task(code).await,
-                            _ => self.cancel_repeat_task().await,
+                            _ => self.spawn_repeat_task(code).await,
                         }
                     }
                 }

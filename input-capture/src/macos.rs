@@ -753,6 +753,11 @@ fn create_event_tap<'a>(
     let event_tap_callback = move |_proxy: CGEventTapProxy,
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
+        // SkyLight invokes this callback through an extern "C" trampoline:
+        // a panic unwinding out of it abort()s the whole process
+        // (issue #394). Catch panics and pass the event through instead
+        // of crashing — losing one event beats losing the app.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         log::trace!("Got event from tap: {event_type:?}");
 
         let mut state = client_state.blocking_lock();
@@ -1006,6 +1011,11 @@ fn create_event_tap<'a>(
         } else {
             CallbackResult::Keep
         }
+        }))
+        .unwrap_or_else(|_| {
+            log::error!("event tap callback panicked — passing event through");
+            CallbackResult::Keep
+        })
     };
 
     let tap = CGEventTap::new(
@@ -1095,22 +1105,26 @@ fn event_tap_thread(
 /// Mode, DesktopShapeChanged, etc.). Skip the begin phase; on the
 /// real notification, kick the producer task to refresh bounds.
 extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_info: *mut c_void) {
-    const K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG: u32 = 1 << 0;
-    if flags & K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG != 0 {
-        return;
-    }
-    if user_info.is_null() {
-        return;
-    }
-    // SAFETY: user_info is a Box::into_raw of Sender<ProducerEvent>
-    // owned by `event_tap_thread`. It's valid for the lifetime of
-    // that thread; the registration is removed before the box is
-    // freed. The callback only fires while the run loop is running
-    // on that thread, so we know the box is live here.
-    let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
-        log::warn!("failed to notify display reconfiguration: {e}");
-    }
+    // Same FFI-boundary rule as the event tap callback: a panic escaping
+    // an extern "C" frame abort()s the process (issue #394).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        const K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG: u32 = 1 << 0;
+        if flags & K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG != 0 {
+            return;
+        }
+        if user_info.is_null() {
+            return;
+        }
+        // SAFETY: user_info is a Box::into_raw of Sender<ProducerEvent>
+        // owned by `event_tap_thread`. It's valid for the lifetime of
+        // that thread; the registration is removed before the box is
+        // freed. The callback only fires while the run loop is running
+        // on that thread, so we know the box is live here.
+        let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
+        if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+            log::warn!("failed to notify display reconfiguration: {e}");
+        }
+    }));
 }
 
 pub struct MacOSInputCapture {
@@ -1118,6 +1132,7 @@ pub struct MacOSInputCapture {
     last_event_requires_enter_only: bool,
     run_loop: CFRunLoop,
     state: Arc<Mutex<InputCaptureState>>,
+    notify_tx: Sender<ProducerEvent>,
 }
 
 impl MacOSInputCapture {
@@ -1175,6 +1190,7 @@ impl MacOSInputCapture {
             last_event_requires_enter_only: false,
             run_loop,
             state: control_state,
+            notify_tx,
         })
     }
 }
