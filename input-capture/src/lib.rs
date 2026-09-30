@@ -146,7 +146,7 @@ pub enum WindowIdentifier {
     X11(u32),
 }
 
-#[cfg(all(unix, feature = "libei"))]
+#[cfg(libei)]
 impl From<WindowIdentifier> for ashpd::WindowIdentifier {
     fn from(identifier: WindowIdentifier) -> Self {
         match identifier {
@@ -434,7 +434,11 @@ fn route_handles(
 
 async fn create_backend(
     backend: Backend,
-    window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
+    // only the libei backend consumes the identifier; other platforms
+    // compile that branch out, leaving the parameter unused
+    #[cfg_attr(not(libei), allow(unused_variables))] window_identifier: Arc<
+        Mutex<Option<WindowIdentifier>>,
+    >,
 ) -> Result<
     Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
     CaptureCreationError,

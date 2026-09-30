@@ -19,7 +19,9 @@ use std::{env, process, str, sync::OnceLock};
 use gtk::CssProvider;
 use window::Window;
 
-use lan_mouse_ipc::{FrontendEvent, FrontendRequest, WindowIdentifier};
+use lan_mouse_ipc::FrontendEvent;
+#[cfg(all(unix, feature = "wayland_window_identifier", not(target_os = "macos")))]
+use lan_mouse_ipc::{FrontendRequest, WindowIdentifier};
 
 /// Local build's commit hash, set once by [`run`] before the GTK
 /// main loop starts. Read by per-row UI to compare against each

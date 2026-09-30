@@ -440,6 +440,24 @@ systemctl --user enable --now lan-mouse.service
 > [!Important]
 > Make sure to point `ExecStart=/usr/bin/lan-mouse daemon` to the actual `lan-mouse` binary (in case it is not under `/usr/bin`, e.g. when installed manually.
 
+## launchd Agent (macOS)
+
+On macOS, lan-mouse must run inside a graphical **user** session — the
+CGEvent taps it uses for capture and emulation do not exist in the
+system context. This means a Launch**Daemon** (`/Library/LaunchDaemons`)
+cannot work; use a Launch**Agent** (`~/Library/LaunchAgents`) instead:
+
+```sh
+cp service/de.feschber.LanMouse.plist ~/Library/LaunchAgents
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/de.feschber.LanMouse.plist
+```
+
+> [!Important]
+> Point `ProgramArguments` at the actual `lan-mouse` binary. The launchd
+> job itself must also be granted Accessibility and Input Monitoring
+> permissions (System Settings → Privacy & Security), since TCC tracks
+> the responsible process.
+
 
 ## Configuration
 To automatically load clients on startup, the file `$XDG_CONFIG_HOME/lan-mouse/config.toml` is parsed.
