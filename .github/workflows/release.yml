@@ -117,6 +117,13 @@ jobs:
         Get-Childitem -Path "C:\\gtk-build\\gtk\\x64\\release\\bin\\*.dll" -File -Recurse | Copy-Item -Destination "lan-mouse-windows"
         Copy-Item -Path "target\release\lan-mouse.exe" -Destination "lan-mouse-windows"
         Compress-Archive -Path "lan-mouse-windows\*" -DestinationPath lan-mouse-windows-x86_64.zip
+    - name: Prepare installer sources
+      run: |
+        # heat harvesting fails when a cached GTK install lacks these directories
+        New-Item -ItemType Directory -Force "C:\gtk-build\gtk\x64\release\share\icons" | Out-Null
+        New-Item -ItemType Directory -Force "C:\gtk-build\gtk\x64\release\lib\gdk-pixbuf-2.0" | Out-Null
+        magick -background none -density 384 lan-mouse-gtk\resources\de.feschber.LanMouse.svg -trim -define icon:auto-resize wix\lan-mouse\icon.ico
+        Copy-Item wix\lan-mouse\icon.ico wix\bundle\icon.ico
     - name: Build MSI and bootstrapper bundle
       run: |
         dotnet build wix\lan-mouse\LanMouse.wixproj

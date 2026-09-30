@@ -1,6 +1,12 @@
 ﻿<Project Sdk="WixToolset.Sdk/5.0.2">
 	<PropertyGroup>
 		<InstallerPlatform>x64</InstallerPlatform>
+		<!-- the GTK install layout varies (e.g. no share/icons from gvsbuild):
+		     tolerate missing/empty harvest dirs instead of failing the build -->
+		<HarvestDirectoryKeepEmptyDirectories>true</HarvestDirectoryKeepEmptyDirectories>
+		<!-- empty-directory components need real guids: '*' is invalid there -->
+		<HarvestDirectoryAutogenerateGuids>false</HarvestDirectoryAutogenerateGuids>
+		<HarvestDirectoryGenerateGuidsNow>true</HarvestDirectoryGenerateGuidsNow>
 	</PropertyGroup>
 	<ItemGroup>
 		<PackageReference Include="WixToolset.Heat">
