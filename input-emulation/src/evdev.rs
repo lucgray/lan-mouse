@@ -57,9 +57,13 @@ impl Emulation for EvdevEmulation {
                     axis,
                     value,
                 } => {
-                    let axis = match axis {
-                        0 => RelativeAxisCode::REL_WHEEL_HI_RES,
-                        _ => RelativeAxisCode::REL_HWHEEL_HI_RES,
+                    // evdev reports REL_WHEEL positive = up, while
+                    // PointerEvent is positive = content moves down, so
+                    // the vertical wheel needs negating. REL_HWHEEL
+                    // shares the positive = right convention.
+                    let (axis, value) = match axis {
+                        0 => (RelativeAxisCode::REL_WHEEL_HI_RES, -value),
+                        _ => (RelativeAxisCode::REL_HWHEEL_HI_RES, value),
                     };
                     self.dev.emit(&[*evdev::RelativeAxisEvent::new(
                         axis,
@@ -67,9 +71,9 @@ impl Emulation for EvdevEmulation {
                     )])?;
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    let axis = match axis {
-                        0 => RelativeAxisCode::REL_WHEEL_HI_RES,
-                        _ => RelativeAxisCode::REL_HWHEEL_HI_RES,
+                    let (axis, value) = match axis {
+                        0 => (RelativeAxisCode::REL_WHEEL_HI_RES, -value),
+                        _ => (RelativeAxisCode::REL_HWHEEL_HI_RES, value),
                     };
                     self.dev
                         .emit(&[*evdev::RelativeAxisEvent::new(axis, value)])?;
