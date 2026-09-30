@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.0"/>
+  <object class="GtkAdjustment" id="sensitivity_adjustment">
+    <property name="lower">0.1</property>
+    <property name="upper">4</property>
+    <property name="step-increment">0.1</property>
+    <property name="value">1</property>
+  </object>
+  <template class="SettingsWindow" parent="AdwPreferencesWindow">
+    <property name="title" translatable="yes">Preferences</property>
+    <property name="default-width">560</property>
+    <property name="default-height">480</property>
+    <property name="content">
+      <object class="AdwPreferencesPage">
+        <child>
+          <object class="AdwPreferencesGroup">
+            <property name="title" translatable="yes">Sharing</property>
+            <child>
+              <object class="AdwActionRow">
+                <property name="title" translatable="yes">Share clipboard</property>
+                <property name="subtitle" translatable="yes">Send text and images you copy to connected devices</property>
+                <property name="activatable-widget">clipboard_switch</property>
+                <child type="suffix">
+                  <object class="GtkSwitch" id="clipboard_switch">
+                    <property name="valign">center</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="AdwPreferencesGroup">
+            <property name="title" translatable="yes">Input</property>
+            <child>
+              <object class="AdwActionRow">
+                <property name="title" translatable="yes">Invert scrolling</property>
+                <property name="subtitle" translatable="yes">Reverse the scroll direction on devices you control</property>
+                <property name="activatable-widget">invert_scroll_switch</property>
+                <child type="suffix">
+                  <object class="GtkSwitch" id="invert_scroll_switch">
+                    <property name="valign">center</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
+              <object class="AdwActionRow">
+                <property name="title" translatable="yes">Mouse sensitivity</property>
+                <property name="subtitle" translatable="yes">Pointer speed multiplier applied on controlled devices</property>
+                <property name="activatable-widget">sensitivity_spin</property>
+                <child type="suffix">
+                  <object class="GtkSpinButton" id="sensitivity_spin">
+                    <property name="adjustment">sensitivity_adjustment</property>
+                    <property name="digits">1</property>
+                    <property name="valign">center</property>
+                    <property name="width-chars">5</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="AdwPreferencesGroup">
+            <property name="title" translatable="yes">Advanced</property>
+            <property name="description" translatable="yes">key remapping, enter &amp; release binds and key-repeat timing are configured in config.toml — restart Lan Mouse to apply</property>
+          </object>
+        </child>
+      </object>
+    </property>
+  </template>
+</interface>

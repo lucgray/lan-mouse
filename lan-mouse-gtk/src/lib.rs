@@ -10,6 +10,7 @@ mod linux_status_item;
 mod macos_privacy;
 #[cfg(target_os = "macos")]
 mod macos_status_item;
+mod settings_window;
 mod window;
 #[cfg(windows)]
 mod windows_status_item;
@@ -19,6 +20,7 @@ use std::{env, process, str, sync::OnceLock};
 use gtk::CssProvider;
 use window::Window;
 
+use input_event::ClipboardContentKind;
 use lan_mouse_ipc::FrontendEvent;
 #[cfg(all(unix, feature = "wayland_window_identifier", not(target_os = "macos")))]
 use lan_mouse_ipc::{FrontendRequest, WindowIdentifier};
@@ -68,6 +70,15 @@ pub(crate) fn local_commit_str() -> String {
         .and_then(|c| std::str::from_utf8(c).ok())
         .unwrap_or("????????")
         .to_string()
+}
+
+/// human-readable byte size for toast hints (e.g. `512 B`, `4 KB`)
+fn human_bytes(bytes: usize) -> String {
+    if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 use adw::Application;
@@ -231,6 +242,21 @@ fn setup_actions(app: &adw::Application) {
         }
     });
     app.add_action(&quit_action);
+
+    // Preferences action (hamburger menu in the main window)
+    let preferences_action = gio::SimpleAction::new("preferences", None);
+    preferences_action.connect_activate({
+        let app = app.clone();
+        move |_, _| {
+            if let Some(window) = app
+                .active_window()
+                .and_then(|w| w.downcast::<Window>().ok())
+            {
+                window.open_settings();
+            }
+        }
+    });
+    app.add_action(&preferences_action);
 }
 
 // Set up a global menu
@@ -436,6 +462,38 @@ fn build_ui(app: &Application) {
                     }
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
+                    }
+                    FrontendEvent::Settings {
+                        clipboard_enabled,
+                        invert_scroll,
+                        mouse_sensitivity,
+                    } => {
+                        window.update_settings(clipboard_enabled, invert_scroll, mouse_sensitivity);
+                    }
+                    FrontendEvent::ClipboardShared {
+                        received,
+                        kind,
+                        bytes,
+                    } => {
+                        let kind = match kind {
+                            ClipboardContentKind::Text => "text",
+                            ClipboardContentKind::Image => "image",
+                        };
+                        let direction = if received { "received" } else { "shared" };
+                        window.show_toast(
+                            format!("clipboard {kind} {direction} ({})", human_bytes(bytes))
+                                .as_str(),
+                        );
+                    }
+                    FrontendEvent::ClipboardTooLarge { bytes, limit } => {
+                        window.show_toast(
+                            format!(
+                                "clipboard too large to share: {} ({} limit)",
+                                human_bytes(bytes),
+                                human_bytes(limit)
+                            )
+                            .as_str(),
+                        );
                     }
                 }
             }

@@ -9,6 +9,7 @@ use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, gli
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
 use crate::authorization_window::AuthorizationWindow;
+use crate::settings_window::SettingsWindow;
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/de/feschber/LanMouse/window.ui")]
@@ -52,6 +53,10 @@ pub struct Window {
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    pub settings_window: RefCell<Option<SettingsWindow>>,
+    /// last settings state received from the daemon
+    /// (clipboard_enabled, invert_scroll, mouse_sensitivity)
+    pub settings: Cell<(bool, bool, f64)>,
 }
 
 #[glib::object_subclass]
@@ -204,6 +209,7 @@ impl ObjectImpl for Window {
         }
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);
+        self.settings.set((true, false, 1.0));
         let obj = self.obj();
         obj.setup_icon();
         obj.setup_clients();

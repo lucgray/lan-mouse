@@ -4,6 +4,10 @@
   <requires lib="libadwaita" version="1.0"/>
   <menu id="main-menu">
     <item>
+      <attribute name="label" translatable="yes">_Preferences</attribute>
+      <attribute name="action">app.preferences</attribute>
+    </item>
+    <item>
       <attribute name="label" translatable="yes">_Close window</attribute>
       <attribute name="action">window.close</attribute>
     </item>

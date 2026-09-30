@@ -19,7 +19,7 @@ plus feature merges: per-client hotkey switching, key/chord remapping and
 scroll inversion (`[input_pre_processing]`), cross-axis warp position
 preservation, scroll-direction unification, macOS receive loops +
 hotplug/relaunch fixes, a Windows service mode with MSI packaging, and
-text clipboard sharing (`enable_clipboard`).
+text + image clipboard sharing (`enable_clipboard`).
 
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 
@@ -658,14 +658,17 @@ the local machine itself is unaffected.
 
 ### Clipboard sharing
 
-Text copied to the clipboard is shared with connected peers and set on the
-receiving machine automatically. Enabled by default; disable it with:
+Text and images copied to the clipboard are shared with connected peers
+and set on the receiving machine automatically. Enabled by default;
+disable it in the GTK Preferences window or with:
 
 ```toml
 enable_clipboard = false
 ```
 
-Only plain text is shared — images and other formats are ignored.
+Text and PNG-encoded images up to 64KB are shared — larger or other
+formats are skipped and the frontend shows a hint when content was too
+large to send.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

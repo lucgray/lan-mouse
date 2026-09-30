@@ -17,7 +17,7 @@ use lan_mouse_ipc::{
 
 use crate::{
     authorization_window::AuthorizationWindow, fingerprint_window::FingerprintWindow,
-    key_object::KeyObject, key_row::KeyRow,
+    key_object::KeyObject, key_row::KeyRow, settings_window::SettingsWindow,
 };
 
 use super::{client_object::ClientObject, client_row::ClientRow};
@@ -539,6 +539,54 @@ impl Window {
 
     pub(super) fn set_pk_fp(&self, fingerprint: &str) {
         self.imp().fingerprint_row.set_subtitle(fingerprint);
+    }
+
+    /// store the settings state pushed by the daemon and apply it to an
+    /// open settings window, if any
+    pub(super) fn update_settings(
+        &self,
+        clipboard_enabled: bool,
+        invert_scroll: bool,
+        mouse_sensitivity: f64,
+    ) {
+        self.imp()
+            .settings
+            .set((clipboard_enabled, invert_scroll, mouse_sensitivity));
+        if let Some(w) = self.imp().settings_window.borrow().as_ref() {
+            w.update_values(clipboard_enabled, invert_scroll, mouse_sensitivity);
+        }
+    }
+
+    pub(crate) fn open_settings(&self) {
+        if let Some(w) = self.imp().settings_window.borrow().as_ref() {
+            w.present();
+            return;
+        }
+        let settings_window = SettingsWindow::new();
+        settings_window.set_transient_for(Some(self));
+        let (clipboard_enabled, invert_scroll, mouse_sensitivity) = self.imp().settings.get();
+        settings_window.update_values(clipboard_enabled, invert_scroll, mouse_sensitivity);
+        settings_window.connect_clipboard_toggled(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |enabled| window.request(FrontendRequest::SetClipboardEnabled(enabled))
+        ));
+        settings_window.connect_invert_scroll_toggled(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |invert| window.request(FrontendRequest::UpdateScrollingInversion(invert))
+        ));
+        settings_window.connect_sensitivity_changed(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |sensitivity| {
+                window.request(FrontendRequest::UpdateMouseSensitivity(sensitivity))
+            }
+        ));
+        self.imp()
+            .settings_window
+            .replace(Some(settings_window.clone()));
+        settings_window.present();
     }
 
     pub(super) fn request_authorization(&self, fingerprint: &str) {
