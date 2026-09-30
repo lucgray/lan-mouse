@@ -3,7 +3,7 @@
 
     <Bundle
         Name="Lan Mouse"
-        Version="0.10.0"
+        Version="0.11.0"
         UpgradeCode="{39A9744D-9D6E-4CD3-A84F-9E034786A7B1}"
         Compressed="no"
         SplashScreenSourceFile="icon.ico">
