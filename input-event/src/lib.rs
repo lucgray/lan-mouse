@@ -176,7 +176,10 @@ impl Display for ClipboardEvent {
         match self {
             ClipboardEvent::Text(text) => {
                 let preview = if text.len() > 50 {
-                    format!("{}...", &text[..50])
+                    // byte 50 can fall inside a multi-byte UTF-8
+                    // character; slice at the boundary instead
+                    let end = text.floor_char_boundary(50);
+                    format!("{}...", &text[..end])
                 } else {
                     text.clone()
                 };
@@ -196,5 +199,43 @@ impl Display for Event {
             Event::Keyboard(k) => write!(f, "{k}"),
             Event::Clipboard(c) => write!(f, "{c}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClipboardEvent;
+
+    #[test]
+    fn display_truncates_long_ascii_text() {
+        let event = ClipboardEvent::Text("a".repeat(60));
+        assert_eq!(
+            event.to_string(),
+            format!("clipboard(text: {}...)", "a".repeat(50))
+        );
+    }
+
+    #[test]
+    fn display_truncates_at_char_boundary_for_multibyte_text() {
+        // 20 CJK chars = 60 UTF-8 bytes; byte 50 falls inside the 17th
+        // char, so the preview must stop at byte 48 without panicking
+        let event = ClipboardEvent::Text("中".repeat(20));
+        let expected = format!("clipboard(text: {}...)", "中".repeat(16));
+        assert_eq!(event.to_string(), expected);
+    }
+
+    #[test]
+    fn display_handles_mixed_multibyte_text() {
+        let text = "中🙂".repeat(13); // 91 bytes
+        let event = ClipboardEvent::Text(text.clone());
+        let display = event.to_string();
+        assert!(display.starts_with("clipboard(text: "));
+        assert!(display.ends_with("...)"));
+    }
+
+    #[test]
+    fn display_keeps_short_text_intact() {
+        let event = ClipboardEvent::Text("short 中文".to_string());
+        assert_eq!(event.to_string(), "clipboard(text: short 中文)");
     }
 }
