@@ -260,8 +260,16 @@ impl VirtualInput {
                 self.pointer.frame();
             }
             Event::Keyboard(e) => match e {
-                KeyboardEvent::Key { time, key, state } => {
-                    self.keyboard.key(time, key, state as u32);
+                KeyboardEvent::Key {
+                    time: _,
+                    key,
+                    state,
+                } => {
+                    // The event's timestamp comes from the sender's
+                    // clock, which is meaningless (and possibly far in
+                    // the past/future) on this machine, so stamp keys
+                    // with local time like axis_discrete does.
+                    self.keyboard.key(now, key, state as u32);
                     if let Ok(mut mods) = self.modifiers.lock() {
                         if mods.update_by_key_event(&self.modmap, key, state) {
                             log::trace!("Key triggers modifier change: {mods:?}");
