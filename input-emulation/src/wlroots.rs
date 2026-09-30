@@ -373,10 +373,6 @@ struct ModMap {
     pressed: HashMap<u32, u32>,
     /// linux keycode -> modifier bits toggled in the locked mask on press
     locked: HashMap<u32, u32>,
-    /// union of every value in `pressed`
-    all_pressed: u32,
-    /// union of every value in `locked`
-    all_locked: u32,
     /// locked bits a fresh virtual keyboard starts with: receivers
     /// generally want their numpad to produce digits; senders that
     /// track lock state correct this with a Modifiers event on entry
@@ -456,8 +452,6 @@ impl ModMap {
     }
 
     fn assemble(pressed: HashMap<u32, u32>, locked: HashMap<u32, u32>) -> Self {
-        let all_pressed = pressed.values().fold(0, |a, b| a | b);
-        let all_locked = locked.values().fold(0, |a, b| a | b);
         let default_locked = locked
             .get(&(scancode::Linux::KeyNumlock as u32))
             .copied()
@@ -465,8 +459,6 @@ impl ModMap {
         Self {
             pressed,
             locked,
-            all_pressed,
-            all_locked,
             default_locked,
         }
     }
