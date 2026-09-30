@@ -265,12 +265,8 @@ impl VirtualInput {
                     if let Ok(mut mods) = self.modifiers.lock() {
                         if mods.update_by_key_event(&self.modmap, key, state) {
                             log::trace!("Key triggers modifier change: {mods:?}");
-                            self.keyboard.modifiers(
-                                mods.mask_pressed(&self.modmap),
-                                0,
-                                mods.mask_locks(&self.modmap),
-                                0,
-                            );
+                            self.keyboard
+                                .modifiers(mods.mask_pressed(), 0, mods.mask_locks(), 0);
                         }
                     }
                 }
@@ -479,8 +475,16 @@ impl ModMap {
 /// Tracked modifier state for one virtual keyboard.
 #[derive(Debug, Default)]
 struct ModState {
-    /// depressed and locked modifier bits, packed as xkb mod indices
-    mods: u32,
+    /// depressed modifier bits, packed as xkb mod indices
+    pressed: u32,
+    /// locked modifier bits, packed as xkb mod indices
+    ///
+    /// Kept separate from `pressed`: on layouts where a lock key's mod
+    /// bit also shows up in the depressed set, folding the two into one
+    /// mask would leak locked bits into the depressed mask sent to the
+    /// compositor (e.g. NumLock appearing as a held modifier and
+    /// breaking exact-match keybinds).
+    locked: u32,
     /// lock keys currently held down; auto-repeated presses must not
     /// toggle a lock twice
     held_locks: HashSet<u32>,
@@ -489,7 +493,8 @@ struct ModState {
 impl ModState {
     fn new(map: &ModMap) -> Self {
         Self {
-            mods: map.default_locked,
+            pressed: 0,
+            locked: map.default_locked,
             held_locks: HashSet::new(),
         }
     }
@@ -499,7 +504,8 @@ impl ModState {
             depressed, locked, ..
         } = evt
         {
-            self.mods = depressed | locked;
+            self.pressed = depressed;
+            self.locked = locked;
         }
     }
 
@@ -511,29 +517,29 @@ impl ModState {
         if pressed == 0 && locked == 0 {
             return false;
         }
-        let before = self.mods;
+        let before = (self.pressed, self.locked);
         match state {
             1 => {
-                self.mods |= pressed;
+                self.pressed |= pressed;
                 // lock keys toggle on press, once per physical press;
                 // senders can repeat the press event while the key is held
                 if locked != 0 && self.held_locks.insert(key) {
-                    self.mods ^= locked;
+                    self.locked ^= locked;
                 }
             }
             _ => {
-                self.mods &= !pressed;
+                self.pressed &= !pressed;
                 self.held_locks.remove(&key);
             }
         }
-        self.mods != before
+        (self.pressed, self.locked) != before
     }
 
-    fn mask_locks(&self, map: &ModMap) -> u32 {
-        self.mods & map.all_locked
+    fn mask_locks(&self) -> u32 {
+        self.locked
     }
 
-    fn mask_pressed(&self, map: &ModMap) -> u32 {
-        self.mods & map.all_pressed
+    fn mask_pressed(&self) -> u32 {
+        self.pressed
     }
 }
