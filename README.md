@@ -72,7 +72,10 @@ Most current desktop environments and operating systems are fully supported, thi
 > Otherwise input capture will not work.
 >
 > - **Windows**: The mouse cursor will be invisible when sending input to a Windows system if
-> there is no real mouse connected to the machine.
+> there is no real mouse connected to the machine. As a workaround, enable
+> *Settings → Bluetooth & devices → Mouse → Mouse keys* ("Control your mouse with a keypad")
+> on the Windows machine — Windows then shows and moves a cursor even without a
+> physical mouse attached.
 
 For more detailed information about os support see [Detailed OS Support](#detailed-os-support)
 

@@ -17,6 +17,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VIRTUAL_KEY, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_NUMLOCK, VK_RMENU, VK_SCROLL,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos,
     GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
@@ -133,6 +136,19 @@ thread_local! {
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
     /// binds that enter a client without crossing a screen edge
     static ENTER_BINDS: RefCell<EnterBindTracker> = RefCell::new(EnterBindTracker::default());
+    /// hook timestamp of a left-control press that was forwarded to the
+    /// client and has not been released there yet
+    static LCTRL_FORWARDED: Cell<Option<u32>> = const { Cell::new(None) };
+    /// the forwarded left-control press turned out to be the synthetic
+    /// keypress Windows generates together with AltGr, so a compensating
+    /// release was already sent and the matching physical key-up must be
+    /// swallowed rather than forwarded
+    static FAKE_LCTRL: Cell<bool> = const { Cell::new(false) };
+}
+
+fn reset_key_tracking() {
+    LCTRL_FORWARDED.take();
+    FAKE_LCTRL.take();
 }
 
 fn get_msg() -> Option<MSG> {
@@ -241,6 +257,7 @@ fn start_routine(
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
                     ACTIVE_CLIENT.take();
+                    reset_key_tracking();
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -301,6 +318,7 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     }
 
     /* update active client and entry point */
+    reset_key_tracking();
     ACTIVE_CLIENT.replace(Some(pos));
     let (entry_point, t) = DISPLAYS.with_borrow(|(displays, _)| {
         (
@@ -318,8 +336,44 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
     blocking_send_event(active, CaptureEvent::Begin(t));
+    send_lock_state(active);
 
     ret
+}
+
+/// Push this machine's lock-key state to the client so the receiver's
+/// NumLock / CapsLock / ScrollLock match the keyboard the user is
+/// actually typing on.
+fn send_lock_state(pos: Position) {
+    // SAFETY: GetKeyState is always safe to call for these constants.
+    let (num, caps, scroll) = unsafe {
+        (
+            GetKeyState(i32::from(VK_NUMLOCK.0)) & 1,
+            GetKeyState(i32::from(VK_CAPITAL.0)) & 1,
+            GetKeyState(i32::from(VK_SCROLL.0)) & 1,
+        )
+    };
+    // same X-style modifier mask the other capture backends use:
+    // LockMask, Mod2 (NumLock) and Mod3 (ScrollLock)
+    let mut locked = 0;
+    if caps != 0 {
+        locked |= 1 << 1;
+    }
+    if num != 0 {
+        locked |= 1 << 4;
+    }
+    if scroll != 0 {
+        locked |= 1 << 5;
+    }
+    blocking_send_event(
+        pos,
+        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked,
+            group: 0,
+        })),
+    );
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -362,6 +416,7 @@ fn enter_via_bind(pos: Position) {
             PREV_POS.get().unwrap_or((0, 0))
         }
     };
+    reset_key_tracking();
     ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
     PREV_POS.replace(Some(entry_point));
@@ -371,6 +426,7 @@ fn enter_via_bind(pos: Position) {
         display_util::cross_axis_position(displays, entry_point, entry_point, pos)
     });
     blocking_send_event(pos, CaptureEvent::Begin(t));
+    send_lock_state(pos);
 }
 
 /// Feed a key event seen while no client is active into the
@@ -443,6 +499,47 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         }
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
+
+    let hook: KBDLLHOOKSTRUCT = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+    let vk = VIRTUAL_KEY(hook.vkCode as u16);
+    let is_down = matches!(
+        wparam.0,
+        w if w == WM_KEYDOWN as usize || w == WM_SYSKEYDOWN as usize
+    );
+    let is_up = matches!(
+        wparam.0,
+        w if w == WM_KEYUP as usize || w == WM_SYSKEYUP as usize
+    );
+
+    /* Pressing AltGr makes Windows report a synthetic left-control
+     * press right before the right-alt press; both events carry the
+     * same hook timestamp. Forwarding it would pin Control down on the
+     * client for every AltGr combination, so release it before the
+     * right-alt press goes out. Its matching release is swallowed
+     * below via FAKE_LCTRL. A real left-control press carries a
+     * different timestamp, so pressing Ctrl+AltGr on purpose still
+     * works. */
+    if is_down && (vk == VK_LCONTROL || vk == VK_CONTROL) {
+        LCTRL_FORWARDED.replace(Some(hook.time));
+    } else if is_down && vk == VK_RMENU && LCTRL_FORWARDED.get() == Some(hook.time) {
+        LCTRL_FORWARDED.take();
+        FAKE_LCTRL.replace(true);
+        let lctrl_up = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 0,
+            key: Linux::KeyLeftCtrl as u32,
+            state: 0,
+        }));
+        if let Err(e) = try_send_event(client, lctrl_up) {
+            log::warn!("e: {e}");
+        }
+    } else if is_up && (vk == VK_LCONTROL || vk == VK_CONTROL) {
+        LCTRL_FORWARDED.take();
+        if FAKE_LCTRL.take() {
+            /* the compensating release for AltGr's synthetic control
+             * press was already sent */
+            return LRESULT(1);
+        }
+    }
 
     /* convert to key event */
     let Some(key_event) = to_key_event(wparam, lparam) else {
@@ -551,9 +648,25 @@ fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     if kybrdllhookstruct.flags.contains(LLKHF_EXTENDED) {
         scan_code |= 0xE000;
     }
-    let Ok(win_scan_code) = scancode::Windows::try_from(scan_code) else {
-        log::warn!("failed to translate to windows scancode: {scan_code}");
-        return None;
+    /* NumLock is reported either as scan code 0x45 or as the extended
+     * 0xE045, which the scancode table cannot express, so it used to
+     * be dropped here (the hook still swallowed it). Identifying the
+     * lock keys by virtual-key code sidesteps that ambiguity. */
+    let vk = VIRTUAL_KEY(kybrdllhookstruct.vkCode as u16);
+    let win_scan_code = if vk == VK_NUMLOCK {
+        scancode::Windows::KeypadNumLock
+    } else if vk == VK_CAPITAL {
+        scancode::Windows::KeyCapsLock
+    } else if vk == VK_SCROLL {
+        scancode::Windows::KeyScrollLock
+    } else {
+        match scancode::Windows::try_from(scan_code) {
+            Ok(code) => code,
+            Err(_) => {
+                log::warn!("failed to translate to windows scancode: {scan_code}");
+                return None;
+            }
+        }
     };
     log::trace!("windows_scan: {win_scan_code:?}");
     let Ok(linux_scan_code): Result<Linux, ()> = win_scan_code.try_into() else {

@@ -119,6 +119,7 @@ impl Capture {
             jail_bind_prev_engaged: Cell::new(false),
             window_identifier,
             enter_t: 0.5,
+            pending_modifiers: None,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -241,6 +242,12 @@ struct CaptureTask {
     /// [`CaptureEvent::Begin`], reused when [`State::WaitingForAck`]
     /// re-sends `Enter` — it's the same logical crossing, just retried.
     enter_t: f64,
+    /// last `Modifiers` update observed while still waiting for the
+    /// enter ack. The lock-state sync emitted right after
+    /// [`CaptureEvent::Begin`] must not be replaced by the `Enter`
+    /// retry like a regular input event, so it is queued here and
+    /// flushed once the ack arrives.
+    pending_modifiers: Option<KeyboardEvent>,
 }
 
 impl CaptureTask {
@@ -397,6 +404,12 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            if let Some(mods) = self.pending_modifiers.take() {
+                                let _ = self
+                                    .conn
+                                    .send(ProtoEvent::Input(Event::Keyboard(mods)), handle)
+                                    .await;
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_, t) => {
@@ -538,7 +551,12 @@ impl CaptureTask {
             }
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => vec![ProtoEvent::Enter(opposite_pos, self.enter_t)],
+                State::WaitingForAck => {
+                    if let Event::Keyboard(mods @ KeyboardEvent::Modifiers { .. }) = e {
+                        self.pending_modifiers = Some(mods);
+                    }
+                    vec![ProtoEvent::Enter(opposite_pos, self.enter_t)]
+                }
                 // a single physical event can resolve into 0-2 outgoing
                 // events once chord remapping buffers/replays a
                 // modifier (see `KeyRemap::apply`)
@@ -587,6 +605,7 @@ impl CaptureTask {
         notify_peer: bool,
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
+        self.pending_modifiers = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire

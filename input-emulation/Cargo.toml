@@ -44,6 +44,7 @@ wayland-protocols-wlr = { version = "0.3.1", features = [
 wayland-protocols-misc = { version = "0.3.1", features = [
     "client",
 ], optional = true }
+xkbcommon = { version = "0.8", optional = true }
 x11 = { version = "2.21.0", features = ["xlib", "xtest"], optional = true }
 ashpd = { version = "0.13.9", default-features = false, features = [
     "remote_desktop",
@@ -85,6 +86,7 @@ wlroots = [
     "dep:wayland-protocols",
     "dep:wayland-protocols-wlr",
     "dep:wayland-protocols-misc",
+    "dep:xkbcommon",
 ]
 evdev = ["dep:evdev"]
 x11 = ["dep:x11"]
