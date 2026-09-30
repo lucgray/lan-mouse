@@ -47,6 +47,55 @@ pub enum KeyboardEvent {
 pub enum ClipboardEvent {
     /// text content from clipboard
     Text(String),
+    /// image content from clipboard, PNG-encoded
+    Image(Vec<u8>),
+}
+
+/// the kind of payload a [`ClipboardEvent`] carries
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ClipboardContentKind {
+    Text,
+    Image,
+}
+
+impl ClipboardEvent {
+    pub fn kind(&self) -> ClipboardContentKind {
+        match self {
+            ClipboardEvent::Text(_) => ClipboardContentKind::Text,
+            ClipboardEvent::Image(_) => ClipboardContentKind::Image,
+        }
+    }
+
+    /// size of the content in bytes (text characters / PNG bytes)
+    pub fn content_len(&self) -> usize {
+        match self {
+            ClipboardEvent::Text(t) => t.len(),
+            ClipboardEvent::Image(png) => png.len(),
+        }
+    }
+}
+
+/// encode raw RGBA pixels into a PNG byte stream for [`ClipboardEvent::Image`]
+pub fn encode_image_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(png)
+}
+
+/// decode a [`ClipboardEvent::Image`] PNG payload into (width, height, RGBA pixels)
+pub fn decode_image_rgba(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let decoder = png::Decoder::new(png);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    Some((info.width, info.height, buf))
 }
 
 #[derive(PartialEq, Debug, Clone)]
@@ -132,6 +181,9 @@ impl Display for ClipboardEvent {
                     text.clone()
                 };
                 write!(f, "clipboard(text: {})", preview)
+            }
+            ClipboardEvent::Image(png) => {
+                write!(f, "clipboard(image: {} bytes)", png.len())
             }
         }
     }

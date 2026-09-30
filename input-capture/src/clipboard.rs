@@ -1,5 +1,5 @@
 use arboard::Clipboard;
-use input_event::{ClipboardEvent, Event};
+use input_event::{ClipboardEvent, Event, encode_image_rgba};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -12,15 +12,52 @@ use crate::{CaptureError, CaptureEvent};
 pub struct ClipboardMonitor {
     event_rx: Receiver<CaptureEvent>,
     _event_tx: Sender<CaptureEvent>,
-    last_content: Arc<Mutex<Option<String>>>,
+    last_content: Arc<Mutex<Option<ClipboardEvent>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
+}
+
+/// Read the current clipboard content: text first, then images.
+/// Returns `None` for empty or unsupported content.
+fn read_clipboard_content(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
+    match clipboard.get_text() {
+        Ok(text) => {
+            log::trace!("Clipboard text read: {} bytes", text.len());
+            return Some(ClipboardEvent::Text(text));
+        }
+        Err(e) => log::trace!("No clipboard text: {}", e),
+    }
+    match clipboard.get_image() {
+        Ok(image) => {
+            let width = image.width as u32;
+            let height = image.height as u32;
+            match encode_image_rgba(width, height, &image.bytes) {
+                Some(png) => {
+                    log::trace!(
+                        "Clipboard image read: {}x{}, {} bytes PNG",
+                        width,
+                        height,
+                        png.len()
+                    );
+                    Some(ClipboardEvent::Image(png))
+                }
+                None => {
+                    log::warn!("Failed to PNG-encode clipboard image");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log::trace!("No clipboard image: {}", e);
+            None
+        }
+    }
 }
 
 impl ClipboardMonitor {
     pub fn new() -> Result<Self, CaptureError> {
         let (event_tx, event_rx) = mpsc::channel(16);
-        let last_content: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let last_content: Arc<Mutex<Option<ClipboardEvent>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
@@ -61,17 +98,10 @@ impl ClipboardMonitor {
                         }
                     };
 
-                    // Get current clipboard text
-                    let current_text = match clipboard.get_text() {
-                        Ok(text) => {
-                            log::trace!("Clipboard text read: {} bytes", text.len());
-                            text
-                        }
-                        Err(e) => {
-                            // Clipboard might be empty or contain non-text data
-                            log::trace!("Failed to get clipboard text: {}", e);
-                            return;
-                        }
+                    // Get current clipboard content (text or image)
+                    let Some(current_content) = read_clipboard_content(&mut clipboard) else {
+                        // Clipboard might be empty or contain non-shareable data
+                        return;
                     };
 
                     // Check if content changed
@@ -80,7 +110,7 @@ impl ClipboardMonitor {
 
                     let content_changed = match last_content.as_ref() {
                         None => true,
-                        Some(last) => last != &current_text,
+                        Some(last) => last != &current_content,
                     };
 
                     if content_changed {
@@ -92,14 +122,16 @@ impl ClipboardMonitor {
                         };
 
                         if should_emit {
-                            log::info!("Clipboard changed, length: {} bytes", current_text.len());
-                            *last_content = Some(current_text.clone());
+                            log::info!(
+                                "Clipboard changed: {} ({} bytes)",
+                                current_content,
+                                current_content.content_len()
+                            );
+                            *last_content = Some(current_content.clone());
                             *last_change = Some(Instant::now());
 
                             // Send event
-                            let event = CaptureEvent::Input(Event::Clipboard(
-                                ClipboardEvent::Text(current_text),
-                            ));
+                            let event = CaptureEvent::Input(Event::Clipboard(current_content));
                             let _ = event_tx_clone2.blocking_send(event);
                         } else {
                             log::trace!("Clipboard changed but debounced (too recent)");
@@ -140,7 +172,7 @@ impl ClipboardMonitor {
 
     /// Update the last known clipboard content (called when we set the clipboard)
     /// This prevents detecting our own clipboard changes as external changes
-    pub fn update_last_content(&self, content: String) {
+    pub fn update_last_content(&self, content: ClipboardEvent) {
         let mut last_content = self.last_content.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
         *last_content = Some(content);

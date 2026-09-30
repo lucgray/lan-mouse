@@ -99,7 +99,7 @@ struct ConfigToml {
     enable_clipboard: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct InputConfig {
     // TODO: implement scroll_sensitivity and mouse_acceleration
     invert_scroll: Option<bool>,
@@ -700,6 +700,34 @@ impl Config {
             .as_mut()
             .expect("config")
             .authorized_fingerprints = Some(fingerprints);
+    }
+
+    fn toml_mut(&mut self) -> &mut ConfigToml {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml.as_mut().expect("config")
+    }
+
+    /// persist the clipboard sharing toggle
+    pub fn set_clipboard_enabled(&mut self, enabled: bool) {
+        self.toml_mut().enable_clipboard = Some(enabled);
+    }
+
+    /// persist the scroll-inversion toggle
+    pub fn set_invert_scroll(&mut self, invert: bool) {
+        self.toml_mut()
+            .input_post_processing
+            .get_or_insert_with(Default::default)
+            .invert_scroll = Some(invert);
+    }
+
+    /// persist the mouse sensitivity multiplier
+    pub fn set_mouse_sensitivity(&mut self, sensitivity: f64) {
+        self.toml_mut()
+            .input_post_processing
+            .get_or_insert_with(Default::default)
+            .mouse_sensitivity = Some(sensitivity);
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {

@@ -1,5 +1,5 @@
-use arboard::Clipboard;
-use input_event::ClipboardEvent;
+use arboard::{Clipboard, ImageData};
+use input_event::{ClipboardEvent, decode_image_rgba};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::task::spawn_blocking;
@@ -67,6 +67,42 @@ impl ClipboardEmulation {
                         .map_err(|e| ClipboardError::Set(format!("{}", e)))?;
 
                     log::debug!("Clipboard set, length: {} bytes", text.len());
+                    Ok(())
+                })
+                .await
+                .map_err(|e| ClipboardError::Access(format!("Task join error: {}", e)))?
+            }
+            ClipboardEvent::Image(png) => {
+                let clipboard_arc = self.clipboard.clone();
+
+                spawn_blocking(move || {
+                    let (width, height, rgba) = decode_image_rgba(&png)
+                        .ok_or_else(|| ClipboardError::Set("invalid PNG data".into()))?;
+
+                    let mut clipboard_guard = clipboard_arc.lock().unwrap();
+
+                    let clipboard = match clipboard_guard.as_mut() {
+                        Some(c) => c,
+                        None => match Clipboard::new() {
+                            Ok(c) => {
+                                *clipboard_guard = Some(c);
+                                clipboard_guard.as_mut().unwrap()
+                            }
+                            Err(e) => {
+                                return Err(ClipboardError::Access(format!("{}", e)));
+                            }
+                        },
+                    };
+
+                    clipboard
+                        .set_image(ImageData {
+                            width: width as usize,
+                            height: height as usize,
+                            bytes: std::borrow::Cow::Owned(rgba),
+                        })
+                        .map_err(|e| ClipboardError::Set(format!("{}", e)))?;
+
+                    log::debug!("Clipboard image set: {}x{}", width, height);
                     Ok(())
                 })
                 .await

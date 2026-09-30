@@ -51,7 +51,7 @@ pub struct Service {
     /// clipboard emulation
     clipboard_emulation: Option<ClipboardEmulation>,
     /// clipboard enabled
-    _clipboard_enabled: bool,
+    clipboard_enabled: bool,
     /// dns resolver
     resolver: DnsResolver,
     /// frontend listener
@@ -136,35 +136,11 @@ impl Service {
 
         // clipboard monitor + emulation
         let clipboard_enabled = config.clipboard_enabled();
-        let clipboard_monitor = if clipboard_enabled {
-            match ClipboardMonitor::new() {
-                Ok(monitor) => {
-                    log::info!("Clipboard monitoring enabled");
-                    Some(monitor)
-                }
-                Err(e) => {
-                    log::warn!("Failed to create clipboard monitor: {}", e);
-                    None
-                }
-            }
+        let (clipboard_monitor, clipboard_emulation) = if clipboard_enabled {
+            Self::create_clipboard_parts()
         } else {
             log::info!("Clipboard sharing disabled by configuration");
-            None
-        };
-
-        let clipboard_emulation = if clipboard_enabled {
-            match ClipboardEmulation::new() {
-                Ok(emulation) => {
-                    log::info!("Clipboard emulation enabled");
-                    Some(emulation)
-                }
-                Err(e) => {
-                    log::warn!("Failed to create clipboard emulation: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
+            (None, None)
         };
 
         // create dns resolver
@@ -177,7 +153,7 @@ impl Service {
             emulation,
             clipboard_monitor,
             clipboard_emulation,
-            _clipboard_enabled: clipboard_enabled,
+            clipboard_enabled,
             frontend_listener,
             resolver,
             authorized_keys,
@@ -311,6 +287,7 @@ impl Service {
             FrontendRequest::UpdateMouseSensitivity(mouse_sensitivity) => {
                 self.update_mouse_sensitivity(mouse_sensitivity)
             }
+            FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
             FrontendRequest::WindowIdentifier(handle) => {
                 log::info!("xdg-foreign handle: {handle:?}");
                 self.window_identifier
@@ -454,9 +431,18 @@ impl Service {
             }
             EmulationEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
-                if let Some(ref clipboard_emulation) = self.clipboard_emulation {
-                    if let Err(e) = clipboard_emulation.set(clipboard_event).await {
-                        log::warn!("Failed to set clipboard: {}", e);
+                if self.clipboard_enabled {
+                    if let Some(ref monitor) = self.clipboard_monitor {
+                        // record the incoming content so our own monitor
+                        // does not echo it right back to the peer
+                        monitor.update_last_content(clipboard_event.clone());
+                    }
+                    if let Some(ref clipboard_emulation) = self.clipboard_emulation {
+                        if let Err(e) = clipboard_emulation.set(clipboard_event.clone()).await {
+                            log::warn!("Failed to set clipboard: {}", e);
+                        } else {
+                            self.notify_clipboard_shared(&clipboard_event, true);
+                        }
                     }
                 }
             }
@@ -490,14 +476,20 @@ impl Service {
             }
             ICaptureEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
-                if let Some(ref clipboard_emulation) = self.clipboard_emulation {
-                    // Spawn async task to set clipboard
-                    let clipboard_emulation = clipboard_emulation.clone();
-                    tokio::task::spawn_local(async move {
-                        if let Err(e) = clipboard_emulation.set(clipboard_event).await {
-                            log::warn!("Failed to set clipboard: {}", e);
-                        }
-                    });
+                if self.clipboard_enabled {
+                    if let Some(ref monitor) = self.clipboard_monitor {
+                        monitor.update_last_content(clipboard_event.clone());
+                    }
+                    if let Some(ref clipboard_emulation) = self.clipboard_emulation {
+                        // Spawn async task to set clipboard
+                        let clipboard_emulation = clipboard_emulation.clone();
+                        self.notify_clipboard_shared(&clipboard_event, true);
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = clipboard_emulation.set(clipboard_event).await {
+                                log::warn!("Failed to set clipboard: {}", e);
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -508,18 +500,49 @@ impl Service {
         use input_event::Event;
 
         if let Some(CaptureEvent::Input(Event::Clipboard(clipboard_event))) = event {
+            use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, ProtocolError, encode_clipboard_event};
+
+            let proto_event = lan_mouse_proto::ProtoEvent::Input(input_event::Event::Clipboard(
+                clipboard_event.clone(),
+            ));
+
+            // encode once up-front: an oversized payload is dropped with a
+            // friendly hint instead of failing per-connection further down
+            match encode_clipboard_event(&proto_event) {
+                Err(ProtocolError::ClipboardTooLarge(bytes)) => {
+                    log::warn!(
+                        "clipboard content too large to share: {} bytes ({} byte limit)",
+                        bytes,
+                        MAX_CLIPBOARD_SIZE
+                    );
+                    self.notify_frontend(FrontendEvent::ClipboardTooLarge {
+                        bytes,
+                        limit: MAX_CLIPBOARD_SIZE,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("failed to encode clipboard event: {e}");
+                    return;
+                }
+                Ok(_) => {}
+            }
+
             log::info!("Clipboard changed locally, sending to all connected peers");
 
             // Send clipboard to all active clients (machines we're controlling)
             let active_clients: Vec<_> = self.client_manager.active_clients().into_iter().collect();
 
+            let mut shared = false;
             for handle in active_clients {
-                let proto_event = lan_mouse_proto::ProtoEvent::Input(
-                    input_event::Event::Clipboard(clipboard_event.clone()),
-                );
-
-                if let Err(e) = self.conn_sender.send_clipboard(proto_event, handle).await {
+                if let Err(e) = self
+                    .conn_sender
+                    .send_clipboard(proto_event.clone(), handle)
+                    .await
+                {
                     log::warn!("Failed to send clipboard to client {}: {}", handle, e);
+                } else {
+                    shared = true;
                 }
             }
 
@@ -533,6 +556,12 @@ impl Service {
             for addr in incoming_addrs {
                 log::info!("Sending clipboard to incoming connection {}", addr);
                 self.emulation.send_clipboard(addr, clipboard_event.clone());
+                shared = true;
+            }
+
+            // only hint when the content actually went somewhere
+            if shared {
+                self.notify_clipboard_shared(&clipboard_event, false);
             }
         }
     }
@@ -572,6 +601,7 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_settings();
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -770,13 +800,97 @@ impl Service {
         self.notify_frontend(event);
     }
 
+    /// lazily create the clipboard monitor + emulation pair; both are
+    /// `None` when the platform clipboard is unavailable (headless, no
+    /// X/Wayland clipboard access)
+    fn create_clipboard_parts() -> (Option<ClipboardMonitor>, Option<ClipboardEmulation>) {
+        let monitor = match ClipboardMonitor::new() {
+            Ok(m) => {
+                log::info!("Clipboard monitoring enabled");
+                Some(m)
+            }
+            Err(e) => {
+                log::warn!("Failed to create clipboard monitor: {}", e);
+                None
+            }
+        };
+        let emulation = match ClipboardEmulation::new() {
+            Ok(e) => {
+                log::info!("Clipboard emulation enabled");
+                Some(e)
+            }
+            Err(e) => {
+                log::warn!("Failed to create clipboard emulation: {}", e);
+                None
+            }
+        };
+        (monitor, emulation)
+    }
+
+    fn set_clipboard_enabled(&mut self, enabled: bool) {
+        if self.clipboard_enabled == enabled {
+            self.notify_settings();
+            return;
+        }
+        log::info!(
+            "clipboard sharing {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        self.clipboard_enabled = enabled;
+        if enabled {
+            // lazily create the monitor/emulation if they were missing
+            // (e.g. clipboard unavailable at daemon startup)
+            if self.clipboard_monitor.is_none() || self.clipboard_emulation.is_none() {
+                let (monitor, emulation) = Self::create_clipboard_parts();
+                if self.clipboard_monitor.is_none() {
+                    self.clipboard_monitor = monitor;
+                }
+                if self.clipboard_emulation.is_none() {
+                    self.clipboard_emulation = emulation;
+                }
+            }
+            if let Some(monitor) = &self.clipboard_monitor {
+                monitor.enable();
+            }
+        } else if let Some(monitor) = &self.clipboard_monitor {
+            monitor.disable();
+        }
+        self.config.set_clipboard_enabled(enabled);
+        self.save_config();
+        self.notify_settings();
+    }
+
     fn update_scrolling_inversion(&mut self, invert_scroll: bool) {
         self.emulation.request_scrolling_inversion(invert_scroll);
+        self.config.set_invert_scroll(invert_scroll);
+        self.save_config();
+        self.notify_settings();
     }
 
     fn update_mouse_sensitivity(&mut self, mouse_sensitivity: f64) {
         self.emulation
             .request_mouse_sensitivity_change(mouse_sensitivity);
+        self.config.set_mouse_sensitivity(mouse_sensitivity);
+        self.save_config();
+        self.notify_settings();
+    }
+
+    /// push the current settings to the frontend
+    fn notify_settings(&mut self) {
+        self.notify_frontend(FrontendEvent::Settings {
+            clipboard_enabled: self.clipboard_enabled,
+            invert_scroll: self.config.invert_scroll(),
+            mouse_sensitivity: self.config.mouse_sensitivity(),
+        });
+    }
+
+    /// let the frontend know clipboard content travelled in either direction
+    fn notify_clipboard_shared(&mut self, event: &input_event::ClipboardEvent, received: bool) {
+        self.notify_frontend(FrontendEvent::ClipboardShared {
+            received,
+            kind: event.kind(),
+            bytes: event.content_len(),
+        });
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {

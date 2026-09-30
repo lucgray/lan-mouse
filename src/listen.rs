@@ -321,7 +321,7 @@ async fn read_loop(
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    use lan_mouse_proto::{EventType, MAX_CLIPBOARD_SIZE, decode_clipboard_event};
+    use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_clipboard_event, is_clipboard_event_type};
 
     // Buffer needs to be large enough for clipboard data
     // Use Vec instead of array for large buffers to avoid stack overflow
@@ -345,7 +345,7 @@ async fn read_loop(
 
         // Check if this is a clipboard event (variable length)
         let event_type = b[0];
-        let event = if event_type == EventType::ClipboardText as u8 {
+        let event = if is_clipboard_event_type(event_type) {
             // This is a clipboard event - need to read full message
             if n < 5 {
                 log::warn!("Clipboard event too short: {} bytes", n);

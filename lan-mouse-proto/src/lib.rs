@@ -12,10 +12,11 @@ use thiserror::Error;
 /// For clipboard events, we have a separate MAX_CLIPBOARD_SIZE limit
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
-/// maximum clipboard data size (4KB - limited by UDP MTU)
-/// UDP datagrams have MTU limits (~1400 bytes on most networks)
-/// 4KB is conservative and should work on all networks
-pub const MAX_CLIPBOARD_SIZE: usize = 4 * 1024;
+/// maximum clipboard data size (64KB)
+/// Clipboard events are sent as a single (DTLS-fragmented) message, so the
+/// payload must stay below the maximum UDP payload (~64KB). Covers text and
+/// reasonably-sized PNG images; larger content is dropped with a UI hint.
+pub const MAX_CLIPBOARD_SIZE: usize = 64 * 1024;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -136,6 +137,7 @@ pub enum EventType {
     Ack,
     Hello,
     ClipboardText,
+    ClipboardImage,
 }
 
 impl ProtoEvent {
@@ -154,6 +156,7 @@ impl ProtoEvent {
                 },
                 InputEvent::Clipboard(c) => match c {
                     ClipboardEvent::Text(_) => EventType::ClipboardText,
+                    ClipboardEvent::Image(_) => EventType::ClipboardImage,
                 },
             },
             ProtoEvent::Ping => EventType::Ping,
@@ -226,7 +229,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 }
                 Ok(Self::Hello { commit })
             }
-            EventType::ClipboardText => {
+            EventType::ClipboardText | EventType::ClipboardImage => {
                 // Clipboard events use variable-length encoding
                 // This path should not be reached for fixed-size buffer decoding
                 Err(ProtocolError::BufferTooSmall)
@@ -353,36 +356,43 @@ encode_impl!(i32);
 encode_impl!(f64);
 
 /// Encode a clipboard event into a Vec<u8>
-/// Format: [event_type: u8][length: u32][data: utf8 bytes]
+/// Format: [event_type: u8][length: u32][data bytes]
 pub fn encode_clipboard_event(event: &ProtoEvent) -> Result<Vec<u8>, ProtocolError> {
-    match event {
+    let (event_type, data): (EventType, &[u8]) = match event {
         ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(text))) => {
-            let text_bytes = text.as_bytes();
-            if text_bytes.len() > MAX_CLIPBOARD_SIZE {
-                return Err(ProtocolError::ClipboardTooLarge(text_bytes.len()));
-            }
-            let mut buf = Vec::with_capacity(1 + 4 + text_bytes.len());
-            buf.push(EventType::ClipboardText as u8);
-            buf.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
-            buf.extend_from_slice(text_bytes);
-            Ok(buf)
+            (EventType::ClipboardText, text.as_bytes())
+        }
+        ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(png))) => {
+            (EventType::ClipboardImage, png.as_slice())
         }
         _ => panic!("encode_clipboard_event called on non-clipboard event"),
+    };
+    if data.len() > MAX_CLIPBOARD_SIZE {
+        return Err(ProtocolError::ClipboardTooLarge(data.len()));
     }
+    let mut buf = Vec::with_capacity(1 + 4 + data.len());
+    buf.push(event_type as u8);
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    Ok(buf)
 }
 
 /// Decode a clipboard event from a byte slice
-/// Format: [event_type: u8][length: u32][data: utf8 bytes]
+/// Format: [event_type: u8][length: u32][data bytes]
 pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     if buf.is_empty() {
         return Err(ProtocolError::BufferTooSmall);
     }
     let event_type = buf[0];
-    if event_type != EventType::ClipboardText as u8 {
-        return Err(ProtocolError::InvalidEventId(
-            EventType::try_from(event_type).unwrap_err(),
-        ));
-    }
+    let is_image = match event_type {
+        t if t == EventType::ClipboardText as u8 => false,
+        t if t == EventType::ClipboardImage as u8 => true,
+        _ => {
+            return Err(ProtocolError::InvalidEventId(
+                EventType::try_from(event_type).unwrap_err(),
+            ));
+        }
+    };
     if buf.len() < 5 {
         return Err(ProtocolError::BufferTooSmall);
     }
@@ -393,11 +403,18 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     if buf.len() < 5 + length {
         return Err(ProtocolError::BufferTooSmall);
     }
-    let text_bytes = &buf[5..5 + length];
-    let text = String::from_utf8(text_bytes.to_vec())?;
-    Ok(ProtoEvent::Input(InputEvent::Clipboard(
-        ClipboardEvent::Text(text),
-    )))
+    let data = &buf[5..5 + length];
+    let clipboard_event = if is_image {
+        ClipboardEvent::Image(data.to_vec())
+    } else {
+        ClipboardEvent::Text(String::from_utf8(data.to_vec())?)
+    };
+    Ok(ProtoEvent::Input(InputEvent::Clipboard(clipboard_event)))
+}
+
+/// whether an event type byte is one of the variable-length clipboard types
+pub fn is_clipboard_event_type(event_type: u8) -> bool {
+    event_type == EventType::ClipboardText as u8 || event_type == EventType::ClipboardImage as u8
 }
 
 #[cfg(test)]
@@ -605,6 +622,37 @@ mod tests {
         assert!(matches!(
             decode_clipboard_event(&[]),
             Err(ProtocolError::BufferTooSmall)
+        ));
+    }
+
+    #[test]
+    fn clipboard_image_roundtrip() {
+        let png = input_event::encode_image_rgba(2, 2, &[255u8; 16]).expect("png encode");
+        let event = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(png.clone())));
+        let buf = encode_clipboard_event(&event).expect("encode");
+        assert_eq!(buf[0], EventType::ClipboardImage as u8);
+        assert!(is_clipboard_event_type(buf[0]));
+        match decode_clipboard_event(&buf).expect("decode") {
+            ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(data))) => {
+                assert_eq!(data, png);
+                let (w, h, rgba) = input_event::decode_image_rgba(&data).expect("png decode");
+                assert_eq!((w, h), (2, 2));
+                assert_eq!(rgba, vec![255u8; 16]);
+            }
+            other => panic!("expected clipboard image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clipboard_image_rejects_oversize() {
+        let big = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(vec![
+            0u8;
+            MAX_CLIPBOARD_SIZE
+                + 1
+        ])));
+        assert!(matches!(
+            encode_clipboard_event(&big),
+            Err(ProtocolError::ClipboardTooLarge(_))
         ));
     }
 }

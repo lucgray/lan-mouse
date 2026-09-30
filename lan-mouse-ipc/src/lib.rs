@@ -226,6 +226,22 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// current daemon settings — sent on sync and whenever they change
+    Settings {
+        clipboard_enabled: bool,
+        invert_scroll: bool,
+        mouse_sensitivity: f64,
+    },
+    /// clipboard content was shared in either direction
+    ClipboardShared {
+        /// true when received from a remote peer, false when sent out
+        received: bool,
+        kind: input_event::ClipboardContentKind,
+        /// content size in bytes
+        bytes: usize,
+    },
+    /// local clipboard content was dropped because it exceeds the wire limit
+    ClipboardTooLarge { bytes: usize, limit: usize },
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
@@ -271,6 +287,8 @@ pub enum FrontendRequest {
     UpdateMouseSensitivity(f64),
     /// window identifier used to present input-capture / remote-desktop prompts
     WindowIdentifier(WindowIdentifier),
+    /// enable/disable clipboard sharing at runtime
+    SetClipboardEnabled(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
