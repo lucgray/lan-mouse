@@ -12,7 +12,7 @@
     <property name="title" translatable="yes">Preferences</property>
     <property name="default-width">560</property>
     <property name="default-height">480</property>
-    <property name="content">
+    <child>
       <object class="AdwPreferencesPage">
         <child>
           <object class="AdwPreferencesGroup">
@@ -70,6 +70,6 @@
           </object>
         </child>
       </object>
-    </property>
+    </child>
   </template>
 </interface>
