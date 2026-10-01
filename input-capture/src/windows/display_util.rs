@@ -144,7 +144,11 @@ pub(crate) fn return_point(
     let display = displays
         .iter()
         .find(|display| is_within_dp_region(entry_point, display))?;
-    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.5 };
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
     let x = display.left + ((display.right - display.left - 1) as f64 * t).round() as i32;
     let y = display.top + ((display.bottom - display.top - 1) as f64 * t).round() as i32;
     let x_inset = 16.min((display.right - display.left - 1) / 2);
