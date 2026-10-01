@@ -132,6 +132,31 @@ pub(crate) fn cross_axis_position(
     }
 }
 
+/// Put a returned cursor inside the display it originally left. Keeping it
+/// away from the barrier prevents the next mouse movement from immediately
+/// capturing it again.
+pub(crate) fn return_point(
+    displays: &[RECT],
+    entry_point: (i32, i32),
+    pos: Position,
+    t: f64,
+) -> Option<(i32, i32)> {
+    let display = displays
+        .iter()
+        .find(|display| is_within_dp_region(entry_point, display))?;
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.5 };
+    let x = display.left + ((display.right - display.left - 1) as f64 * t).round() as i32;
+    let y = display.top + ((display.bottom - display.top - 1) as f64 * t).round() as i32;
+    let x_inset = 16.min((display.right - display.left - 1) / 2);
+    let y_inset = 16.min((display.bottom - display.top - 1) / 2);
+    Some(match pos {
+        Position::Left => (display.left + x_inset, y),
+        Position::Right => (display.right - 1 - x_inset, y),
+        Position::Top => (x, display.top + y_inset),
+        Position::Bottom => (x, display.bottom - 1 - y_inset),
+    })
+}
+
 #[cfg(test)]
 mod cross_axis_test {
     use super::*;
@@ -180,5 +205,23 @@ mod cross_axis_test {
         let displays = [rect(0, 0, 1000, 800)];
         let t = cross_axis_position(&displays, (5000, 5000), (5000, -5), Position::Top);
         assert_eq!(t, 0.5);
+    }
+
+    #[test]
+    fn return_point_uses_entry_display_and_insets_from_barrier() {
+        let displays = [rect(-1000, 0, 0, 800), rect(0, 0, 1000, 800)];
+        assert_eq!(
+            return_point(&displays, (-1, 400), Position::Right, 0.25),
+            Some((-17, 200))
+        );
+    }
+
+    #[test]
+    fn return_point_clamps_invalid_cross_axis() {
+        let displays = [rect(0, 0, 1000, 800)];
+        assert_eq!(
+            return_point(&displays, (0, 400), Position::Left, f64::NAN),
+            Some((16, 400))
+        );
     }
 }
