@@ -152,3 +152,10 @@ report a failure after five seconds; failed refreshes retain known DNS addresses
 Native resolver calls share four process-wide slots. A slot remains held until
 the blocking system call returns, even when its async wrapper is cancelled.
 Running native resolver calls cannot be forcibly cancelled by dropping a future.
+
+Outgoing connection attempts and sessions are cancelled when their target is
+changed, deactivated, or deleted. A new target can start connecting without
+waiting for the old handshake timeout. Attempt cleanup checks its own identity;
+idle receivers also respond to cancellation. Hello and each connection close
+have a one-second wait limit. Shutdown releases input capture/emulation before
+waiting for outgoing connection and hook cleanup.

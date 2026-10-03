@@ -247,11 +247,12 @@ impl Service {
         }
 
         log::info!("terminating service ...");
-        self.hooks.terminate().await;
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
         self.emulation.terminate().await;
+        self.conn_sender.terminate().await;
+        self.hooks.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 

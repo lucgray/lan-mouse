@@ -8,12 +8,14 @@ use std::{
 use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
 
 use crate::config::ConfigClient;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default)]
 pub struct ClientManager {
     clients: Rc<RefCell<BTreeMap<ClientHandle, (ClientConfig, ClientState)>>>,
     next_handle: Rc<Cell<ClientHandle>>,
     revisions: Rc<RefCell<BTreeMap<ClientHandle, u64>>>,
+    target_tokens: Rc<RefCell<BTreeMap<ClientHandle, CancellationToken>>>,
 }
 
 impl ClientManager {
@@ -52,6 +54,9 @@ impl ClientManager {
         self.next_handle.set(handle + 1);
         self.clients.borrow_mut().insert(handle, Default::default());
         self.revisions.borrow_mut().insert(handle, 0);
+        self.target_tokens
+            .borrow_mut()
+            .insert(handle, CancellationToken::new());
         handle
     }
 
@@ -145,6 +150,9 @@ impl ClientManager {
     /// remove a client from the list
     pub fn remove_client(&self, client: ClientHandle) -> Option<(ClientConfig, ClientState)> {
         self.revisions.borrow_mut().remove(&client);
+        if let Some(token) = self.target_tokens.borrow_mut().remove(&client) {
+            token.cancel();
+        }
         self.clients.borrow_mut().remove(&client)
     }
 
@@ -319,13 +327,37 @@ impl ClientManager {
     pub(crate) fn target_is_current(&self, handle: ClientHandle, revision: u64) -> bool {
         self.target_revision(handle) == Some(revision)
             && self
+                .target_tokens
+                .borrow()
+                .get(&handle)
+                .is_some_and(|token| !token.is_cancelled())
+            && self
                 .clients
                 .borrow()
                 .get(&handle)
                 .is_some_and(|(_, s)| s.active)
     }
 
+    pub(crate) fn target_token(&self, handle: ClientHandle) -> Option<CancellationToken> {
+        self.target_tokens.borrow().get(&handle).cloned()
+    }
+
+    pub(crate) fn cancel_targets(&self) {
+        for token in self.target_tokens.borrow().values() {
+            token.cancel();
+        }
+        for (_, state) in self.clients.borrow_mut().values_mut() {
+            state.active_addr = None;
+            state.alive = false;
+            state.peer_commit = None;
+        }
+    }
+
     fn invalidate_target(&self, handle: ClientHandle) {
+        if let Some(token) = self.target_tokens.borrow_mut().get_mut(&handle) {
+            token.cancel();
+            *token = CancellationToken::new();
+        }
         if let Some(revision) = self.revisions.borrow_mut().get_mut(&handle) {
             *revision = revision
                 .checked_add(1)
