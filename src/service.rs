@@ -7,6 +7,7 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    hooks::{HookKind, HookRunner},
     listen::{LanMouseListener, ListenerCreationError},
     remap::KeyRemap,
     scroll::ScrollInvert,
@@ -26,7 +27,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{signal, sync::Notify};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -43,6 +44,7 @@ pub enum ServiceError {
 pub struct Service {
     /// configuration
     config: Config,
+    hooks: HookRunner,
     /// input capture
     capture: Capture,
     /// input emulation
@@ -158,6 +160,7 @@ impl Service {
         let port = config.port();
         let service = Self {
             config,
+            hooks: HookRunner::new(),
             capture,
             emulation,
             clipboard_monitor,
@@ -244,6 +247,7 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        self.hooks.terminate().await;
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -762,6 +766,7 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        self.hooks.cancel_client(handle);
         if self
             .client_manager
             .remove_client(handle)
@@ -927,46 +932,16 @@ impl Service {
         });
     }
 
-    fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {
-        let cmd = match kind {
+    fn spawn_hook_command(&mut self, handle: ClientHandle, kind: HookKind) {
+        let command = match kind {
             HookKind::Enter => self.client_manager.get_enter_cmd(handle),
             HookKind::Leave => self.client_manager.get_leave_cmd(handle),
         };
-        let Some(cmd) = cmd else { return };
-        tokio::task::spawn_local(async move {
-            log::info!("spawning {kind} hook for client {handle}");
-            let mut child = match Command::new("sh").arg("-c").arg(cmd.as_str()).spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("could not execute {kind} hook for client {handle}: {e}");
-                    return;
-                }
-            };
-            match child.wait().await {
-                Ok(s) => {
-                    if s.success() {
-                        log::info!("{kind} hook for client {handle} ({cmd}) exited successfully");
-                    } else {
-                        log::warn!("{kind} hook for client {handle} ({cmd}) exited with {s}");
-                    }
-                }
-                Err(e) => log::warn!("{kind} hook for client {handle} ({cmd}): {e}"),
+        if let Some(command) = command {
+            if let Some(notice) = self.hooks.submit(handle, kind, command) {
+                log::warn!("{notice}");
+                self.notify_frontend(FrontendEvent::Error(notice));
             }
-        });
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum HookKind {
-    Enter,
-    Leave,
-}
-
-impl std::fmt::Display for HookKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HookKind::Enter => f.write_str("enter"),
-            HookKind::Leave => f.write_str("leave"),
         }
     }
 }

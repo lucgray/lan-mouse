@@ -127,3 +127,13 @@ Clipboard monitoring reuses platform access and compares dimensions and raw
 pixels before re-encoding an unchanged image. The last raw image cache is bounded
 to 64 MiB; larger images retain normal encoding and transfer-limit behavior.
 Missed polling ticks are skipped, and dropping the monitor stops future polling.
+
+Enter/leave hooks run serially outside the input loop, with at most 64 pending
+commands. Normal submissions retain order. On overload, older pending commands
+for the same device are replaced by its latest command and a warning is shown;
+if the full queue belongs to other devices, the new command is rejected visibly.
+Each command has a 30-second limit. Device deletion and service shutdown cancel
+managed commands. Unix uses sh -c with a process group; Windows uses cmd.exe /C
+without a console window and a Job Object. Existing Windows POSIX scripts should
+explicitly invoke sh. Background programs launched by normally completed hooks
+remain running, matching the previous behavior.
