@@ -18,11 +18,12 @@ pub(crate) struct DnsResolver {
 struct DnsRequest {
     handle: ClientHandle,
     hostname: String,
+    revision: u64,
 }
 
 pub(crate) enum DnsEvent {
-    Resolving(ClientHandle),
-    Resolved(ClientHandle, String, io::Result<Vec<IpAddr>>),
+    Resolving(ClientHandle, u64),
+    Resolved(ClientHandle, u64, String, io::Result<Vec<IpAddr>>),
 }
 
 struct DnsTask {
@@ -52,8 +53,12 @@ impl DnsResolver {
         })
     }
 
-    pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
-        let request = DnsRequest { handle, hostname };
+    pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String, revision: u64) {
+        let request = DnsRequest {
+            handle,
+            hostname,
+            revision,
+        };
         self.request_tx.send(request).expect("channel closed");
     }
 
@@ -78,8 +83,13 @@ impl DnsTask {
 
     async fn do_dns(&mut self) {
         while let Some(dns_request) = self.request_rx.recv().await {
-            let DnsRequest { handle, hostname } = dns_request;
+            let DnsRequest {
+                handle,
+                hostname,
+                revision,
+            } = dns_request;
 
+            self.active_tasks.retain(|_, task| !task.is_finished());
             /* abort previous dns task */
             let previous_task = self.active_tasks.remove(&handle);
             if let Some(task) = previous_task {
@@ -89,7 +99,7 @@ impl DnsTask {
             }
 
             self.event_tx
-                .send(DnsEvent::Resolving(handle))
+                .send(DnsEvent::Resolving(handle, revision))
                 .expect("channel closed");
 
             /* spawn task for dns request */
@@ -100,7 +110,7 @@ impl DnsTask {
                 tokio::select! {
                     result = resolve_hostname(&hostname) => {
                        event_tx
-                           .send(DnsEvent::Resolved(handle, hostname, result))
+                           .send(DnsEvent::Resolved(handle, revision, hostname, result))
                            .expect("channel closed");
                     }
                     _ = cancellation_token.cancelled() => {},

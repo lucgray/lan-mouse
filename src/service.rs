@@ -571,11 +571,19 @@ impl Service {
 
     fn handle_resolver_event(&mut self, event: DnsEvent) {
         let handle = match event {
-            DnsEvent::Resolving(handle) => {
+            DnsEvent::Resolving(handle, revision) => {
+                if self.client_manager.target_revision(handle) != Some(revision) {
+                    return;
+                }
                 self.client_manager.set_resolving(handle, true);
                 handle
             }
-            DnsEvent::Resolved(handle, hostname, ips) => {
+            DnsEvent::Resolved(handle, revision, hostname, ips) => {
+                if self.client_manager.target_revision(handle) != Some(revision)
+                    || self.client_manager.get_hostname(handle).as_deref() != Some(&hostname)
+                {
+                    return;
+                }
                 self.client_manager.set_resolving(handle, false);
                 if let Err(e) = &ips {
                     log::warn!("could not resolve {hostname}: {e}");
@@ -590,7 +598,9 @@ impl Service {
 
     fn resolve(&self, handle: ClientHandle) {
         if let Some(hostname) = self.client_manager.get_hostname(handle) {
-            self.resolver.resolve(handle, hostname);
+            if let Some(revision) = self.client_manager.target_revision(handle) {
+                self.resolver.resolve(handle, hostname, revision);
+            }
         }
     }
 
