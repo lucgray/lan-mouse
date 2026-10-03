@@ -48,6 +48,14 @@ impl Window {
             .frontend_request_writer
             .borrow_mut()
             .replace(conn);
+        window.connect_close_request(|window| {
+            for index in 0..window.clients().n_items() {
+                if let Some(row) = window.row_by_idx(index as i32) {
+                    row.flush_pending_edits();
+                }
+            }
+            glib::Propagation::Proceed
+        });
         window
     }
 

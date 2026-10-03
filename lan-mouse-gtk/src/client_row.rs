@@ -1,3 +1,4 @@
+mod draft;
 mod imp;
 
 use adw::prelude::*;
@@ -131,7 +132,13 @@ impl ClientRow {
         self.refresh_version_status();
     }
 
+    pub fn flush_pending_edits(&self) {
+        self.imp().flush_hostname();
+        self.imp().flush_port();
+    }
+
     pub fn unbind(&self) {
+        self.imp().cancel_pending_edits();
         for binding in self.imp().bindings.borrow_mut().drain(..) {
             binding.unbind();
         }
@@ -191,5 +198,79 @@ impl ClientRow {
             None => self.add_css_class("peer-unknown"),
         };
         self.set_subtitle(&markup);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    fn dispatch_for(duration: Duration) {
+        let context = glib::MainContext::default();
+        let until = Instant::now() + duration;
+        while Instant::now() < until {
+            while context.pending() {
+                context.iteration(false);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        while context.pending() {
+            context.iteration(false);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run separately"]
+    fn actual_row_debounces_protects_drafts_and_cancels_removed_rows() {
+        adw::init().unwrap();
+        gtk::gio::resources_register_include!("lan-mouse.gresource").unwrap();
+        let client = ClientObject::new(
+            1,
+            lan_mouse_ipc::ClientConfig {
+                hostname: Some("old.local".into()),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        let row = ClientRow::new(&client);
+        row.bind(&client);
+        let requests = Rc::new(RefCell::new(Vec::<String>::new()));
+        let received = requests.clone();
+        row.connect_local("request-hostname-change", false, move |values| {
+            received.borrow_mut().push(values[1].get().unwrap());
+            None
+        });
+        for text in ["n", "new", "new.local"] {
+            row.imp().hostname.set_text(text);
+        }
+        row.set_hostname(Some("old.local".into()));
+        assert_eq!(row.imp().hostname.text(), "new.local");
+        dispatch_for(Duration::from_millis(100));
+        assert!(requests.borrow().is_empty());
+        dispatch_for(Duration::from_millis(350));
+        assert_eq!(&*requests.borrow(), &["new.local"]);
+        row.set_hostname(Some("old.local".into()));
+        assert_eq!(row.imp().hostname.text(), "new.local");
+        row.set_hostname(Some("new.local".into()));
+        assert_eq!(client.get_data().hostname.as_deref(), Some("new.local"));
+        row.imp().hostname.set_text("immediate.local");
+        row.imp().hostname.emit_by_name::<()>("activate", &[]);
+        assert_eq!(requests.borrow().last().unwrap(), "immediate.local");
+        row.imp().port.set_text("invalid");
+        row.set_port(1234);
+        assert_eq!(row.imp().port.text(), "invalid");
+        assert!(row.imp().port.has_css_class("error"));
+        row.imp().hostname.set_text("close.local");
+        row.flush_pending_edits();
+        assert_eq!(requests.borrow().last().unwrap(), "close.local");
+        row.imp().hostname.set_text("deleted.local");
+        row.unbind();
+        dispatch_for(Duration::from_millis(450));
+        assert_eq!(requests.borrow().len(), 3);
     }
 }

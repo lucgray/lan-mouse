@@ -137,3 +137,10 @@ managed commands. Unix uses sh -c with a process group; Windows uses cmd.exe /C
 without a console window and a Job Object. Existing Windows POSIX scripts should
 explicitly invoke sh. Background programs launched by normally completed hooks
 remain running, matching the previous behavior.
+
+Client hostname and port edits are submitted after a 400 ms pause, or immediately
+on Enter, focus leaving the entry, a DNS refresh, or window close. Draft values
+remain visible while awaiting daemon confirmation, so stale state messages do
+not replace ongoing edits. Invalid ports are marked and not submitted. Removing
+a row discards its pending edit timers. Configuration writes are still performed
+by the service; this edit debounce does not make disk persistence asynchronous.
