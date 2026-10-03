@@ -31,6 +31,9 @@ mod layer_shell;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(any(windows, test))]
+mod hook_queue;
+
 #[cfg(x11)]
 mod x11;
 

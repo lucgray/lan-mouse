@@ -126,6 +126,13 @@ impl KeyRemap {
         }
     }
 
+    /// Discard session state after transport failure without changing rules.
+    pub(crate) fn reset_session(&mut self) {
+        self.pending.clear();
+        self.active.clear();
+        self.raw_mask = (0, 0, 0, 0);
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.keys.is_empty() && self.chords.is_empty()
     }
@@ -361,6 +368,25 @@ mod test {
             locked: 0,
             group: 0,
         })
+    }
+
+    #[test]
+    fn failed_session_reset_preserves_rules_without_old_modifiers() {
+        for resolved in [false, true] {
+            let mut r = swap_with_chord();
+            r.apply(key_ev(KeyLeftMeta, 1));
+            r.apply(mods(1 << 6));
+            if resolved {
+                r.apply(key_ev(KeyTab, 1));
+            }
+            r.reset_session();
+            assert_eq!(r.apply(key_ev(KeyC, 1)), vec![key_ev(KeyC, 1)]);
+            assert!(r.apply(key_ev(KeyLeftMeta, 1)).is_empty());
+            assert_eq!(
+                r.apply(key_ev(KeyTab, 1)),
+                vec![key_ev(KeyLeftAlt, 1), mods(0), key_ev(KeyTab, 1)]
+            );
+        }
     }
 
     #[test]

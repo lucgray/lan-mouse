@@ -482,6 +482,11 @@ impl Service {
                     self.emulation.send_leave_event(incoming.addr, t);
                 }
             }
+            ICaptureEvent::CaptureFailed(error) => {
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Input capture stopped: {error}"
+                )));
+            }
             ICaptureEvent::CaptureDisabled => {
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));

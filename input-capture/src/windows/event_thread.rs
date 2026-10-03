@@ -2,12 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ptr::addr_of_mut;
 
+use crate::hook_queue::HookSender;
 use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
@@ -45,7 +44,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_tx: HookSender) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
         Self {
@@ -112,15 +111,20 @@ enum ThreadRequest {
     SetEnterBinds(HashMap<Position, Vec<scancode::Linux>>),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
+fn send_event(pos: Position, event: CaptureEvent) -> bool {
+    let sent = EVENT_TX.with_borrow(|tx| tx.as_ref().unwrap().send(pos, event).is_ok());
+    if !sent {
+        // The queue remains failed until the backend is recreated. Hooks
+        // become passthrough immediately, even if the daemon is stalled.
+        ACTIVE_CLIENT.take();
+        reset_key_tracking();
+        ENTER_BINDS.with_borrow_mut(|binds| binds.clear());
+    }
+    sent
 }
 
-fn try_send_event(
-    pos: Position,
-    event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+fn queue_available() -> bool {
+    EVENT_TX.with_borrow(|tx| tx.as_ref().is_some_and(HookSender::available))
 }
 
 thread_local! {
@@ -129,13 +133,11 @@ thread_local! {
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    static EVENT_TX: RefCell<Option<HookSender>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
-    /// motion that could not be sent yet because the event channel was full
-    static PENDING_MOTION: Cell<(f64, f64)> = const { Cell::new((0., 0.)) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
     /// binds that enter a client without crossing a screen edge
@@ -168,7 +170,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: HookSender,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
@@ -188,7 +190,7 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: HookSender,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
@@ -286,6 +288,9 @@ fn start_routine(
 }
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
+    if !queue_available() {
+        return false;
+    }
     if wparam.0 != WM_MOUSEMOVE as usize {
         return ACTIVE_CLIENT.get().is_some();
     }
@@ -330,13 +335,13 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* keys held now stop being observed for the duration of the
      * capture, so they must not still count as held afterwards */
     ENTER_BINDS.with_borrow_mut(|binds| binds.clear());
-    PENDING_MOTION.take();
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
     let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin(t));
-    send_lock_state(active);
+    if send_event(active, CaptureEvent::Begin(t)) {
+        send_lock_state(active);
+    }
 
     ret
 }
@@ -365,7 +370,7 @@ fn send_lock_state(pos: Position) {
     if scroll != 0 {
         locked |= 1 << 5;
     }
-    blocking_send_event(
+    send_event(
         pos,
         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
             depressed: 0,
@@ -377,6 +382,9 @@ fn send_lock_state(pos: Position) {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -394,8 +402,9 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (motion is deferred, other events dropped if sending too fast) */
-    send_pointer_event(pos, pointer_event);
+    if !send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -420,20 +429,20 @@ fn enter_via_bind(pos: Position) {
     ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
     PREV_POS.replace(Some(entry_point));
-    PENDING_MOTION.take();
     log::info!("entering client @ {pos}: enter-bind pressed");
     let t = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::cross_axis_position(displays, entry_point, entry_point, pos)
     });
-    blocking_send_event(pos, CaptureEvent::Begin(t));
-    send_lock_state(pos);
+    if send_event(pos, CaptureEvent::Begin(t)) {
+        send_lock_state(pos);
+    }
 }
 
 /// Feed a key event seen while no client is active into the
 /// enter-bind tracker, entering a client if one of the binds just
 /// completed. Returns whether the key was consumed.
 fn check_enter_bind(wparam: WPARAM, lparam: LPARAM) -> bool {
-    if ENTER_BINDS.with_borrow(|binds| binds.is_empty()) {
+    if !queue_available() || ENTER_BINDS.with_borrow(|binds| binds.is_empty()) {
         return false;
     }
     let Some(KeyboardEvent::Key { key, state, .. }) = to_key_event(wparam, lparam) else {
@@ -451,44 +460,13 @@ fn check_enter_bind(wparam: WPARAM, lparam: LPARAM) -> bool {
     enter_via_bind(pos);
     // The bind keys stay physically held — see EnterBindTracker::clear
     ENTER_BINDS.with_borrow_mut(|binds| binds.clear());
-    true
-}
-
-/// Sends a pointer event without blocking the hook.
-///
-/// Motion deltas are relative to the entry point, so a dropped motion event
-/// loses that movement for good. Motion that does not fit into the channel is
-/// therefore accumulated and sent along with the next event instead.
-fn send_pointer_event(pos: Position, event: PointerEvent) {
-    let event = match event {
-        PointerEvent::Motion { time, dx, dy } => {
-            let (pdx, pdy) = PENDING_MOTION.take();
-            let (dx, dy) = (dx + pdx, dy + pdy);
-            let motion = PointerEvent::Motion { time, dx, dy };
-            if try_send_event(pos, CaptureEvent::Input(Event::Pointer(motion))).is_err() {
-                log::debug!("event channel full, deferring motion ({dx}, {dy})");
-                PENDING_MOTION.set((dx, dy));
-            }
-            return;
-        }
-        event => event,
-    };
-
-    /* flush deferred motion first, so buttons and scrolling happen at the right position */
-    let (dx, dy) = PENDING_MOTION.take();
-    if dx != 0. || dy != 0. {
-        let motion = PointerEvent::Motion { time: 0, dx, dy };
-        if try_send_event(pos, CaptureEvent::Input(Event::Pointer(motion))).is_err() {
-            PENDING_MOTION.set((dx, dy));
-        }
-    }
-
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(event))) {
-        log::warn!("e: {e}");
-    }
+    ACTIVE_CLIENT.get().is_some()
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         /* no client active: the keys belong to this machine, unless
@@ -529,8 +507,8 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
             key: Linux::KeyLeftCtrl as u32,
             state: 0,
         }));
-        if let Err(e) = try_send_event(client, lctrl_up) {
-            log::warn!("e: {e}");
+        if !send_event(client, lctrl_up) {
+            return CallNextHookEx(None, ncode, wparam, lparam);
         }
     } else if is_up && (vk == VK_LCONTROL || vk == VK_CONTROL) {
         LCTRL_FORWARDED.take();
@@ -546,8 +524,8 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
+    if !send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
+        return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
     /* don't pass event to applications */

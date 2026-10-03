@@ -152,6 +152,23 @@ impl LanMouseConnection {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
+    /// End only the failed capture's transport and heartbeat. A fresh token
+    /// permits reconnect after capture is explicitly re-enabled.
+    pub(crate) async fn abort_capture(&self, handle: ClientHandle) {
+        self.sender.client_manager.invalidate_target(handle);
+        let connection = self.sender.conns.lock().await.get(&handle).cloned();
+        if let Some((addr, conn)) = connection {
+            disconnect(
+                &self.sender.client_manager,
+                handle,
+                addr,
+                &conn,
+                &self.sender.conns,
+            )
+            .await;
+        }
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -587,6 +604,40 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_capture_cancels_session_without_affecting_other_target() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let other = clients.add_client();
+        clients.activate_client(handle);
+        clients.activate_client(other);
+        let old_token = clients.target_token(handle).unwrap();
+        let other_token = clients.target_token(other).unwrap();
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let own = Arc::new(RefusedConnection::default());
+        let peer = Arc::new(RefusedConnection::default());
+        let addr = "127.0.0.1:2".parse().unwrap();
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        connection.sender.conns.lock().await.extend([
+            (handle, (addr, own.clone() as Connection)),
+            (other, (addr, peer.clone() as Connection)),
+        ]);
+        connection.abort_capture(handle).await;
+        assert!(old_token.is_cancelled());
+        assert!(!clients.target_token(handle).unwrap().is_cancelled());
+        assert!(!other_token.is_cancelled());
+        assert!(clients.active_addr(handle).is_none());
+        assert!(own.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!peer.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!connection.sender.conns.lock().await.contains_key(&handle));
+        assert!(connection.sender.conns.lock().await.contains_key(&other));
+        connection.abort_capture(handle).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

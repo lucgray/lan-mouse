@@ -25,6 +25,8 @@ use core_graphics::base::CGError;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
+    #[error("Windows input queue overloaded; capture released. Re-enable capture to resume.")]
+    HookQueueOverloaded,
     #[error("activation stream closed unexpectedly")]
     ActivationClosed,
     #[error("libei stream was closed")]

@@ -353,7 +353,7 @@ impl ClientManager {
         }
     }
 
-    fn invalidate_target(&self, handle: ClientHandle) {
+    pub(crate) fn invalidate_target(&self, handle: ClientHandle) {
         if let Some(token) = self.target_tokens.borrow_mut().get_mut(&handle) {
             token.cancel();
             *token = CancellationToken::new();

@@ -34,6 +34,8 @@ pub(crate) enum ICaptureEvent {
     CaptureBegin(CaptureHandle, f64),
     /// capture disabled
     CaptureDisabled,
+    /// A backend failed and capture was disabled until explicitly re-enabled.
+    CaptureFailed(String),
     /// capture disabled
     CaptureEnabled,
     /// A (new) client was entered.
@@ -357,6 +359,21 @@ impl CaptureTask {
         }
 
         let r = self.do_capture_session(&mut capture).await;
+        if let Err(error) = &r {
+            let active = self.active_client;
+            // The event queue may contain stale presses. Do not send cleanup
+            // input through a failing session or start a new connection.
+            if let Err(cleanup) = self.release_capture_with(&mut capture, false, None).await {
+                log::warn!("failed to release capture after backend error: {cleanup}");
+            }
+            self.remap.reset_session();
+            if let Some(handle) = active {
+                self.conn.abort_capture(handle).await;
+            }
+            self.event_tx
+                .send(ICaptureEvent::CaptureFailed(error.to_string()))
+                .expect("channel closed");
+        }
 
         // FIXME replace with async drop when stabilized
         capture.terminate().await?;

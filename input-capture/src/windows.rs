@@ -6,8 +6,7 @@ use input_event::scancode;
 use std::collections::HashMap;
 use std::pin::Pin;
 
-use std::task::ready;
-use tokio::sync::mpsc::{Receiver, channel};
+use crate::hook_queue::{HookReceiver, channel};
 
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
@@ -15,7 +14,7 @@ mod display_util;
 mod event_thread;
 
 pub struct WindowsInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    event_rx: HookReceiver,
     event_thread: EventThread,
 }
 
@@ -46,6 +45,7 @@ impl Capture for WindowsInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
+        self.event_thread.release_capture();
         Ok(())
     }
 
@@ -56,7 +56,7 @@ impl Capture for WindowsInputCapture {
 
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
-        let (event_tx, event_rx) = channel(10);
+        let (event_tx, event_rx) = channel();
         let event_thread = EventThread::new(event_tx);
         Self {
             event_thread,
@@ -68,9 +68,6 @@ impl WindowsInputCapture {
 impl Stream for WindowsInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match ready!(self.event_rx.poll_recv(cx)) {
-            None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
-        }
+        self.event_rx.poll_recv(cx)
     }
 }

@@ -168,3 +168,14 @@ and heartbeat metadata; a watchdog timeout on the same live connection retains
 the existing Input/Ping recovery behavior. Listener shutdown cancels idle readers.
 Connection-table access ends before certificate, send, or close awaits. These
 lifecycle changes do not change the network wire format.
+
+
+Windows capture uses an ordered queue of at most 256 events. When at least 32
+are pending, adjacent motion for the same target can merge while retaining its
+total displacement. Discrete events and target boundaries remain ordered. Hooks
+do not wait for queue capacity; a short mutex protects queue operations. If the
+queue cannot accept an event, hooks immediately return to local passthrough and
+the daemon discards stale input, ends that target's transport/heartbeats, clears
+mapping state, reports the failure, and disables capture. Explicitly re-enable
+capture to start a fresh backend. Remote release follows disconnect or watchdog
+cleanup; it is not guaranteed to arrive immediately on an unreliable network.

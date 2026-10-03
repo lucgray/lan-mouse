@@ -8,6 +8,7 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R02 | 已实现并通过队列/连接状态回归 | 256 条保序有界队列，积压时合并相邻 motion；超载立即恢复本机透传，清空旧队列并禁用捕获，取消目标连接/心跳并提示；Windows 原生 hook 与拥塞真机验收待 CI/实测 |
 | R03 | 已实现并通过回归 | transport 发送拒绝时输入/剪贴板均返回 Err 并清理 active_addr |
 | R04 | 已实现并通过回归 | 100 次小数运动累计 40，反向运动总量归零；真机低速体验待验 |
 | R05、R06 | 已实现并通过回归 | 两个接收方向共用帧解码；图片、截断帧、后续 Ping、旧式 padded 帧测试通过 |
@@ -393,3 +394,26 @@ GTK 测试命令：`cargo test -p lan-mouse-gtk --all-features --offline actual_
 - [ ] 成功认证后的同地址会话替换、跨平台 CI 和真实 Windows/Linux 往返仍需验收；这组 mock 回归不替代认证与输入后端的完整测试。
 
 日志位于 work/diagnostics/incoming-cleanup-workspace.log、incoming-cleanup-clippy.log。修复尚未部署；性能实测及其余清单缺口仍未闭环，不能据此认定 90 分。
+
+
+## 第十六轮：Windows 输入队列拥塞与故障释放
+
+- [x] 替换容量 10 的 try_send 通道；新队列最多保留 256 条事件。积压达到 32 条后合并同目标、相邻且尚未消费的 motion，保留总位移及最新时间戳；不跨按钮、按键、Begin 或目标边界合并。
+- [x] Begin、锁状态、AltGr 补偿释放、普通按键、按钮与滚轮共用同一顺序队列。hook 不等待消费者腾出容量，不再使用 blocking_send；短 mutex 只保护 push/pop/尾部合并，不包含 I/O、回调或 await，仍需在 Windows 测量真实竞争时延。
+- [x] 不能容纳离散事件时，将队列标为故障，立即清除 hook 的捕获状态并恢复 Windows 本机透传；禁止重新进入直到后端重建。消费者优先接收错误并丢弃积压，不把旧事件发送到新会话。
+- [x] 服务收到捕获错误后清除活跃目标及键盘映射会话状态，取消该设备连接/握手/心跳并有界关闭，提示错误并保持禁用，用户可显式重新启用；其他设备不受取消影响。远端依靠真正断开或停止心跳后的 watchdog 释放输入，不声称不可靠网络下立即到达。
+- [x] 修正队列读取与生产者关闭的竞争，空队列和 closed 标志在同一锁内判断，避免最后一次移动丢失；低级 hook 的负 ncode 直接透传。
+- [x] 六个队列回归覆盖 8,000 次暂停消费者的 motion + Ctrl/拖拽顺序与总位移、离散/目标边界、超载锁定与丢弃、接收器退出、最终样本唤醒、100,000 次并发移动和生产者关闭。
+- [x] 目标取消回归验证旧 token 取消、连接关闭、其他目标保留和再次调用安全；映射重置回归覆盖未决及已决 chord，保留配置规则并不带入旧修饰键。
+- [x] Linux 工作区全特性测试通过（root 63 个、input-capture 27 个通过 + 1 个手工基准忽略），严格 Clippy 通过。
+- [ ] Windows 原生编译、hook 拥塞、快速 Ctrl/Win/拖拽与重新启用验收；完整服务输入 p99、短锁竞争及远端按钮释放仍待真机实测。
+
+日志位于 work/diagnostics/windows-hook-queue-workspace.log、windows-hook-queue-clippy.log。R02 已落实代码及平台独立回归，尚不把 Windows 真机门槛标为通过。R19、后台持久化、剪贴板重连与评分实测继续保留。
+
+### R24 / P2：Windows 线程过早报告 ready，首个请求可能 panic
+
+- [ ] 修复并验证。
+- 证据：`event_thread.rs::start_routine` 在建立窗口/执行 GetMessage 前返回 thread ID，主线程随后使用 PostThreadMessageW 并 unwrap；在该间隙接收线程没有保证已建立消息队列。
+- Windows 要求目标线程先建消息队列，可在通知 ready 前调用 PeekMessage。依据：[Microsoft PostThreadMessageW 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postthreadmessagew)。这是一条文档支持的源码时序风险，尚未现场复现。
+- 影响：启动、立即注册边缘或退出时，首次投递可能失败并触发 panic。
+- 验收：接收线程先创建队列再发 ready；主线程收到 ready 后立刻投递，Windows 原生测试成功读取该消息。
