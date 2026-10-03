@@ -123,13 +123,17 @@ impl ClipboardMonitor {
 
                         if should_emit {
                             log::info!(
-                                "Clipboard changed: {} ({} bytes)",
-                                current_content,
+                                "Clipboard changed: {:?} ({} bytes)",
+                                current_content.kind(),
                                 current_content.content_len()
                             );
                             *last_content = Some(current_content.clone());
                             *last_change = Some(Instant::now());
 
+                            // Never hold the cache locks while waiting for the consumer:
+                            // it may be applying remote content through update_last_content.
+                            drop(last_change);
+                            drop(last_content);
                             // Send event
                             let event = CaptureEvent::Input(Event::Clipboard(current_content));
                             let _ = event_tx_clone2.blocking_send(event);

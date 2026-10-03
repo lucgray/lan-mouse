@@ -4,10 +4,13 @@ use std::path::PathBuf;
 use std::{
     io::ErrorKind,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
@@ -33,10 +36,7 @@ pub struct AsyncFrontendListener {
     line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
     #[cfg(windows)]
     line_streams: SelectAll<LinesStream<BufReader<ReadHalf<TcpStream>>>>,
-    #[cfg(unix)]
-    tx_streams: Vec<WriteHalf<UnixStream>>,
-    #[cfg(windows)]
-    tx_streams: Vec<WriteHalf<TcpStream>>,
+    tx_streams: Vec<mpsc::Sender<Arc<str>>>,
 }
 
 impl AsyncFrontendListener {
@@ -96,21 +96,31 @@ impl AsyncFrontendListener {
         let mut json = serde_json::to_string(&notify).unwrap();
         json.push('\n');
 
-        let mut keep = vec![];
-        // TODO do simultaneously
-        for tx in self.tx_streams.iter_mut() {
-            // write len + payload
-            if tx.write(json.as_bytes()).await.is_err() {
-                keep.push(false);
-                continue;
-            }
-            keep.push(true);
-        }
-
-        // could not find a better solution because async
-        let mut keep = keep.into_iter();
-        self.tx_streams.retain(|_| keep.next().unwrap());
+        let json: Arc<str> = json.into();
+        // Disconnect a slow frontend rather than blocking input routing.
+        self.tx_streams
+            .retain(|tx| tx.try_send(json.clone()).is_ok());
     }
+}
+
+fn frontend_writer<W>(mut writer: W, deadline: Duration) -> mpsc::Sender<Arc<str>>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = mpsc::channel::<Arc<str>>(64);
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            match tokio::time::timeout(deadline, writer.write_all(frame.as_bytes())).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    log::warn!("disconnecting frontend: notification write failed or timed out");
+                    break;
+                }
+            }
+        }
+        let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+    });
+    tx
 }
 
 #[cfg(unix)]
@@ -135,7 +145,8 @@ impl Stream for AsyncFrontendListener {
             let lines = buf_reader.lines();
             let lines = LinesStream::new(lines);
             self.line_streams.push(lines);
-            self.tx_streams.push(tx);
+            self.tx_streams
+                .push(frontend_writer(tx, Duration::from_secs(2)));
             sync = true;
         }
         if sync {
@@ -143,5 +154,53 @@ impl Stream for AsyncFrontendListener {
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tiny_transport_preserves_complete_ordered_frames() {
+        let (writer, mut reader) = tokio::io::duplex(3);
+        let tx = frontend_writer(writer, Duration::from_secs(1));
+        tx.try_send(Arc::from("{\"one\":1}\n")).unwrap();
+        tx.try_send(Arc::from("{\"two\":2}\n")).unwrap();
+        drop(tx);
+        let mut frames = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_string(&mut frames))
+            .await
+            .unwrap()
+            .unwrap();
+        let values: Vec<serde_json::Value> = frames
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![serde_json::json!({"one": 1}), serde_json::json!({"two": 2})]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_frontend_does_not_delay_healthy_writer() {
+        let (stalled, _reader) = tokio::io::duplex(1);
+        let slow = frontend_writer(stalled, Duration::from_millis(20));
+        slow.try_send(Arc::from("blocked\n")).unwrap();
+        let (healthy, mut reader) = tokio::io::duplex(1);
+        let fast = frontend_writer(healthy, Duration::from_secs(1));
+        fast.try_send(Arc::from("ok\n")).unwrap();
+        drop(fast);
+        let mut frame = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_to_string(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, "ok\n");
+        tokio::time::timeout(Duration::from_secs(1), slow.closed())
+            .await
+            .unwrap();
     }
 }

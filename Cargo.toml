@@ -125,3 +125,6 @@ resources = ["target/menubar-template.png"]
 [package.metadata.bundle.osx]
 info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 
+
+[dev-dependencies]
+async-trait = "0.1.80"

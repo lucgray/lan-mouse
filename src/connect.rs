@@ -155,7 +155,7 @@ impl LanMouseConnectionSender {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let event_str = format!("{event}");
+        log::trace!("sending {event} to client {handle}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
@@ -172,9 +172,9 @@ impl LanMouseConnectionSender {
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        return Err(e.into());
                     }
                 }
-                log::trace!("{event_str} >->->->->- {addr}");
                 return Ok(());
             }
         }
@@ -224,6 +224,7 @@ impl LanMouseConnectionSender {
                     Err(e) => {
                         log::warn!("client {handle} failed to send clipboard: {e}");
                         disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        return Err(e.into());
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -231,12 +232,7 @@ impl LanMouseConnectionSender {
             }
         }
 
-        // Not connected yet - clipboard will sync when connection is established
-        log::debug!(
-            "Client {} not connected, clipboard will sync when connection is established",
-            handle
-        );
-        Ok(())
+        Err(LanMouseConnectionError::NotConnected)
     }
 }
 
@@ -340,7 +336,7 @@ async fn receive_loop(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    use lan_mouse_proto::{EventType, MAX_CLIPBOARD_SIZE, decode_clipboard_event};
+    use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_event_frame};
 
     // Buffer needs to be large enough for clipboard data.
     // Use Vec instead of array for large buffers to avoid stack overflow.
@@ -349,30 +345,11 @@ async fn receive_loop(
         if n == 0 {
             break;
         }
-        // Clipboard events use variable-length encoding
-        let event = if buf[0] == EventType::ClipboardText as u8 {
-            match decode_clipboard_event(&buf[..n]) {
-                Ok(event) => event,
-                Err(e) => {
-                    log::warn!("Failed to decode clipboard from {addr}: {e:?}");
-                    continue;
-                }
-            }
-        } else {
-            // Pad with zeros if message is smaller than MAX_EVENT_SIZE
-            let mut fixed_buf = [0u8; MAX_EVENT_SIZE];
-            let copy_len = n.min(MAX_EVENT_SIZE);
-            fixed_buf[..copy_len].copy_from_slice(&buf[..copy_len]);
-            match fixed_buf.try_into() {
-                Ok(event) => event,
-                // Skip undecodable datagrams without dropping the
-                // connection. Each DTLS recv is one framed message, so
-                // skipping is safe and keeps us forward-compatible with
-                // peers that send event types we don't yet know about.
-                Err(e) => {
-                    log::debug!("ignoring undecodable event from {addr}: {e}");
-                    continue;
-                }
+        let event = match decode_event_frame(&buf[..n]) {
+            Ok(event) => event,
+            Err(e) => {
+                log::debug!("ignoring undecodable event from {addr}: {e}");
+                continue;
             }
         };
 
@@ -411,6 +388,85 @@ async fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RefusedConnection;
+
+    #[async_trait::async_trait]
+    impl Conn for RefusedConnection {
+        async fn connect(&self, _: SocketAddr) -> webrtc_util::Result<()> {
+            Ok(())
+        }
+        async fn recv(&self, _: &mut [u8]) -> webrtc_util::Result<usize> {
+            unreachable!()
+        }
+        async fn recv_from(&self, _: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+            unreachable!()
+        }
+        async fn send(&self, _: &[u8]) -> webrtc_util::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "test refusal").into())
+        }
+        async fn send_to(&self, _: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
+            unreachable!()
+        }
+        fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            Some("127.0.0.1:2".parse().unwrap())
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_input_and_clipboard_sends_return_errors() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        for clipboard in [false, true] {
+            clients.set_active_addr(handle, Some(addr));
+            clients.set_alive(handle, true);
+            sender
+                .conns
+                .lock()
+                .await
+                .insert(addr, Arc::new(RefusedConnection));
+            let result = if clipboard {
+                sender
+                    .send_clipboard(
+                        ProtoEvent::Input(input_event::Event::Clipboard(
+                            input_event::ClipboardEvent::Text("test".into()),
+                        )),
+                        handle,
+                    )
+                    .await
+            } else {
+                sender.send(ProtoEvent::Ping, handle).await
+            };
+            assert!(result.is_err());
+            assert!(clients.active_addr(handle).is_none());
+        }
+        assert!(
+            sender
+                .send_clipboard(
+                    ProtoEvent::Input(input_event::Event::Clipboard(
+                        input_event::ClipboardEvent::Text("offline".into())
+                    )),
+                    handle
+                )
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn bind_addr_matches_target_family() {

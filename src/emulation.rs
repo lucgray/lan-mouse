@@ -490,8 +490,10 @@ impl EmulationTask {
                         emulation.warp(handle, pos, t).await;
                     },
                     ProxyRequest::Remove(addr) => {
-                        if let Some(handle) = self.handles.remove(&addr) {
-                            emulation.destroy(handle).await;
+                        if let Some(&handle) = self.handles.get(&addr) {
+                            if emulation.destroy_bounded(handle).await {
+                                self.handles.remove(&addr);
+                            }
                         }
                     }
                     ProxyRequest::UpdateConfig(input_config) => {

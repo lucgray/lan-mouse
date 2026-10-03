@@ -80,3 +80,28 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+
+## Input and frontend notification reliability
+
+Both DTLS receive directions use `lan_mouse_proto::decode_event_frame` to decode
+one application message at a time, including text and image clipboard frames.
+A truncated clipboard message is rejected without reading another message as
+its continuation. Existing compact and padded fixed-size frames remain accepted;
+the wire event IDs and encoding are unchanged.
+
+Input and clipboard send failures propagate to their callers. Clipboard sends
+while disconnected return an error rather than reporting a successful transfer;
+reconnect replay is not provided by this change.
+
+Frontend notifications use an ordered writer per IPC connection, with a queue
+of 64 messages and a two-second write deadline. Each JSON line is written in
+full. A slow or failed frontend is disconnected so it cannot block the service's
+input routing. The current GTK frontend still exits when its IPC connection
+closes; automatic GUI reconnection is tracked in the review checklist.
+
+The evdev backend retains fractional pointer movement per emulation handle,
+clearing the remainder when that handle is destroyed. Default clipboard change
+logs contain the content kind and size rather than the text preview.
+
+See [the performance and UX review](docs/performance-ux-review.md) for remaining
+issues and validation requirements.

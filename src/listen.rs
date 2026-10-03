@@ -248,11 +248,20 @@ impl LanMouseListener {
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+        let conn = self
+            .conns
+            .lock()
+            .await
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, conn)| conn.clone());
+        match conn {
+            Some(conn) => {
+                if let Err(e) = conn.send(&buf[..len]).await {
+                    log::warn!("control reply to {addr} failed: {e}");
+                }
             }
+            None => log::debug!("control reply to {addr} skipped: connection missing"),
         }
     }
 
@@ -321,7 +330,7 @@ async fn read_loop(
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_clipboard_event, is_clipboard_event_type};
+    use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_event_frame};
 
     // Buffer needs to be large enough for clipboard data
     // Use Vec instead of array for large buffers to avoid stack overflow
@@ -343,92 +352,11 @@ async fn read_loop(
 
         log::trace!("Received {} bytes from {}", n, addr);
 
-        // Check if this is a clipboard event (variable length)
-        let event_type = b[0];
-        let event = if is_clipboard_event_type(event_type) {
-            // This is a clipboard event - need to read full message
-            if n < 5 {
-                log::warn!("Clipboard event too short: {} bytes", n);
-                break;
-            }
-
-            // Parse length from bytes 1-4
-            let length = u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize;
-
-            if length > MAX_CLIPBOARD_SIZE {
-                log::warn!("Clipboard data too large: {} bytes", length);
-                break;
-            }
-
-            let total_size = 5 + length;
-            log::debug!(
-                "Clipboard event: received {} bytes, total expected {}",
-                n,
-                total_size
-            );
-
-            // Check if we already have all the data
-            if n >= total_size {
-                // All data received in one packet
-                match decode_clipboard_event(&b[..total_size]) {
-                    Ok(event) => event,
-                    Err(e) => {
-                        log::warn!("error decoding clipboard event: {e}");
-                        break;
-                    }
-                }
-            } else {
-                // Need to read more data
-                let mut clipboard_buf = vec![0u8; total_size];
-                clipboard_buf[..n].copy_from_slice(&b[..n]);
-
-                let mut read_so_far = n;
-                let mut read_failed = false;
-                while read_so_far < total_size {
-                    match conn.recv(&mut clipboard_buf[read_so_far..]).await {
-                        Ok(n) if n > 0 => read_so_far += n,
-                        _ => {
-                            log::warn!("Connection closed while reading clipboard data");
-                            read_failed = true;
-                            break;
-                        }
-                    }
-                }
-
-                if read_failed || read_so_far < total_size {
-                    log::warn!("Incomplete clipboard data received, closing connection");
-                    break;
-                }
-
-                match decode_clipboard_event(&clipboard_buf) {
-                    Ok(event) => event,
-                    Err(e) => {
-                        log::warn!("error decoding clipboard event: {e}");
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Standard fixed-size event - need to convert to fixed-size array
-            // Pad with zeros if message is smaller than MAX_EVENT_SIZE
-            let mut fixed_buf = [0u8; MAX_EVENT_SIZE];
-            let copy_len = n.min(MAX_EVENT_SIZE);
-            fixed_buf[..copy_len].copy_from_slice(&b[..copy_len]);
-            match fixed_buf.try_into() {
-                Ok(event) => event,
-                Err(e) => {
-                    // Skip the malformed/unknown datagram and keep
-                    // listening. Each DTLS recv returns one full
-                    // datagram, so a parse error here can't desync a
-                    // stream; the next call gets a fresh, framed
-                    // message. This makes the protocol forward-
-                    // compatible: a peer running a newer Lan Mouse
-                    // version can introduce additional event types
-                    // and old peers will simply ignore them rather
-                    // than dropping the connection.
-                    log::debug!("ignoring undecodable event from {addr}: {e}");
-                    continue;
-                }
+        let event = match decode_event_frame(&b[..n]) {
+            Ok(event) => event,
+            Err(e) => {
+                log::debug!("ignoring undecodable event from {addr}: {e}");
+                continue;
             }
         };
 

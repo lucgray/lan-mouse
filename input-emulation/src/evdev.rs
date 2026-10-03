@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use evdev::{AttributeSet, KeyCode, RelativeAxisCode, uinput::VirtualDevice};
 use input_event::{KeyboardEvent, PointerEvent};
+use std::collections::HashMap;
 
 use crate::{Emulation, EmulationError, EmulationHandle, error::EvdevEmulationCreationError};
 
@@ -8,6 +9,7 @@ const WHEEL_SENSITIVITY: f64 = 3.0;
 
 pub(crate) struct EvdevEmulation {
     dev: VirtualDevice,
+    motion_remainders: HashMap<EmulationHandle, (f64, f64)>,
 }
 
 impl EvdevEmulation {
@@ -25,7 +27,10 @@ impl EvdevEmulation {
                 RelativeAxisCode::REL_HWHEEL_HI_RES,
             ]))?
             .build()?;
-        Ok(EvdevEmulation { dev })
+        Ok(EvdevEmulation {
+            dev,
+            motion_remainders: HashMap::new(),
+        })
     }
 }
 
@@ -34,15 +39,22 @@ impl Emulation for EvdevEmulation {
     async fn consume(
         &mut self,
         event: input_event::Event,
-        _: EmulationHandle,
+        handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         match event {
             input_event::Event::Pointer(p) => match p {
                 PointerEvent::Motion { time: _, dx, dy } => {
+                    let residual = self
+                        .motion_remainders
+                        .get(&handle)
+                        .copied()
+                        .unwrap_or_default();
+                    let ((x, y), remainder) = quantize_motion((dx, dy), residual);
                     self.dev.emit(&[
-                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_X, dx.round() as i32),
-                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_Y, dy.round() as i32),
+                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_X, x),
+                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_Y, y),
                     ])?;
+                    self.motion_remainders.insert(handle, remainder);
                 }
                 PointerEvent::Button {
                     time: _,
@@ -97,8 +109,18 @@ impl Emulation for EvdevEmulation {
     }
 
     async fn create(&mut self, _: EmulationHandle) {}
-    async fn destroy(&mut self, _: EmulationHandle) {}
-    async fn terminate(&mut self) {}
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        self.motion_remainders.remove(&handle);
+    }
+    async fn terminate(&mut self) {
+        self.motion_remainders.clear();
+    }
+}
+
+fn quantize_motion((dx, dy): (f64, f64), (rx, ry): (f64, f64)) -> ((i32, i32), (f64, f64)) {
+    let (x, y) = (dx + rx, dy + ry);
+    let (ix, iy) = (x.round() as i32, y.round() as i32);
+    ((ix, iy), (x - f64::from(ix), y - f64::from(iy)))
 }
 
 const ALL_KEYS: [KeyCode; 549] = [
@@ -740,3 +762,30 @@ const ALL_KEYS: [KeyCode; 549] = [
     KeyCode::BTN_TRIGGER_HAPPY39,
     KeyCode::BTN_TRIGGER_HAPPY40,
 ];
+
+#[cfg(test)]
+mod motion_tests {
+    use super::quantize_motion;
+
+    #[test]
+    fn slow_motion_preserves_total_displacement_and_reversals() {
+        let mut residual = (0.0, 0.0);
+        let mut total = (0, 0);
+        for dx in [0.4; 100].into_iter().chain([-0.4; 100]) {
+            let (motion, next) = quantize_motion((dx, -dx), residual);
+            residual = next;
+            total.0 += motion.0;
+            total.1 += motion.1;
+            assert!(residual.0.abs() <= 0.5 && residual.1.abs() <= 0.5);
+        }
+        assert_eq!(total, (0, 0));
+        let mut residual = (0.0, 0.0);
+        let mut total = 0;
+        for _ in 0..100 {
+            let ((x, _), next) = quantize_motion((0.4, 0.0), residual);
+            total += x;
+            residual = next;
+        }
+        assert_eq!(total, 40);
+    }
+}
