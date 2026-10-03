@@ -40,11 +40,9 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
-    async fn release_to(&mut self, _t: f64) -> Result<(), CaptureError> {
-        // TODO: warp the cursor before releasing, like the macOS
-        // backend does — needs the same per-display RECT math already
-        // used for the crossing position (see `display_util.rs`).
-        self.release().await
+    async fn release_to(&mut self, t: f64) -> Result<(), CaptureError> {
+        self.event_thread.release_capture_to(t);
+        Ok(())
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
