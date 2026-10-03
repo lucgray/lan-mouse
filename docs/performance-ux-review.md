@@ -8,6 +8,7 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R24 | 已实现，Windows 原生回归待 CI | 通知 ready 前以 PeekMessage 创建线程队列；测试禁止接收线程在首个投递前调用其他建队列 API |
 | R02 | 已实现并通过队列/连接状态回归 | 256 条保序有界队列，积压时合并相邻 motion；超载立即恢复本机透传，清空旧队列并禁用捕获，取消目标连接/心跳并提示；Windows 原生 hook 与拥塞真机验收待 CI/实测 |
 | R03 | 已实现并通过回归 | transport 发送拒绝时输入/剪贴板均返回 Err 并清理 active_addr |
 | R04 | 已实现并通过回归 | 100 次小数运动累计 40，反向运动总量归零；真机低速体验待验 |
@@ -412,8 +413,17 @@ GTK 测试命令：`cargo test -p lan-mouse-gtk --all-features --offline actual_
 
 ### R24 / P2：Windows 线程过早报告 ready，首个请求可能 panic
 
-- [ ] 修复并验证。
+- [x] 在通知 ready 前建立消息队列；原生回归待 Windows CI。
 - 证据：`event_thread.rs::start_routine` 在建立窗口/执行 GetMessage 前返回 thread ID，主线程随后使用 PostThreadMessageW 并 unwrap；在该间隙接收线程没有保证已建立消息队列。
 - Windows 要求目标线程先建消息队列，可在通知 ready 前调用 PeekMessage。依据：[Microsoft PostThreadMessageW 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postthreadmessagew)。这是一条文档支持的源码时序风险，尚未现场复现。
 - 影响：启动、立即注册边缘或退出时，首次投递可能失败并触发 panic。
 - 验收：接收线程先创建队列再发 ready；主线程收到 ready 后立刻投递，Windows 原生测试成功读取该消息。
+
+
+## 第十七轮：Windows 第一次线程消息的初始化竞争
+
+- [x] 在给主线程提供 thread ID 前调用 PeekMessageW(PM_NOREMOVE)，先建立线程消息队列；注册 hook 和创建窗口仍沿用原流程。
+- [x] 新增 Windows 原生测试，使用同一 ready 函数。接收线程在 ready 后等待主线程完成 PostThreadMessageW，期间不调用其他 Windows API；然后读取并核对第一次消息。该屏障避免测试后续的 PeekMessage 偶然掩盖未初始化缺陷。
+- [ ] 原生测试和 Windows 编译/Clippy 待 CI；本机 Linux 不能执行这条 Windows 消息队列测试。第十六轮 Linux 工作区/Clippy 记录仍适用于其代码，不能算作本轮 Windows 测试成功。
+
+本轮实现 R24；评分所需的真机、性能与长时间验收仍未完成。

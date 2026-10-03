@@ -21,11 +21,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos,
-    GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+    GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
+    PeekMessageW, PostThreadMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW,
+    TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
@@ -188,19 +188,25 @@ fn start(
     (msg_thread, thread_id.expect("thread id"))
 }
 
+/// Windows does not guarantee a message queue merely because a thread exists.
+/// Create it before publishing the id used by PostThreadMessageW.
+fn publish_thread_ready(ready: &Arc<(Condvar, Mutex<Option<u32>>)>) {
+    let mut msg = MSG::default();
+    unsafe {
+        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
+    }
+    let (cnd, mtx) = &**ready;
+    *mtx.lock().unwrap() = Some(unsafe { GetCurrentThreadId() });
+    cnd.notify_one();
+}
+
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
     event_tx: HookSender,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
-    /* communicate thread id */
-    {
-        let (cnd, mtx) = &*ready;
-        let mut ready = mtx.lock().unwrap();
-        *ready = Some(unsafe { GetCurrentThreadId() });
-        cnd.notify_one();
-    }
+    publish_thread_ready(&ready);
 
     let mouse_proc: HOOKPROC = Some(mouse_proc);
     let kybrd_proc: HOOKPROC = Some(kybrd_proc);
@@ -773,5 +779,43 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use std::time::Duration;
+    use windows::Win32::UI::WindowsAndMessaging::PM_REMOVE;
+
+    #[test]
+    fn ready_thread_accepts_first_message_before_other_windows_calls() {
+        let ready = Arc::new((Condvar::new(), Mutex::new(None)));
+        let worker_ready = ready.clone();
+        let (posted_tx, posted_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            publish_thread_ready(&worker_ready);
+            // Do not let PeekMessage in the test itself create the queue
+            // before the caller attempts the first post.
+            posted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut msg = MSG::default();
+            let received = unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_REMOVE) };
+            received
+                .as_bool()
+                .then_some((msg.message, msg.wParam.0, msg.lParam.0))
+        });
+        let (condvar, id) = &*ready;
+        let (id, timeout) = condvar
+            .wait_timeout_while(id.lock().unwrap(), Duration::from_secs(2), |id| {
+                id.is_none()
+            })
+            .unwrap();
+        assert!(!timeout.timed_out());
+        let id = id.unwrap();
+        let posted = unsafe { PostThreadMessageW(id, WM_USER, WPARAM(1234), LPARAM(5678)) };
+        posted_tx.send(()).unwrap();
+        let received = worker.join().unwrap();
+        posted.expect("ready thread must already have a message queue");
+        assert_eq!(received, Some((WM_USER, 1234, 5678)));
     }
 }

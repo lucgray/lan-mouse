@@ -179,3 +179,7 @@ the daemon discards stale input, ends that target's transport/heartbeats, clears
 mapping state, reports the failure, and disables capture. Explicitly re-enable
 capture to start a fresh backend. Remote release follows disconnect or watchdog
 cleanup; it is not guaranteed to arrive immediately on an unreliable network.
+
+
+The Windows capture thread creates its message queue before reporting its thread
+ID as ready, so the caller can immediately post the first configuration request.
