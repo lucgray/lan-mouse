@@ -105,3 +105,13 @@ logs contain the content kind and size rather than the text preview.
 
 See [the performance and UX review](docs/performance-ux-review.md) for remaining
 issues and validation requirements.
+
+Configuration saves write and sync a temporary file in the destination directory
+before replacing the existing file. A failed write leaves the original file
+intact and the watcher is restored even on failure. User-managed symlinks are
+preserved by replacing their target; existing file permissions are retained.
+Rename-based external updates are also detected by the config watcher.
+
+On Windows, only a repeatable key-down changes the repeat target. Releasing
+another key or pressing a modifier/lock key leaves the current repeat running.
+Releasing the target, terminating, or dropping the backend stops its repeat task.

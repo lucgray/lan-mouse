@@ -26,6 +26,9 @@ mod evdev;
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(any(windows, test))]
+mod repeat;
+
 pub mod clipboard;
 /// fallback input emulation (logs events)
 mod dummy;

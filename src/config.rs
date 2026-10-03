@@ -517,6 +517,7 @@ impl Config {
                     event.kind,
                     EventKind::Create(_)
                         | EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Modify(ModifyKind::Name(_))
                         | EventKind::Remove(_)
                 )
                 && self.read_from_disk()?
@@ -775,20 +776,18 @@ impl Config {
          * For now we just override the config file.
          */
 
-        let _ = self.unwatch();
-        /* write new config to file */
-        if let Some(p) = self.config_path().parent() {
-            fs::create_dir_all(p)?;
+        if let Err(e) = self.unwatch() {
+            log::warn!("could not suspend config watcher: {e}");
         }
-        {
-            let mut f = File::create(self.config_path())?;
-            f.write_all(new_config.as_bytes())?;
-            f.sync_all()?;
+        let saved = atomic_write_config(self.config_path(), |file| {
+            file.write_all(new_config.as_bytes())
+        });
+        // Always re-arm the watcher, including after write/sync/rename failure.
+        let watched = self.watch().map_err(io::Error::other);
+        if let Err(e) = &watched {
+            log::warn!("could not restore config watcher: {e}");
         }
-
-        let _ = self.watch();
-
-        Ok(())
+        saved.and(watched)
     }
 
     /// whether clipboard sharing is enabled (default: true)
@@ -800,10 +799,121 @@ impl Config {
     }
 }
 
+fn atomic_write_config(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    // Keep user-managed symlinks intact and replace their target instead.
+    let target =
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            fs::canonicalize(path)?
+        } else {
+            path.to_owned()
+        };
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = fs::metadata(&target) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?;
+    }
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&target).map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use input_event::scancode::Linux::*;
+
+    #[test]
+    fn failed_atomic_save_keeps_original_and_removes_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false\n").unwrap();
+        let error = atomic_write_config(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected write failure"))
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "enable_clipboard = false\n"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        atomic_write_config(&path, |file| file.write_all(b"enable_clipboard = true\n")).unwrap();
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap()).enable_clipboard,
+            Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_symlink_and_target_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&target, "old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &link).unwrap();
+        atomic_write_config(&link, |file| file.write_all(b"new")).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_is_restored_after_save_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory_path = directory.path().canonicalize().unwrap();
+        let blocked = directory_path.join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let watcher = RecommendedWatcher::new(
+            move |event| {
+                let _ = tx.blocking_send(event);
+            },
+            notify::Config::default(),
+        )
+        .unwrap();
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: directory.path().join("cert"),
+            config_path: blocked,
+            config_dir: directory_path.clone(),
+            config_toml: Some(parse("enable_clipboard = false")),
+            watcher,
+            watch_rx: rx,
+        };
+        config.watch().unwrap();
+        assert!(config.write_back().is_err());
+        config.config_path = directory_path.join("config.toml");
+        atomic_write_config(config.config_path(), |file| {
+            file.write_all(b"enable_clipboard = true")
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), config.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(config.clipboard_enabled());
+    }
 
     fn parse(toml: &str) -> ConfigToml {
         toml::from_str(toml).expect("valid toml")

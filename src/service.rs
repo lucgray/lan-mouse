@@ -324,6 +324,9 @@ impl Service {
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "Failed to update settings: {e}"
+            )));
         }
     }
 

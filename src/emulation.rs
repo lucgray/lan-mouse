@@ -188,22 +188,21 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         // a sender whose session timed out may resume without
                         // repeating Enter — restore its incoming registration
-                        // so the return edge still works. Enter re-registers
-                        // on its own and needs no resume
-                        if dormant.remove(&addr) && !matches!(&event, ProtoEvent::Enter(..)) {
-                            if let Some((pos, fingerprint)) = entered_clients.get(&addr) {
-                                log::info!("incoming connection resumed: {addr}");
-                                self.event_tx.send(EmulationEvent::Entered {
-                                    addr,
-                                    pos: to_ipc_pos(*pos),
-                                    fingerprint: fingerprint.clone(),
-                                }).expect("channel closed");
-                            }
+                        // so the return edge still works. Only input/Ping
+                        // can resume it; Enter registers itself and Leave tears down.
+                        if let Some((pos, fingerprint)) = resumed_edge(&mut dormant, &entered_clients, addr, &event) {
+                            log::info!("incoming connection resumed: {addr}");
+                            self.event_tx.send(EmulationEvent::Entered {
+                                addr,
+                                pos: to_ipc_pos(pos),
+                                fingerprint,
+                            }).expect("channel closed");
                         }
                         match event {
                             ProtoEvent::Enter(pos, t) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
+                                    dormant.remove(&addr);
                                     entered_clients.insert(addr, (pos, fingerprint.clone()));
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -313,6 +312,21 @@ impl ListenTask {
         }
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
+    }
+}
+
+fn resumed_edge(
+    dormant: &mut HashSet<SocketAddr>,
+    entered: &HashMap<SocketAddr, (Position, String)>,
+    addr: SocketAddr,
+    event: &ProtoEvent,
+) -> Option<(Position, String)> {
+    // A late Leave must not re-register a timed-out sender just before teardown.
+    // Hello/Ack are bookkeeping: leave the dormant state for real input or Ping.
+    if matches!(event, ProtoEvent::Input(_) | ProtoEvent::Ping) && dormant.remove(&addr) {
+        entered.get(&addr).cloned()
+    } else {
+        None
     }
 }
 
@@ -601,5 +615,39 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    #[test]
+    fn bookkeeping_and_leave_do_not_restore_return_edge() {
+        let addr = "127.0.0.1:4242".parse().unwrap();
+        let entered = HashMap::from([(addr, (Position::Left, "peer".into()))]);
+        let mut dormant = HashSet::from([addr]);
+        for event in [
+            ProtoEvent::Leave(0, 0.5),
+            ProtoEvent::Ack(0),
+            ProtoEvent::Hello {
+                commit: *b"12345678",
+            },
+            ProtoEvent::Enter(Position::Left, 0.5),
+        ] {
+            assert!(resumed_edge(&mut dormant, &entered, addr, &event).is_none());
+            assert!(dormant.contains(&addr));
+        }
+        assert!(
+            matches!(resumed_edge(&mut dormant, &entered, addr, &ProtoEvent::Ping), Some((Position::Left, fingerprint)) if fingerprint == "peer")
+        );
+        assert!(resumed_edge(&mut dormant, &entered, addr, &ProtoEvent::Ping).is_none());
+        dormant.insert(addr);
+        let motion = ProtoEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 0.0,
+        }));
+        assert!(resumed_edge(&mut dormant, &entered, addr, &motion).is_some());
     }
 }
