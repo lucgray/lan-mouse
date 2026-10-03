@@ -220,6 +220,7 @@ impl ClientManager {
             c.hostname = hostname;
             s.active_addr = None;
             s.dns_ips.clear();
+            s.resolving = false;
             drop(clients);
             self.invalidate_target(handle);
             self.update_ips(handle);
@@ -331,7 +332,6 @@ impl ClientManager {
                 .expect("client revision space exhausted");
         }
         if let Some((_, state)) = self.clients.borrow_mut().get_mut(&handle) {
-            state.resolving = false;
             state.active_addr = None;
             state.alive = false;
             state.peer_commit = None;

@@ -144,3 +144,11 @@ remain visible while awaiting daemon confirmation, so stale state messages do
 not replace ongoing edits. Invalid ports are marked and not submitted. Removing
 a row discards its pending edit timers. Configuration writes are still performed
 by the service; this edit debounce does not make disk persistence asynchronous.
+
+Hostname lookups coalesce pending requests per device and use request revisions
+independent of transport configuration changes. Deleting a device or changing
+its hostname cancels the old async lookup and invalidates late results. Queries
+report a failure after five seconds; failed refreshes retain known DNS addresses.
+Native resolver calls share four process-wide slots. A slot remains held until
+the blocking system call returns, even when its async wrapper is cancelled.
+Running native resolver calls cannot be forcibly cancelled by dropping a future.

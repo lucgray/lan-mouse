@@ -582,24 +582,28 @@ impl Service {
     fn handle_resolver_event(&mut self, event: DnsEvent) {
         let handle = match event {
             DnsEvent::Resolving(handle, revision) => {
-                if self.client_manager.target_revision(handle) != Some(revision) {
+                if !self.resolver.is_current(handle, revision) {
                     return;
                 }
                 self.client_manager.set_resolving(handle, true);
                 handle
             }
             DnsEvent::Resolved(handle, revision, hostname, ips) => {
-                if self.client_manager.target_revision(handle) != Some(revision)
+                if !self.resolver.is_current(handle, revision)
                     || self.client_manager.get_hostname(handle).as_deref() != Some(&hostname)
                 {
                     return;
                 }
                 self.client_manager.set_resolving(handle, false);
-                if let Err(e) = &ips {
-                    log::warn!("could not resolve {hostname}: {e}");
+                match ips {
+                    Ok(ips) => self.client_manager.set_dns_ips(handle, ips),
+                    Err(error) => {
+                        log::warn!("could not resolve {hostname}: {error}");
+                        self.notify_frontend(FrontendEvent::Error(format!(
+                            "Could not resolve {hostname}: {error}"
+                        )));
+                    }
                 }
-                let ips = ips.unwrap_or_default();
-                self.client_manager.set_dns_ips(handle, ips);
                 handle
             }
         };
@@ -608,9 +612,7 @@ impl Service {
 
     fn resolve(&self, handle: ClientHandle) {
         if let Some(hostname) = self.client_manager.get_hostname(handle) {
-            if let Some(revision) = self.client_manager.target_revision(handle) {
-                self.resolver.resolve(handle, hostname, revision);
-            }
+            self.resolver.resolve(handle, hostname);
         }
     }
 
@@ -766,6 +768,7 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        self.resolver.cancel(handle);
         self.hooks.cancel_client(handle);
         if self
             .client_manager
@@ -786,6 +789,7 @@ impl Service {
     fn update_hostname(&mut self, handle: ClientHandle, hostname: Option<String>) {
         log::info!("hostname changed: {hostname:?}");
         if self.client_manager.set_hostname(handle, hostname.clone()) {
+            self.resolver.cancel(handle);
             self.resolve(handle);
         }
         self.broadcast_client(handle);
