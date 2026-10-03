@@ -159,3 +159,12 @@ waiting for the old handshake timeout. Attempt cleanup checks its own identity;
 idle receivers also respond to cancellation. Hello and each connection close
 have a one-second wait limit. Shutdown releases input capture/emulation before
 waiting for outgoing connection and hook cleanup.
+
+
+Incoming messages and cleanup are checked against their connection identity.
+Replacing a connection at the same address cannot let an old receiver remove
+or deliver messages to its replacement. Actual DTLS closure clears return-edge
+and heartbeat metadata; a watchdog timeout on the same live connection retains
+the existing Input/Ping recovery behavior. Listener shutdown cancels idle readers.
+Connection-table access ends before certificate, send, or close awaits. These
+lifecycle changes do not change the network wire format.

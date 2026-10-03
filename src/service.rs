@@ -429,6 +429,10 @@ impl Service {
                     self.update_incoming(addr, pos, fingerprint);
                 }
             }
+            EmulationEvent::ConnectionClosed { addr } => {
+                self.remove_incoming(addr);
+                self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+            }
             EmulationEvent::Disconnected { addr } => {
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));

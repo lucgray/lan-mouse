@@ -47,6 +47,10 @@ pub(crate) enum EmulationEvent {
     Disconnected {
         addr: SocketAddr,
     },
+    /// actual DTLS connection ended or was replaced
+    ConnectionClosed {
+        addr: SocketAddr,
+    },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
@@ -180,10 +184,12 @@ impl ListenTask {
         let mut entered_clients: HashMap<SocketAddr, (Position, String)> = HashMap::new();
         // addrs whose emulation session timed out while entered
         let mut dormant: HashSet<SocketAddr> = HashSet::new();
+        let mut accepted_clients = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::Msg { event, addr }) => {
+                    Some(ListenEvent::Msg { event, addr, conn }) => {
+                        if !self.listener.is_current(addr, &conn) { continue; }
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         // a sender whose session timed out may resume without
@@ -201,11 +207,13 @@ impl ListenTask {
                         match event {
                             ProtoEvent::Enter(pos, t) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+                                    if !self.listener.is_current(addr, &conn) { continue; }
                                     log::info!("releasing capture: {addr} entered this device");
                                     dormant.remove(&addr);
                                     entered_clients.insert(addr, (pos, fingerprint.clone()));
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    if !self.listener.is_current(addr, &conn) { continue; }
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
@@ -252,8 +260,23 @@ impl ListenTask {
                             _ => {}
                         }
                     }
-                    Some(ListenEvent::Accept { addr, fingerprint }) => {
+                    Some(ListenEvent::Accept { addr, fingerprint, conn }) => {
+                        if !self.listener.is_current(addr, &conn) { continue; }
+                        let remembered = forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
+                        if !accepted_clients.insert(addr) || remembered {
+                            self.emulation_proxy.remove(addr);
+                            self.event_tx.send(EmulationEvent::ConnectionClosed { addr }).expect("channel closed");
+                        }
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                    }
+                    Some(ListenEvent::Disconnected { addr }) => {
+                        // A new connection may already have replaced this one
+                        // while its disconnect notification was queued.
+                        if self.listener.has_connection(addr) { continue; }
+                        accepted_clients.remove(&addr);
+                        forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
+                        self.emulation_proxy.remove(addr);
+                        self.event_tx.send(EmulationEvent::ConnectionClosed { addr }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
@@ -313,6 +336,18 @@ impl ListenTask {
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }
+}
+
+fn forget_peer(
+    addr: SocketAddr,
+    entered: &mut HashMap<SocketAddr, (Position, String)>,
+    dormant: &mut HashSet<SocketAddr>,
+    last_response: &mut HashMap<SocketAddr, Instant>,
+) -> bool {
+    let entered = entered.remove(&addr).is_some();
+    let dormant = dormant.remove(&addr);
+    let response = last_response.remove(&addr).is_some();
+    entered || dormant || response
 }
 
 fn resumed_edge(
@@ -621,6 +656,39 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
+
+    #[test]
+    fn forgetting_real_connection_clears_only_its_return_metadata() {
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let other = "127.0.0.1:3".parse().unwrap();
+        let mut entered = HashMap::from([
+            (addr, (Position::Left, "old".into())),
+            (other, (Position::Right, "other".into())),
+        ]);
+        let mut dormant = HashSet::from([addr, other]);
+        let mut responses = HashMap::from([(addr, Instant::now()), (other, Instant::now())]);
+        assert!(forget_peer(
+            addr,
+            &mut entered,
+            &mut dormant,
+            &mut responses
+        ));
+        assert!(!entered.contains_key(&addr));
+        assert!(!dormant.contains(&addr));
+        assert!(!responses.contains_key(&addr));
+        assert!(
+            entered.contains_key(&other)
+                && dormant.contains(&other)
+                && responses.contains_key(&other)
+        );
+        assert!(resumed_edge(&mut dormant, &entered, addr, &ProtoEvent::Ping).is_none());
+        assert!(!forget_peer(
+            addr,
+            &mut entered,
+            &mut dormant,
+            &mut responses
+        ));
+    }
 
     #[test]
     fn bookkeeping_and_leave_do_not_restore_return_edge() {
