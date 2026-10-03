@@ -9,7 +9,7 @@ use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -174,16 +174,37 @@ impl ListenTask {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         let mut rejected_connections = HashMap::new();
+        // peers that entered this device: addr -> (edge, fingerprint).
+        // kept across temporary silence so a resuming sender does not
+        // need to repeat Enter for the return edge to work again
+        let mut entered_clients: HashMap<SocketAddr, (Position, String)> = HashMap::new();
+        // addrs whose emulation session timed out while entered
+        let mut dormant: HashSet<SocketAddr> = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
+                        // a sender whose session timed out may resume without
+                        // repeating Enter — restore its incoming registration
+                        // so the return edge still works. Enter re-registers
+                        // on its own and needs no resume
+                        if dormant.remove(&addr) && !matches!(&event, ProtoEvent::Enter(..)) {
+                            if let Some((pos, fingerprint)) = entered_clients.get(&addr) {
+                                log::info!("incoming connection resumed: {addr}");
+                                self.event_tx.send(EmulationEvent::Entered {
+                                    addr,
+                                    pos: to_ipc_pos(*pos),
+                                    fingerprint: fingerprint.clone(),
+                                }).expect("channel closed");
+                            }
+                        }
                         match event {
                             ProtoEvent::Enter(pos, t) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
+                                    entered_clients.insert(addr, (pos, fingerprint.clone()));
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
@@ -191,6 +212,8 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(..) => {
+                                entered_clients.remove(&addr);
+                                dormant.remove(&addr);
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
@@ -274,6 +297,11 @@ impl ListenTask {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
+                            // remember a timed-out entered peer so its return
+                            // edge can be rebuilt if it starts sending again
+                            if entered_clients.contains_key(&addr) {
+                                dormant.insert(addr);
+                            }
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
                         } else {
