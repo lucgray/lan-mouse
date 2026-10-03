@@ -122,3 +122,8 @@ Received notifications follow successful platform writes; failed writes report
 an error. Monitoring pauses feedback during a remote write and commits its cache
 only on success. Disabling sharing discards pending snapshots; a platform write
 that has already started is allowed to finish to preserve ordering.
+
+Clipboard monitoring reuses platform access and compares dimensions and raw
+pixels before re-encoding an unchanged image. The last raw image cache is bounded
+to 64 MiB; larger images retain normal encoding and transfer-limit behavior.
+Missed polling ticks are skipped, and dropping the monitor stops future polling.

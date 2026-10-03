@@ -1,4 +1,4 @@
-use arboard::Clipboard;
+use arboard::{Clipboard, ImageData};
 use input_event::{ClipboardEvent, Event, encode_image_rgba};
 use std::sync::{
     Arc, Mutex,
@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::spawn_blocking;
-use tokio::time::interval;
+use tokio::time::{MissedTickBehavior, interval};
 
 use crate::{CaptureError, CaptureEvent};
 
@@ -15,6 +15,7 @@ use crate::{CaptureError, CaptureEvent};
 pub struct ClipboardMonitor {
     event_rx: Receiver<CaptureEvent>,
     _event_tx: Sender<CaptureEvent>,
+    task: tokio::task::JoinHandle<()>,
     last_content: Arc<Mutex<Option<ClipboardEvent>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
@@ -57,39 +58,73 @@ impl Drop for ClipboardWriteGuard {
     }
 }
 
-/// Read the current clipboard content: text first, then images.
-/// Returns `None` for empty or unsupported content.
-fn read_clipboard_content(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
-    match clipboard.get_text() {
-        Ok(text) => {
-            log::trace!("Clipboard text read: {} bytes", text.len());
-            return Some(ClipboardEvent::Text(text));
+/// Keep at most one raw image, bounded to 64 MiB. Oversized images still
+/// encode normally, but are not retained. No duplicate PNG is cached.
+#[derive(Default)]
+struct ImageCache(Option<(usize, usize, Vec<u8>)>);
+
+impl ImageCache {
+    fn encode_with<F>(&mut self, image: ImageData<'_>, encode: F) -> Option<ClipboardEvent>
+    where
+        F: FnOnce(u32, u32, &[u8]) -> Option<Vec<u8>>,
+    {
+        let width = u32::try_from(image.width).ok()?;
+        let height = u32::try_from(image.height).ok()?;
+        let expected = image.width.checked_mul(image.height)?.checked_mul(4)?;
+        if expected != image.bytes.len() {
+            self.0 = None;
+            return None;
         }
-        Err(e) => log::trace!("No clipboard text: {}", e),
-    }
-    match clipboard.get_image() {
-        Ok(image) => {
-            let width = image.width as u32;
-            let height = image.height as u32;
-            match encode_image_rgba(width, height, &image.bytes) {
-                Some(png) => {
-                    log::trace!(
-                        "Clipboard image read: {}x{}, {} bytes PNG",
-                        width,
-                        height,
-                        png.len()
-                    );
-                    Some(ClipboardEvent::Image(png))
-                }
-                None => {
-                    log::warn!("Failed to PNG-encode clipboard image");
-                    None
-                }
-            }
+        if self.0.as_ref().is_some_and(|(width, height, bytes)| {
+            *width == image.width
+                && *height == image.height
+                && bytes.as_slice() == image.bytes.as_ref()
+        }) {
+            return None;
         }
-        Err(e) => {
-            log::trace!("No clipboard image: {}", e);
+        let png = encode(width, height, &image.bytes)?;
+        self.0 = if image.bytes.len() <= 64 * 1024 * 1024 {
+            Some((image.width, image.height, image.bytes.into_owned()))
+        } else {
             None
+        };
+        Some(ClipboardEvent::Image(png))
+    }
+}
+
+#[derive(Default)]
+struct ClipboardReader {
+    clipboard: Option<Clipboard>,
+    images: ImageCache,
+}
+
+impl ClipboardReader {
+    /// Read text first, then images. An unchanged image skips PNG encoding.
+    fn read(&mut self) -> Option<ClipboardEvent> {
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new()
+                .map_err(|e| {
+                    log::debug!("Failed to create clipboard: {e}");
+                })
+                .ok();
+        }
+        let clipboard = self.clipboard.as_mut()?;
+        match clipboard.get_text() {
+            Ok(text) => {
+                self.images.0 = None;
+                return Some(ClipboardEvent::Text(text));
+            }
+            Err(e) => log::trace!("No clipboard text: {e}"),
+        }
+        match clipboard.get_image() {
+            Ok(image) => self.images.encode_with(image, encode_image_rgba),
+            Err(e) => {
+                log::trace!("No clipboard image: {e}");
+                self.images.0 = None;
+                // Retry platform access on the next poll after a failed read.
+                self.clipboard = None;
+                None
+            }
         }
     }
 }
@@ -110,9 +145,11 @@ impl ClipboardMonitor {
         let enabled_clone = enabled.clone();
         let event_tx_clone = event_tx.clone();
 
+        let reader = Arc::new(Mutex::new(ClipboardReader::default()));
         // Spawn monitoring task
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut check_interval = interval(Duration::from_millis(500));
+            check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
                 check_interval.tick().await;
@@ -134,20 +171,11 @@ impl ClipboardMonitor {
                 let writing = writing.clone();
                 let revisions = revisions.clone();
                 let read_revision = revisions.load(Ordering::SeqCst);
+                let reader = reader.clone();
 
                 let _ = spawn_blocking(move || {
-                    // Create clipboard instance
-                    let mut clipboard = match Clipboard::new() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::debug!("Failed to create clipboard: {}", e);
-                            return;
-                        }
-                    };
-
-                    // Get current clipboard content (text or image)
-                    let Some(current_content) = read_clipboard_content(&mut clipboard) else {
-                        // Clipboard might be empty or contain non-shareable data
+                    let mut reader = reader.lock().unwrap();
+                    let Some(current_content) = reader.read() else {
                         return;
                     };
 
@@ -157,6 +185,7 @@ impl ClipboardMonitor {
                     if writing.load(Ordering::SeqCst)
                         || revisions.load(Ordering::SeqCst) != read_revision
                     {
+                        reader.images.0 = None;
                         return;
                     }
 
@@ -186,10 +215,12 @@ impl ClipboardMonitor {
                             // it may be applying remote content through update_last_content.
                             drop(last_change);
                             drop(last_content);
+                            drop(reader);
                             // Send event
                             let event = CaptureEvent::Input(Event::Clipboard(current_content));
                             let _ = event_tx_clone2.blocking_send(event);
                         } else {
+                            reader.images.0 = None;
                             log::trace!("Clipboard changed but debounced (too recent)");
                         }
                     }
@@ -201,6 +232,7 @@ impl ClipboardMonitor {
         Ok(Self {
             event_rx,
             _event_tx: event_tx,
+            task,
             last_content,
             last_change,
             enabled,
@@ -247,9 +279,119 @@ impl ClipboardMonitor {
     }
 }
 
+impl Drop for ClipboardMonitor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image(width: usize, height: usize, bytes: &[u8]) -> ImageData<'_> {
+        ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Borrowed(bytes),
+        }
+    }
+
+    #[test]
+    fn unchanged_image_encodes_once_and_changed_pixels_or_dimensions_reencode() {
+        let mut cache = ImageCache::default();
+        let mut calls = 0;
+        let pixels = [1u8; 16];
+        for _ in 0..120 {
+            cache.encode_with(image(2, 2, &pixels), |_, _, _| {
+                calls += 1;
+                Some(vec![1])
+            });
+        }
+        assert_eq!(calls, 1);
+        for data in [image(1, 4, &pixels), image(2, 2, &[2u8; 16])] {
+            cache.encode_with(data, |_, _, _| {
+                calls += 1;
+                Some(vec![2])
+            });
+        }
+        assert_eq!(calls, 3);
+        cache.0 = None; // discarded samples / text / unsupported content invalidate it
+        assert!(
+            cache
+                .encode_with(image(2, 2, &[2u8; 16]), |_, _, _| Some(vec![3]))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn invalid_or_failed_encoding_is_not_cached() {
+        let mut cache = ImageCache::default();
+        assert!(
+            cache
+                .encode_with(image(2, 2, &[1]), |_, _, _| panic!("invalid buffer"))
+                .is_none()
+        );
+        assert!(
+            cache
+                .encode_with(image(1, 1, &[1; 4]), |_, _, _| None)
+                .is_none()
+        );
+        assert!(
+            cache
+                .encode_with(image(1, 1, &[1; 4]), |_, _, _| Some(vec![1]))
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release performance measurement"]
+    fn measure_static_4k_image_processing() {
+        // Synthetic screenshot-like RGBA; does not measure platform read cost.
+        let (width, height) = (3840, 2160);
+        let mut pixels = vec![0u8; width * height * 4];
+        for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let x = index % width;
+            let y = index / width;
+            pixel.copy_from_slice(&[(x / 16) as u8, (y / 16) as u8, ((x + y) / 32) as u8, 255]);
+        }
+        let baseline = Instant::now();
+        for _ in 0..3 {
+            std::hint::black_box(
+                encode_image_rgba(width as u32, height as u32, std::hint::black_box(&pixels))
+                    .unwrap(),
+            );
+        }
+        let baseline_ns = baseline.elapsed().as_nanos() / 3;
+        let mut cache = ImageCache::default();
+        cache
+            .encode_with(image(width, height, &pixels), encode_image_rgba)
+            .unwrap();
+        let optimized = Instant::now();
+        for _ in 0..120 {
+            assert!(
+                std::hint::black_box(&mut cache)
+                    .encode_with(
+                        image(width, height, std::hint::black_box(&pixels)),
+                        |_, _, _| panic!("unchanged image encoded")
+                    )
+                    .is_none()
+            );
+        }
+        let optimized_ns = optimized.elapsed().as_nanos() / 120;
+        println!(
+            "4K synthetic baseline PNG ns/poll={baseline_ns}; cached pixel comparison ns/poll={optimized_ns}; unchanged polls=120; repeat encodes=0"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_monitor_stops_poll_task() {
+        let monitor = ClipboardMonitor::new().unwrap();
+        let task = monitor.task.abort_handle();
+        drop(monitor);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished());
+    }
 
     fn feedback() -> ClipboardFeedback {
         ClipboardFeedback {
