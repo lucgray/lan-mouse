@@ -23,11 +23,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos,
     GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
-    WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    PostThreadMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -39,7 +39,7 @@ use super::{CaptureEvent, Position, display_util};
 use crate::enter_bind::EnterBindTracker;
 
 pub(crate) struct EventThread {
-    request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
     thread: Option<thread::JoinHandle<()>>,
     thread_id: u32,
 }
@@ -56,31 +56,35 @@ impl EventThread {
     }
 
     pub(crate) fn release_capture(&self) {
-        self.signal(RequestType::Release);
+        self.queue_request(ThreadRequest::Release(None));
+    }
+
+    pub(crate) fn release_capture_to(&self, t: f64) {
+        self.queue_request(ThreadRequest::Release(Some(t)));
     }
 
     pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+        self.queue_request(ThreadRequest::Create(pos));
     }
 
     pub(crate) fn destroy(&self, pos: Position) {
-        self.client_update(ClientUpdate::Destroy(pos));
+        self.queue_request(ThreadRequest::Destroy(pos));
     }
 
     pub(crate) fn set_enter_binds(&self, binds: HashMap<Position, Vec<scancode::Linux>>) {
-        self.client_update(ClientUpdate::SetEnterBinds(binds));
+        self.queue_request(ThreadRequest::SetEnterBinds(binds));
     }
 
     fn exit(&self) {
         self.signal(RequestType::Exit);
     }
 
-    fn client_update(&self, request: ClientUpdate) {
+    fn queue_request(&self, request: ThreadRequest) {
         {
             let mut requests = self.request_buffer.lock().unwrap();
             requests.push(request);
         }
-        self.signal(RequestType::ClientUpdate);
+        self.signal(RequestType::ProcessRequests);
     }
 
     fn signal(&self, event_type: RequestType) {
@@ -97,12 +101,12 @@ impl Drop for EventThread {
 }
 
 enum RequestType {
-    ClientUpdate = 0,
-    Release = 1,
-    Exit = 2,
+    ProcessRequests = 0,
+    Exit = 1,
 }
 
-enum ClientUpdate {
+enum ThreadRequest {
+    Release(Option<f64>),
     Create(Position),
     Destroy(Position),
     SetEnterBinds(HashMap<Position, Vec<scancode::Linux>>),
@@ -165,7 +169,7 @@ fn get_msg() -> Option<MSG> {
 
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
-    request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
@@ -185,7 +189,7 @@ fn start(
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
-    request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
+    request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
     /* communicate thread id */
@@ -255,11 +259,7 @@ fn start_routine(
             /* messages sent via PostThreadMessage */
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
-                x if x == RequestType::Release as usize => {
-                    ACTIVE_CLIENT.take();
-                    reset_key_tracking();
-                }
-                x if x == RequestType::ClientUpdate as usize => {
+                x if x == RequestType::ProcessRequests as usize => {
                     let requests = {
                         let mut res = vec![];
                         let mut requests = request_buffer.lock().unwrap();
@@ -270,7 +270,7 @@ fn start_routine(
                     };
 
                     for request in requests {
-                        update_clients(request)
+                        process_request(request)
                     }
                 }
                 _ => {}
@@ -622,12 +622,39 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
     }
 }
 
-fn update_clients(request: ClientUpdate) {
+fn release_capture(t: Option<f64>) {
+    let active = ACTIVE_CLIENT.take();
+    reset_key_tracking();
+    let (Some(pos), Some(t)) = (active, t) else {
+        return;
+    };
+
+    let target = DISPLAYS.with_borrow_mut(|(displays, generation)| {
+        update_display_regions(displays, generation);
+        display_util::return_point(displays, ENTRY_POINT.get(), pos, t)
+    });
+    let Some((x, y)) = target else {
+        log::warn!("could not find the entry display to return the cursor");
+        return;
+    };
+    // The hook may observe the synthetic move after capture was released.
+    // Start its next crossing check from the returned position.
+    let prev_pos = PREV_POS.replace(Some((x, y)));
+    if let Err(e) = unsafe { SetCursorPos(x, y) } {
+        PREV_POS.replace(prev_pos);
+        log::warn!("failed to return cursor to ({x}, {y}): {e:?}");
+    } else {
+        log::debug!("returned cursor to ({x}, {y})");
+    }
+}
+
+fn process_request(request: ThreadRequest) {
     match request {
-        ClientUpdate::Create(pos) => {
+        ThreadRequest::Release(t) => release_capture(t),
+        ThreadRequest::Create(pos) => {
             CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
         }
-        ClientUpdate::Destroy(pos) => {
+        ThreadRequest::Destroy(pos) => {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
@@ -635,7 +662,7 @@ fn update_clients(request: ClientUpdate) {
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
         }
-        ClientUpdate::SetEnterBinds(binds) => {
+        ThreadRequest::SetEnterBinds(binds) => {
             ENTER_BINDS.with_borrow_mut(|tracker| tracker.set_binds(binds));
         }
     }
