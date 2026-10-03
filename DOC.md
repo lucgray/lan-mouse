@@ -115,3 +115,10 @@ Rename-based external updates are also detected by the config watcher.
 On Windows, only a repeatable key-down changes the repeat target. Releasing
 another key or pressing a modifier/lock key leaves the current repeat running.
 Releasing the target, terminating, or dropping the backend stops its repeat task.
+
+Remote clipboard updates use one serial writer outside the service event loop.
+While a write is busy, only the latest pending clipboard snapshot is retained.
+Received notifications follow successful platform writes; failed writes report
+an error. Monitoring pauses feedback during a remote write and commits its cache
+only on success. Disabling sharing discards pending snapshots; a platform write
+that has already started is allowed to finish to preserve ordering.

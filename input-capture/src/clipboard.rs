@@ -1,6 +1,9 @@
 use arboard::Clipboard;
 use input_event::{ClipboardEvent, Event, encode_image_rgba};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::spawn_blocking;
@@ -15,6 +18,43 @@ pub struct ClipboardMonitor {
     last_content: Arc<Mutex<Option<ClipboardEvent>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
+    remote_write: Arc<AtomicBool>,
+    write_revision: Arc<AtomicU64>,
+}
+
+/// Shared suppression state for one serial remote clipboard writer.
+#[derive(Clone)]
+pub struct ClipboardFeedback {
+    last_content: Arc<Mutex<Option<ClipboardEvent>>>,
+    last_change: Arc<Mutex<Option<Instant>>>,
+    remote_write: Arc<AtomicBool>,
+    write_revision: Arc<AtomicU64>,
+}
+
+pub struct ClipboardWriteGuard(ClipboardFeedback);
+
+impl ClipboardFeedback {
+    pub fn begin_write(self) -> ClipboardWriteGuard {
+        self.remote_write.store(true, Ordering::SeqCst);
+        self.write_revision.fetch_add(1, Ordering::SeqCst);
+        ClipboardWriteGuard(self)
+    }
+}
+
+impl ClipboardWriteGuard {
+    pub fn finish(self, content: Option<ClipboardEvent>) {
+        if let Some(content) = content {
+            *self.0.last_content.lock().unwrap() = Some(content);
+            *self.0.last_change.lock().unwrap() = Some(Instant::now());
+        }
+    }
+}
+
+impl Drop for ClipboardWriteGuard {
+    fn drop(&mut self) {
+        self.0.write_revision.fetch_add(1, Ordering::SeqCst);
+        self.0.remote_write.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Read the current clipboard content: text first, then images.
@@ -60,6 +100,10 @@ impl ClipboardMonitor {
         let last_content: Arc<Mutex<Option<ClipboardEvent>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
+        let remote_write = Arc::new(AtomicBool::new(false));
+        let writing = remote_write.clone();
+        let write_revision = Arc::new(AtomicU64::new(0));
+        let revisions = write_revision.clone();
 
         let last_content_clone = last_content.clone();
         let last_change_clone = last_change.clone();
@@ -79,7 +123,7 @@ impl ClipboardMonitor {
                     *enabled
                 };
 
-                if !is_enabled {
+                if !is_enabled || writing.load(Ordering::SeqCst) {
                     continue;
                 }
 
@@ -87,6 +131,9 @@ impl ClipboardMonitor {
                 let last_content_clone2 = last_content_clone.clone();
                 let last_change_clone2 = last_change_clone.clone();
                 let event_tx_clone2 = event_tx_clone.clone();
+                let writing = writing.clone();
+                let revisions = revisions.clone();
+                let read_revision = revisions.load(Ordering::SeqCst);
 
                 let _ = spawn_blocking(move || {
                     // Create clipboard instance
@@ -107,6 +154,11 @@ impl ClipboardMonitor {
                     // Check if content changed
                     let mut last_content = last_content_clone2.lock().unwrap();
                     let mut last_change = last_change_clone2.lock().unwrap();
+                    if writing.load(Ordering::SeqCst)
+                        || revisions.load(Ordering::SeqCst) != read_revision
+                    {
+                        return;
+                    }
 
                     let content_changed = match last_content.as_ref() {
                         None => true,
@@ -152,7 +204,18 @@ impl ClipboardMonitor {
             last_content,
             last_change,
             enabled,
+            remote_write,
+            write_revision,
         })
+    }
+
+    pub fn feedback(&self) -> ClipboardFeedback {
+        ClipboardFeedback {
+            last_content: self.last_content.clone(),
+            last_change: self.last_change.clone(),
+            remote_write: self.remote_write.clone(),
+            write_revision: self.write_revision.clone(),
+        }
     }
 
     /// Receive the next clipboard event
@@ -181,5 +244,52 @@ impl ClipboardMonitor {
         let mut last_change = self.last_change.lock().unwrap();
         *last_content = Some(content);
         *last_change = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feedback() -> ClipboardFeedback {
+        ClipboardFeedback {
+            last_content: Arc::new(Mutex::new(Some(ClipboardEvent::Text("local".into())))),
+            last_change: Arc::new(Mutex::new(None)),
+            remote_write: Arc::new(AtomicBool::new(false)),
+            write_revision: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn successful_remote_write_commits_cache_before_resuming_monitor() {
+        let feedback = feedback();
+        let guard = feedback.clone().begin_write();
+        assert!(feedback.remote_write.load(Ordering::SeqCst));
+        let read_revision = feedback.write_revision.load(Ordering::SeqCst);
+        guard.finish(Some(ClipboardEvent::Text("remote".into())));
+        assert!(!feedback.remote_write.load(Ordering::SeqCst));
+        assert_eq!(
+            *feedback.last_content.lock().unwrap(),
+            Some(ClipboardEvent::Text("remote".into()))
+        );
+        assert!(feedback.last_change.lock().unwrap().is_some());
+        assert_ne!(
+            read_revision,
+            feedback.write_revision.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn failed_or_dropped_write_preserves_cache_and_resumes_monitor() {
+        let feedback = feedback();
+        feedback.clone().begin_write().finish(None);
+        assert_eq!(
+            *feedback.last_content.lock().unwrap(),
+            Some(ClipboardEvent::Text("local".into()))
+        );
+        assert!(!feedback.remote_write.load(Ordering::SeqCst));
+        drop(feedback.clone().begin_write());
+        assert!(!feedback.remote_write.load(Ordering::SeqCst));
+        assert!(feedback.last_change.lock().unwrap().is_none());
     }
 }

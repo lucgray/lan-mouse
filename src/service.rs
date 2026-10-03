@@ -1,6 +1,7 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard_writer::ClipboardWriter,
     config::{Config, ConfigClient},
     connect::{LanMouseConnection, LanMouseConnectionSender},
     crypto,
@@ -50,6 +51,7 @@ pub struct Service {
     clipboard_monitor: Option<ClipboardMonitor>,
     /// clipboard emulation
     clipboard_emulation: Option<ClipboardEmulation>,
+    clipboard_writer: Option<ClipboardWriter>,
     /// clipboard enabled
     clipboard_enabled: bool,
     /// dns resolver
@@ -143,6 +145,13 @@ impl Service {
             (None, None)
         };
 
+        let clipboard_writer = clipboard_emulation.as_ref().map(|emulation| {
+            ClipboardWriter::new(
+                emulation.clone(),
+                clipboard_monitor.as_ref().map(ClipboardMonitor::feedback),
+            )
+        });
+
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
@@ -153,6 +162,7 @@ impl Service {
             emulation,
             clipboard_monitor,
             clipboard_emulation,
+            clipboard_writer,
             clipboard_enabled,
             frontend_listener,
             resolver,
@@ -207,6 +217,24 @@ impl Service {
                         None => std::future::pending().await,
                     }
                 } => self.handle_clipboard_event(event).await,
+                result = async {
+                    match &mut self.clipboard_writer {
+                        Some(writer) => writer.completed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some((event, result)) = result {
+                        match result {
+                            Ok(()) if self.clipboard_enabled => self.notify_clipboard_shared(&event, true),
+                            Ok(()) => {},
+                            Err(e) => { log::warn!("Failed to apply remote clipboard: {e}");
+                                self.notify_frontend(FrontendEvent::Error(format!("Failed to apply clipboard: {e}"))); }
+                        }
+                    } else {
+                        self.clipboard_writer = None;
+                        self.notify_frontend(FrontendEvent::Error("Clipboard writer stopped unexpectedly".into()));
+                    }
+                },
                 r = signal::ctrl_c(), if shutdown.is_none() => break r.expect("failed to wait for CTRL+C"),
                 _ = async { shutdown.as_mut().unwrap().recv().await }, if shutdown.is_some() => {
                     log::info!("Shutdown signal received");
@@ -432,23 +460,7 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
-            EmulationEvent::ClipboardReceived(clipboard_event) => {
-                // Received clipboard data from a remote machine - set it locally
-                if self.clipboard_enabled {
-                    if let Some(ref monitor) = self.clipboard_monitor {
-                        // record the incoming content so our own monitor
-                        // does not echo it right back to the peer
-                        monitor.update_last_content(clipboard_event.clone());
-                    }
-                    if let Some(ref clipboard_emulation) = self.clipboard_emulation {
-                        if let Err(e) = clipboard_emulation.set(clipboard_event.clone()).await {
-                            log::warn!("Failed to set clipboard: {}", e);
-                        } else {
-                            self.notify_clipboard_shared(&clipboard_event, true);
-                        }
-                    }
-                }
-            }
+            EmulationEvent::ClipboardReceived(event) => self.receive_clipboard(event),
         }
     }
 
@@ -477,28 +489,22 @@ impl Service {
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
-            ICaptureEvent::ClipboardReceived(clipboard_event) => {
-                // Received clipboard data from a remote machine - set it locally
-                if self.clipboard_enabled {
-                    if let Some(ref monitor) = self.clipboard_monitor {
-                        monitor.update_last_content(clipboard_event.clone());
-                    }
-                    if let Some(ref clipboard_emulation) = self.clipboard_emulation {
-                        // Spawn async task to set clipboard
-                        let clipboard_emulation = clipboard_emulation.clone();
-                        self.notify_clipboard_shared(&clipboard_event, true);
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = clipboard_emulation.set(clipboard_event).await {
-                                log::warn!("Failed to set clipboard: {}", e);
-                            }
-                        });
-                    }
-                }
+            ICaptureEvent::ClipboardReceived(event) => self.receive_clipboard(event),
+        }
+    }
+
+    fn receive_clipboard(&self, event: input_event::ClipboardEvent) {
+        if self.clipboard_enabled {
+            if let Some(writer) = &self.clipboard_writer {
+                writer.submit(event);
             }
         }
     }
 
     async fn handle_clipboard_event(&mut self, event: Option<input_capture::CaptureEvent>) {
+        if !self.clipboard_enabled {
+            return;
+        }
         use input_capture::CaptureEvent;
         use input_event::Event;
 
@@ -862,11 +868,26 @@ impl Service {
                     self.clipboard_emulation = emulation;
                 }
             }
+            if self.clipboard_writer.is_none() {
+                self.clipboard_writer = self.clipboard_emulation.as_ref().map(|emulation| {
+                    ClipboardWriter::new(
+                        emulation.clone(),
+                        self.clipboard_monitor
+                            .as_ref()
+                            .map(ClipboardMonitor::feedback),
+                    )
+                });
+            }
             if let Some(monitor) = &self.clipboard_monitor {
                 monitor.enable();
             }
-        } else if let Some(monitor) = &self.clipboard_monitor {
-            monitor.disable();
+        } else {
+            if let Some(monitor) = &self.clipboard_monitor {
+                monitor.disable();
+            }
+            if let Some(writer) = &self.clipboard_writer {
+                writer.clear_pending();
+            }
         }
         self.config.set_clipboard_enabled(enabled);
         self.save_config();
