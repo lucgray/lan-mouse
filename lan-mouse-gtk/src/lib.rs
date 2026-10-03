@@ -1,6 +1,7 @@
 mod authorization_window;
 mod client_object;
 mod client_row;
+mod daemon_client;
 mod fingerprint_window;
 mod key_object;
 mod key_row;
@@ -15,7 +16,7 @@ mod window;
 #[cfg(windows)]
 mod windows_status_item;
 
-use std::{env, process, str, sync::OnceLock};
+use std::{env, str, sync::OnceLock};
 
 use gtk::CssProvider;
 use window::Window;
@@ -82,7 +83,7 @@ fn human_bytes(bytes: usize) -> String {
 }
 
 use adw::Application;
-use gtk::{IconTheme, gdk::Display, glib::clone, prelude::*};
+use gtk::{IconTheme, gdk::Display, prelude::*};
 use gtk::{gio, glib, prelude::ApplicationExt};
 
 use self::client_object::ClientObject;
@@ -282,47 +283,14 @@ fn build_ui(app: &Application) {
         return;
     }
 
-    log::debug!("connecting to lan-mouse-socket");
-    let (mut frontend_rx, frontend_tx) = match lan_mouse_ipc::try_connect() {
-        Ok(conn) => conn,
-        Err(e) => {
-            log::warn!("could not connect to daemon ({e}), spawning a new one");
-            if let Err(spawn_err) = process::Command::new(
-                env::current_exe().expect("could not determine executable path"),
-            )
-            .args(env::args().skip(1))
-            .arg("daemon")
-            .spawn()
-            {
-                log::error!("failed to spawn daemon: {spawn_err}");
-                process::exit(1);
-            }
-            match lan_mouse_ipc::connect() {
-                Ok(conn) => conn,
-                Err(e) => {
-                    log::error!("{e}");
-                    process::exit(1);
-                }
-            }
-        }
-    };
-    log::debug!("connected to lan-mouse-socket");
-
-    let (sender, receiver) = async_channel::bounded(10);
-
-    gio::spawn_blocking(move || {
-        while let Some(e) = frontend_rx.next_event() {
-            match e {
-                Ok(e) => sender.send_blocking(e).unwrap(),
-                Err(e) => {
-                    log::error!("{e}");
-                    break;
-                }
-            }
+    let (client, receiver) = daemon_client::DaemonClient::new();
+    let window = Window::new(app, client);
+    let shutdown_window = window.downgrade();
+    app.connect_shutdown(move |_| {
+        if let Some(window) = shutdown_window.upgrade() {
+            window.stop_daemon_client();
         }
     });
-
-    let window = Window::new(app, frontend_tx);
     #[cfg(target_os = "macos")]
     {
         window.connect_close_request(|window| {
@@ -421,84 +389,102 @@ fn build_ui(app: &Application) {
         tray_active
     };
 
-    glib::spawn_future_local(clone!(
-        #[weak]
-        window,
-        async move {
-            loop {
-                let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
-                match notify {
-                    FrontendEvent::Created(handle, client, state) => {
-                        window.new_client(handle, client, state)
+    let weak_window = window.downgrade();
+    glib::spawn_future_local(async move {
+        while let Ok(notice) = receiver.recv().await {
+            let Some(window) = weak_window.upgrade() else {
+                break;
+            };
+            let notify = match notice {
+                daemon_client::Notice::Connected(generation) => {
+                    window.daemon_connected(generation);
+                    continue;
+                }
+                daemon_client::Notice::Disconnected(error) => {
+                    window.daemon_disconnected(&error);
+                    continue;
+                }
+                daemon_client::Notice::Event(generation, event) => {
+                    if generation != window.daemon_generation() {
+                        continue;
                     }
-                    FrontendEvent::Deleted(client) => window.delete_client(client),
-                    FrontendEvent::State(handle, config, state) => {
-                        window.update_client_config(handle, config);
-                        window.update_client_state(handle, state);
-                    }
-                    FrontendEvent::NoSuchClient(_) => {}
-                    FrontendEvent::Error(e) => window.show_toast(e.as_str()),
-                    FrontendEvent::Enumerate(clients) => window.update_client_list(clients),
-                    FrontendEvent::PortChanged(port, msg) => window.update_port(port, msg),
-                    FrontendEvent::CaptureStatus(s) => window.set_capture(s.into()),
-                    FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
-                    FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
-                    FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
-                    FrontendEvent::ConnectionAttempt { fingerprint } => {
-                        window.request_authorization(&fingerprint);
-                    }
-                    FrontendEvent::DeviceConnected {
-                        fingerprint: _,
-                        addr,
-                    } => {
-                        window.show_toast(format!("device connected: {addr}").as_str());
-                    }
-                    FrontendEvent::DeviceEntered {
-                        fingerprint: _,
-                        addr,
-                        pos,
-                    } => {
-                        window.show_toast(format!("device entered: {addr} ({pos})").as_str());
-                    }
-                    FrontendEvent::IncomingDisconnected(addr) => {
-                        window.show_toast(format!("{addr} disconnected").as_str());
-                    }
-                    FrontendEvent::Settings {
-                        clipboard_enabled,
-                        invert_scroll,
-                        mouse_sensitivity,
-                    } => {
-                        window.update_settings(clipboard_enabled, invert_scroll, mouse_sensitivity);
-                    }
-                    FrontendEvent::ClipboardShared {
-                        received,
-                        kind,
-                        bytes,
-                    } => {
-                        let kind = match kind {
-                            ClipboardContentKind::Text => "text",
-                            ClipboardContentKind::Image => "image",
-                        };
-                        let direction = if received { "received" } else { "shared" };
-                        window.show_toast(
-                            format!("clipboard {kind} {direction} ({})", human_bytes(bytes))
-                                .as_str(),
-                        );
-                    }
-                    FrontendEvent::ClipboardTooLarge { bytes, limit } => {
-                        window.show_toast(
-                            format!(
-                                "clipboard too large to share: {} ({} limit)",
-                                human_bytes(bytes),
-                                human_bytes(limit)
-                            )
-                            .as_str(),
-                        );
-                    }
+                    *event
+                }
+            };
+            match notify {
+                FrontendEvent::Created(handle, client, state) => {
+                    window.new_client(handle, client, state)
+                }
+                FrontendEvent::Deleted(client) => window.delete_client(client),
+                FrontendEvent::State(handle, config, state) => {
+                    window.update_client_config(handle, config);
+                    window.update_client_state(handle, state);
+                }
+                FrontendEvent::NoSuchClient(_) => {}
+                FrontendEvent::Error(e) => window.show_toast(e.as_str()),
+                FrontendEvent::Enumerate(clients) => window.update_client_list(clients),
+                FrontendEvent::PortChanged(port, msg) => window.update_port(port, msg),
+                FrontendEvent::CaptureStatus(s) => window.set_capture(s.into()),
+                FrontendEvent::EmulationStatus(s) => window.set_emulation(s.into()),
+                FrontendEvent::AuthorizedUpdated(keys) => window.set_authorized_keys(keys),
+                FrontendEvent::PublicKeyFingerprint(fp) => window.set_pk_fp(&fp),
+                FrontendEvent::ConnectionAttempt { fingerprint } => {
+                    window.request_authorization(&fingerprint);
+                }
+                FrontendEvent::DeviceConnected {
+                    fingerprint: _,
+                    addr,
+                } => {
+                    window.show_toast(format!("device connected: {addr}").as_str());
+                }
+                FrontendEvent::DeviceEntered {
+                    fingerprint: _,
+                    addr,
+                    pos,
+                } => {
+                    window.show_toast(format!("device entered: {addr} ({pos})").as_str());
+                }
+                FrontendEvent::IncomingDisconnected(addr) => {
+                    window.show_toast(format!("{addr} disconnected").as_str());
+                }
+                FrontendEvent::Settings {
+                    clipboard_enabled,
+                    invert_scroll,
+                    mouse_sensitivity,
+                } => {
+                    window.update_settings(clipboard_enabled, invert_scroll, mouse_sensitivity);
+                    window.daemon_synced();
+                }
+                FrontendEvent::ClipboardShared {
+                    received,
+                    kind,
+                    bytes,
+                } => {
+                    let kind = match kind {
+                        ClipboardContentKind::Text => "text",
+                        ClipboardContentKind::Image => "image",
+                    };
+                    let direction = if received { "received" } else { "shared" };
+                    window.show_toast(
+                        format!("clipboard {kind} {direction} ({})", human_bytes(bytes)).as_str(),
+                    );
+                }
+                FrontendEvent::ClipboardTooLarge { bytes, limit } => {
+                    window.show_toast(
+                        format!(
+                            "clipboard too large to share: {} ({} limit)",
+                            human_bytes(bytes),
+                            human_bytes(limit)
+                        )
+                        .as_str(),
+                    );
                 }
             }
         }
-    ));
+        if let Some(window) = weak_window.upgrade() {
+            window.daemon_worker_stopped();
+        }
+    });
 
     // Present on every launch unless
     // `LAN_MOUSE_HIDDEN=1` requests a quiet start into the tray.

@@ -38,6 +38,14 @@ impl<T: Clone + PartialEq> Draft<T> {
         true
     }
 
+    pub(super) fn reject_submission(&mut self) {
+        if let Some(value) = self.awaiting.take() {
+            if self.pending.is_none() {
+                self.pending = Some(value);
+            }
+        }
+    }
+
     pub(super) fn clear(&mut self) {
         self.pending = None;
         self.awaiting = None;
@@ -72,6 +80,19 @@ mod tests {
         assert!(draft.accept(&1));
         draft.stage(1);
         assert_eq!(draft.submit(&1), None);
+    }
+
+    #[test]
+    fn rejected_submission_remains_editable_and_can_be_resubmitted() {
+        let mut draft = Draft::default();
+        draft.stage(2u16);
+        assert_eq!(draft.submit(&1), Some(2));
+        draft.reject_submission();
+        assert!(!draft.accept(&1));
+        assert_eq!(draft.submit(&1), Some(2));
+        draft.stage(3);
+        draft.reject_submission();
+        assert_eq!(draft.submit(&1), Some(3));
     }
 
     #[test]

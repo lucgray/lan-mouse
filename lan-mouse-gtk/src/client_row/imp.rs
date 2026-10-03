@@ -278,6 +278,14 @@ impl ClientRow {
         }
     }
 
+    pub(super) fn reject_edit_submission(&self, hostname: bool) {
+        if hostname {
+            self.hostname_draft.borrow_mut().reject_submission();
+        } else {
+            self.port_draft.borrow_mut().reject_submission();
+        }
+    }
+
     pub(super) fn cancel_pending_edits(&self) {
         if let Some(timeout) = self.hostname_timeout.borrow_mut().take() {
             timeout.remove();

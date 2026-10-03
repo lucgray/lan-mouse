@@ -11,8 +11,7 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
-    Position,
+    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, Position,
 };
 
 use crate::{
@@ -41,13 +40,9 @@ glib::wrapper! {
 }
 
 impl Window {
-    pub(super) fn new(app: &adw::Application, conn: FrontendRequestWriter) -> Self {
+    pub(super) fn new(app: &adw::Application, conn: crate::daemon_client::DaemonClient) -> Self {
         let window: Self = Object::builder().property("application", app).build();
-        window
-            .imp()
-            .frontend_request_writer
-            .borrow_mut()
-            .replace(conn);
+        window.imp().daemon_client.borrow_mut().replace(conn);
         window.connect_close_request(|window| {
             for index in 0..window.clients().n_items() {
                 if let Some(row) = window.row_by_idx(index as i32) {
@@ -449,11 +444,99 @@ impl Window {
     }
 
     pub(crate) fn request(&self, request: FrontendRequest) {
-        let mut requester = self.imp().frontend_request_writer.borrow_mut();
-        let requester = requester.as_mut().unwrap();
-        if let Err(e) = requester.request(request) {
-            log::error!("error sending message: {e}");
+        if let FrontendRequest::WindowIdentifier(identifier) = &request {
+            self.imp()
+                .window_identifier
+                .replace(Some(identifier.clone()));
+            if self.daemon_generation() == 0 {
+                return;
+            }
+        }
+        let edit = match &request {
+            FrontendRequest::UpdateHostname(handle, _) => Some((*handle, true)),
+            FrontendRequest::UpdatePort(handle, _) => Some((*handle, false)),
+            _ => None,
         };
+        let result = self
+            .imp()
+            .daemon_client
+            .borrow()
+            .as_ref()
+            .ok_or("Service unavailable")
+            .and_then(|client| client.request(self.daemon_generation(), request));
+        if let Err(error) = result {
+            if let Some((handle, hostname)) = edit {
+                if let Some(row) = self.row_for_handle(handle) {
+                    row.reject_edit_submission(hostname);
+                }
+            }
+            self.show_toast(error);
+        }
+    }
+
+    pub(super) fn stop_daemon_client(&self) {
+        self.imp().daemon_client.borrow_mut().take();
+    }
+
+    pub(super) fn daemon_worker_stopped(&self) {
+        self.daemon_disconnected("IPC worker stopped. Relaunch the frontend to reconnect.");
+        self.imp()
+            .connection_row
+            .set_title("Service connection stopped");
+    }
+
+    pub(super) fn daemon_generation(&self) -> u64 {
+        self.imp().daemon_generation.get()
+    }
+
+    pub(super) fn daemon_connected(&self, generation: u64) {
+        self.imp().daemon_generation.set(generation);
+        self.imp().daemon_ready.set(false);
+        self.imp()
+            .connection_row
+            .set_title("Synchronizing service state");
+        self.imp()
+            .connection_row
+            .set_subtitle("Waiting for current settings");
+        self.imp().connection_row.set_visible(true);
+        self.imp().service_controls.set_sensitive(false);
+        let identifier = self.imp().window_identifier.borrow().clone();
+        if let Some(identifier) = identifier {
+            self.request(FrontendRequest::WindowIdentifier(identifier));
+        }
+    }
+
+    pub(super) fn daemon_synced(&self) {
+        self.imp().daemon_ready.set(true);
+        self.imp().connection_row.set_visible(false);
+        self.imp().service_controls.set_sensitive(true);
+        if let Some(settings) = self.imp().settings_window.borrow().as_ref() {
+            settings.set_daemon_available(true);
+        }
+    }
+
+    pub(super) fn daemon_disconnected(&self, error: &str) {
+        self.imp().daemon_generation.set(0);
+        self.imp().daemon_ready.set(false);
+        self.imp()
+            .connection_row
+            .set_title("Service disconnected — reconnecting");
+        self.imp().connection_row.set_subtitle(error);
+        self.imp().connection_row.set_visible(true);
+        self.imp().service_controls.set_sensitive(false);
+        self.clients().remove_all();
+        self.authorized().remove_all();
+        self.update_placeholder_visibility();
+        self.update_auth_placeholder_visibility();
+        self.set_pk_fp("Service disconnected");
+        self.set_capture(false);
+        self.set_emulation(false);
+        if let Some(settings) = self.imp().settings_window.borrow().as_ref() {
+            settings.set_daemon_available(false);
+        }
+        if let Some(authorization) = self.imp().authorization_window.borrow_mut().take() {
+            authorization.close();
+        }
     }
 
     pub(super) fn show_toast(&self, msg: &str) {
@@ -572,6 +655,7 @@ impl Window {
         }
         let settings_window = SettingsWindow::new();
         settings_window.set_transient_for(Some(self));
+        settings_window.set_daemon_available(self.imp().daemon_ready.get());
         let (clipboard_enabled, invert_scroll, mouse_sensitivity) = self.imp().settings.get();
         settings_window.update_values(clipboard_enabled, invert_scroll, mouse_sensitivity);
         settings_window.connect_clipboard_toggled(clone!(
@@ -624,5 +708,121 @@ impl Window {
         );
         window.present();
         self.imp().authorization_window.replace(Some(window));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    #[ignore = "requires a GTK display; run separately"]
+    fn actual_window_retains_visibility_clears_stale_state_and_waits_for_sync() {
+        adw::init().unwrap();
+        gio::resources_register_include!("lan-mouse.gresource").unwrap();
+        let app = adw::Application::new(
+            Some("de.feschber.LanMouse.RecoveryTest"),
+            gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let (client, current, mut requests) = crate::daemon_client::test_client();
+        let window = Window::new(&app, client);
+        window.present();
+        window.daemon_connected(1);
+        assert!(!window.imp().service_controls.is_sensitive());
+        assert!(window.imp().connection_row.is_visible());
+        window.new_client(
+            7,
+            ClientConfig {
+                hostname: Some("old.local".into()),
+                ..Default::default()
+            },
+            ClientState {
+                alive: true,
+                ..Default::default()
+            },
+        );
+        window.set_capture(true);
+        window.set_emulation(true);
+        window.update_settings(true, false, 1.);
+        window.daemon_synced();
+        window.open_settings();
+        assert!(window.imp().service_controls.is_sensitive());
+        assert_eq!(window.clients().n_items(), 1);
+
+        current.store(0, Ordering::Release);
+        window.daemon_disconnected("fixture EOF");
+        assert!(window.is_visible());
+        assert_eq!(window.clients().n_items(), 0);
+        assert!(!window.imp().capture_active.get());
+        assert!(!window.imp().emulation_active.get());
+        assert!(window.imp().connection_row.is_visible());
+        assert!(!window.imp().service_controls.is_sensitive());
+        assert!(
+            !window
+                .imp()
+                .settings_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .imp()
+                .clipboard_switch
+                .is_sensitive()
+        );
+
+        current.store(2, Ordering::Release);
+        window.daemon_connected(2);
+        assert!(!window.imp().service_controls.is_sensitive());
+        window.new_client(
+            7,
+            ClientConfig {
+                hostname: Some("fresh.local".into()),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        window.update_settings(false, true, 0.5);
+        window.daemon_synced();
+        assert!(window.is_visible());
+        assert!(window.imp().service_controls.is_sensitive());
+        assert!(!window.imp().connection_row.is_visible());
+        assert_eq!(window.clients().n_items(), 1);
+        assert_eq!(
+            window
+                .client_by_idx(0)
+                .unwrap()
+                .get_data()
+                .hostname
+                .as_deref(),
+            Some("fresh.local")
+        );
+        assert_eq!(window.imp().settings.get(), (false, true, 0.5));
+        assert!(
+            window
+                .imp()
+                .settings_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .imp()
+                .clipboard_switch
+                .is_sensitive()
+        );
+        while requests.try_recv().is_ok() {}
+        for _ in 0..64 {
+            window.request(FrontendRequest::Create);
+        }
+        let row = window.row_for_handle(7).unwrap();
+        row.imp().hostname.set_text("retry.local");
+        row.flush_pending_edits(); // full queue rejects this submission
+        assert_eq!(row.imp().hostname.text(), "retry.local");
+        while requests.try_recv().is_ok() {}
+        row.flush_pending_edits(); // retry once capacity is available
+        assert!(
+            matches!(requests.try_recv().unwrap(), (2, FrontendRequest::UpdateHostname(7, Some(host))) if host == "retry.local")
+        );
+        window.stop_daemon_client();
+        window.close();
     }
 }

@@ -34,6 +34,13 @@
           </object>
         </child>
         <child>
+          <object class="AdwActionRow" id="connection_row">
+            <property name="title">Connecting to service</property>
+            <property name="subtitle">Waiting for the service to become available</property>
+            <property name="icon-name">dialog-warning-symbolic</property>
+          </object>
+        </child>
+        <child>
           <object class="AdwToastOverlay" id="toast_overlay">
             <child>
               <object class="AdwStatusPage">
@@ -45,7 +52,8 @@
                   <property name="maximum-size">600</property>
                   <property name="tightening-threshold">0</property>
                   <property name="child">
-                    <object class="GtkBox">
+                    <object class="GtkBox" id="service_controls">
+                    <property name="sensitive">False</property>
                     <property name="orientation">vertical</property>
                     <property name="spacing">12</property>
                     <child>

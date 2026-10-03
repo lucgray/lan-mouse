@@ -183,3 +183,18 @@ cleanup; it is not guaranteed to arrive immediately on an unreliable network.
 
 The Windows capture thread creates its message queue before reporting its thread
 ID as ready, so the caller can immediately post the first configuration request.
+
+
+GTK keeps its window open when the service disconnects or an IPC message cannot
+be decoded. A visible status row reports disconnection/reconnection, clears old
+connection state, and disables service controls until the new full Sync completes
+(with its final Settings message). Connections and sends run on one cancellable
+background worker; requests and notifications each have a 64-item queue. GUI
+requests never wait for socket writes. Sends have a two-second limit; connection
+attempts have a one-second limit and retry delays grow from 250 ms to five seconds.
+Old connection generations and queued edits are discarded on reconnect. Rejected
+hostname/port submissions retain an editable draft for explicit resubmission.
+The Wayland window identifier is reapplied to the new service. Closing the app
+allows accepted requests to drain for at most two seconds before the IPC worker
+stops. This is a socket-send flush, not confirmation of configuration disk sync. The normal program entry point manages daemon startup;
+the GTK UI no longer spawns an additional unmanaged daemon while waiting for IPC.

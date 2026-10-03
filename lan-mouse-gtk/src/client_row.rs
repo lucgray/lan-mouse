@@ -132,6 +132,10 @@ impl ClientRow {
         self.refresh_version_status();
     }
 
+    pub(crate) fn reject_edit_submission(&self, hostname: bool) {
+        self.imp().reject_edit_submission(hostname);
+    }
+
     pub fn flush_pending_edits(&self) {
         self.imp().flush_hostname();
         self.imp().flush_port();

@@ -2082,6 +2082,7 @@ name = "lan-mouse-gtk"
 version = "0.3.0"
 dependencies = [
  "async-channel",
+ "futures",
  "gdk4-wayland",
  "glib-build-tools",
  "gtk4",
@@ -2092,6 +2093,8 @@ dependencies = [
  "libadwaita",
  "log",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tray-icon",
 ]
 
