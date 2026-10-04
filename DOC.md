@@ -378,3 +378,21 @@ active OS write retains its lease until completion. Dropping the writer prevents
 its last unseen request from starting, while a write already in progress finishes.
 Connection readiness/latest-value replay still requires service-level ordering
 work. These changes do not retract a sample already delivered to its consumer.
+
+
+## Authorization prompts
+
+Unknown leaf certificate fingerprints are reported directly by certificate
+verification, independently of input dispatch and later handshake errors. Pending
+prompts are deduplicated and limited to 64 fingerprints; overflow retains the newest
+requests. Recently delivered fingerprints expire after two seconds and are capped
+at 128 entries. Delivery is limited to one prompt per 250 ms; repeated attempts do
+not postpone the same fingerprint's next eligible prompt. Service checks current
+authorization before notifying the frontend. These are application prompt limits,
+not limits on DTLS library handshake state or every event queue.
+
+Empty certificate chains return an authentication error. For a nonempty chain,
+authorization uses the leaf fingerprint; an authorized intermediate does not grant
+access to an unknown leaf. The GTK authorization dialog currently replaces an
+existing prompt when a new one arrives; preserving active interactions remains
+review work.

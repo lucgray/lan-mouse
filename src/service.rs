@@ -46,6 +46,7 @@ pub struct Service {
     /// configuration
     config: Config,
     hooks: HookRunner,
+    authentication_notices: crate::authentication::AuthenticationNotices,
     /// input capture
     capture: Capture,
     /// input emulation
@@ -117,6 +118,7 @@ impl Service {
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let port = listener.port();
         let configured_port = config.port();
+        let authentication_notices = listener.authentication_notices();
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
         let conn_sender = conn.sender();
 
@@ -172,6 +174,7 @@ impl Service {
             clipboard_emulation,
             clipboard_writer,
             clipboard_outgoing: Default::default(),
+            authentication_notices,
             clipboard_enabled,
             frontend_listener,
             resolver,
@@ -217,6 +220,7 @@ impl Service {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
+                fingerprint = self.authentication_notices.next() => self.handle_authentication_attempt(fingerprint),
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
@@ -443,11 +447,20 @@ impl Service {
         }
     }
 
+    fn handle_authentication_attempt(&mut self, fingerprint: String) {
+        // Authorization may have changed while this bounded prompt was waiting.
+        if !self
+            .authorized_keys
+            .read()
+            .expect("lock")
+            .contains_key(&fingerprint)
+        {
+            self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
+        }
+    }
+
     async fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
-            EmulationEvent::ConnectionAttempt { fingerprint } => {
-                self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
-            }
             EmulationEvent::Entered {
                 addr,
                 pos,
@@ -1167,6 +1180,35 @@ mod tests {
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::PortChanged(port, None) if *port == service.port
             )));
+            // Real unauthorized DTLS handshake -> verifier notice -> Service prompt.
+            // The notice path is independent of ListenTask's input/error queues.
+            service.pending_frontend_events.clear();
+            let peer_cert = webrtc_dtls::crypto::Certificate::generate_self_signed(vec![]).unwrap();
+            let peer_fingerprint = crypto::certificate_fingerprint(&peer_cert);
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket.connect((std::net::Ipv4Addr::LOCALHOST, service.port)).await.unwrap();
+            let attempt = tokio::task::spawn_local(async move {
+                tokio::time::timeout(Duration::from_secs(2), webrtc_dtls::conn::DTLSConn::new(socket, webrtc_dtls::config::Config {
+                    certificates: vec![peer_cert],
+                    insecure_skip_verify: true,
+                    extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require,
+                    ..Default::default()
+                }, true, None)).await
+            });
+            let fingerprint = tokio::time::timeout(Duration::from_secs(2), service.authentication_notices.next()).await.unwrap();
+            assert_eq!(fingerprint, peer_fingerprint);
+            service.handle_authentication_attempt(fingerprint.clone());
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                FrontendEvent::ConnectionAttempt { fingerprint: key } if key == &fingerprint
+            )));
+            service.pending_frontend_events.clear();
+            for _ in 0..1000 { service.authentication_notices.record(fingerprint.clone()); }
+            assert!(tokio::time::timeout(Duration::from_millis(10), service.authentication_notices.next()).await.is_err());
+            service.authorized_keys.write().unwrap().insert(fingerprint.clone(), "accepted peer".into());
+            service.handle_authentication_attempt(fingerprint);
+            assert!(service.pending_frontend_events.is_empty());
+            attempt.abort();
+            let _ = attempt.await;
             service.capture.terminate().await;
             service.emulation.terminate().await;
             service.conn_sender.terminate().await;

@@ -46,9 +46,6 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
-    ConnectionAttempt {
-        fingerprint: String,
-    },
     /// new connection
     Entered {
         /// address of the connection
@@ -59,13 +56,9 @@ pub(crate) enum EmulationEvent {
         fingerprint: String,
     },
     /// connection closed
-    Disconnected {
-        addr: SocketAddr,
-    },
+    Disconnected { addr: SocketAddr },
     /// actual DTLS connection ended or was replaced
-    ConnectionClosed {
-        addr: SocketAddr,
-    },
+    ConnectionClosed { addr: SocketAddr },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
@@ -81,10 +74,7 @@ pub(crate) enum EmulationEvent {
     /// broken (one-way setups, asymmetric NAT, peer's TCP listener
     /// down). The connect-side path stays as the primary source;
     /// this is the defensive fallback.
-    PeerHello {
-        addr: SocketAddr,
-        commit: [u8; 8],
-    },
+    PeerHello { addr: SocketAddr, commit: [u8; 8] },
     /// clipboard data received from remote
     ClipboardReceived(input_event::ClipboardEvent),
     /// Completion of a network send, not acknowledgement of a remote OS write.
@@ -263,7 +253,6 @@ impl ListenTask {
     async fn run(mut self) {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
-        let mut rejected_connections = HashMap::new();
         // peers that entered this device: addr -> (edge, fingerprint).
         // kept across temporary silence so a resuming sender does not
         // need to repeat Enter for the return edge to work again
@@ -392,12 +381,6 @@ impl ListenTask {
                     }
                     Some(ListenEvent::PortChanged(result)) => {
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
-                    }
-                    Some(ListenEvent::Rejected { fingerprint }) => {
-                        if rejected_connections.insert(fingerprint.clone(), Instant::now())
-                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
-                            }
                     }
                     None => break
                 }}

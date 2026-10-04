@@ -8,10 +8,13 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
+| R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
+| R44 | 待修复 | GTK request_authorization 每次提示关闭当前窗口并创建新窗口；连续重试会中断用户点击/确认，应保留当前交互并显示有界待处理请求 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
 | R40 | 已实现并通过监控队列回归 | 本地队列携带监控/写入代次，消费时过滤旧事件/禁用/远端写入；切换重新采样；失败保持缓存并标记新代次刷新，旧采样不能清除；阻塞发送前释放锁 |
-| R41 | 待修复 | ClipboardWriter.submit 只更新 watch，反馈暂停在实际 apply 开始；远端请求已接受到实际写入之间仍有本地样本可消费的窗口；补发缓存须处理该顺序 |
-| R39 | 已实现并通过真实 UDP/Service 回归 | 端口 0 首次绑定选实际端口，两族共用；启动和切换回报非零运行端口；不一致结果关闭；未改变配置端口的重载不再触发换端口；fc03572 原生测试/编译均通过，Windows Clippy 的 Unix fixture helper 修正待新 CI |
+| R41 | 已实现并通过提交/监控顺序回归 | submit 同步预留暂停 lease；待写/活动计数覆盖合并、完成反压、清除与退出未启动项；重连补发与真机时延仍待验 |
+| R39 | 已实现并通过真实 UDP/Service 回归 | 端口 0 首次绑定选实际端口，两族共用；启动和切换回报非零运行端口；不一致结果关闭；未改变配置端口的重载不再触发换端口；6885935 Windows 测试/Clippy 通过；macOS 错误 socket 数量断言已改成 IPv4/IPv6 真实握手，30a193e 原生 CI 待验 |
 | R38 | 已实现并通过监听/真实 UDP 及原生 CI | 最新端口单槽；绑定/清理独立任务、2 秒/1 秒期限；旧绑定成功但过期则关闭，失败保留当前监听，结果走事件；退出先释放输入，再并发网络清理；50cf4f6 完整原生 Rust CI 成功 |
 | R36 | 出站剪贴板有界异步发送已实现并通过任务/服务回归 | 独立 4 并发/32 待发 peer；目标代次取消、捕获连接清理、try_lock 不等待；超限在克隆/编码前拒绝；重连补发和完整输入时延仍待验 |
 | R35 | 入站剪贴板有界异步发送已实现并通过任务/服务回归 | 32 请求、4 并发任务、32 最新待发 peer 槽；2 秒期限独立轮询；连接快照、过期会话取消、开关代次隔离、完成只保留元数据；出站发送见 R36，全服务时延仍待验 |
@@ -742,3 +745,34 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 新提交必须由自己的 Windows/macOS CI 验证，旧 head 的失败不会被描述为成功。
 
 验证日志：clipboard-pending-scope-workspace.log、clipboard-pending-scope-clippy.log、clipboard-pending-scope-service.log；原生失败证据 macos-arm-6885935.log、macos-intel-6885935.log。本轮不部署本机程序，整体 90 分的真机、延迟和长时间资源验收仍未完成。
+
+
+## 第三十一轮：认证提示积压与证书链输入
+
+### R42 / P2：认证队列无界、永久历史和错误匹配
+
+- 源码证据：LanMouseListener 的 connection_attempts 为无界 VecDeque；验证回调 push 后仅在 accept 返回 ErrVerifyDataMismatch 时 pop。错误没有对应证书/会话标识，身份通知依赖另一异步结果；ListenTask 的 rejected_connections 永不清理，并在每次重试时覆盖时间，持续重试会不断延后提示。
+- [x] 删除两处无界历史及 ListenEvent::Rejected -> EmulationEvent::ConnectionAttempt 中转。认证回调把拒绝的准确 leaf 指纹写入共享有界通知状态，Service 独立 select，失败的 accept 不再消费不对应的指纹。
+- [x] 最多 64 个唯一待提示，满时移除最旧项保留新请求；近期投递历史最多 128 项并按两秒 TTL 清除。两秒去重从上次投递计算，观察重试不延后期限；250ms 全局间隔限制输出，Notify 只合并唤醒。
+- [x] 等待注册后检查状态；select 取消等待保留未投递请求。无队列 Mutex 跨 await，指纹扫描上界固定。Service 发提示前重查授权，已授权的排队项不再弹窗。
+- [x] 三条通知回归覆盖 10,000 个不同指纹及持续投递有界、持续重试去重/到期再提示、全局间隔和取消等待不丢唤醒。
+- [x] 真实监听配置 verifier 回归证明不经过 accept 错误就取得准确指纹。隔离 Service fixture 用真实未授权 DTLS 客户端验证回调 -> 通知状态 -> 服务提示；1,000 重试不重复提示，授权后排队处理不提示。
+- [ ] 这是应用认证通知状态上限，不是 webrtc 握手内部、已授权会话数、所有输入事件队列或整个进程的资源上限；洪泛下真机 p99/RSS 仍待验。R13 保留部分完成。
+
+### R43 / P1：外来证书数量触发进程 assert
+
+- 源码证据：verify_peer_certificate 原 assert!(certs.len() == 1)，release panic=abort。回调不能把不符合单证书假设的外来证书列表变成进程断言。
+- [x] 空链返回认证错误；非空链只以第一项 leaf 指纹授权，不因多个证书而 panic。认证根基仍是配置的 leaf 指纹，不因附带已授权 intermediate 放行另一 leaf。
+- [x] 同一真实监听 verifier 回归覆盖空链拒绝、未知 leaf + 多证书拒绝并准确提示、授权 leaf + chain 接受、未知 leaf + 已授权 intermediate 拒绝。未声称网络解析层一定允许恶意包抵达回调。
+
+### R44 / P2：认证提示打断当前交互（新发现，待修复）
+
+- GTK window.rs::request_authorization 无条件关闭现有 AuthorizationWindow 再 present 新窗口。即使服务端限制到每 250ms 一条/单指纹两秒重试，持续提示仍可打断当前点击和确认。
+- [ ] 下一轮保留当前交互和有界等待请求，去重当前指纹，确认/取消后推进，并在同步授权/IPC 断连后清除过期状态。需要真实 GTK 状态/窗口验收。
+
+### 验证与限制
+
+- Linux 全特性工作区 root 104 通过、1 默认忽略；input-capture 33 通过、1 默认忽略；GTK 11 通过、3 默认忽略。隔离真实 Service fixture 显式通过；严格 Clippy、格式和 diff 检查通过。
+- 日志：authentication-notices-workspace.log、authentication-notices-clippy.log、authentication-notices-service.log、authentication-verifier-tests.log。
+- 上一提交 30a193e / Rust run 37180406339 已确认 Linux、Windows、macOS ARM 的测试/编译/Clippy 成功；macOS Intel 部分仍 queued/in_progress，整个矩阵尚未终止，不能描述为完整成功。
+- 新提交仍需自己的 Windows/macOS CI。剪贴板最新值重连补发、其他输入队列拥塞、真机 1,000 次往返、p95/p99、八小时资源验收仍未完成。本轮不部署运行程序，目标继续保持未完成，不能认定达到 90 分。

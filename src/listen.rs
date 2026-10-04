@@ -4,10 +4,10 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -119,9 +119,6 @@ pub(crate) enum ListenEvent {
         fingerprint: String,
         conn: ArcConn,
     },
-    Rejected {
-        fingerprint: String,
-    },
     PortChanged(Result<u16, ListenerCreationError>),
 }
 
@@ -133,6 +130,7 @@ pub(crate) struct LanMouseListener {
     conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
     request_port_change: tokio::sync::watch::Sender<Option<u16>>,
     port: Rc<Cell<u16>>,
+    authentication_notices: crate::authentication::AuthenticationNotices,
 }
 
 type BoundListeners = Vec<Box<dyn Listener>>;
@@ -237,30 +235,23 @@ impl LanMouseListener {
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, mut request_port_change_rx) = tokio::sync::watch::channel(None);
-        let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
+        let authentication_notices = crate::authentication::AuthenticationNotices::default();
 
         let authorized = authorized_keys.clone();
         let verify_peer_certificate: Option<VerifyPeerCertificateFn> = {
-            let connection_attempts = connection_attempts.clone();
+            let authentication_notices = authentication_notices.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
+                    // Authorize the leaf certificate, not intermediates. An empty
+                    // chain is invalid input, never a process assertion failure.
+                    let Some(cert) = certs.first() else {
+                        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+                    };
+                    let fingerprint = crypto::generate_fingerprint(cert);
+                    if authorized.read().expect("lock").contains_key(&fingerprint) {
                         Ok(())
                     } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
-                        connection_attempts
-                            .lock()
-                            .expect("lock")
-                            .push_back(fingerprint);
+                        authentication_notices.record(fingerprint);
                         Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
                     }
                 },
@@ -291,7 +282,6 @@ impl LanMouseListener {
         let readers_cancel = cancellation.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
-            let connection_attempts = connection_attempts.clone();
             spawn_local(async move {
                 let current_port = task_port;
                 let mut binding: Option<OwnedListenerTask<BindingResult>> = None;
@@ -324,9 +314,8 @@ impl LanMouseListener {
                                     if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
-                                                }
+                                                // The verifier already recorded the exact fingerprint.
+                                                // Accept errors carry no identity and must not dequeue one.
                                             }
                                             _ => log::warn!("accept: {e}"),
                                         }
@@ -396,6 +385,7 @@ impl LanMouseListener {
             cancellation,
             request_port_change,
             port: running_port,
+            authentication_notices,
         })
     }
 
@@ -405,6 +395,10 @@ impl LanMouseListener {
 
     pub(crate) fn has_connection(&self, addr: SocketAddr) -> bool {
         self.conns.borrow().iter().any(|(a, _)| *a == addr)
+    }
+
+    pub(crate) fn authentication_notices(&self) -> crate::authentication::AuthenticationNotices {
+        self.authentication_notices.clone()
     }
 
     pub(crate) fn port(&self) -> u16 {
@@ -646,6 +640,7 @@ async fn close_incoming(conn: &ArcConn) {
 mod tests {
     use super::*;
     use lan_mouse_proto::MAX_EVENT_SIZE;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TestConn {
@@ -739,7 +734,57 @@ mod tests {
             conns: Rc::new(RefCell::new(conns)),
             request_port_change,
             port: Rc::new(Cell::new(2)),
+            authentication_notices: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn verifier_reports_exact_leaf_without_accept_error_matching_or_chain_assertions() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let server = Certificate::generate_self_signed(vec![]).unwrap();
+                let peer = Certificate::generate_self_signed(vec![]).unwrap();
+                let other = Certificate::generate_self_signed(vec![]).unwrap();
+                let peer_bytes = peer.certificate[0].as_ref().to_vec();
+                let other_bytes = other.certificate[0].as_ref().to_vec();
+                let keys = Arc::new(RwLock::new(HashMap::new()));
+                let verifier = Arc::new(Mutex::new(None));
+                let captured = verifier.clone();
+                let binder: ListenerBinder = Rc::new(move |port, cfg| {
+                    *captured.lock().unwrap() = cfg.verify_peer_certificate.clone();
+                    async move { bind_dtls(port, &cfg).await }.boxed_local()
+                });
+                let mut listener =
+                    LanMouseListener::new_with_binder(0, server, keys.clone(), binder)
+                        .await
+                        .unwrap();
+                let verify: VerifyPeerCertificateFn = verifier.lock().unwrap().take().unwrap();
+                assert!(verify(&[], &[]).is_err());
+                assert!(verify(&[peer_bytes.clone(), other_bytes.clone()], &[]).is_err());
+                assert_eq!(
+                    listener.authentication_notices().next().await,
+                    crypto::certificate_fingerprint(&peer)
+                );
+                // Leaf authorization accepts an accompanying chain, but an authorized
+                // intermediate never authorizes a different leaf.
+                keys.write()
+                    .unwrap()
+                    .insert(crypto::certificate_fingerprint(&peer), "peer".into());
+                assert!(verify(&[peer_bytes.clone(), other_bytes.clone()], &[]).is_ok());
+                assert!(verify(&[other_bytes, peer_bytes], &[]).is_err());
+                assert_eq!(
+                    listener.authentication_notices().next().await,
+                    crypto::certificate_fingerprint(&other)
+                );
+                // No failed accept has occurred; reporting is directly from verification.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), listener.next())
+                        .await
+                        .is_err()
+                );
+                listener.terminate().await;
+            })
+            .await;
     }
 
     #[tokio::test]
