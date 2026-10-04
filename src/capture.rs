@@ -394,20 +394,23 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let disconnected = self.conn.disconnect_signal();
         loop {
+            // Drain closure notices before another input can reconnect this target.
+            for handle in self.conn.take_disconnected() {
+                self.handle_disconnected(capture, handle).await?;
+            }
             tokio::select! {
+                _ = disconnected.notified() => {},
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
                 received = self.conn.recv() => {
                     let crate::connect::ReceivedEvent { handle, event, .. } = received;
-                    if let Some(active) = self.active_client {
-                        if handle != active {
-                            // we only care about events coming from the client we are currently connected to
-                            // only `Ack` and `Leave` are relevant
-                            continue
-                        }
+                    if self.active_client != Some(handle) {
+                        // Late Ack/Leave cannot change an idle or different capture.
+                        continue;
                     }
 
                     match event {
@@ -597,6 +600,20 @@ impl CaptureTask {
         Ok(())
     }
 
+    async fn handle_disconnected(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        if self.active_client == Some(handle) {
+            log::info!("releasing capture: client {handle} transport disconnected");
+            self.remap.reset_session();
+            self.state = State::WaitingForAck;
+            self.release_capture_with(capture, false, None).await?;
+        }
+        Ok(())
+    }
+
     async fn release_capture(
         &mut self,
         capture: &mut InputCapture,
@@ -758,6 +775,72 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_dtls_close_releases_idle_capture_without_input_or_leave() {
+        use crate::{
+            client::ClientManager,
+            crypto,
+            listen::{LanMouseListener, ListenEvent},
+        };
+        use std::sync::RwLock;
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client();
+            let cert = Certificate::generate_self_signed(vec![]).unwrap();
+            let keys = Arc::new(RwLock::new(HashMap::from([
+                (crypto::certificate_fingerprint(&cert), "fixture".into())
+            ])));
+            let mut peer = LanMouseListener::new(0, Certificate::generate_self_signed(vec![]).unwrap(), keys).await.unwrap();
+            clients.set_fix_ips(handle, vec!["127.0.0.1".parse().unwrap()]);
+            clients.set_port(handle, peer.port());
+            clients.activate_client(handle);
+            let conn = LanMouseConnection::new(cert, clients.clone());
+            let sender = conn.sender();
+            assert!(sender.send(ProtoEvent::Ping, handle).await.is_err());
+            let transport = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(ListenEvent::Accept { conn, .. }) = peer.next().await { break conn; }
+                }
+            }).await.unwrap();
+            sender.clipboard_ready_signal().notified().await;
+            let (event_tx, mut events) = channel();
+            let (_requests, request_rx) = channel();
+            let cancellation_token = CancellationToken::new();
+            let mut task = CaptureTask {
+                active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: cancellation_token.clone(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5,
+                pending_modifiers: Some(KeyboardEvent::Modifiers { depressed: 64, latched: 0, locked: 0, group: 0 }),
+            };
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            // No backend barriers: no input events can drive a failed send/release.
+            // Terminate the peer without ever sending Leave or Ack.
+            transport.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let session = task.do_capture_session(&mut capture);
+                tokio::pin!(session);
+                tokio::select! {
+                    result = &mut session => panic!("capture exited unexpectedly: {result:?}"),
+                    event = events.recv() => assert!(matches!(event.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle)),
+                }
+                cancellation_token.cancel();
+                session.await.unwrap();
+            }).await.unwrap();
+            assert!(task.active_client.is_none());
+            assert!(task.pending_modifiers.is_none());
+            assert_eq!(task.state, State::WaitingForAck);
+            assert!(clients.active_addr(handle).is_none());
+            assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+            peer.terminate().await;
+        }).await;
+    }
 
     #[test]
     fn jail_bind_toggles_only_on_fresh_engagement() {

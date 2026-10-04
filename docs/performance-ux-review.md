@@ -14,7 +14,8 @@
 | R45 | 已实现并通过真实 GTK 反压/代次回归 | FingerprintWindow 被主窗口跟踪；请求满/断线保留草稿，接收入队后关闭；断线关闭旧编辑器，迟到旧按钮不投递；接收入队不等于服务已授权 |
 | R46 | 已实现并通过真实 GTK 属性回归 | 认证说明 GtkLabel.wrap 原非法 word-wrap 已改布尔 True，wrap-mode=word-char；最终测试无原模板警告 |
 | R48 | 已实现并通过真实 DTLS / Service 回归 | 剪贴板接收脱离捕获任务；Pong(false) 不阻断共享，入站无需 Enter；旧目标/连接消息过滤，最终已接收 Leave 仍可释放捕获 |
-| R49 | 待修复 / 真机复现 | 出站 EOF 清理连接未单独通知捕获任务；无后续本地输入且无 Leave 时可能继续抓取，需独立断线释放事件及回归 |
+| R49 | 已实现并通过真实 DTLS 捕获会话回归 | 断线独立通知、每目标一项合并、Weak/配置版本校验；无输入/Leave 仍释放、清修饰键及 remap；心跳结束直接清理，发送一秒期限/短发送检查；真实后端光标与输入等待见 R50 |
+| R50 | 待修复 | 普通输入 send 没有期限，在捕获会话处理器内 await；挂起时不能处理释放绑定、断线通知或退出，需有界失败策略及真正会话回归 |
 | R47 | 待修复 | 人工指纹输入只 trim，服务直接存储原字符串；空值、错误长度/大小写格式可被存入授权但不匹配运行指纹，应做统一格式校验和用户反馈 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
 | R40 | 已实现并通过监控队列回归 | 本地队列携带监控/写入代次，消费时过滤旧事件/禁用/远端写入；切换重新采样；失败保持缓存并标记新代次刷新，旧采样不能清除；阻塞发送前释放锁 |
@@ -839,3 +840,26 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - R49 是本轮源码发现：connect::disconnect 清理出站连接但没有独立捕获释放事件；无 Leave 且之后没有本地输入时可能仍抓取。物理设备复现及修复仍待完成。R47 指纹格式校验、R13 一般事件通道积压、真机往返/输入延迟/八小时资源门槛继续保留。
 
 日志：clipboard-replay-workspace.log、clipboard-replay-clippy.log、clipboard-replay-service.log、clipboard-replay-reload-service.log。源码已推进，不认定达到 90 分。
+
+
+## 第三十四轮：出站断线主动释放捕获
+
+### R49 / P1 证据与修复
+
+- 原 connect::disconnect 仅移除连接及 alive/地址状态，CaptureTask 不会因 EOF 得知断线；只有后续输入发送失败才释放，静止鼠标且没有 Leave 时可能仍抓取。
+- [x] 新增独立 ClosedConnections 通知：每个配置目标至多一条，携带 Weak 连接身份及配置版本，不进入普通输入/控制无界队列，也不保持关闭连接存活。移除当前连接后、等待网络 close 前发布。
+- [x] CaptureTask 每轮处理输入前排空关闭通知；当前目标关闭时立即走不通知远端的释放路径，清待发修饰键、重置 remap/WaitingForAck、发一次 ClientLeft。不为清理按键建立新连接。
+- [x] 旧连接/旧目标版本通知被过滤，其他目标关闭不释放当前捕获。关闭后的排队 Ack 被过滤；闲置捕获不再处理其他设备的 Ack/Leave。已接受的最终 Leave 仍可通过传输过滤。
+- [x] 心跳任务退出直接调用同一清理路径，不依赖 DTLS recv 在 close 后醒来；心跳 send 限一秒，错误/超时/短发送均结束任务。重复清理只由移除当前 Arc 的一方发布通知。
+- [x] 元数据被其他握手清理且 Weak 已死亡时，只要目标版本未变且没有替换传输，仍保留断线释放。不能因清理身份缓存丢失关闭信号。
+
+### 验证与剩余风险
+
+- 真实回环 DTLS + 生产 CaptureTask 会话 + Dummy 后端：无后端输入屏障，对端直接关闭且不发送 Leave/Ack，捕获发 ClientLeft、清 active/pending modifiers、恢复 WaitingForAck；没有后续输入触发 send 失败，也没有重复 leave。
+- 回归覆盖 1,000 通知合并、替换连接/目标版本过滤、旧断开不清新连接、重复断开、Weak 不保活及身份元数据清理；注入永不完成的 close 验证通知早于网络清理且连接表锁释放；注入永不完成/短发送的心跳验证有界退出。
+- Linux workspace all-features：主包 111 通过 / 2 默认忽略；GTK 14 通过 / 4 默认忽略；input-capture 33 通过 / 1 默认忽略。严格 all-targets Clippy、格式和 diff 检查通过。上一轮默认忽略的真实剪贴板 DTLS Service 回归另行运行通过。
+- Dummy 验证生产捕获状态及释放调用，不证明 Windows/Hyprland 原生光标已恢复；真实网络断线、对端挂起/休眠、千次往返和输入延迟门槛仍须硬件验收。
+- 新发现 R50：普通输入 send 仍无期限且在 CaptureTask.handle_capture_event 内 await，即使本轮通知已发，挂起的处理器仍无法返回循环消费它。后续必须为输入 send 实施期限/失败释放，并验证释放绑定和退出响应；不把本轮主动通知等同于所有网络挂起已解决。
+- 上一 HEAD 33fb133 的 Rust run 37189451064 当次检查：除 macOS Intel build 尚运行，其他 16 项均成功；本轮需要新 HEAD CI。评分和完整性能/长期门槛仍未闭环，不认定 90 分。
+
+日志：disconnect-release-workspace.log、disconnect-release-clippy.log、disconnect-release-clipboard-service.log。

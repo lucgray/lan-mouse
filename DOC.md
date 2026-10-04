@@ -107,6 +107,17 @@ latest snapshot at 250 ms intervals and rate-limit busy notices to two seconds.
 Queue admission and complete network sends do not confirm the remote OS write;
 simultaneous copies on different devices have no global conflict ordering.
 
+Outgoing transport loss publishes an independent capture-close notice before
+waiting for network cleanup. Capture drains these notices before processing
+another input event, releases the current target without reconnecting to send
+cleanup messages, clears pending modifiers and resets remapping state. Notices
+coalesce to one per configured target and carry weak connection identity plus
+target revision; a stale close cannot release a replacement or another target.
+The heartbeat worker also performs current-session cleanup directly when it
+ends, without relying on recv waking after close. Heartbeat sends have a
+one-second deadline and reject incomplete sends. Ordinary input send waits still
+need a separate bounded policy, and native cursor recovery needs hardware tests.
+
 Frontend notifications use an ordered writer per IPC connection, with a queue
 of 64 messages and a two-second write deadline. Each JSON line is written in
 full. A slow or failed frontend is disconnected so it cannot block the service's
