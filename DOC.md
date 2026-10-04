@@ -439,3 +439,25 @@ request; it does not acknowledge server authorization or disk persistence. Both
 steps are tracked and closed on service disconnect, and old dialog callbacks
 cannot submit into a new session. Prompts wait for daemon state synchronization.
 Manual fingerprint format validation remains review work.
+
+
+## Certificate fingerprint input
+
+New GTK, CLI and raw IPC authorization requests validate the same SHA-256 input:
+32 hexadecimal byte pairs separated by colons, or 64 continuous hexadecimal
+digits. Uppercase and surrounding whitespace are accepted and normalized to
+lowercase colon-separated bytes. Internal whitespace, wrong lengths, other
+separators and non-hexadecimal characters are rejected. This parser does not
+change the fingerprint hash or IPC event encoding.
+
+The GTK editor shows an inline error and retains both drafts when validation
+fails; correcting the field clears the error. CLI argument parsing rejects bad
+input before connecting to the daemon. The service validates independently,
+reports invalid input through the existing Error event, and does not save a
+rejected authorization. Queue admission is still not a disk-write acknowledgement.
+Removal first matches the exact stored key and then a canonical alias, retaining
+the ability to delete legacy malformed or uppercase entries.
+
+Configuration-file loading still uses its original raw authorization map; legacy
+noncanonical keys are not migrated by this change. This remaining path is tracked
+as R53 in the review checklist.

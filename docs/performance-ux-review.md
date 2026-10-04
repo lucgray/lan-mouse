@@ -18,7 +18,8 @@
 | R50 | 已实现并通过发送/生产捕获会话回归 | 输入/锁等待共享 250ms 期限、短发送错误、退出取消；本机先释放，清理批次 250ms 且固定旧 Arc/目标版本；真实后端/完整延迟仍待验 |
 | R51 | 已实现并通过生产捕获会话回归 | 释放后或其他 handle 的旧 Input 被过滤；需新的 Begin 才可进入；Dummy 持续产生旧输入仍无后续发送 |
 | R52 | 已实现并通过生产捕获会话回归 | 空 release_bind 不再被 all(empty) 误当按下；夹具确实发送 Enter，不进入错误的释放清理路径 |
-| R47 | 待修复 | 人工指纹输入只 trim，服务直接存储原字符串；空值、错误长度/大小写格式可被存入授权但不匹配运行指纹，应做统一格式校验和用户反馈 |
+| R47 | 新授权入口已实现并通过 GTK / CLI / Service / DTLS 回归 | 共享 SHA-256 解析，大小写/64 连续 hex 规范化到 95 字符；坏输入保留草稿并提示、不写授权/配置；原文件加载路径见 R53 |
+| R53 | 待修复 | Config::authorized_fingerprints 直接复制原表；已有大写/连续格式或坏键在启动/外部重载后仍显示为授权但不能匹配标准指纹，需加载校验、规范化及明确反馈 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
 | R40 | 已实现并通过监控队列回归 | 本地队列携带监控/写入代次，消费时过滤旧事件/禁用/远端写入；切换重新采样；失败保持缓存并标记新代次刷新，旧采样不能清除；阻塞发送前释放锁 |
 | R41 | 已实现并通过提交/监控顺序回归 | submit 同步预留暂停 lease；待写/活动计数覆盖合并、完成反压、清除与退出未启动项；服务级提交/完成顺序与最新值重连补发已通过真实 DTLS 回归；真机时延仍待验 |
@@ -891,3 +892,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 上一 HEAD 63dbe48 Rust run 37189908037 已完成成功，Linux/Windows/macOS Intel/ARM 的测试、构建、check、Clippy 与格式 17 项通过；33fb133 run 37189451064 被后续 push 取消，不记为完整成功。本轮 HEAD 仍需自己的 CI。
 
 日志：input-send-deadline-workspace.log、input-send-deadline-clippy.log、input-send-deadline-service.log；审查和修复继续推进，整体 90 分仍未获完整证据。
+
+
+## 第三十六轮：授权指纹校验和错误反馈
+
+### R47 / P2
+
+- [x] 在 lan-mouse-ipc 新增公共 normalize_fingerprint 和 FingerprintError，不改 IPC serialization。接受 32 个两位 hex 字节与冒号（95 字符），或 64 个连续 hex 字符；允许大小写和首尾空白，统一小写冒号格式。拒绝少字节、错分隔、内部空白、非 ASCII hex、SHA256 前缀；不通过删除错误字符“修复”输入。
+- [x] GTK 确认前使用同一解析器：错误标签和 error 样式反馈，不发 confirm、不关编辑器，保留说明及指纹草稿。编辑字段清错误；成功提交标准格式。已有队列满/断线/旧按钮/只读网络指纹回归保留。
+- [x] CLI authorize-key 的 clap value_parser 在连接前拒绝坏参数并规范化合法输入。服务对 raw IPC 再次校验，仅合法请求调用 save_config；坏请求不改授权表、不生成 AuthorizedUpdated，发 Error。
+- [x] RemoveAuthorizedKey 优先删除精确旧键，再用合法指纹的标准化别名匹配；既可撤销新标准授权，也保留删除旧无效或大写原始键的能力。
+
+### 验证与剩余事项
+
+- 共享解析器两项回归覆盖摘要字节不变、多种格式和 Unicode/长度/分隔/百万字符错误输入；CLI 新回归验证解析阶段拒绝及标准化。Linux all-features 工作区通过：主包 114 / 2 默认忽略，GTK 14 / 4 默认忽略，CLI 3，IPC 4；严格 all-targets Clippy、格式和 diff 检查通过。
+- 默认忽略的真实 GTK 认证夹具单独运行：四种坏输入无请求，说明草稿保留，纠正后请求携带标准指纹；错误标签实际布局可见，尺寸非零且位于窗口边界内。请求队列反压、认证通知去重、旧会话按钮和清理仍通过。
+- 隔离 Service 夹具单独运行：坏 raw IPC 不改变授权或配置文件字节；合法大写连续输入在内存及磁盘保存标准指纹；大写别名/旧原始大写键/无效旧键可移除。真实未授权 DTLS 先产生提示，经新请求入口授权后同一证书重新握手成功。
+- R53 是独立未完成路径：Config::authorized_fingerprints 仍复制已有文件的原表，启动/重载未复用解析器。不能宣称所有旧配置已校验或自动迁移，下一轮处理加载规范化、坏键反馈和别名碰撞的确定行为。
+- 上一 HEAD dc75eb6 Rust run 37190588053 已完成成功；本轮仍需新 HEAD 的 Windows/macOS CI。原生桌面、高频往返、端到端 p95/p99 和八小时资源门槛保持未完成，不认定达到 90 分。
+
+日志：fingerprint-validation-workspace.log、fingerprint-validation-clippy.log、fingerprint-validation-gtk.log、fingerprint-validation-service.log。

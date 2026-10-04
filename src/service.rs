@@ -326,8 +326,9 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::AuthorizeKey(desc, fp) => {
-                self.add_authorized_key(desc, fp);
-                self.save_config();
+                if self.add_authorized_key(desc, fp) {
+                    self.save_config();
+                }
             }
             FrontendRequest::ChangePort(port) => self.change_port(port),
             FrontendRequest::Create => {
@@ -960,14 +961,30 @@ impl Service {
         self.frontend_event_pending.notify_one();
     }
 
-    fn add_authorized_key(&mut self, desc: String, fp: String) {
+    fn add_authorized_key(&mut self, desc: String, fp: String) -> bool {
+        let fp = match lan_mouse_ipc::normalize_fingerprint(&fp) {
+            Ok(fp) => fp,
+            Err(error) => {
+                self.notify_frontend(FrontendEvent::Error(error.to_string()));
+                return false;
+            }
+        };
         self.authorized_keys.write().expect("lock").insert(fp, desc);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        true
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
+        // Exact lookup preserves removal of malformed/noncanonical legacy keys;
+        // normalized fallback accepts pasted aliases of newly canonical keys.
+        let mut keys = self.authorized_keys.write().expect("lock");
+        if keys.remove(&fp).is_none() {
+            if let Ok(canonical) = lan_mouse_ipc::normalize_fingerprint(&fp) {
+                keys.remove(&canonical);
+            }
+        }
+        drop(keys);
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
@@ -1554,6 +1571,34 @@ mod tests {
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::PortChanged(port, None) if *port == initial_port
             )));
+            // Invalid raw IPC requests cannot change trust or persist a bad key.
+            service.pending_frontend_events.clear();
+            let before = std::fs::read(&path).unwrap();
+            let old_keys = service.authorized_keys.read().unwrap().clone();
+            for invalid in ["", "bad", &"A".repeat(63), &"gg".repeat(32)] {
+                service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey("bad input".into(), invalid.into()))));
+            }
+            service.config.flush().await.unwrap();
+            assert_eq!(*service.authorized_keys.read().unwrap(), old_keys);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(service.pending_frontend_events.iter().all(|event| matches!(event, FrontendEvent::Error(_))));
+            assert_eq!(service.pending_frontend_events.len(), 4);
+            let canonical = service.public_key_fingerprint.clone();
+            service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey("valid peer".into(), canonical.replace(':', "").to_uppercase()))));
+            service.config.flush().await.unwrap();
+            assert_eq!(service.authorized_keys.read().unwrap().get(&canonical).unwrap(), "valid peer");
+            let persisted = Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+            assert_eq!(persisted.authorized_fingerprints().get(&canonical).unwrap(), "valid peer");
+            service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(canonical.to_uppercase()))));
+            assert!(!service.authorized_keys.read().unwrap().contains_key(&canonical));
+            let legacy = canonical.to_uppercase();
+            service.authorized_keys.write().unwrap().insert(legacy.clone(), "legacy uppercase".into());
+            service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(legacy.clone()))));
+            assert!(!service.authorized_keys.read().unwrap().contains_key(&legacy));
+            service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey("old".into()))));
+            assert!(!service.authorized_keys.read().unwrap().contains_key("old"));
+            service.config.flush().await.unwrap();
+            service.pending_frontend_events.clear();
             // Model an already enabled session without starting OS clipboard
             // resources: the external snapshot must disable it on reload.
             service.clipboard_enabled = true;
@@ -1655,6 +1700,7 @@ mod tests {
             service.pending_frontend_events.clear();
             let peer_cert = webrtc_dtls::crypto::Certificate::generate_self_signed(vec![]).unwrap();
             let peer_fingerprint = crypto::certificate_fingerprint(&peer_cert);
+            let retry_cert = peer_cert.clone();
             let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
             socket.connect((std::net::Ipv4Addr::LOCALHOST, service.port)).await.unwrap();
             let attempt = tokio::task::spawn_local(async move {
@@ -1674,11 +1720,21 @@ mod tests {
             service.pending_frontend_events.clear();
             for _ in 0..1000 { service.authentication_notices.record(fingerprint.clone()); }
             assert!(tokio::time::timeout(Duration::from_millis(10), service.authentication_notices.next()).await.is_err());
-            service.authorized_keys.write().unwrap().insert(fingerprint.clone(), "accepted peer".into());
+            service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey("accepted peer".into(), fingerprint.replace(':', "").to_uppercase()))));
+            assert_eq!(service.authorized_keys.read().unwrap().get(&fingerprint).unwrap(), "accepted peer");
+            service.pending_frontend_events.clear();
             service.handle_authentication_attempt(fingerprint);
             assert!(service.pending_frontend_events.is_empty());
             attempt.abort();
             let _ = attempt.await;
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket.connect((std::net::Ipv4Addr::LOCALHOST, service.port)).await.unwrap();
+            let accepted = tokio::time::timeout(Duration::from_secs(3), webrtc_dtls::conn::DTLSConn::new(socket, webrtc_dtls::config::Config {
+                certificates: vec![retry_cert], insecure_skip_verify: true,
+                extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require, ..Default::default()
+            }, true, None)).await.unwrap().unwrap();
+            webrtc_util::Conn::close(&accepted).await.unwrap();
+            service.config.flush().await.unwrap();
             service.capture.terminate().await;
             service.emulation.terminate().await;
             service.conn_sender.terminate().await;

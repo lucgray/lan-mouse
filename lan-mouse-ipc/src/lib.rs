@@ -16,6 +16,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+mod fingerprint;
+pub use fingerprint::{FingerprintError, normalize_fingerprint};
+
 mod connect;
 mod connect_async;
 mod listen;

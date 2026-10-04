@@ -849,6 +849,15 @@ mod recovery_tests {
     #[test]
     #[ignore = "requires a GTK display; run separately"]
     fn actual_authorization_windows_preserve_interaction_drafts_and_session_identity() {
+        fn test_fp(value: &str) -> String {
+            value
+                .bytes()
+                .chain(std::iter::repeat(0))
+                .take(32)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        }
         fn advance(window: &Window) {
             let context = glib::MainContext::default();
             let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -889,16 +898,16 @@ mod recovery_tests {
         let window = Window::new(&app, client);
         window.present();
         window.daemon_connected(1);
-        window.request_authorization("before-sync");
+        window.request_authorization(test_fp("before-sync").as_str());
         assert!(window.imp().authorization_window.borrow().is_none());
         window.set_authorized_keys(HashMap::from([(
-            "before-sync".into(),
+            test_fp("before-sync").as_str().into(),
             "already accepted".into(),
         )]));
         window.daemon_synced();
         assert!(window.imp().authorization_window.borrow().is_none());
 
-        window.request_authorization("peer-a");
+        window.request_authorization(test_fp("peer-a").as_str());
         let original = prompt(&window);
         assert!(original.imp().message.wraps());
         assert_eq!(
@@ -906,19 +915,22 @@ mod recovery_tests {
             gtk::pango::WrapMode::WordChar
         );
         for _ in 0..1000 {
-            window.request_authorization("peer-a");
-            window.request_authorization("peer-b");
+            window.request_authorization(test_fp("peer-a").as_str());
+            window.request_authorization(test_fp("peer-b").as_str());
         }
         assert_eq!(prompt(&window), original);
-        assert_eq!(original.imp().fingerprint.text(), "peer-a");
+        assert_eq!(
+            original.imp().fingerprint.text(),
+            test_fp("peer-a").as_str()
+        );
         original.imp().confirm_button.emit_clicked();
         let draft = editor(&window);
         assert!(window.imp().authorization_window.borrow().is_none());
         draft.imp().description.set_text("my peer description");
-        window.request_authorization("peer-c");
-        window.request_authorization("peer-a");
+        window.request_authorization(test_fp("peer-c").as_str());
+        window.request_authorization(test_fp("peer-a").as_str());
         assert_eq!(editor(&window), draft);
-        assert_eq!(draft.imp().fingerprint.text(), "peer-a");
+        assert_eq!(draft.imp().fingerprint.text(), test_fp("peer-a").as_str());
         for _ in 0..64 {
             window.request(FrontendRequest::Create);
         }
@@ -929,45 +941,80 @@ mod recovery_tests {
         while requests.try_recv().is_ok() {}
         draft.imp().confirm_button.emit_clicked();
         assert!(
-            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "my peer description" && fp == "peer-a")
+            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "my peer description" && fp == test_fp("peer-a").as_str())
         );
         assert!(window.imp().fingerprint_window.borrow().is_none());
         advance(&window);
-        assert_eq!(prompt(&window).imp().fingerprint.text(), "peer-b");
+        assert_eq!(
+            prompt(&window).imp().fingerprint.text(),
+            test_fp("peer-b").as_str()
+        );
         window.set_authorized_keys(HashMap::from([
-            ("peer-b".into(), "b".into()),
-            ("peer-c".into(), "c".into()),
+            (test_fp("peer-b").as_str().into(), "b".into()),
+            (test_fp("peer-c").as_str().into(), "c".into()),
         ]));
         advance(&window);
         assert!(window.imp().authorization_window.borrow().is_none());
 
         window.open_fingerprint_dialog(None);
         let manual = editor(&window);
-        manual.imp().fingerprint.set_text("manual-key");
         manual.imp().description.set_text("manual description");
-        window.request_authorization("peer-d");
+        for invalid in ["", "bad", &"A".repeat(63), &"gg".repeat(32)] {
+            manual.imp().fingerprint.set_text(invalid);
+            manual.imp().confirm_button.emit_clicked();
+            assert_eq!(editor(&window), manual);
+            assert!(manual.imp().validation_error.is_visible());
+            assert!(manual.imp().fingerprint.has_css_class("error"));
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            while manual.imp().validation_error.height() == 0 || !manual.is_mapped() {
+                assert!(
+                    Instant::now() < deadline,
+                    "validation error was not laid out"
+                );
+                context.iteration(false);
+            }
+            let bounds = manual
+                .imp()
+                .validation_error
+                .compute_bounds(&manual)
+                .unwrap();
+            assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+            assert!(bounds.y() >= 0.0 && bounds.y() + bounds.height() <= manual.height() as f32);
+            assert_eq!(manual.imp().description.text(), "manual description");
+            assert!(requests.try_recv().is_err());
+        }
+        manual
+            .imp()
+            .fingerprint
+            .set_text(&test_fp("manual-key").replace(':', "").to_uppercase());
+        assert!(!manual.imp().validation_error.is_visible());
+        window.request_authorization(test_fp("peer-d").as_str());
         assert_eq!(editor(&window), manual);
         assert!(window.imp().authorization_window.borrow().is_none());
         manual.imp().confirm_button.emit_clicked();
         assert!(
-            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "manual description" && fp == "manual-key")
+            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "manual description" && fp == test_fp("manual-key").as_str())
         );
         advance(&window);
         prompt(&window).imp().cancel_button.emit_clicked();
         advance(&window);
         for _ in 0..1000 {
-            window.request_authorization("peer-d");
+            window.request_authorization(test_fp("peer-d").as_str());
         }
         assert!(window.imp().authorization_window.borrow().is_none());
-        window.request_authorization("peer-e");
-        window.request_authorization("peer-f");
+        window.request_authorization(test_fp("peer-e").as_str());
+        window.request_authorization(test_fp("peer-f").as_str());
         prompt(&window).close(); // Window-manager close also advances the queue.
         advance(&window);
         let stale_prompt = prompt(&window);
-        assert_eq!(stale_prompt.imp().fingerprint.text(), "peer-f");
+        assert_eq!(
+            stale_prompt.imp().fingerprint.text(),
+            test_fp("peer-f").as_str()
+        );
         stale_prompt.imp().confirm_button.emit_clicked();
         let stale_editor = editor(&window);
-        window.request_authorization("peer-g");
+        window.request_authorization(test_fp("peer-g").as_str());
         current.store(0, Ordering::Release);
         window.daemon_disconnected("fixture EOF");
         assert!(window.imp().authorization_window.borrow().is_none());
@@ -979,11 +1026,14 @@ mod recovery_tests {
         assert!(requests.try_recv().is_err());
         current.store(2, Ordering::Release);
         window.daemon_connected(2);
-        window.request_authorization("peer-d"); // Previous dismissal belongs to the old session.
+        window.request_authorization(test_fp("peer-d").as_str()); // Previous dismissal belongs to the old session.
         assert!(window.imp().authorization_window.borrow().is_none());
         window.daemon_synced();
-        assert_eq!(prompt(&window).imp().fingerprint.text(), "peer-d");
-        window.request_authorization("never-replay");
+        assert_eq!(
+            prompt(&window).imp().fingerprint.text(),
+            test_fp("peer-d").as_str()
+        );
+        window.request_authorization(test_fp("never-replay").as_str());
         prompt(&window).close();
         assert!(window.imp().authorization_next.borrow().is_some());
         current.store(0, Ordering::Release);
