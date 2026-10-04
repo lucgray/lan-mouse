@@ -85,10 +85,7 @@ impl Emulation for EvdevEmulation {
                     )])?;
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    let (axis, value) = match axis {
-                        0 => (RelativeAxisCode::REL_WHEEL_HI_RES, -value),
-                        _ => (RelativeAxisCode::REL_HWHEEL_HI_RES, value),
-                    };
+                    let (axis, value) = discrete_scroll_event(axis, value);
                     self.dev
                         .emit(&[*evdev::RelativeAxisEvent::new(axis, value)])?;
                 }
@@ -116,6 +113,48 @@ impl Emulation for EvdevEmulation {
     }
     async fn terminate(&mut self) {
         self.motion_remainders.clear();
+    }
+}
+
+fn discrete_scroll_event(axis: u8, value: i32) -> (RelativeAxisCode, i32) {
+    match axis {
+        0 => (RelativeAxisCode::REL_WHEEL_HI_RES, value.saturating_neg()),
+        _ => (RelativeAxisCode::REL_HWHEEL_HI_RES, value),
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn discrete_scroll_conversion_preserves_axes_and_saturates_vertical_minimum() {
+        for value in [i32::MIN, -240, -120, -1, 0, 1, 120, 240, i32::MAX] {
+            for axis in [0, 1] {
+                let event =
+                    input_event::Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value });
+                assert!(event.validate_input().is_ok());
+                let (native_axis, native_value) = discrete_scroll_event(axis, value);
+                assert_eq!(
+                    native_axis,
+                    if axis == 0 {
+                        RelativeAxisCode::REL_WHEEL_HI_RES
+                    } else {
+                        RelativeAxisCode::REL_HWHEEL_HI_RES
+                    }
+                );
+                let expected = if axis == 0 {
+                    (-i64::from(value)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                } else {
+                    value
+                };
+                assert_eq!(native_value, expected);
+            }
+        }
+        assert_eq!(
+            discrete_scroll_event(0, 120),
+            (RelativeAxisCode::REL_WHEEL_HI_RES, -120)
+        );
     }
 }
 

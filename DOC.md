@@ -698,3 +698,10 @@ Windows commits the next residual only after successful SendInput delivery.
 X11 still does not inspect XTest return values; fractional conversion tests do
 not establish native delivery success. Extreme output saturates to i32 and drops
 unrepresentable excess. Wire encoding and protocol version are unchanged.
+
+
+Evdev reverses vertical AxisDiscrete120 units with saturating negation. Ordinary
+vertical direction and horizontal units are preserved. The positive equivalent
+of i32::MIN is outside the native i32 representation and becomes i32::MAX,
+losing one extreme unit instead of panicking or wrapping direction. Conversion
+tests do not establish kernel/native delivery of enormous scroll values.

@@ -1262,3 +1262,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] X11 同步控制通道/线程退出/native 阻塞、R13 资源总上限、R60 故障退出、真机千次往返、完整延迟与 8h RSS 仍未完成，尚不认定达到 90 分。
 
 日志：fractional-motion-baseline.log、fractional-motion-library.log、fractional-motion-workspace.log、fractional-motion-clippy.log、fractional-motion-{x11,evdev,none}-clippy.log。
+
+
+## 第五十轮：evdev 垂直离散滚动的整数溢出
+
+### R71 / P1
+
+- 将生产 AxisDiscrete120 转换提取到实际 consume 使用的 discrete_scroll_event，保持原 -value；基线用合法 axis=0/value=i32::MIN 通过 validate_input 后调用该 helper，catch_unwind 确认 debug panic：attempt to negate with overflow。日志 evdev-scroll-overflow-baseline.log。未创建 uinput 设备、未注入用户桌面；不是系统 core dump。
+- [x] 垂直转换使用 saturating_neg；普通向上/向下的 high-resolution units 保持原方向，水平原值不变。垂直 i32::MIN 的正值无法用 native i32 表示，截到 i32::MAX，明确损失一个极端单位，避免 panic / release 构建方向错误。
+- [x] 同一生产 helper 的回归覆盖两轴、zero、±1、±120、±240 与两端 i32 极值，期望使用 i64 的方向转换与表示范围计算；极值后继续调用普通 120 转换保持 -120。
+
+### 验证和下一轮
+
+- Linux all-features 工作区通过：input-emulation 40，input-capture 38 / 1 忽略，root 136 / 2 忽略，GTK 14 / 4 忽略，CLI 3、IPC 4、input-event 5、proto 11。严格工作区 all-targets Clippy、fmt/diff 检查通过。本轮未改 Service/协议；此前独立 Service fixtures 的证据不称为本轮新执行。
+- 本轮验证了生产转换和库回归，没有验证 uinput native 交付、kernel 对巨大 high-resolution units 的处理，或 worker panic 后实机清理。避免算术 panic 能移除该路径，但不能证明全部原生故障已经解决。
+- 第 49 轮 c95d989 检查时 Rust queued / Nix in_progress，新提交仍需对应 CI；旧检查状态不是本轮通过证据。
+- [ ] R70 / P1：X11 do_grab 已检查 XGrabPointer 返回值，却忽略 XGrabKeyboard 返回值；键盘 grab 失败后仍 warp、active_client=Some、发布 Begin，可能形成鼠标已转发/键盘仍本地的混合状态。下一轮应模拟第二阶段拒绝，保证整组捕获失败时撤销 pointer grab，并且不发布 Begin。
+- [ ] X11 同步控制通道/线程退出/native 阻塞、R13 资源总上限、R60 原生退出、真机千次往返、完整 p95/p99 与 8h RSS 仍待完成，尚不认定达到 90 分。
+
+日志：evdev-scroll-overflow-baseline.log、evdev-scroll-overflow-library.log、evdev-scroll-overflow-workspace.log、evdev-scroll-overflow-clippy.log。
