@@ -14,11 +14,15 @@ const MAX_INPUT_AGE: Duration = Duration::from_millis(50);
 pub(crate) struct InputLease {
     deadline: Instant,
     cancellation: CancellationToken,
+    identity: Arc<()>,
     _global: OwnedSemaphorePermit,
     _peer: OwnedSemaphorePermit,
 }
 
 impl InputLease {
+    pub(crate) fn identity(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.identity)
+    }
     pub(crate) fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -39,6 +43,7 @@ impl InputLease {
 pub(crate) struct InputBudget {
     global: Arc<Semaphore>,
     peer: Arc<Semaphore>,
+    identity: Arc<()>,
     timeout: Duration,
 }
 
@@ -47,6 +52,7 @@ impl Default for InputBudget {
         Self {
             global: Arc::new(Semaphore::new(GLOBAL_INPUT_LIMIT)),
             peer: Arc::new(Semaphore::new(PEER_INPUT_LIMIT)),
+            identity: Arc::new(()),
             timeout: Duration::from_millis(250),
         }
     }
@@ -56,6 +62,7 @@ impl InputBudget {
     pub(crate) fn for_peer(&self) -> Self {
         Self {
             peer: Arc::new(Semaphore::new(PEER_INPUT_LIMIT)),
+            identity: Arc::new(()),
             ..self.clone()
         }
     }
@@ -69,7 +76,7 @@ impl InputBudget {
             result = tokio::time::timeout_at(admission_deadline, async {
                 let peer = self.peer.clone().acquire_owned().await.ok()?;
                 let global = self.global.clone().acquire_owned().await.ok()?;
-                Some(InputLease { deadline, cancellation: cancellation.clone(), _global: global, _peer: peer })
+                Some(InputLease { deadline, cancellation: cancellation.clone(), identity: self.identity.clone(), _global: global, _peer: peer })
             }) => result.ok().flatten(),
         }
     }
@@ -87,6 +94,7 @@ impl InputBudget {
         Self {
             global: Arc::new(Semaphore::new(global)),
             peer: Arc::new(Semaphore::new(peer)),
+            identity: Arc::new(()),
             timeout,
         }
     }
@@ -97,10 +105,33 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cloned_peer_keeps_identity_and_replacement_gets_a_fresh_identity() {
+        let peer = InputBudget::default();
+        let clone = peer.clone();
+        let replacement = peer.for_peer();
+        let token = CancellationToken::new();
+        let a = peer.acquire(&token).await.unwrap();
+        let b = clone.acquire(&token).await.unwrap();
+        let c = replacement.acquire(&token).await.unwrap();
+        assert!(a.identity().ptr_eq(&b.identity()));
+        assert!(!a.identity().ptr_eq(&c.identity()));
+        assert_eq!(peer.available(), (253, 62));
+        assert_eq!(replacement.available(), (253, 63));
+        let old = a.identity();
+        drop((a, b, peer, clone));
+        assert_eq!(old.strong_count(), 0);
+        assert!(
+            !old.ptr_eq(&c.identity()),
+            "dead old allocation must not alias live replacement"
+        );
+    }
+
+    #[tokio::test]
     async fn shared_global_limit_peer_isolation_and_cancellation_release_capacity() {
         let budget = InputBudget::with_limits(3, 2, Duration::from_millis(10));
         let other = InputBudget {
             peer: Arc::new(Semaphore::new(2)),
+            identity: Arc::new(()),
             ..budget.clone()
         };
         let token = CancellationToken::new();

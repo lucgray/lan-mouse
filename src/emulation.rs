@@ -72,6 +72,9 @@ pub(crate) enum EmulationEvent {
     EmulationDisabled,
     /// backend operation failed; surfaced separately from the disabled status
     BackendFailed(String),
+    InputCleanupFailed {
+        addr: SocketAddr,
+    },
     InputOverloaded {
         addr: SocketAddr,
     },
@@ -558,6 +561,7 @@ impl EmulationProxy {
             request_rx,
             event_tx,
             handles: Default::default(),
+            handle_sessions: Default::default(),
             next_id: 0,
             operation_timeout: Duration::from_millis(500),
             input_config,
@@ -694,8 +698,16 @@ async fn backend_operation<T>(
     })
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ProxyInputError {
+    #[error(transparent)]
+    Backend(#[from] InputEmulationError),
+    #[error("previous input session cleanup failed")]
+    PreviousSessionCleanup,
+}
+
 enum InputDelivery {
-    Completed(Result<(), InputEmulationError>),
+    Completed(Result<(), ProxyInputError>),
     Canceled,
     Discarded,
     Expired,
@@ -703,7 +715,7 @@ enum InputDelivery {
 
 async fn deliver_before_deadline(
     lease: Option<&crate::input_budget::InputLease>,
-    operation: impl std::future::Future<Output = Result<(), InputEmulationError>>,
+    operation: impl std::future::Future<Output = Result<(), ProxyInputError>>,
 ) -> InputDelivery {
     let Some(lease) = lease else {
         return InputDelivery::Completed(operation.await);
@@ -732,6 +744,7 @@ struct EmulationTask {
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
+    handle_sessions: HashMap<SocketAddr, std::sync::Weak<()>>,
     next_id: EmulationHandle,
     operation_timeout: Duration,
     input_config: InputConfig,
@@ -822,9 +835,9 @@ impl EmulationTask {
                     ProxyRequest::Input(event, addr, session, budget) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let outcome = deliver_before_deadline(budget.as_ref(), async {
-                            let handle = self.handle_for(emulation, addr).await?;
+                            let handle = self.handle_for(emulation, addr, budget.as_ref().map(crate::input_budget::InputLease::identity)).await?;
                             if session.as_ref().is_some_and(CancellationToken::is_cancelled) { return Ok(()); }
-                            backend_operation(self.operation_timeout, "consume", emulation.consume(event, handle)).await??;
+                            backend_operation(self.operation_timeout, "consume", emulation.consume(event, handle)).await?.map_err(InputEmulationError::from)?;
                             Ok(())
                         }).await;
                         self.finish_input_delivery(outcome, addr, budget.as_ref(), emulation).await?;
@@ -832,7 +845,7 @@ impl EmulationTask {
                     ProxyRequest::Warp(addr, pos, t, session, budget) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let outcome = deliver_before_deadline(budget.as_ref(), async {
-                            let handle = self.handle_for(emulation, addr).await?;
+                            let handle = self.handle_for(emulation, addr, budget.as_ref().map(crate::input_budget::InputLease::identity)).await?;
                             if session.as_ref().is_some_and(CancellationToken::is_cancelled) { return Ok(()); }
                             backend_operation(self.operation_timeout, "warp", emulation.warp(handle, pos, t)).await?;
                             Ok(())
@@ -843,6 +856,7 @@ impl EmulationTask {
                         if let Some(&handle) = self.handles.get(&addr) {
                             if emulation.destroy_bounded(handle).await {
                                 self.handles.remove(&addr);
+                                self.handle_sessions.remove(&addr);
                             }
                         }
                     }
@@ -865,7 +879,24 @@ impl EmulationTask {
         emulation: &mut impl ProxyBackend,
     ) -> Result<(), InputEmulationError> {
         match outcome {
-            InputDelivery::Completed(result) => result?,
+            InputDelivery::Completed(result) => {
+                if let Err(error) = result {
+                    if let Some(lease) = lease {
+                        lease.cancel();
+                    }
+                    match error {
+                        ProxyInputError::Backend(error) => return Err(error),
+                        ProxyInputError::PreviousSessionCleanup => {
+                            // Keep the old backend and its cleanup ledger alive.
+                            // Only the replacement reader is rejected; other
+                            // peers and later cleanup retries can still run.
+                            self.event_tx
+                                .send(EmulationEvent::InputCleanupFailed { addr })
+                                .expect("channel closed");
+                        }
+                    }
+                }
+            }
             InputDelivery::Discarded => {}
             InputDelivery::Canceled | InputDelivery::Expired => {
                 if matches!(outcome, InputDelivery::Expired)
@@ -880,6 +911,7 @@ impl EmulationTask {
                 if let Some(&handle) = self.handles.get(&addr) {
                     if emulation.destroy_bounded(handle).await {
                         self.handles.remove(&addr);
+                        self.handle_sessions.remove(&addr);
                     }
                 }
             }
@@ -892,15 +924,33 @@ impl EmulationTask {
         &mut self,
         emulation: &mut impl ProxyBackend,
         addr: SocketAddr,
-    ) -> Result<EmulationHandle, InputEmulationError> {
+        session: Option<std::sync::Weak<()>>,
+    ) -> Result<EmulationHandle, ProxyInputError> {
         if let Some(&handle) = self.handles.get(&addr) {
-            return Ok(handle);
+            let same_session = match (self.handle_sessions.get(&addr), session.as_ref()) {
+                (Some(old), Some(current)) => old.ptr_eq(current),
+                (None, None) => true, // internal unscoped callers
+                _ => false,
+            };
+            if same_session {
+                return Ok(handle);
+            }
+            // Preserve failed cleanup for retry, but never let a replacement
+            // session inherit uncertain keys/buttons from this native handle.
+            if !emulation.destroy_bounded(handle).await {
+                return Err(ProxyInputError::PreviousSessionCleanup);
+            }
+            self.handles.remove(&addr);
+            self.handle_sessions.remove(&addr);
         }
         let handle = self.next_id;
         self.next_id += 1;
         // Retain the mapping if create partially succeeds before timing out.
         // Session termination must still be able to release/destroy this handle.
         self.handles.insert(addr, handle);
+        if let Some(session) = session {
+            self.handle_sessions.insert(addr, session);
+        }
         backend_operation(self.operation_timeout, "create", emulation.create(handle)).await?;
         Ok(handle)
     }
@@ -970,6 +1020,8 @@ mod resume_tests {
         removes: usize,
         held: bool,
         consume_delay: Duration,
+        fail_all_removes: bool,
+        held_handles: HashSet<EmulationHandle>,
     }
 
     impl ProxyBackend for StallingBackend {
@@ -986,6 +1038,7 @@ mod resume_tests {
         ) -> Result<(), input_emulation::EmulationError> {
             self.consumed.push(handle);
             self.held = true;
+            self.held_handles.insert(handle);
             tokio::time::sleep(self.consume_delay).await;
             if self.stall == Some("consume") {
                 std::future::pending::<()>().await;
@@ -997,8 +1050,11 @@ mod resume_tests {
                 std::future::pending::<()>().await;
             }
         }
-        async fn destroy_bounded(&mut self, _: EmulationHandle) -> bool {
+        async fn destroy_bounded(&mut self, handle: EmulationHandle) -> bool {
             self.removes += 1;
+            if self.fail_all_removes {
+                return false;
+            }
             if self.stall == Some("remove") && self.removes == 1 {
                 return tokio::time::timeout(
                     Duration::from_millis(10),
@@ -1007,7 +1063,8 @@ mod resume_tests {
                 .await
                 .unwrap_or(false);
             }
-            self.held = false;
+            self.held_handles.remove(&handle);
+            self.held = !self.held_handles.is_empty();
             true
         }
         fn update_config(&mut self, _: InputConfig) {}
@@ -1028,6 +1085,7 @@ mod resume_tests {
                 request_rx,
                 event_tx,
                 handles: Default::default(),
+                handle_sessions: Default::default(),
                 next_id: 0,
                 operation_timeout: Duration::from_millis(20),
                 input_config: Default::default(),
@@ -1116,6 +1174,198 @@ mod resume_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn replacement_retries_old_cleanup_before_creating_fresh_handle() {
+        let (mut task, tx, _events) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let budget = crate::input_budget::InputBudget::default();
+        let old = CancellationToken::new();
+        let old_lease = budget.acquire(&old).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(old.clone()),
+            Some(old_lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Remove(addr)).unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        let mut backend = StallingBackend {
+            stall: Some("remove"),
+            ..Default::default()
+        };
+        task.do_emulation_session(&mut backend).await.unwrap();
+        assert!(backend.held);
+        old.cancel();
+        let fresh = CancellationToken::new();
+        let replacement = budget.for_peer();
+        let fresh_lease = replacement.acquire(&fresh).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(fresh),
+            Some(fresh_lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut backend).await.unwrap();
+        eprintln!(
+            "replacement fixed: creates={:?}, consumed={:?}, cleanup attempts={}",
+            backend.creates, backend.consumed, backend.removes
+        );
+        assert_eq!(backend.creates, vec![0, 1]);
+        assert_eq!(backend.consumed, vec![0, 1]);
+        assert_eq!(backend.removes, 2);
+        assert_eq!(task.handles.get(&addr), Some(&1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_cleanup_failure_cancels_new_reader_and_preserves_old_state_until_recovery()
+    {
+        let (mut task, tx, mut events) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let other = "127.0.0.1:3".parse().unwrap();
+        let budget = crate::input_budget::InputBudget::default();
+        let old = CancellationToken::new();
+        let lease = budget.acquire(&old).await.unwrap();
+        let old_identity = lease.identity();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(old.clone()),
+            Some(lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Remove(addr)).unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        let mut backend = StallingBackend {
+            fail_all_removes: true,
+            ..Default::default()
+        };
+        task.do_emulation_session(&mut backend).await.unwrap();
+        old.cancel();
+        let fresh = CancellationToken::new();
+        let replacement = budget.for_peer();
+        let fresh_lease = replacement.acquire(&fresh).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(fresh.clone()),
+            Some(fresh_lease),
+        ))
+        .unwrap();
+        let healthy = CancellationToken::new();
+        let healthy_budget = budget.for_peer();
+        let healthy_lease = healthy_budget.acquire(&healthy).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            other,
+            Some(healthy.clone()),
+            Some(healthy_lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut backend).await.unwrap();
+        assert!(
+            fresh.is_cancelled(),
+            "failed replacement must wake and close its reader"
+        );
+        assert!(!healthy.is_cancelled());
+        assert_eq!(backend.creates, vec![0, 1]); // only the healthy peer was created
+        assert_eq!(backend.consumed, vec![0, 1]);
+        assert!(backend.held_handles.contains(&0));
+        assert_eq!(task.handles.get(&addr), Some(&0));
+        assert!(
+            task.handle_sessions
+                .get(&addr)
+                .unwrap()
+                .ptr_eq(&old_identity)
+        );
+        assert_eq!(budget.available(), (256, 64));
+        assert_eq!(replacement.available(), (256, 64));
+        assert!(
+            matches!(events.recv().await, Some(EmulationEvent::InputCleanupFailed { addr: actual }) if actual == addr)
+        );
+        assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
+        backend.fail_all_removes = false;
+        let recovered = replacement.for_peer();
+        let token = CancellationToken::new();
+        let lease = recovered.acquire(&token).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(token.clone()),
+            Some(lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut backend).await.unwrap();
+        assert!(!token.is_cancelled());
+        assert_eq!(backend.creates, vec![0, 1, 2]);
+        assert_eq!(backend.consumed, vec![0, 1, 2]);
+        assert!(!backend.held_handles.contains(&0));
+        assert!(
+            backend.held_handles.contains(&1),
+            "replacement cleanup must not release healthy peer"
+        );
+        assert!(backend.held_handles.contains(&2));
+        tx.send(ProxyRequest::Remove(addr)).unwrap();
+        tx.send(ProxyRequest::Remove(other)).unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut backend).await.unwrap();
+        assert_eq!(backend.removes, 5);
+        assert!(!backend.held);
+        assert!(task.handles.is_empty());
+        assert!(task.handle_sessions.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_uses_fresh_tracked_ctrl_state_after_releasing_old_handle() {
+        let (mut task, tx, _events) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut emulation = InputEmulation::new(
+            Some(input_emulation::Backend::Dummy),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let budget = crate::input_budget::InputBudget::default();
+        let old = CancellationToken::new();
+        let lease = budget.acquire(&old).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(old.clone()),
+            Some(lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut emulation).await.unwrap();
+        let old_handle = *task.handles.get(&addr).unwrap();
+        assert!(emulation.has_pressed_keys(old_handle));
+        old.cancel();
+        let replacement = budget.for_peer();
+        let token = CancellationToken::new();
+        let lease = replacement.acquire(&token).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(token.clone()),
+            Some(lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut emulation).await.unwrap();
+        let fresh_handle = *task.handles.get(&addr).unwrap();
+        assert_ne!(fresh_handle, old_handle);
+        assert!(!emulation.has_pressed_keys(old_handle));
+        assert!(emulation.has_pressed_keys(fresh_handle));
+        assert!(!token.is_cancelled());
+        emulation.terminate().await;
+        assert!(!emulation.has_pressed_keys(fresh_handle));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn slow_backend_expires_session_instead_of_replaying_old_input() {
         let (mut task, tx, mut events) = worker();
         task.operation_timeout = Duration::from_millis(500);
@@ -1167,7 +1417,7 @@ mod resume_tests {
         )
         .await
         .unwrap();
-        let old_handle = task.handle_for(&mut emulation, addr).await.unwrap();
+        let old_handle = task.handle_for(&mut emulation, addr, None).await.unwrap();
         emulation.consume(press(), old_handle).await.unwrap();
         assert!(emulation.has_pressed_keys(old_handle));
         let budget = crate::input_budget::InputBudget::default();
@@ -1293,7 +1543,13 @@ mod resume_tests {
         assert!(budget.acquire(&token).await.is_none());
         operation.await.unwrap_err();
         assert_eq!(budget.available(), (1, 1));
-        assert!(budget.acquire(&token).await.is_some());
+        assert!(
+            token.is_cancelled(),
+            "failed delivery must close its reader"
+        );
+        assert!(budget.acquire(&token).await.is_none());
+        let fresh = CancellationToken::new();
+        assert!(budget.for_peer().acquire(&fresh).await.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1304,11 +1560,25 @@ mod resume_tests {
             stall: Some("remove"),
             ..Default::default()
         };
-        tx.send(ProxyRequest::Input(press(), addr, None, None))
-            .unwrap();
+        let budget = crate::input_budget::InputBudget::default();
+        let token = CancellationToken::new();
+        let first = budget.acquire(&token).await.unwrap();
+        let second = budget.acquire(&token).await.unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(token.clone()),
+            Some(first),
+        ))
+        .unwrap();
         tx.send(ProxyRequest::Remove(addr)).unwrap();
-        tx.send(ProxyRequest::Input(press(), addr, None, None))
-            .unwrap();
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(token),
+            Some(second),
+        ))
+        .unwrap();
         tx.send(ProxyRequest::Remove(addr)).unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         tokio::time::timeout(
@@ -1322,6 +1592,7 @@ mod resume_tests {
         assert_eq!(backend.consumed, vec![0, 0]);
         assert_eq!(backend.removes, 2);
         assert!(task.handles.is_empty());
+        assert!(task.handle_sessions.is_empty());
         assert!(!backend.held);
     }
 
@@ -1338,6 +1609,7 @@ mod resume_tests {
             request_rx,
             event_tx,
             handles: Default::default(),
+            handle_sessions: Default::default(),
             next_id: 0,
             operation_timeout: Duration::from_millis(20),
             input_config: Default::default(),
@@ -1354,7 +1626,7 @@ mod resume_tests {
             key: input_event::scancode::Linux::KeyLeftCtrl as u32,
             state: 1,
         });
-        let handle = task.handle_for(&mut emulation, addr).await.unwrap();
+        let handle = task.handle_for(&mut emulation, addr, None).await.unwrap();
         emulation.consume(key.clone(), handle).await.unwrap();
         assert!(emulation.has_pressed_keys(handle));
         let token = CancellationToken::new();

@@ -537,3 +537,25 @@ tests remain required.
 Enter uses the fingerprint recorded at the verified handshake, checked against
 the exact connection identity and uncanceled session. It no longer rehashes a
 certificate or waits on DTLS connection state in the input dispatcher.
+
+
+### Native handle session ownership
+
+Each accepted reader's input budget assigns an opaque connection identity.
+Cloning that same reader's budget preserves its identity; accepting a replacement
+always assigns a fresh identity, including at the same socket address. Input
+leases carry it to the emulation worker, which stores only a weak identity beside
+the native handle. No extra DTLS connection ownership or wire fields are added.
+
+The worker may reuse a handle only within its owning session. Before a replacement
+can create or deliver input, it retries bounded cleanup of the old handle. On
+failure it cancels the replacement reader and reports an input cleanup error;
+the old backend, handle identity and tracked state remain available for retry.
+Other peers can continue submitting input. A later successful cleanup permits a
+fresh native handle. Same-session Remove retries still reuse the retained handle,
+and successful removal clears both the handle and its identity.
+
+Ordinary backend delivery errors also cancel the failing reader before entering
+the existing backend failure path, allowing the sender to release capture rather
+than retain a live transport to disabled emulation. Native OS cleanup failures
+and failed final termination remain separate acceptance requirements.

@@ -52,7 +52,8 @@
 | R07 | 已实现并通过真实 DTLS / Service 回归 | 单份最多 64 KiB 最新有效值；就绪补发、忙队列重试、双路同身份去重、来源排除、远端完成顺序和禁用清空；真实系统剪贴板/跨平台验收仍待验 |
 | R57 | 已实现并通过慢后端/实际 tracked-input 回归 | 入队起本地 50ms 期限覆盖排队/create/delivery；到期取消会话、一次错误反馈、即时 bounded 清理；旧输入不重播，活动操作可取消；同步原生与完整端到端时延仍待验 |
 | R58 | 已实现并通过身份/真实 DTLS Enter 回归 | Enter 复用握手验证时存下的指纹，核对 Weak/实际 Arc 与 token；不在 dispatcher 重读 DTLS 状态或 rehash，也无错误 downcast expect |
-| R59 | 待修复 / 条件性源码路径确认 | 地址对应的 handle 在 destroy_bounded 失败后保留，但没有 native handle 的会话身份；同地址新连接的有效 token 可在 handle_for 复用旧状态，需区分同会话重试与替换会话 |
+| R59 | 已实现并通过代理故障/实际 tracked-input 回归 | lease 携带连接独立 opaque 身份，native handle 弱引用记录所属会话；替换先重试旧 cleanup，失败只拒绝新 reader 并保留旧 backend/ledger，其他 peer 可提交；成功后分配新 handle，同会话重试仍复用 |
+| R60 | 待修复 / 条件性源码路径及底层测试证据 | 普通致命 backend 错误/最终退出会 terminate 后 drop InputEmulation；terminate 返回 unit 且失败时仍有 tracked input，旧 ledger 在实例丢弃时失去重试能力；R59 替换拒绝现已避免这条 fatal/drop 路径 |
 | R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；普通 Input/Enter 帧现有全局 256 / 每会话 64 贯穿额度，超额等待受 50ms freshness 剩余时间约束，过期关闭并清理；协议控制/剪贴板接收/生命周期及其他事件链仍未全部有界，旧输入年龄见 R57，完整风暴资源及界面验收仍待验 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
 | R14 | 已实现并通过故障注入 | 临时文件原子替换；写入失败保留旧文件；失败后恢复监听，并支持 rename 型外部更新；符号链接和权限测试通过；保存失败在界面显示提示 |
@@ -1043,3 +1044,32 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - R13 其他无界事件及连接数量、同步原生调用、真机千次往返、完整 p95/p99 和八小时 RSS 保持未闭环，不认定达到 90 分。
 
 日志：input-freshness-baseline.log、input-freshness-focused.log、input-freshness-workspace.log、input-freshness-clippy.log、input-freshness-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、input-freshness-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+## 第四十二轮：失败清理后的 native handle 会话归属
+
+### R59 / P1
+
+- 基线实际代理循环复现：旧会话按下输入后，Remove 的 bounded cleanup 首次失败；取消旧 token，用同地址 fresh token 和 fresh peer budget 再投输入。旧代码 creates=[0]、consumed=[0,0]、cleanup attempts=1，新连接直接复用旧 native handle。底层重复按下保护可能把新 Ctrl 当旧状态处理，不能仅按 SocketAddr 复用。
+- [x] InputBudget.for_peer 每次接受连接分配独立 Arc 身份，同 peer 的 clone 保留身份；InputLease 携带身份，EmulationTask 的 handle_sessions 按地址保存 Weak。旧 Weak 即使 strong_count=0 也不会与活的新身份混淆，不持有额外 Conn，不改协议。
+- [x] handle_for 只在相同身份时复用。替换时先尝试 destroy_bounded 旧 handle；仅成功后清除旧 handle/身份并分配新 ID。部分创建登记与失败清理的状态保留继续有效。
+- [x] 替换清理失败作为独立内部 PreviousSessionCleanup 结果处理：取消该新 reader，前端 InputCleanupFailed 解释拒绝原因；代理不返回 fatal backend 错误，不丢弃旧 InputEmulation/清理 ledger，不禁用其他 peer 的提交。后续 Remove 或新替换仍可重试。
+- [x] 真正的 backend 交付错误仍走原 fatal 反馈/退出路径，但先取消出错 reader，避免发送端继续捕获到已禁用的 emulation。此类最终失败下的 ledger 生命周期见新发现 R60。
+- [x] 成功 Remove / 到期清理 / 替换清理同步移除 handle 与弱身份；同一会话 cleanup 首次失败后的新 Input 可复用同 handle，第二次 Remove 能释放，没有改变 R23 的同会话重试语义。
+
+### 四个新增回归与已有断言更新
+
+- 身份模型：同 peer clone 的两个 lease 身份相等，新 peer 独立身份；共享总额和各自 peer 上限不变；旧身份仅剩 Weak 时也不等于活替换。
+- 基线变为修复回归：creates=[0,1]、consumed=[0,1]、cleanup attempts=2，旧状态清成功后才创建并投递新的 native handle。
+- 连续失败模型：新 reader 被取消，仅一次清理错误事件，旧 handle 0/身份/held 状态保留；健康另一个 peer 可在 handle 1 投递且不取消。恢复后替换重试先释放 0，再创建 2；健康 handle 1 的 held 状态不受清理 0 影响，最终两个 Remove 清空 handle/身份表。始终无旧状态交付给新会话。
+- 实际 InputEmulation Dummy 回归：旧 Ctrl 在 0 跟踪，替换先释放旧状态，Ctrl 在新的 1 上重新跟踪，最终 terminate 释放新键。该用例验证 tracked-input 层，不称为真实 OS 的故障注入。
+- R23 回归升级为有身份的同一 peer lease，仍 creates=[0]、consumed=[0,0]，第二次 Remove 成功；非替换不会不必要地创建新 handle。
+- 出错 reader 取消后，旧额度测试改为断言旧 token 不可再申请、新 reader 可获得释放后的容量，禁止用已失败 token 恢复连接。
+
+### 验证与剩余发现
+
+- Linux all-features 工作区通过：主包 133 / 2 默认忽略，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略；严格 all-targets Clippy、格式和 diff 检查通过。
+- 隔离真实 Service-DTLS 授权/活跃撤销、双向剪贴板重播/来源/禁用/重连两个回归通过。上一 HEAD 970d025 Rust run 37195039728 已完成成功，新提交需自己的跨平台 CI。
+- R60 条件性源码证据：EmulationTask.do_emulation 调用 emulation.terminate 后结束实例；InputEmulation.terminate 忽略 destroy_bounded=false 并返回 unit。底层 terminate_is_bounded_across_many_stalled_handles 测试已明确证明终止后仍能 has_pressed_keys(0)。保留旧实例时可重试，fatal 路径丢弃实例则无法用旧 ledger 重试。R59 新替换拒绝不再触发此路径，但普通 fatal/backend 重启与最终退出的失败回收仍需修复与验收。
+- R13 其他无界事件/连接资源、原生 API 阻塞和失败清理、真实千次切换、完整 p95/p99 和八小时 RSS 尚未闭环。保持目标未完成，不认定 90 分。
+
+日志：handle-session-baseline.log、handle-session-focused.log、handle-session-workspace.log、handle-session-clippy.log、handle-session-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、handle-session-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
