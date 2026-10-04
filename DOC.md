@@ -819,3 +819,19 @@ The internal abort API schedules closure without awaiting transport close, so a
 replacement created during native release is preserved. Controlled replacement
 and stalled-close tests verify this decision stage; full native fault/recovery
 and global pending-task bounds remain acceptance work.
+
+
+### Unexpected capture stream closure
+
+An input stream ending while capture is enabled now returns UnexpectedEof with
+a backend-independent message. It follows the existing failure cleanup path:
+release capture, clear active/remapping/modifier state, cancel the original
+transport, and report CaptureFailed. Idle closure still reports failure without
+canceling an unrelated connection. Explicit re-enable remains required after
+backend failure; no reconnect loop is started.
+
+When shutdown has already been requested, EOF remains successful. Service
+shutdown separately terminates capture, emulation and connection senders. EOF
+regressions use the production classification/finalization methods with a Dummy
+backend and controlled transport; physical backend receiver closure and remote
+key release remain unverified. Wire encoding and public APIs are unchanged.

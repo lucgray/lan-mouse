@@ -356,7 +356,15 @@ impl CaptureTask {
             return Err(e.into());
         }
 
-        let r = self.do_capture_session(&mut capture).await;
+        let result = self.do_capture_session(&mut capture).await;
+        self.finish_capture_session(&mut capture, result).await
+    }
+
+    async fn finish_capture_session(
+        &mut self,
+        capture: &mut InputCapture,
+        r: Result<(), InputCaptureError>,
+    ) -> Result<(), InputCaptureError> {
         if let Err(error) = &r {
             let active = self.active_client.and_then(|handle| {
                 self.conn
@@ -368,7 +376,7 @@ impl CaptureTask {
                 .and_then(|handle| self.conn.prepare_cleanup(handle));
             // The event queue may contain stale presses. Do not send cleanup
             // input through a failing session or start a new connection.
-            match self.release_capture_with(&mut capture, false, None).await {
+            match self.release_capture_with(capture, false, None).await {
                 Err(cleanup) => {
                     log::warn!("failed to release capture after backend error: {cleanup}")
                 }
@@ -416,7 +424,7 @@ impl CaptureTask {
                 _ = disconnected.notified() => {},
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
-                    None => return Ok(()),
+                    None => return self.capture_stream_ended(),
                 },
                 received = self.conn.recv() => {
                     let crate::connect::ReceivedEvent { handle, event, .. } = received;
@@ -482,6 +490,17 @@ impl CaptureTask {
             }
         }
         Ok(())
+    }
+
+    fn capture_stream_ended(&self) -> Result<(), InputCaptureError> {
+        if self.cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+        Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "input capture stream closed unexpectedly",
+        ))
+        .into())
     }
 
     /// Toggle the "mouse jail" whenever the jail bind is engaged, i.e. all
@@ -797,6 +816,58 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_eof_cleans_active_session_and_reports_idle_failure() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+            for active in [false, true] {
+            let clients = ClientManager::default(); let handle = clients.add_client(); clients.activate_client(handle);
+            let token = clients.target_token(handle).unwrap();
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients.clone());
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection::default());
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let (event_tx, mut events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                active_client: active.then_some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: KeyRemap::new(Default::default(), vec![crate::remap::ChordRemap {
+                    modifier: scancode::Linux::KeyLeftMeta, trigger: scancode::Linux::KeyTab, to: scancode::Linux::KeyLeftAlt,
+                }]),
+                scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5,
+                pending_modifiers: Some(KeyboardEvent::Modifiers { depressed: 64, latched: 0, locked: 0, group: 0 }),
+            };
+            assert!(task.remap.apply(Event::Keyboard(KeyboardEvent::Key { time: 0, key: scancode::Linux::KeyLeftMeta as u32, state: 1 })).is_empty());
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            let result = task.capture_stream_ended();
+            let result = task.finish_capture_session(&mut capture, result).await;
+            assert!(matches!(result, Err(InputCaptureError::Capture(CaptureError::Io(error))) if error.kind() == std::io::ErrorKind::UnexpectedEof));
+            assert!(task.active_client.is_none());
+            assert!(task.pending_modifiers.is_none());
+            assert_eq!(task.state, State::WaitingForAck);
+            assert_eq!(token.is_cancelled(), active);
+            assert_eq!(clients.active_addr(handle).is_none(), active);
+            assert_eq!(task.remap.release_key(scancode::Linux::KeyLeftMeta), Some(scancode::Linux::KeyLeftMeta));
+            assert!(transport.sent.lock().unwrap().is_empty());
+            if active {
+                assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+            }
+            assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureFailed(message) if message.contains("stream closed unexpectedly")));
+            assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+            // EOF during requested shutdown remains successful; service shutdown owns connection cleanup.
+            task.cancellation_token.cancel();
+            assert!(task.capture_stream_ended().is_ok());
+            sender.terminate().await;
+            }
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fatal_capture_abort_preserves_replacement_and_never_waits_for_close() {

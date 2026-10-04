@@ -1428,3 +1428,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全局连接/任务资源上限、R60 原生故障恢复、其他 backend 会话队列、真机千次往返、全服务 p95/p99 和 8h RSS 未完成，不认定达到 90 分。后台连接表等待不因本次改动获得全局上限。
 
 日志：capture-fatal-abort-baseline.log、capture-fatal-abort-library.log、capture-fatal-abort-workspace.log、capture-fatal-abort-clippy.log。
+
+
+## 第五十八轮：输入流意外 EOF 未清理捕获会话
+
+### R79 / P1
+
+- 基线核对公共 InputCapture 将底层 None 传到 root；Windows 的 event receiver、macOS 的 event_rx 关闭均可输出 None。root do_capture_session 在该分支直接 Ok，而 do_capture 只对 Err 执行会话清理。服务继续运行时这种 EOF 不进入服务 shutdown。
+- 将原 EOF 分类和最终处理提取为生产调用的方法后，受控 EOF 决策/实际最终处理基线确认 active handle、pending modifiers、Sending 状态、pending chord、目标 token/address 保留，且没有 ClientLeft/CaptureFailed。日志 capture-eof-baseline.log。测试用 Dummy native lifecycle 和受控 transport，没有在物理 Windows/macOS receiver 上制造 EOF。
+- [x] 非 shutdown 的 None 返回通用 UnexpectedEof（input capture stream closed unexpectedly），进入原有失败清理：释放捕获、取走 active handle、清 remap/modifier 状态、取消原连接并通知前端失败。空闲 EOF 也报告原因，但不取消不属于当前捕获的连接。
+- [x] cancellation 已请求时 EOF 仍 Ok，避免正常服务关闭产生额外故障通知。源码确认 Service.run shutdown 会 terminate capture/emulation/connection sender；没有把原正常关闭笼统称为漏掉网络清理。
+
+### 验证与限制
+
+- 新回归覆盖 active/idle EOF 的生产分类与最终处理，检查活动状态、修饰键、pending chord、token/address、无过时 cleanup input、ClientLeft 和 CaptureFailed 通知；另检查 shutdown 与 EOF 同时出现的成功分类。不是经真实 backend poll 强制 receiver 关闭的端到端测试。
+- 全工作区 all-features 通过：root 141 / 2 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。公共 API 和 wire encoding 不变。
+- 230de1c Rust run 37212537772 / Nix 37212537779 检查时 in_progress；新 HEAD 需要自己的 CI。
+- [ ] 后续检查创建/终止错误的前端可见性：InputCapture::new、create_captures 或 terminate 的错误可能仅被 run 的 warn 捕获，未经过会话 CaptureFailed 通知；需要明确现有 CaptureDisabled 和 frontend 行为再做基线，尚未确认具体缺陷。
+- [ ] R13 全局连接/任务资源上限、R60 原生恢复、其他 backend 会话队列、真机千次往返、完整延迟和 8h RSS 未完成，尚不认定达到 90 分。受控 EOF 状态清理不能证明本次用户故障的真实触发原因或远端物理按键释放。
+
+日志：capture-eof-baseline.log、capture-eof-library.log、capture-eof-workspace.log、capture-eof-clippy.log。
