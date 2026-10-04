@@ -1448,3 +1448,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全局连接/任务资源上限、R60 原生恢复、其他 backend 会话队列、真机千次往返、完整延迟和 8h RSS 未完成，尚不认定达到 90 分。受控 EOF 状态清理不能证明本次用户故障的真实触发原因或远端物理按键释放。
 
 日志：capture-eof-baseline.log、capture-eof-library.log、capture-eof-workspace.log、capture-eof-clippy.log。
+
+
+## 第五十九轮：捕获启动/退出失败没有前端原因
+
+### R80 / P2
+
+- 基线源码：run 对 do_capture 的所有错误只 warn；仅 finish_capture_session 的运行错误分支发送 CaptureFailed。new/create_captures/terminate 的错误可跳过该分支。Service 的 CaptureFailed 映射为 FrontendEvent::Error，GTK 将其显示为 toast；CaptureDisabled 只更新状态，没有故障原因。
+- 提取并调用原 run 结果处理阶段后，NoAvailableBackend 的受控基线只有日志、没有事件。另将原 terminate?; result 提取为实际调用的结果合并方法，基线证明第二个 cleanup timeout 覆盖 barrier creation failed。日志 capture-error-notice-baseline.log、capture-error-context-baseline.log。这些是生产结果处理阶段注入，不是真实显示服务器失败或 GTK 实机 toast 验证。
+- [x] 统一在每次 do_capture 返回之后发送一次 CaptureFailed；移除运行错误分支的独立通知。创建、边界创建、运行、退出的返回错误都可到达这个出口；成功返回不通知。已有 CaptureDisabled guard 在返回前更新状态，保持显式重新启用机制。
+- [x] 创建/运行错误和 terminate 错误同时出现时，在一条组合消息中保留两个原因；仅一阶段失败保留原 typed error。双失败用现有 CaptureError::Io(Other) 承载组合文本，不新增 public error variant 或协议格式。
+
+### 验证与剩余限制
+
+- 2 个新增回归：4 类阶段错误各发送一次准确通知、无重复事件且成功安静；两阶段结果的四种组合，双失败包含原原因与 cleanup 原因、单失败保留 variant。原 EOF 状态清理回归调整到统一通知出口并继续通过。测试没有运行真实创建失败或 GTK 界面。
+- 测试数组初次出现 Rust 类型推断错误，补上明确 InputCaptureError 类型后重新通过全部检查。全工作区 all-features：root 143 / 2 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。
+- 1d2f16b Rust run 37212943155 检查时 queued、Nix 37212943128 in_progress；本轮新 HEAD 需自己的 CI。
+- [ ] R81 / P1：通知现在等待 do_capture（含 terminate）返回，统一出口修复的是返回错误可见性，不能保证退出永久 pending 时仍及时通知。之前运行错误可在 terminate 前通知，本次统一会增加这段等待。下一轮需要解决 pending termination 下的反馈延迟并验证取消/重启安全；不能以 X11 已有 deadline 推断所有 backend 都有界。同步 native 调用也不能靠 Tokio timeout 自动变得可取消。
+- [ ] R13 全局连接/任务上限、R60 原生恢复、真机千次往返、完整 p95/p99 和 8h RSS 尚未验收，不认定达到 90 分。
+
+日志：capture-error-notice-baseline.log、capture-error-context-baseline.log、capture-error-notice-workspace.log、capture-error-notice-clippy.log。

@@ -835,3 +835,22 @@ shutdown separately terminates capture, emulation and connection senders. EOF
 regressions use the production classification/finalization methods with a Dummy
 backend and controlled transport; physical backend receiver closure and remote
 key release remain unverified. Wire encoding and public APIs are unchanged.
+
+
+### Capture exit error reporting
+
+Each completed capture attempt reports its returned error once through
+CaptureFailed, including backend creation, barrier creation and termination
+errors. Service forwards this as a frontend Error; GTK displays that event as
+a toast. Successful attempts emit no failure event. Existing disabled status
+and explicit re-enable behavior remain in place.
+
+If capture/barrier processing and backend termination both fail, the existing
+Io(Other) error contains both messages. A single failure retains its original
+error variant. There is no protocol or public variant addition.
+
+Reporting currently waits for backend termination to return. A pending native
+termination can delay the notification; this is still an acceptance issue,
+including the extra wait relative to the former runtime-only error notice.
+Result-stage tests verify notification/content, not actual GUI display or
+physical backend failure/cleanup.

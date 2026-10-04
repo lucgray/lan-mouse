@@ -303,9 +303,8 @@ impl CaptureTask {
     async fn run(mut self) {
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
-            if let Err(e) = self.do_capture().await {
-                log::warn!("input capture exited: {e}");
-            }
+            let result = self.do_capture().await;
+            report_capture_exit(&self.event_tx, &result);
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
@@ -352,8 +351,7 @@ impl CaptureTask {
         /* create barriers for active clients */
         let r = self.create_captures(&mut capture).await;
         if let Err(e) = r {
-            capture.terminate().await?;
-            return Err(e.into());
+            return capture_result_after_termination(Err(e.into()), capture.terminate().await);
         }
 
         let result = self.do_capture_session(&mut capture).await;
@@ -365,7 +363,7 @@ impl CaptureTask {
         capture: &mut InputCapture,
         r: Result<(), InputCaptureError>,
     ) -> Result<(), InputCaptureError> {
-        if let Err(error) = &r {
+        if r.is_err() {
             let active = self.active_client.and_then(|handle| {
                 self.conn
                     .capture_revision(handle)
@@ -388,15 +386,10 @@ impl CaptureTask {
                 }
             }
             self.remap.reset_session();
-            self.event_tx
-                .send(ICaptureEvent::CaptureFailed(error.to_string()))
-                .expect("channel closed");
         }
 
         // FIXME replace with async drop when stabilized
-        capture.terminate().await?;
-
-        r
+        capture_result_after_termination(r, capture.terminate().await)
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -751,6 +744,30 @@ impl CaptureTask {
     }
 }
 
+fn capture_result_after_termination(
+    result: Result<(), InputCaptureError>,
+    termination: Result<(), CaptureError>,
+) -> Result<(), InputCaptureError> {
+    match (result, termination) {
+        (Err(error), Err(cleanup)) => Err(CaptureError::Io(std::io::Error::other(format!(
+            "{error}; backend termination also failed: {cleanup}"
+        )))
+        .into()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn report_capture_exit(event_tx: &Sender<ICaptureEvent>, result: &Result<(), InputCaptureError>) {
+    if let Err(error) = result {
+        log::warn!("input capture exited: {error}");
+        event_tx
+            .send(ICaptureEvent::CaptureFailed(error.to_string()))
+            .expect("channel closed");
+    }
+}
+
 thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -817,6 +834,89 @@ impl<T> Drop for DropGuard<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn capture_exit_preserves_primary_and_cleanup_failures() {
+        let result = Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "barrier creation failed",
+        ))
+        .into());
+        let termination = Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "worker cleanup timed out",
+        )));
+        let result = capture_result_after_termination(result, termination).unwrap_err();
+        assert!(result.to_string().contains("worker cleanup timed out"));
+        assert!(result.to_string().contains("barrier creation failed"));
+        for (failed, cleanup_failed) in [(false, false), (true, false), (false, true)] {
+            let result = if failed {
+                Err(CaptureError::ActivationClosed.into())
+            } else {
+                Ok(())
+            };
+            let cleanup = if cleanup_failed {
+                Err(CaptureError::EndOfStream)
+            } else {
+                Ok(())
+            };
+            let result = capture_result_after_termination(result, cleanup);
+            match (failed, cleanup_failed) {
+                (false, false) => assert!(result.is_ok()),
+                (true, false) => assert!(matches!(
+                    result,
+                    Err(InputCaptureError::Capture(CaptureError::ActivationClosed))
+                )),
+                (false, true) => assert!(matches!(
+                    result,
+                    Err(InputCaptureError::Capture(CaptureError::EndOfStream))
+                )),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_capture_exit_error_notifies_once_and_success_is_quiet() {
+        let (tx, mut events) = channel();
+        for result in [
+            Err::<(), InputCaptureError>(
+                input_capture::CaptureCreationError::NoAvailableBackend.into(),
+            ),
+            Err(CaptureError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "barrier creation failed",
+            ))
+            .into()),
+            Err(CaptureError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "capture EOF",
+            ))
+            .into()),
+            Err(CaptureError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker cleanup timed out",
+            ))
+            .into()),
+        ] {
+            let expected = result.as_ref().unwrap_err().to_string();
+            report_capture_exit(&tx, &result);
+            assert!(
+                matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureFailed(message) if message == expected)
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), events.recv())
+                    .await
+                    .is_err()
+            );
+        }
+        report_capture_exit(&tx, &Ok(()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn capture_eof_cleans_active_session_and_reports_idle_failure() {
         use crate::{client::ClientManager, connect::tests::RefusedConnection};
@@ -847,6 +947,7 @@ mod tests {
             let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
             let result = task.capture_stream_ended();
             let result = task.finish_capture_session(&mut capture, result).await;
+            report_capture_exit(&task.event_tx, &result);
             assert!(matches!(result, Err(InputCaptureError::Capture(CaptureError::Io(error))) if error.kind() == std::io::ErrorKind::UnexpectedEof));
             assert!(task.active_client.is_none());
             assert!(task.pending_modifiers.is_none());
