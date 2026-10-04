@@ -913,3 +913,27 @@ Ordinary NotifyPeer/Silent releases are outside this fatal cleanup chain. Native
 synchronous calls can still block the timer, and service shutdown can pause
 frontend event consumption. Those recovery/feedback gates remain open. Wire
 encoding and public APIs are unchanged.
+
+
+### Incoming reader lifecycle limit
+
+A LanMouseListener admits at most 32 application input readers in total across
+its address families and port changes. The lease is reserved after authorization
+and before session replacement or Accept publication. At capacity, the new
+transport is closed without changing existing peers; retry after a reader exits.
+
+Scheduled-but-unpolled readers, active reads and pending transport close all hold
+a lease. Read-loop completion or task drop releases it. Replaced readers are
+canceled and perform their own close; no duplicate replacement close task is
+spawned. Task cancellation does not establish physical transport cleanup.
+
+This bounds reader tasks and their receive buffers (roughly 2MiB at the current
+64KiB protocol clipboard limit), not full service RSS. DTLS internal handshakes,
+accept/event queues, queued transport references, identity retention and other
+cleanup paths remain separate resource work. Excess-peer close may delay the
+listener's accept/rebind loop by its existing one-second close deadline. Idle
+reader retirement also remains under review; no idle timeout is added here.
+
+Regressions include application admission/close ownership and 33 real local DTLS
+connections with excess rejection and existing-peer Ping delivery. Wire encoding
+and public APIs are unchanged.

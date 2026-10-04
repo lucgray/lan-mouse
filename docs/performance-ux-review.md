@@ -1,6 +1,6 @@
 # Lan Mouse 性能与体验审查清单
 
-初次审查日期：2026-10-03；修复状态更新：2026-10-04。初次审查对象：`work/src-latest`，当时 HEAD `1185ee3`，工作树干净；与运行中的 fork.7 相比，源码额外包含 Windows 返回光标修复。本文不表示该修复已经部署。
+初次审查日期：2026-10-03；修复状态更新：2026-10-05。初次审查对象：`work/src-latest`，当时 HEAD `1185ee3`，工作树干净；与运行中的 fork.7 相比，源码额外包含 Windows 返回光标修复。本文不表示该修复已经部署。
 
 ## 当前修复状态（fix/input-reliability-review）
 
@@ -15,6 +15,7 @@
 | R81 | 异步清理链进度已实现 | fatal release/terminate 共用 250ms 进度计时、保留 future/owner；隔离 Service 转发通过；普通 release、同步阻塞和服务 shutdown 的反馈未闭环 |
 | R82 | 故障取消顺序已实现并通过受控等待回归 | AbortPeer 在 native release 首次 poll 前请求取消旧 snapshot；健康/迟到替代连接保留；锁竞争及物理释放边界见第 61 轮 |
 | R83 | fatal release 反馈/错误上下文已实现 | 整条 fatal 清理链只发一次进度；释放/退出连续等待保持 owner，最终保留三个阶段原因；生产 helper 模型验证，物理故障未验收 |
+| R84 | 应用入站 reader 上限已实现 | 每 Listener 32 个，覆盖排队任务/接收/close；满额保留旧会话，33 个真实 DTLS 回归通过；握手内部、事件队列与其他 cleanup 仍未全局有界 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1534,3 +1535,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 下一轮转向 R13：检查 accepted connection、reader 和后台 cleanup 生命周期的全局资源上限，而不是仅依靠普通输入队列已有额度。真机千次往返、完整 p95/p99 和 8h RSS 仍缺少证明，不认定达到 90 分。
 
 日志：capture-release-feedback-baseline.log、capture-release-feedback-library.log、capture-release-feedback-workspace.log、capture-release-feedback-clippy.log。
+
+
+## 第六十三轮：限制入站 reader 的整个生命周期
+
+### R84 / P2（R13 的一部分）
+
+- 基线源码：每个通过授权的 accepted transport 直接注册、发布 Accept、spawn read_loop，没有 reader 数量预算；按 addr 替换取消旧 reader 后另外 spawn close，旧 reader 自己也会 close。read_loop 每个分配 MAX_CLIPBOARD_SIZE+5（当前协议为 64KiB+5）的缓冲区，并在读完后等待关闭。
+- 将原无限准入提取为生产预算方法（仅统计、不拒绝）的基线接纳第 33 个 lease，确认拟定上限不生效；它是准入阶段模型，不是旧版本 RSS 风暴实测。日志 incoming-reader-budget-baseline.log。
+- [x] 每个 LanMouseListener 总计最多 32 个应用 reader lease；同实例的地址族与端口切换共享预算。授权检查后、安装身份/替换连接/发布 Accept 之前预留；满额关闭新连接，debug 记录，不触碰现有 token/连接或发布新 Accept。
+- [x] lease 从 spawn 之前一直保留到 read_loop（含已有一秒 close 等待）返回；未 poll 的 task 和关闭中的旧 reader 也计数。Task 取消/Drop 释放 lease，防止额度泄漏；这代表任务及缓冲区生命周期，不是物理 transport 已关闭的证明。
+- [x] 替代连接只取消旧 reader token，由旧 reader 负责 close；移除额外的重复 close task。普通撤销的其他 close 路径本轮未改，不声称所有 cleanup task 都由这个预算覆盖。
+
+### 验证与边界
+
+- 3 个新增回归：准入满额不替换原身份、不发布拒绝连接的 Accept，释放一个额度后可准入；实际 read_loop 的受控 recv EOF/close pending 保持额度，完成或 task abort 后可重用；33 个真实本地 DTLS 连接，第 33 个关闭/无 Accept、前 32 个保留且第一条仍可传 Ping。没有输入硬件或已安装服务变更。
+- 全工作区 all-features 通过：root 150 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。507e6e9 Rust run 37214945697 completed/success；Nix 37214945701 检查时 in_progress。新 HEAD 需自己的 CI。
+- 这限制应用 reader 的并发任务/原始接收缓冲区（最多约 2MiB），不是完整 RSS/DTLS 资源上限。底层握手/accept 队列、已发布且未消费的事件/Arc、授权身份缓存、其他关闭任务尚未全部有界。拒绝连接的 close 在 listener accept 循环内等待最多一秒，可能延迟该循环的下一次 accept/rebind，但不阻塞整个服务 async runtime。
+- [ ] 下一轮检查 DTLS listener 内部握手资源和 idle reader 回收：32 个无限空闲的旧会话可能长期占用预算，须核对实际心跳/关闭语义后再决定超时，不能直接给所有空闲设备加任意断线。
+- [ ] R13 全服务资源、R60 原生恢复、真机千次往返、完整 p95/p99 和 8h RSS 未验收，不认定达到 90 分。协议格式/公共 API 不变；32 个是新应用生命周期上限，超过上限需等现有 reader 完成再连接。
+
+日志：incoming-reader-budget-baseline.log、incoming-reader-budget-library.log、incoming-reader-budget-dtls.log、incoming-reader-budget-workspace.log、incoming-reader-budget-clippy.log。

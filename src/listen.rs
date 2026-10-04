@@ -130,6 +130,62 @@ pub(crate) enum ListenEvent {
     PortChanged(Result<u16, ListenerCreationError>),
 }
 
+const MAX_INCOMING_READERS: usize = 32;
+
+#[derive(Default)]
+struct ReaderBudget(Rc<Cell<usize>>);
+
+struct ReaderLease(Rc<Cell<usize>>);
+
+impl ReaderBudget {
+    fn try_reserve(&self) -> Option<ReaderLease> {
+        if self.0.get() >= MAX_INCOMING_READERS {
+            return None;
+        }
+        self.0.set(self.0.get() + 1);
+        Some(ReaderLease(self.0.clone()))
+    }
+}
+
+impl Drop for ReaderLease {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
+async fn hold_reader_slot<F: std::future::Future>(lease: ReaderLease, reader: F) -> F::Output {
+    let _lease = lease;
+    reader.await
+}
+
+fn admit_reader(
+    budget: &ReaderBudget,
+    authorization: &IncomingAuthorization,
+    addr: SocketAddr,
+    fingerprint: String,
+    conn: &ArcConn,
+    parent: &CancellationToken,
+    events: &Sender<ListenEvent>,
+) -> Option<(ReaderLease, CancellationToken)> {
+    // Reserve before replacing authorization/state or publishing Accept.
+    let lease = budget.try_reserve()?;
+    let session = authorization.install(addr, fingerprint.clone(), conn, parent);
+    let mut current = authorization.conns.borrow_mut();
+    if let Some(index) = current.iter().position(|(old, _)| *old == addr) {
+        current.remove(index);
+    }
+    current.push((addr, conn.clone()));
+    drop(current);
+    events
+        .send(ListenEvent::Accept {
+            addr,
+            fingerprint,
+            conn: conn.clone(),
+        })
+        .expect("channel closed");
+    Some((lease, session))
+}
+
 type SessionIdentities =
     HashMap<SocketAddr, (String, Weak<dyn Conn + Send + Sync>, CancellationToken)>;
 
@@ -375,6 +431,7 @@ impl LanMouseListener {
         let cancellation = CancellationToken::new();
         let readers_cancel = cancellation.clone();
         let input_budget = crate::input_budget::InputBudget::default();
+        let reader_budget = ReaderBudget::default();
         let authorization = IncomingAuthorization {
             keys: authorized_keys,
             conns: conns.clone(),
@@ -394,7 +451,6 @@ impl LanMouseListener {
                         _ = sleep => continue,
                         c = accept_any(&listeners) => match c {
                             Ok((conn, addr)) => {
-                                log::info!("dtls client connected, ip: {addr}");
                                 let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
                                 let Some(cert) = certs.first() else { close_incoming(&conn).await; continue; };
@@ -402,17 +458,16 @@ impl LanMouseListener {
                                 if !accept_authorization.keys.read().expect("keys").contains_key(&fingerprint) {
                                     close_incoming(&conn).await; continue;
                                 }
-                                let session = accept_authorization.install(addr, fingerprint.clone(), &conn, &readers_cancel);
-                                let previous = {
-                                    let mut current = conns_clone.borrow_mut();
-                                    let index = current.iter().position(|(a, _)| *a == addr);
-                                    let previous = index.map(|index| current.remove(index).1);
-                                    current.push((addr, conn.clone()));
-                                    previous
+                                let Some((lease, session)) = admit_reader(&reader_budget, &accept_authorization,
+                                    addr, fingerprint, &conn, &readers_cancel, &listen_tx) else {
+                                    log::debug!("incoming reader capacity exhausted; closing new connection from {addr}");
+                                    close_incoming(&conn).await;
+                                    continue;
                                 };
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint, conn: conn.clone() }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session, input_budget.for_peer()));
-                                if let Some(previous) = previous { spawn_local(async move { close_incoming(&previous).await; }); }
+                                log::info!("dtls client connected, ip: {addr}");
+                                // Replaced readers are canceled by install and own their close.
+                                // Keep their lease through close instead of spawning duplicate cleanup.
+                                spawn_local(hold_reader_slot(lease, read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session, input_budget.for_peer())));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -793,10 +848,215 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn incoming_reader_limit_preserves_existing_session_and_does_not_publish_rejection() {
+        let budget = ReaderBudget::default();
+        let auth = IncomingAuthorization::default();
+        let parent = CancellationToken::new();
+        let (tx, mut events) = channel();
+        let mut leases = Vec::new();
+        let original: ArcConn = Arc::new(TestConn::new(None));
+        for index in 0..MAX_INCOMING_READERS {
+            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6000 + index as u16));
+            let conn: ArcConn = if index == 0 {
+                original.clone()
+            } else {
+                Arc::new(TestConn::new(None))
+            };
+            let (lease, _) = admit_reader(
+                &budget,
+                &auth,
+                addr,
+                "authorized".into(),
+                &conn,
+                &parent,
+                &tx,
+            )
+            .unwrap();
+            leases.push(lease);
+        }
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 6000));
+        let old_token = auth.token(addr, &original).unwrap();
+        let replacement: ArcConn = Arc::new(TestConn::new(None));
+        assert!(
+            admit_reader(
+                &budget,
+                &auth,
+                addr,
+                "replacement".into(),
+                &replacement,
+                &parent,
+                &tx
+            )
+            .is_none()
+        );
+        assert!(!old_token.is_cancelled());
+        assert!(is_current(&auth.conns.borrow(), addr, &original));
+        assert!(auth.token(addr, &replacement).is_none());
+        assert_eq!(auth.conns.borrow().len(), MAX_INCOMING_READERS);
+        for _ in 0..MAX_INCOMING_READERS {
+            assert!(matches!(
+                events.recv().await.unwrap(),
+                ListenEvent::Accept { .. }
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+        drop(leases.pop());
+        let (lease, _) = admit_reader(
+            &budget,
+            &auth,
+            addr,
+            "replacement".into(),
+            &replacement,
+            &parent,
+            &tx,
+        )
+        .unwrap();
+        assert!(old_token.is_cancelled());
+        assert!(is_current(&auth.conns.borrow(), addr, &replacement));
+        assert_eq!(budget.0.get(), MAX_INCOMING_READERS);
+        drop(lease);
+        drop(leases);
+        assert_eq!(budget.0.get(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incoming_reader_slot_covers_actual_close_and_releases_on_task_cancellation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for abort in [false, true] {
+                    let budget = ReaderBudget::default();
+                    let held: Vec<_> = (0..MAX_INCOMING_READERS - 1)
+                        .map(|_| budget.try_reserve().unwrap())
+                        .collect();
+                    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                    let conn = Arc::new(TestConn {
+                        close_gate: Some(gate.clone()),
+                        ..TestConn::new(None)
+                    });
+                    let addr = "127.0.0.1:2".parse().unwrap();
+                    let conns = Rc::new(RefCell::new(vec![(addr, conn.clone() as ArcConn)]));
+                    let (tx, _events) = channel();
+                    let task = spawn_local(hold_reader_slot(
+                        budget.try_reserve().unwrap(),
+                        read_loop(
+                            conns,
+                            addr,
+                            conn.clone(),
+                            tx,
+                            CancellationToken::new(),
+                            crate::input_budget::InputBudget::default(),
+                        ),
+                    ));
+                    assert!(budget.try_reserve().is_none()); // counts scheduled tasks before their first poll.
+                    tokio::time::timeout(Duration::from_millis(100), async {
+                        while !conn.closed.load(Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert!(budget.try_reserve().is_none()); // recv ended but close is still pending.
+                    if abort {
+                        task.abort();
+                        assert!(task.await.unwrap_err().is_cancelled());
+                    } else {
+                        gate.add_permits(1);
+                        task.await.unwrap().unwrap();
+                    }
+                    assert!(budget.try_reserve().is_some());
+                    drop(held);
+                    assert_eq!(budget.0.get(), 0);
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_dtls_incoming_reader_limit_rejects_excess_without_replacing_live_peers() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let peer = Certificate::generate_self_signed(vec![]).unwrap();
+                let keys = Arc::new(RwLock::new(HashMap::from([(
+                    crypto::certificate_fingerprint(&peer),
+                    "fixture".into(),
+                )])));
+                let mut listener = LanMouseListener::new(
+                    0,
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    keys,
+                )
+                .await
+                .unwrap();
+                let mut clients = Vec::new();
+                for index in 0..=MAX_INCOMING_READERS {
+                    let socket =
+                        Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    socket
+                        .connect((Ipv4Addr::LOCALHOST, listener.port()))
+                        .await
+                        .unwrap();
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        DTLSConn::new(
+                            socket,
+                            Config {
+                                certificates: vec![peer.clone()],
+                                insecure_skip_verify: true,
+                                extended_master_secret: ExtendedMasterSecretType::Require,
+                                ..Default::default()
+                            },
+                            true,
+                            None,
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    if index < MAX_INCOMING_READERS {
+                        clients.push(result.unwrap());
+                        assert!(matches!(
+                            tokio::time::timeout(Duration::from_secs(1), listener.next())
+                                .await
+                                .unwrap(),
+                            Some(ListenEvent::Accept { .. })
+                        ));
+                        assert_eq!(listener.conns.borrow().len(), index + 1);
+                    } else {
+                        if let Ok(client) = result {
+                            let received = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                client.recv(&mut [0u8; 32]),
+                            )
+                            .await
+                            .unwrap();
+                            assert!(received.is_err() || received == Ok(0));
+                            client.close().await.unwrap();
+                        }
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(100), listener.next())
+                                .await
+                                .is_err()
+                        );
+                        assert_eq!(listener.conns.borrow().len(), MAX_INCOMING_READERS);
+                    }
+                }
+                listener.terminate().await;
+                for client in clients {
+                    client.close().await.unwrap();
+                }
+            })
+            .await;
+    }
+
     struct TestConn {
         packet: Mutex<Option<Vec<u8>>>,
         repeat_packet: bool,
         closed: AtomicBool,
+        close_gate: Option<Arc<tokio::sync::Semaphore>>,
         send_result: Mutex<Option<webrtc_util::Result<usize>>>,
         sent: Mutex<Vec<Vec<u8>>>,
         send_gate: Option<Arc<tokio::sync::Semaphore>>,
@@ -809,6 +1069,7 @@ mod tests {
                 packet: Mutex::new(packet),
                 repeat_packet: false,
                 closed: AtomicBool::new(false),
+                close_gate: None,
                 send_result: Mutex::new(None),
                 sent: Mutex::new(Vec::new()),
                 send_gate: None,
@@ -872,6 +1133,9 @@ mod tests {
         }
         async fn close(&self) -> webrtc_util::Result<()> {
             self.closed.store(true, Ordering::SeqCst);
+            if let Some(gate) = &self.close_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             Ok(())
         }
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
