@@ -594,6 +594,8 @@ mod tests {
             event: input_event::ClipboardEvent::Text(text),
             generation: 0,
             cancellation: CancellationToken::new(),
+            outgoing: None,
+            session_cancellation: None,
         }
     }
 

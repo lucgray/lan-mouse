@@ -15,6 +15,8 @@ pub(crate) struct ClipboardRequest {
     pub event: ClipboardEvent,
     pub generation: u64,
     pub cancellation: CancellationToken,
+    pub session_cancellation: Option<CancellationToken>,
+    pub outgoing: Option<(u64, u64)>,
 }
 
 pub(crate) struct ClipboardCompletion {
@@ -23,6 +25,8 @@ pub(crate) struct ClipboardCompletion {
     pub kind: ClipboardContentKind,
     pub bytes: usize,
     pub result: Result<(), ClipboardSendError>,
+    pub outgoing: Option<(u64, u64)>,
+    pub conn: Option<ArcConn>,
 }
 
 /// Polled alongside input, never awaited inside input dispatch. One active send
@@ -35,9 +39,9 @@ pub(crate) struct ClipboardJobs {
 }
 
 impl ClipboardJobs {
-    pub fn submit(&mut self, request: ClipboardRequest) -> Result<(), ClipboardRequest> {
+    pub fn submit(&mut self, request: ClipboardRequest) -> Result<(), Box<ClipboardRequest>> {
         if self.pending.len() == MAX_PENDING && !self.pending.contains_key(&request.addr) {
-            return Err(request);
+            return Err(Box::new(request));
         }
         self.pending.insert(request.addr, request);
         self.pump();
@@ -58,8 +62,10 @@ impl ClipboardJobs {
             let generation = request.generation;
             let kind = request.event.kind();
             let bytes = request.event.content_len();
+            let outgoing = request.outgoing;
             let token = request.cancellation.clone();
             let conn = request.conn.clone();
+            let completion_conn = conn.clone();
             // Run independently so a different dispatch path awaiting I/O
             // cannot stop this send's timeout or cancellation from being polled.
             let task = tokio::spawn(async move {
@@ -69,10 +75,18 @@ impl ClipboardJobs {
                     kind,
                     bytes,
                     result: Ok(()),
+                    outgoing,
+                    conn: request.conn.clone(),
                 };
                 completed.result = tokio::select! {
                     biased;
                     _ = request.cancellation.cancelled() => Err(ClipboardSendError::Canceled),
+                    _ = async {
+                        match &request.session_cancellation {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Err(ClipboardSendError::Canceled),
                     result = tokio::time::timeout(SEND_TIMEOUT, send_clipboard_reply(
                         request.conn, ProtoEvent::Input(Event::Clipboard(request.event)),
                     )) => match result {
@@ -92,6 +106,8 @@ impl ClipboardJobs {
                             generation,
                             kind,
                             bytes,
+                            outgoing,
+                            conn: completion_conn,
                             result: Err(ClipboardSendError::Transport(
                                 std::io::Error::other(error).into(),
                             )),

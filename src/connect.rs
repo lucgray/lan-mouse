@@ -34,8 +34,8 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
-    #[error("clipboard send wrote {sent} of {expected} bytes")]
-    IncompleteClipboard { sent: usize, expected: usize },
+    #[error("clipboard send is busy; copy again")]
+    ClipboardBusy,
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -281,59 +281,58 @@ impl LanMouseConnectionSender {
         Err(LanMouseConnectionError::NotConnected)
     }
 
-    /// Send clipboard event with variable-length encoding
-    pub(crate) async fn send_clipboard(
+    /// Capture the exact target without waiting in the service input loop.
+    pub(crate) fn prepare_clipboard(
         &self,
-        event: ProtoEvent,
+        event: input_event::ClipboardEvent,
         handle: ClientHandle,
-    ) -> Result<(), LanMouseConnectionError> {
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<crate::clipboard_network::ClipboardRequest, LanMouseConnectionError> {
         let target = self
             .target(handle)
             .ok_or(LanMouseConnectionError::NotConnected)?;
-        use lan_mouse_proto::encode_clipboard_event;
-
-        let buf = encode_clipboard_event(&event).map_err(|e| {
-            log::error!("Failed to encode clipboard event: {}", e);
-            LanMouseConnectionError::NotConnected
-        })?;
-
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns
-                    .get(&handle)
-                    .filter(|(a, _)| *a == addr)
-                    .map(|(_, c)| c.clone())
-            };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
-                }
-                let sent = tokio::select! {
-                    _ = target.cancellation.cancelled() => return Err(LanMouseConnectionError::NotConnected),
-                    result = conn.send(&buf) => result,
-                };
-                match sent {
-                    Ok(sent) if sent == buf.len() => {}
-                    Ok(sent) => {
-                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
-                        return Err(LanMouseConnectionError::IncompleteClipboard {
-                            sent,
-                            expected: buf.len(),
-                        });
-                    }
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send clipboard: {e}");
-                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
-                        return Err(e.into());
-                    }
-                }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
-            }
+        let addr = self
+            .client_manager
+            .active_addr(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        if !self.client_manager.alive(handle) {
+            return Err(LanMouseConnectionError::TargetEmulationDisabled);
         }
+        let table = self
+            .conns
+            .try_lock()
+            .map_err(|_| LanMouseConnectionError::ClipboardBusy)?;
+        let conn = table
+            .get(&handle)
+            .filter(|(a, _)| *a == addr)
+            .map(|(_, conn)| conn.clone())
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        Ok(crate::clipboard_network::ClipboardRequest {
+            addr,
+            conn: Some(conn),
+            event,
+            generation,
+            cancellation,
+            session_cancellation: Some(target.cancellation),
+            outgoing: Some((handle, target.revision)),
+        })
+    }
 
-        Err(LanMouseConnectionError::NotConnected)
+    pub(crate) fn clipboard_send_failed(
+        &self,
+        handle: ClientHandle,
+        revision: u64,
+        addr: SocketAddr,
+        conn: Connection,
+    ) {
+        if !self.client_manager.target_is_current(handle, revision) {
+            return;
+        }
+        let sender = self.clone();
+        spawn_local(async move {
+            disconnect(&sender.client_manager, handle, addr, &conn, &sender.conns).await;
+        });
     }
 }
 
@@ -574,7 +573,87 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn incomplete_clipboard_send_is_an_error_and_disconnects_only_that_target() {
+    async fn prepared_clipboard_failures_cleanup_only_the_captured_target() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let other = clients.add_client();
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let other_addr = "127.0.0.1:3".parse().unwrap();
+                clients.set_active_addr(other, Some(other_addr));
+                let connection = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = connection.sender();
+                let other_conn = Arc::new(RefusedConnection::default());
+                sender
+                    .conns
+                    .lock()
+                    .await
+                    .insert(other, (other_addr, other_conn.clone()));
+                for short_send in [false, true] {
+                    clients.set_active_addr(handle, Some(addr));
+                    clients.set_alive(handle, true);
+                    let conn = Arc::new(RefusedConnection {
+                        short_send,
+                        ..Default::default()
+                    });
+                    sender
+                        .conns
+                        .lock()
+                        .await
+                        .insert(handle, (addr, conn.clone()));
+                    let request = sender
+                        .prepare_clipboard(
+                            input_event::ClipboardEvent::Text("test".into()),
+                            handle,
+                            7,
+                            CancellationToken::new(),
+                        )
+                        .unwrap();
+                    let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+                    jobs.submit(request)
+                        .unwrap_or_else(|_| panic!("queue rejected fixture"));
+                    let completed = jobs.completed().await;
+                    if short_send {
+                        assert!(matches!(
+                            completed.result,
+                            Err(crate::listen::ClipboardSendError::Incomplete { sent: 0, .. })
+                        ));
+                    } else {
+                        assert!(matches!(
+                            completed.result,
+                            Err(crate::listen::ClipboardSendError::Transport(_))
+                        ));
+                    }
+                    let (completed_handle, revision) = completed.outgoing.unwrap();
+                    assert_eq!(completed_handle, handle);
+                    sender.clipboard_send_failed(
+                        handle,
+                        revision,
+                        completed.addr,
+                        completed.conn.unwrap(),
+                    );
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while !conn.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert!(clients.active_addr(handle).is_none());
+                    assert_eq!(clients.active_addr(other), Some(other_addr));
+                    assert!(!other_conn.closed.load(std::sync::atomic::Ordering::SeqCst));
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_preparation_never_waits_for_table_and_target_changes_cancel_job() {
         let clients = ClientManager::default();
         let handle = clients.add_client();
         clients.activate_client(handle);
@@ -586,43 +665,49 @@ mod tests {
             clients.clone(),
         );
         let sender = connection.sender();
-        let conn = Arc::new(RefusedConnection {
-            short_send: true,
-            ..Default::default()
-        });
-        sender
-            .conns
-            .lock()
-            .await
-            .insert(handle, (addr, conn.clone()));
-        let other = clients.add_client();
-        let other_addr = "127.0.0.1:3".parse().unwrap();
-        clients.set_active_addr(other, Some(other_addr));
-        let other_conn = Arc::new(RefusedConnection::default());
-        sender
-            .conns
-            .lock()
-            .await
-            .insert(other, (other_addr, other_conn.clone()));
-        let result = sender
-            .send_clipboard(
-                ProtoEvent::Input(input_event::Event::Clipboard(
-                    input_event::ClipboardEvent::Text("test".into()),
-                )),
+        let conn: Connection = Arc::new(RefusedConnection::default());
+        let mut table = sender.conns.lock().await;
+        table.insert(handle, (addr, conn.clone()));
+        assert!(matches!(
+            sender.prepare_clipboard(
+                input_event::ClipboardEvent::Text("test".into()),
                 handle,
+                1,
+                CancellationToken::new()
+            ),
+            Err(LanMouseConnectionError::ClipboardBusy)
+        ));
+        drop(table);
+        let request = sender
+            .prepare_clipboard(
+                input_event::ClipboardEvent::Text("test".into()),
+                handle,
+                1,
+                CancellationToken::new(),
             )
-            .await;
+            .unwrap();
+        assert!(Arc::ptr_eq(request.conn.as_ref().unwrap(), &conn));
+        let (_, revision) = request.outgoing.unwrap();
+        clients.set_port(handle, 4444);
+        assert!(!clients.target_is_current(handle, revision));
         assert!(
-            matches!(result, Err(LanMouseConnectionError::IncompleteClipboard { sent: 0, expected }) if expected > 0)
+            request
+                .session_cancellation
+                .as_ref()
+                .unwrap()
+                .is_cancelled()
         );
-        assert!(clients.active_addr(handle).is_none());
-        assert!(conn.closed.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(clients.active_addr(other), Some(other_addr));
-        assert!(!other_conn.closed.load(std::sync::atomic::Ordering::SeqCst));
+        let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+        jobs.submit(request)
+            .unwrap_or_else(|_| panic!("queue rejected fixture"));
+        assert!(matches!(
+            jobs.completed().await.result,
+            Err(crate::listen::ClipboardSendError::Canceled)
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn failed_input_and_clipboard_sends_return_errors() {
+    async fn failed_input_sends_return_errors_and_offline_clipboard_preparation_fails() {
         let clients = ClientManager::default();
         let handle = clients.add_client();
         clients.activate_client(handle);
@@ -632,38 +717,23 @@ mod tests {
             clients.clone(),
         );
         let sender = connection.sender();
-        for clipboard in [false, true] {
-            clients.set_active_addr(handle, Some(addr));
-            clients.set_alive(handle, true);
-            sender
-                .conns
-                .lock()
-                .await
-                .insert(handle, (addr, Arc::new(RefusedConnection::default())));
-            let result = if clipboard {
-                sender
-                    .send_clipboard(
-                        ProtoEvent::Input(input_event::Event::Clipboard(
-                            input_event::ClipboardEvent::Text("test".into()),
-                        )),
-                        handle,
-                    )
-                    .await
-            } else {
-                sender.send(ProtoEvent::Ping, handle).await
-            };
-            assert!(result.is_err());
-            assert!(clients.active_addr(handle).is_none());
-        }
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, Arc::new(RefusedConnection::default())));
+        assert!(sender.send(ProtoEvent::Ping, handle).await.is_err());
+        assert!(clients.active_addr(handle).is_none());
         assert!(
             sender
-                .send_clipboard(
-                    ProtoEvent::Input(input_event::Event::Clipboard(
-                        input_event::ClipboardEvent::Text("offline".into())
-                    )),
-                    handle
+                .prepare_clipboard(
+                    input_event::ClipboardEvent::Text("offline".into()),
+                    handle,
+                    0,
+                    CancellationToken::new()
                 )
-                .await
                 .is_err()
         );
     }

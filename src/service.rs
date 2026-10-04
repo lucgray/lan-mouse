@@ -55,6 +55,7 @@ pub struct Service {
     /// clipboard emulation
     clipboard_emulation: Option<ClipboardEmulation>,
     clipboard_writer: Option<ClipboardWriter>,
+    clipboard_outgoing: crate::clipboard_network::ClipboardJobs,
     /// clipboard enabled
     clipboard_enabled: bool,
     /// dns resolver
@@ -167,6 +168,7 @@ impl Service {
             clipboard_monitor,
             clipboard_emulation,
             clipboard_writer,
+            clipboard_outgoing: Default::default(),
             clipboard_enabled,
             frontend_listener,
             resolver,
@@ -236,7 +238,8 @@ impl Service {
                         Some(monitor) => monitor.recv().await,
                         None => std::future::pending().await,
                     }
-                } => self.handle_clipboard_event(event).await,
+                } => self.handle_clipboard_event(event),
+                completed = self.clipboard_outgoing.completed() => self.handle_clipboard_completion(completed),
                 result = async {
                     match &mut self.clipboard_writer {
                         Some(writer) => writer.completed().await,
@@ -496,26 +499,42 @@ impl Service {
             }
             EmulationEvent::ClipboardReceived(event) => self.receive_clipboard(event),
             EmulationEvent::ClipboardSendCompleted(completed) => {
-                if !self.clipboard_enabled
-                    || completed.generation != self.emulation.clipboard_generation()
+                self.handle_clipboard_completion(completed)
+            }
+        }
+    }
+
+    fn handle_clipboard_completion(
+        &mut self,
+        completed: crate::clipboard_network::ClipboardCompletion,
+    ) {
+        if !self.clipboard_enabled || completed.generation != self.emulation.clipboard_generation()
+        {
+            return;
+        }
+        if let Some((handle, revision)) = completed.outgoing {
+            if !self.client_manager.target_is_current(handle, revision) {
+                return;
+            }
+        }
+        match completed.result {
+            Ok(()) => self.notify_frontend(FrontendEvent::ClipboardShared {
+                received: false,
+                kind: completed.kind,
+                bytes: completed.bytes,
+            }),
+            Err(crate::listen::ClipboardSendError::Canceled) => {}
+            Err(error) => {
+                if let (Some((handle, revision)), Some(conn)) = (completed.outgoing, completed.conn)
                 {
-                    return;
+                    self.conn_sender
+                        .clipboard_send_failed(handle, revision, completed.addr, conn);
                 }
-                match completed.result {
-                    Ok(()) => self.notify_frontend(FrontendEvent::ClipboardShared {
-                        received: false,
-                        kind: completed.kind,
-                        bytes: completed.bytes,
-                    }),
-                    Err(crate::listen::ClipboardSendError::Canceled) => {}
-                    Err(error) => {
-                        log::warn!("clipboard send to {} failed: {error}", completed.addr);
-                        self.notify_frontend(FrontendEvent::Error(format!(
-                            "Failed to send clipboard to {}: {error}",
-                            completed.addr
-                        )));
-                    }
-                }
+                log::warn!("clipboard send to {} failed: {error}", completed.addr);
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Failed to send clipboard to {}: {error}",
+                    completed.addr
+                )));
             }
         }
     }
@@ -562,7 +581,7 @@ impl Service {
         }
     }
 
-    async fn handle_clipboard_event(&mut self, event: Option<input_capture::CaptureEvent>) {
+    fn handle_clipboard_event(&mut self, event: Option<input_capture::CaptureEvent>) {
         if !self.clipboard_enabled {
             return;
         }
@@ -570,32 +589,15 @@ impl Service {
         use input_event::Event;
 
         if let Some(CaptureEvent::Input(Event::Clipboard(clipboard_event))) = event {
-            use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, ProtocolError, encode_clipboard_event};
-
-            let proto_event = lan_mouse_proto::ProtoEvent::Input(input_event::Event::Clipboard(
-                clipboard_event.clone(),
-            ));
-
-            // encode once up-front: an oversized payload is dropped with a
-            // friendly hint instead of failing per-connection further down
-            match encode_clipboard_event(&proto_event) {
-                Err(ProtocolError::ClipboardTooLarge(bytes)) => {
-                    log::warn!(
-                        "clipboard content too large to share: {} bytes ({} byte limit)",
-                        bytes,
-                        MAX_CLIPBOARD_SIZE
-                    );
-                    self.notify_frontend(FrontendEvent::ClipboardTooLarge {
-                        bytes,
-                        limit: MAX_CLIPBOARD_SIZE,
-                    });
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("failed to encode clipboard event: {e}");
-                    return;
-                }
-                Ok(_) => {}
+            // The protocol limit is payload bytes. Check before cloning or
+            // encoding a potentially huge image; encoding belongs in the job.
+            let bytes = clipboard_event.content_len();
+            if bytes > lan_mouse_proto::MAX_CLIPBOARD_SIZE {
+                self.notify_frontend(FrontendEvent::ClipboardTooLarge {
+                    bytes,
+                    limit: lan_mouse_proto::MAX_CLIPBOARD_SIZE,
+                });
+                return;
             }
 
             log::info!("Clipboard changed locally, sending to all connected peers");
@@ -603,16 +605,27 @@ impl Service {
             // Send clipboard to all active clients (machines we're controlling)
             let active_clients: Vec<_> = self.client_manager.active_clients().into_iter().collect();
 
-            let mut shared = false;
             for handle in active_clients {
-                if let Err(e) = self
-                    .conn_sender
-                    .send_clipboard(proto_event.clone(), handle)
-                    .await
-                {
-                    log::warn!("Failed to send clipboard to client {}: {}", handle, e);
-                } else {
-                    shared = true;
+                let (generation, cancellation) = self.emulation.clipboard_scope();
+                match self.conn_sender.prepare_clipboard(
+                    clipboard_event.clone(),
+                    handle,
+                    generation,
+                    cancellation,
+                ) {
+                    Ok(request) => {
+                        if self.clipboard_outgoing.submit(request).is_err() {
+                            self.notify_frontend(FrontendEvent::Error(
+                                "Clipboard send is busy; copy again".into(),
+                            ));
+                        }
+                    }
+                    Err(crate::connect::LanMouseConnectionError::ClipboardBusy) => {
+                        self.notify_frontend(FrontendEvent::Error(
+                            "Clipboard send is busy; copy again".into(),
+                        ));
+                    }
+                    Err(error) => log::debug!("clipboard target {handle} unavailable: {error}"),
                 }
             }
 
@@ -628,11 +641,6 @@ impl Service {
                 if let Err(error) = self.emulation.send_clipboard(addr, clipboard_event.clone()) {
                     self.notify_frontend(FrontendEvent::Error(error.into()));
                 }
-            }
-
-            // only hint when the content actually went somewhere
-            if shared {
-                self.notify_clipboard_shared(&clipboard_event, false);
             }
         }
     }
@@ -1097,7 +1105,7 @@ mod tests {
             )));
             service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted(crate::clipboard_network::ClipboardCompletion {
                 addr: missing_addr, kind: clipboard.kind(), bytes: clipboard.content_len(),
-                generation: service.emulation.clipboard_generation(), result: Ok(()),
+                generation: service.emulation.clipboard_generation(), outgoing: None, conn: None, result: Ok(()),
             })).await;
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::ClipboardShared { .. }
@@ -1106,9 +1114,17 @@ mod tests {
             service.apply_clipboard_enabled(false);
             service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted(crate::clipboard_network::ClipboardCompletion {
                 addr: missing_addr, kind: clipboard.kind(), bytes: clipboard.content_len(),
-                generation: service.emulation.clipboard_generation(), result: Ok(()),
+                generation: service.emulation.clipboard_generation(), outgoing: None, conn: None, result: Ok(()),
             })).await;
             assert!(service.pending_frontend_events.is_empty());
+            let oversized = input_event::ClipboardEvent::Image(vec![0; lan_mouse_proto::MAX_CLIPBOARD_SIZE + 1]);
+            service.clipboard_enabled = true;
+            service.handle_clipboard_event(Some(input_capture::CaptureEvent::Input(input_event::Event::Clipboard(oversized))));
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                FrontendEvent::ClipboardTooLarge { bytes, .. } if *bytes == lan_mouse_proto::MAX_CLIPBOARD_SIZE + 1
+            )));
+            assert_eq!(service.clipboard_outgoing.sizes(), (0, 0));
+            service.pending_frontend_events.clear();
             let old_generation = service.emulation.clipboard_generation();
             for _ in 0..32 {
                 service.emulation.send_clipboard(missing_addr, clipboard.clone()).unwrap();
@@ -1118,7 +1134,7 @@ mod tests {
             service.clipboard_enabled = true;
             service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted(crate::clipboard_network::ClipboardCompletion {
                 addr: missing_addr, kind: clipboard.kind(), bytes: clipboard.content_len(),
-                generation: old_generation, result: Ok(()),
+                generation: old_generation, outgoing: None, conn: None, result: Ok(()),
             })).await;
             assert!(service.pending_frontend_events.is_empty());
             service.capture.terminate().await;

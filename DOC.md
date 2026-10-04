@@ -281,9 +281,15 @@ connection captured at submission; replacement/disconnection cancels only stale
 sessions. Disabling sharing cancels the generation, and completions from an old
 generation are ignored even after re-enabling. Completion events retain only
 payload kind/size, not its contents. Shutdown drops and aborts active tasks without
-closing input connections just to cancel a clipboard send. Outgoing-session
-network waits still run in the service dispatch path; reconnect replay and
-notification deduplication also remain review work.
+closing input connections just to cancel a clipboard send. Outgoing sends use a
+second pool with the same four-task/32-pending-peer limits, submitted directly
+without waiting for the connection table or network in service dispatch. They
+capture the target revision and connection; target changes cancel queued work,
+and failures clean up only the captured session asynchronously. Both pools share
+the clipboard enable generation. Oversized local payloads are rejected before
+cloning/encoding, and packet encoding runs inside send tasks. These limits bound
+clipboard network work, not all process memory or input latency. Reconnect replay
+and notification deduplication remain review work.
 
 
 On Windows, watcher path matching treats ordinary and verbatim drive/UNC

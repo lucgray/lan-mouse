@@ -161,6 +161,8 @@ impl Emulation {
             conn,
             event,
             generation: self.clipboard_generation(),
+            outgoing: None,
+            session_cancellation: None,
             cancellation: self
                 .clipboard_cancel
                 .lock()
@@ -170,6 +172,16 @@ impl Emulation {
         self.clipboard_tx
             .try_send(request)
             .map_err(|_| "Clipboard send is busy or stopped; copy again")
+    }
+
+    pub(crate) fn clipboard_scope(&self) -> (u64, CancellationToken) {
+        (
+            self.clipboard_generation(),
+            self.clipboard_cancel
+                .lock()
+                .expect("clipboard token")
+                .child_token(),
+        )
     }
 
     pub(crate) fn clipboard_generation(&self) -> u64 {
@@ -263,6 +275,7 @@ impl ListenTask {
                         self.event_tx.send(EmulationEvent::ClipboardSendCompleted(ClipboardCompletion {
                             addr: request.addr, generation: request.generation,
                             kind: request.event.kind(), bytes: request.event.content_len(),
+                            outgoing: None, conn: request.conn,
                             result: Err(ClipboardSendError::Transport(std::io::Error::new(
                                 std::io::ErrorKind::WouldBlock, "clipboard send is busy; copy again"
                             ).into())),
