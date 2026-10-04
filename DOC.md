@@ -214,11 +214,23 @@ one latest pending snapshot are retained; intermediate pending snapshots are
 coalesced. Save completion is separate from external reload and cannot revert
 newer runtime settings. Errors are reported asynchronously to the frontend.
 `Config::changed` returns `Ok(true)` for an applied external edit and
-`Ok(false)` for a successful background save; its in-flight task survives
+`Ok(false)` for a successful background save or an unchanged read; its in-flight task survives
 cancellation of the awaiting future. `queue_write_back` accepts a snapshot and
 `flush` waits for all accepted snapshots or reports a failure. The blocking
 `write_back` utility remains available, rejecting calls while a background save
-runs. Configuration reads still perform synchronous disk I/O.
+runs or a read is in progress. Service reloads also read and parse on a retained
+blocking task. Reads and saves do not run concurrently for a Config instance;
+saves queued while reading wait for its result. The blocking `read_from_disk`
+utility rejects calls while background I/O runs.
+
+A file matching the committed byte baseline is an own-save notification and
+cannot revert newer runtime edits. A genuinely changed external file replaces
+pending snapshots based on the previous file. If this displaces edits queued
+while reading, the service shows an error asking the user to review and retry;
+the external snapshot and runtime reload are applied together. Invalid TOML or
+read errors preserve runtime state and the old baseline, discard pending saves
+and report failure; subsequent valid edits can reload. `flush` also waits for a
+read when saves are queued behind it and reports any displaced pending edits.
 
 Before saving, file bytes must match the last loaded/saved baseline. A second
 check after syncing the temporary file catches edits during save preparation;

@@ -215,7 +215,14 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 result = self.config.changed() => match result {
-                    Ok(true) => self.handle_config_change(),
+                    Ok(true) => {
+                        if self.config.take_reload_conflict() {
+                            self.notify_frontend(FrontendEvent::Error(
+                                "External configuration replaced pending settings; review and retry your edits".into()
+                            ));
+                        }
+                        self.handle_config_change();
+                    },
                     Ok(false) => {},
                     Err(error) => {
                         log::warn!("could not save or reload configuration: {error}");
@@ -1025,7 +1032,9 @@ mod tests {
             service.clipboard_enabled = true;
             let external = "# external edit must survive reload\nport = 0\nenable_clipboard = false\n[authorized_fingerprints]\nnew = 'new-peer'\n[input_post_processing]\ninvert_scroll = true\nmouse_sensitivity = 1.75\n";
             std::fs::write(&path, external).unwrap();
-            assert!(service.config.read_from_disk().unwrap());
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !service.config.changed().await.unwrap() {}
+            }).await.unwrap();
             service.handle_config_change();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
             assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([("new".into(), "new-peer".into())]));

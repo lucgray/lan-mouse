@@ -33,7 +33,7 @@
 | R09 | 部分实现并有处理基准 | 复用平台读取对象；按尺寸/原始像素比较跳过重复编码；原始缓存最多 64 MiB；慢采样不补跑过期 tick，销毁监控停止任务；合成 4K 单次处理由约 9.15 ms 降至 1.90 ms；真实读取成本/输入 p99 和超过缓存上限的策略仍待测 |
 | R21 | 已实现并通过 Linux 命令回归 | 一个 managed shell + 最多 64 条待执行命令，正常 FIFO；满载才合并同设备旧命令并提示；30 秒超时、设备删除及服务退出取消；Unix 进程组及 Windows Job 清理，Windows 新增原生 shell 测试待 CI |
 | R19、R25 | 已实现并通过 worker / GTK / 本机 IPC 回归 | 窗口保留断线状态；后台有界发送、代次保护、250ms–5s 退避重连、重新 Sync；同步完成前禁用控件；隔离 Unix socket 解码/重连/退出及真实 GTK 窗口状态/草稿重提通过；Windows/macOS GUI 恢复待验 |
-| R20 | 部分实现并通过真实 GTK 行测试 | 主机名/端口停顿 400 ms 后提交，回车/离开输入框/关窗前显式提交；草稿和等待确认值隔离迟到状态；非法端口标记错误；移除行取消计时器。服务端 DNS 已按设备合并并限制系统调用并发，服务保存已移到有序后台任务，一次在写 + 一个最新快照；冲突保护及退出 flush 回归通过。外部配置读取仍同步，完整服务时延/极慢盘退出仍待验 |
+| R20 | 部分实现并通过真实 GTK 行测试 | 主机名/端口停顿 400 ms 后提交，回车/离开输入框/关窗前显式提交；草稿和等待确认值隔离迟到状态；非法端口标记错误；移除行取消计时器。服务端 DNS 已按设备合并并限制系统调用并发，服务保存已移到有序后台任务，一次在写 + 一个最新快照；冲突保护及退出 flush 回归通过。服务读取及 TOML 解析也已后台化；读写串行、读取取消后结果保留、外部快照替换待写编辑有提示；完整服务时延/极慢盘退出仍待验 |
 | 其余项 | 待实现 | 保留原有验收要求 |
 
 本机工作目录中已有 Rust 工具链，现已实际使用；此前仅检查系统 PATH 就判断没有工具链，已纠正。已通过 Linux `cargo test --workspace --all-features`；跨平台 CI 和真机长时间测试仍待完成。下方原始清单用于保留问题证据，勾选仍代表完整验收，而不是只有源码实现。
@@ -504,3 +504,19 @@ Linux 工作区测试通过（root 65 个通过、隔离服务测试默认忽略
 Linux 工作区全特性测试通过（root 69 个通过 + 1 个默认忽略），隔离服务测试已单独运行通过；严格 Clippy、格式和 diff 检查通过。
 
 日志：work/diagnostics/config-background-tests.log、config-background-workspace.log、config-background-clippy.log、config-background-service.log。R20 继续标为部分完成，保留异步读取与完整时延门槛；软件的 90 分目标仍未被证据证明。
+
+
+## 第二十一轮：后台配置读取、编辑交错及错误恢复
+
+- [x] `Config::changed` 不再同步 read_to_string 或 TOML 解析；读任务的 JoinHandle 保存在 Config 中，输入服务 select 取消等待后继续观察同一任务。一个 Config 同时至多一个读取或保存任务。
+- [x] 读取期间保存只保留最新待写快照，不开始第二个 I/O 任务。读取匹配已提交基线时，保留 runtime 编辑并启动其保存；真实外部快照优先，清除派生自旧文件的待写编辑。
+- [x] 外部快照替换待写编辑时，服务在应用 runtime 重载的同一分支提示用户 review/retry，不把它当成编辑已保存成功。若外部文件已恰好包含 runtime 的值，则无须重复保存或发冲突提示。
+- [x] 无效 TOML 从原先仅日志/忽略改为 InvalidData 错误并通知前端，保留当前 runtime 和已知基线；清除未保存快照时错误说明 pending settings were not saved。后续有效编辑可恢复。
+- [x] flush 覆盖等待读取后的保存；读取期间退出若外部文件替换待写编辑，则返回失败，不能冒充旧编辑已落盘。同步 read_from_disk/write_back 工具拒绝与本实例后台 I/O 并发使用。
+- [x] 四条回归覆盖读取结果延迟时 GUI 修改排队、运行时定时器可运行/取消后句柄保留、冲突提示状态仅消费一次、外部字节和授权保留/显式重试；自身通知不回滚并且 flush 落盘；无效解析保留状态/基线、清除待写后恢复；退出 flush 在外部读取替换待写设置时返回失败并保留原文件。
+- [x] 隔离实际 Service 回归改为真实 notify 事件 → Config::changed 后台读取 → runtime 重载，再通过 setter → 后台保存 → flush → 新 Config 重读。
+- [ ] 文件最终校验与 rename 竞态、符号链接监听目标覆盖、生产极慢盘退出、实际客户端往返输入 p95/p99 及资源测量仍需闭环；本轮定时器测试不替代完整输入延迟验收。
+
+Linux 工作区测试通过（root 73 个通过 + 1 个默认忽略），隔离实际 notify/Service 回归已单独运行通过；严格 Clippy、格式与 diff 检查通过。
+
+日志：work/diagnostics/config-async-read-tests.log、config-async-read-workspace.log、config-async-read-clippy.log、config-async-read-service.log。R20 的服务磁盘读写和解析已离开输入循环，但完整性能和用户验收仍未完成，保持目标活跃。
