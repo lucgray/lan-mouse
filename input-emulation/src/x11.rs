@@ -9,13 +9,16 @@ use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
 };
 
-use crate::{error::EmulationError, scroll_accumulator::Scroll120Accumulator};
+use crate::{
+    error::EmulationError, motion::MotionRemainders, scroll_accumulator::Scroll120Accumulator,
+};
 
 use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
     scroll_states: HashMap<EmulationHandle, ScrollState>,
+    motion_remainders: MotionRemainders,
 }
 
 unsafe impl Send for X11Emulation {}
@@ -33,13 +36,8 @@ impl X11Emulation {
         Ok(Self {
             display,
             scroll_states: HashMap::new(),
+            motion_remainders: MotionRemainders::default(),
         })
-    }
-
-    fn relative_motion(&self, dx: i32, dy: i32) {
-        unsafe {
-            xtest::XTestFakeRelativeMotionEvent(self.display, dx, dy, 0, 0);
-        }
     }
 
     fn emulate_mouse_button(&self, button: u32, state: u32) {
@@ -102,7 +100,14 @@ impl Emulation for X11Emulation {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    self.relative_motion(dx as i32, dy as i32);
+                    let display = self.display;
+                    self.motion_remainders.deliver(handle, (dx, dy), |x, y| {
+                        unsafe {
+                            xtest::XTestFakeRelativeMotionEvent(display, x, y, 0, 0);
+                        }
+                        // XTest delivery errors still need separate native handling.
+                        Ok::<_, EmulationError>(())
+                    })?;
                 }
                 PointerEvent::Button {
                     time: _,
@@ -142,14 +147,17 @@ impl Emulation for X11Emulation {
 
     async fn create(&mut self, handle: EmulationHandle) {
         self.scroll_states.entry(handle).or_default();
+        self.motion_remainders.remove(handle);
     }
 
     async fn destroy(&mut self, handle: EmulationHandle) {
         self.scroll_states.remove(&handle);
+        self.motion_remainders.remove(handle);
     }
 
     async fn terminate(&mut self) {
         self.scroll_states.clear();
+        self.motion_remainders.clear();
     }
 }
 

@@ -1,5 +1,8 @@
 use super::error::{EmulationError, WindowsEmulationCreationError};
-use crate::repeat::{RepeatAction, RepeatTarget};
+use crate::{
+    motion::MotionRemainders,
+    repeat::{RepeatAction, RepeatTarget},
+};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode,
@@ -51,6 +54,7 @@ pub(crate) struct WindowsEmulation {
     repeat_target: RepeatTarget,
     options: EmulationOptions,
     meta_pressed: bool,
+    motion_remainders: MotionRemainders,
 }
 
 impl WindowsEmulation {
@@ -60,6 +64,7 @@ impl WindowsEmulation {
             repeat_target: RepeatTarget::default(),
             options,
             meta_pressed: false,
+            motion_remainders: MotionRemainders::default(),
         })
     }
 }
@@ -70,11 +75,16 @@ impl Emulation for WindowsEmulation {
         self.kill_repeat_task();
         self.repeat_target = RepeatTarget::default();
     }
-    async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    rel_mouse(dx as i32, dy as i32)?;
+                    self.motion_remainders
+                        .deliver(handle, (dx, dy), rel_mouse)?;
                 }
                 PointerEvent::Button {
                     time: _,
@@ -127,11 +137,16 @@ impl Emulation for WindowsEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, handle: EmulationHandle) {
+        self.motion_remainders.remove(handle);
+    }
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        self.motion_remainders.remove(handle);
+    }
 
     async fn terminate(&mut self) {
+        self.motion_remainders.clear();
         self.kill_repeat_task();
         self.repeat_target = RepeatTarget::default();
     }

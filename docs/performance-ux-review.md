@@ -1241,3 +1241,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务资源上限、R60 原生故障/退出、真机千次往返、完整 p95/p99 和 8h RSS 未闭环，尚不认定达到 90 分。
 
 日志：x11-overload-baseline.log、x11-overload-workspace.log、x11-overload-clippy.log、x11-overload-minimal-clippy.log、x11-overload-fanout.log，以及两个 x11-overload-* Service fixture 日志。
+
+
+## 第四十九轮：X11 / Windows 慢速运动的小数丢失
+
+### R69 / P2
+
+- 基线核对实际生产转换：X11 relative_motion 与 Windows rel_mouse 的参数直接 dx/dy as i32。每次 (0.4, -0.4) 变成 (0, 0)，1,000 次请求累计 (400, -400)，原生请求累计为零。这是源码转换证据，没有在真实桌面注入鼠标。日志 fractional-motion-baseline.log。
+- [x] 将已有 evdev quantize_motion 提取为共用算法，evdev 调用语义保持不变。X11 / Windows 新增按 EmulationHandle 保存的余量，四舍五入后保留有限 |r|<=0.5 的小数，极值饱和到 i32，丢弃不可表示的超额；无效量不污染后续移动。
+- [x] X11 / Windows create、destroy、terminate 清理对应生命周期余量。零整数位移不调用 native motion injection；X11 consume 的现有 XFlush 仍执行。
+- [x] Windows 的 SendInput 错误通过共用 deliver 返回，失败时不提交候选余量。X11 XTest 返回值仍未处理，本轮只改善运动转换，不能宣称真实原生交付可靠。
+- [x] 仅启用 X11 时补齐 scroll_accumulator 模块 cfg；该后端的独立功能构建此前依赖其他功能间接启用模块。
+
+### 验证及未完成门槛
+
+- 共用生产 deliver 回归：1,000 次正向后累计 (400, -400)，再 1,000 次反向累计回零；仅 800 次非零 callback。另测不同 handle / 横纵余量隔离、remove/recreate、clear、native callback 失败不更新余量，以及极值/NaN 后恢复。原 evdev 数值回归仍通过。
+- 全工作区 all-features 通过：input-emulation 39，input-capture 38 / 1 忽略，root 136 / 2 忽略，GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格全工作区 all-targets Clippy、独立 x11 / evdev / 无默认功能 Clippy、fmt/diff 均通过。
+- 第 48 轮 27310bd CI 检查时 Rust queued、Nix in_progress；本轮新 HEAD 需自己的 Windows/macOS/Linux CI。共享算法的 Linux callback 测试不能替代 Windows SendInput、X11 原生事件和物理鼠标验收。
+- [ ] 下一轮优先核对 evdev AxisDiscrete120 的垂直 -value：i32::MIN 是合法协议值，但直接取负存在 debug panic / release overflow 风险；需实际转换回归再修复。
+- [ ] X11 同步控制通道/线程退出/native 阻塞、R13 资源总上限、R60 故障退出、真机千次往返、完整延迟与 8h RSS 仍未完成，尚不认定达到 90 分。
+
+日志：fractional-motion-baseline.log、fractional-motion-library.log、fractional-motion-workspace.log、fractional-motion-clippy.log、fractional-motion-{x11,evdev,none}-clippy.log。

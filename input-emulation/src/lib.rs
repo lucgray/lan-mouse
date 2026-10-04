@@ -33,7 +33,9 @@ pub mod clipboard;
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
-#[cfg(any(wlroots, libei, rdp))]
+#[cfg(any(windows, x11, evdev, test))]
+mod motion;
+#[cfg(any(wlroots, libei, rdp, x11))]
 mod scroll_accumulator;
 
 pub type EmulationHandle = u64;

@@ -684,3 +684,17 @@ to both Windows and X11. X11QueueOverloaded is an additive CaptureError variant;
 wire encoding and protocol version are unchanged. Tests prove queue/state/error
 behavior using release callbacks; synchronous native ungrab/flush success and
 physical device recovery still require target-desktop verification.
+
+
+### Fractional integer motion
+
+X11 and Windows preserve relative-motion fractions per EmulationHandle using
+the same quantizer as evdev. Rounding retains a finite residual of at most 0.5
+per axis; slow input no longer disappears at every integer conversion. Creation,
+destruction and termination reset the relevant lifecycle. Zero integer motion
+skips native motion injection (X11's existing consume flush still runs).
+
+Windows commits the next residual only after successful SendInput delivery.
+X11 still does not inspect XTest return values; fractional conversion tests do
+not establish native delivery success. Extreme output saturates to i32 and drops
+unrepresentable excess. Wire encoding and protocol version are unchanged.

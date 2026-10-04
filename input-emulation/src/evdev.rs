@@ -3,6 +3,8 @@ use evdev::{AttributeSet, KeyCode, RelativeAxisCode, uinput::VirtualDevice};
 use input_event::{KeyboardEvent, PointerEvent};
 use std::collections::HashMap;
 
+use crate::motion::quantize_motion;
+
 use crate::{Emulation, EmulationError, EmulationHandle, error::EvdevEmulationCreationError};
 
 const WHEEL_SENSITIVITY: f64 = 3.0;
@@ -115,31 +117,6 @@ impl Emulation for EvdevEmulation {
     async fn terminate(&mut self) {
         self.motion_remainders.clear();
     }
-}
-
-fn quantize_motion((dx, dy): (f64, f64), (rx, ry): (f64, f64)) -> ((i32, i32), (f64, f64)) {
-    let (x, rx) = quantize_axis(dx, rx);
-    let (y, ry) = quantize_axis(dy, ry);
-    ((x, y), (rx, ry))
-}
-
-fn quantize_axis(delta: f64, residual: f64) -> (i32, f64) {
-    // Residuals contain fractions only, never unrepresentable displacement.
-    let residual = if residual.is_finite() && residual.abs() <= 0.5 {
-        residual
-    } else {
-        0.0
-    };
-    if !delta.is_finite() {
-        return (0, residual);
-    }
-    let sum = delta + residual;
-    let rounded = sum.round();
-    let integer = rounded as i32;
-    if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
-        return (integer, 0.0);
-    }
-    (integer, sum - f64::from(integer))
 }
 
 const ALL_KEYS: [KeyCode; 549] = [
