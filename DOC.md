@@ -393,6 +393,16 @@ not limits on DTLS library handshake state or every event queue.
 
 Empty certificate chains return an authentication error. For a nonempty chain,
 authorization uses the leaf fingerprint; an authorized intermediate does not grant
-access to an unknown leaf. The GTK authorization dialog currently replaces an
-existing prompt when a new one arrives; preserving active interactions remains
-review work.
+access to an unknown leaf. GTK keeps the current authorization prompt or description editor stable while
+new requests wait in a deduplicated queue of at most 64 fingerprints. Canceling or
+closing an interaction suppresses the same fingerprint locally for 30 seconds
+(with at most 128 recent closures); authorization updates remove known requests.
+After the current interaction closes, one coalesced idle opens the next prompt.
+Manual fingerprint editing also prevents incoming prompts from interrupting it.
+
+Description/fingerprint drafts stay open when the IPC request queue refuses a
+submission. Closing after a successful submission means the worker accepted the
+request; it does not acknowledge server authorization or disk persistence. Both
+steps are tracked and closed on service disconnect, and old dialog callbacks
+cannot submit into a new session. Prompts wait for daemon state synchronization.
+Manual fingerprint format validation remains review work.

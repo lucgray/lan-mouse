@@ -13,6 +13,8 @@ use gtk::{
 #[template(resource = "/de/feschber/LanMouse/authorization_window.ui")]
 pub struct AuthorizationWindow {
     #[template_child]
+    pub message: TemplateChild<Label>,
+    #[template_child]
     pub fingerprint: TemplateChild<Label>,
     #[template_child]
     pub cancel_button: TemplateChild<Button>,

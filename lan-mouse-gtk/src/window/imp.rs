@@ -61,6 +61,9 @@ pub struct Window {
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    pub fingerprint_window: RefCell<Option<crate::fingerprint_window::FingerprintWindow>>,
+    pub(super) authorization_queue: RefCell<super::authorization::AuthorizationQueue>,
+    pub authorization_next: RefCell<Option<glib::SourceId>>,
     pub settings_window: RefCell<Option<SettingsWindow>>,
     /// last settings state received from the daemon
     /// (clipboard_enabled, invert_scroll, mouse_sensitivity)
@@ -211,6 +214,7 @@ impl Window {
 
 impl ObjectImpl for Window {
     fn dispose(&self) {
+        self.obj().clear_authorization_dialogs();
         self.daemon_client.borrow_mut().take();
     }
 

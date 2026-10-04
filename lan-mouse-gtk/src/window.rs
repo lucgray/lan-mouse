@@ -1,6 +1,7 @@
+mod authorization;
 mod imp;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -44,6 +45,7 @@ impl Window {
         let window: Self = Object::builder().property("application", app).build();
         window.imp().daemon_client.borrow_mut().replace(conn);
         window.connect_close_request(|window| {
+            window.clear_authorization_dialogs();
             for index in 0..window.clients().n_items() {
                 if let Some(row) = window.row_by_idx(index as i32) {
                     row.flush_pending_edits();
@@ -418,25 +420,58 @@ impl Window {
     }
 
     fn open_fingerprint_dialog(&self, fp: Option<String>) {
+        if !self.imp().daemon_ready.get() {
+            return;
+        }
+        if let Some(editor) = self.imp().fingerprint_window.borrow().as_ref() {
+            editor.present();
+            return;
+        }
+        if fp.is_none() {
+            if let Some(prompt) = self.imp().authorization_window.borrow().as_ref() {
+                prompt.present();
+                return;
+            }
+        }
         let window = FingerprintWindow::new(fp);
         window.set_transient_for(Some(self));
         window.connect_closure(
             "confirm-clicked",
             false,
             closure_local!(
-                #[strong(rename_to = parent)]
+                #[weak(rename_to = parent)]
                 self,
                 move |w: FingerprintWindow, desc: String, fp: String| {
-                    parent.request_fingerprint_add(desc, fp);
-                    w.close();
+                    if parent.imp().fingerprint_window.borrow().as_ref() != Some(&w)
+                        || !parent.imp().daemon_ready.get()
+                    {
+                        return;
+                    }
+                    // Keep the description/fingerprint draft open on a full or
+                    // disconnected request queue; closing is not a success signal.
+                    if parent.try_request(FrontendRequest::AuthorizeKey(desc, fp)) {
+                        w.close();
+                    }
                 }
             ),
         );
+        let parent = self.downgrade();
+        window.connect_close_request(move |w| {
+            if let Some(parent) = parent.upgrade() {
+                if parent.imp().fingerprint_window.borrow().as_ref() == Some(w) {
+                    parent.imp().fingerprint_window.borrow_mut().take();
+                    parent
+                        .imp()
+                        .authorization_queue
+                        .borrow_mut()
+                        .complete(Instant::now());
+                    parent.schedule_authorization();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.imp().fingerprint_window.replace(Some(window.clone()));
         window.present();
-    }
-
-    fn request_fingerprint_add(&self, desc: String, fp: String) {
-        self.request(FrontendRequest::AuthorizeKey(desc, fp));
     }
 
     fn request_fingerprint_remove(&self, fp: String) {
@@ -444,12 +479,16 @@ impl Window {
     }
 
     pub(crate) fn request(&self, request: FrontendRequest) {
+        self.try_request(request);
+    }
+
+    fn try_request(&self, request: FrontendRequest) -> bool {
         if let FrontendRequest::WindowIdentifier(identifier) = &request {
             self.imp()
                 .window_identifier
                 .replace(Some(identifier.clone()));
             if self.daemon_generation() == 0 {
-                return;
+                return true;
             }
         }
         let edit = match &request {
@@ -471,10 +510,14 @@ impl Window {
                 }
             }
             self.show_toast(error);
+            return false;
         }
+        true
     }
 
     pub(super) fn stop_daemon_client(&self) {
+        self.imp().daemon_ready.set(false);
+        self.clear_authorization_dialogs();
         self.imp().daemon_client.borrow_mut().take();
     }
 
@@ -490,8 +533,9 @@ impl Window {
     }
 
     pub(super) fn daemon_connected(&self, generation: u64) {
-        self.imp().daemon_generation.set(generation);
         self.imp().daemon_ready.set(false);
+        self.clear_authorization_dialogs();
+        self.imp().daemon_generation.set(generation);
         self.imp()
             .connection_row
             .set_title("Synchronizing service state");
@@ -508,6 +552,7 @@ impl Window {
 
     pub(super) fn daemon_synced(&self) {
         self.imp().daemon_ready.set(true);
+        self.present_next_authorization();
         self.imp().connection_row.set_visible(false);
         self.imp().service_controls.set_sensitive(true);
         if let Some(settings) = self.imp().settings_window.borrow().as_ref() {
@@ -534,9 +579,7 @@ impl Window {
         if let Some(settings) = self.imp().settings_window.borrow().as_ref() {
             settings.set_daemon_available(false);
         }
-        if let Some(authorization) = self.imp().authorization_window.borrow_mut().take() {
-            authorization.close();
-        }
+        self.clear_authorization_dialogs();
     }
 
     pub(super) fn show_toast(&self, msg: &str) {
@@ -617,6 +660,11 @@ impl Window {
     }
 
     pub(super) fn set_authorized_keys(&self, fingerprints: HashMap<String, String>) {
+        let active_authorized = self
+            .imp()
+            .authorization_queue
+            .borrow_mut()
+            .set_authorized(fingerprints.keys().cloned().collect());
         let authorized = self.authorized();
         // clear list
         authorized.remove_all();
@@ -626,6 +674,15 @@ impl Window {
             authorized.append(&key_obj);
         }
         self.update_auth_placeholder_visibility();
+        if active_authorized {
+            let editor = self.imp().fingerprint_window.borrow().clone();
+            let prompt = self.imp().authorization_window.borrow().clone();
+            if let Some(editor) = editor {
+                editor.close();
+            } else if let Some(prompt) = prompt {
+                prompt.close();
+            }
+        }
     }
 
     pub(super) fn set_pk_fp(&self, fingerprint: &str) {
@@ -682,20 +739,74 @@ impl Window {
     }
 
     pub(super) fn request_authorization(&self, fingerprint: &str) {
-        if let Some(w) = self.imp().authorization_window.borrow_mut().take() {
-            w.close();
+        if self.daemon_generation() == 0 {
+            return;
         }
-        let window = AuthorizationWindow::new(fingerprint);
+        self.imp()
+            .authorization_queue
+            .borrow_mut()
+            .enqueue(fingerprint, Instant::now());
+        self.present_next_authorization();
+    }
+
+    fn schedule_authorization(&self) {
+        if self.imp().authorization_next.borrow().is_some() {
+            return;
+        }
+        let parent = self.downgrade();
+        let source = glib::idle_add_local_once(move || {
+            if let Some(parent) = parent.upgrade() {
+                parent.imp().authorization_next.borrow_mut().take();
+                parent.present_next_authorization();
+            }
+        });
+        self.imp().authorization_next.replace(Some(source));
+    }
+
+    fn clear_authorization_dialogs(&self) {
+        if let Some(source) = self.imp().authorization_next.borrow_mut().take() {
+            source.remove();
+        }
+        self.imp().authorization_queue.borrow_mut().clear();
+        // Detach both before closing: callbacks cannot advance old queued prompts.
+        let prompt = self.imp().authorization_window.borrow_mut().take();
+        let editor = self.imp().fingerprint_window.borrow_mut().take();
+        if let Some(prompt) = prompt {
+            prompt.close();
+        }
+        if let Some(editor) = editor {
+            editor.close();
+        }
+    }
+
+    fn present_next_authorization(&self) {
+        if !self.imp().daemon_ready.get()
+            || self.imp().authorization_window.borrow().is_some()
+            || self.imp().fingerprint_window.borrow().is_some()
+        {
+            return;
+        }
+        let Some(fingerprint) = self.imp().authorization_queue.borrow_mut().next() else {
+            return;
+        };
+        let window = AuthorizationWindow::new(&fingerprint);
         window.set_transient_for(Some(self));
         window.connect_closure(
             "confirm-clicked",
             false,
             closure_local!(
-                #[strong(rename_to = parent)]
+                #[weak(rename_to = parent)]
                 self,
                 move |w: AuthorizationWindow, fp: String| {
-                    w.close();
+                    if parent.imp().authorization_window.borrow().as_ref() != Some(&w)
+                        || !parent.imp().daemon_ready.get()
+                    {
+                        return;
+                    }
+                    // Install the editor first, so closing the prompt preserves
+                    // this active identity through description editing.
                     parent.open_fingerprint_dialog(Some(fp));
+                    w.close();
                 }
             ),
         );
@@ -706,8 +817,27 @@ impl Window {
                 w.close();
             }),
         );
+        let parent = self.downgrade();
+        window.connect_close_request(move |w| {
+            if let Some(parent) = parent.upgrade() {
+                if parent.imp().authorization_window.borrow().as_ref() == Some(w) {
+                    parent.imp().authorization_window.borrow_mut().take();
+                    if parent.imp().fingerprint_window.borrow().is_none() {
+                        parent
+                            .imp()
+                            .authorization_queue
+                            .borrow_mut()
+                            .complete(Instant::now());
+                        parent.schedule_authorization();
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.imp()
+            .authorization_window
+            .replace(Some(window.clone()));
         window.present();
-        self.imp().authorization_window.replace(Some(window));
     }
 }
 
@@ -715,6 +845,164 @@ impl Window {
 mod recovery_tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    #[ignore = "requires a GTK display; run separately"]
+    fn actual_authorization_windows_preserve_interaction_drafts_and_session_identity() {
+        fn advance(window: &Window) {
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while window.imp().authorization_next.borrow().is_some() {
+                assert!(
+                    Instant::now() < deadline,
+                    "next authorization idle did not run"
+                );
+                context.iteration(false);
+            }
+        }
+        fn prompt(window: &Window) -> AuthorizationWindow {
+            window
+                .imp()
+                .authorization_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone()
+        }
+        fn editor(window: &Window) -> FingerprintWindow {
+            window
+                .imp()
+                .fingerprint_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone()
+        }
+        adw::init().unwrap();
+        gio::resources_register_include!("lan-mouse.gresource").unwrap();
+        let app = adw::Application::new(
+            Some("de.feschber.LanMouse.AuthorizationTest"),
+            gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let (client, current, mut requests) = crate::daemon_client::test_client();
+        let window = Window::new(&app, client);
+        window.present();
+        window.daemon_connected(1);
+        window.request_authorization("before-sync");
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.set_authorized_keys(HashMap::from([(
+            "before-sync".into(),
+            "already accepted".into(),
+        )]));
+        window.daemon_synced();
+        assert!(window.imp().authorization_window.borrow().is_none());
+
+        window.request_authorization("peer-a");
+        let original = prompt(&window);
+        assert!(original.imp().message.wraps());
+        assert_eq!(
+            original.imp().message.wrap_mode(),
+            gtk::pango::WrapMode::WordChar
+        );
+        for _ in 0..1000 {
+            window.request_authorization("peer-a");
+            window.request_authorization("peer-b");
+        }
+        assert_eq!(prompt(&window), original);
+        assert_eq!(original.imp().fingerprint.text(), "peer-a");
+        original.imp().confirm_button.emit_clicked();
+        let draft = editor(&window);
+        assert!(window.imp().authorization_window.borrow().is_none());
+        draft.imp().description.set_text("my peer description");
+        window.request_authorization("peer-c");
+        window.request_authorization("peer-a");
+        assert_eq!(editor(&window), draft);
+        assert_eq!(draft.imp().fingerprint.text(), "peer-a");
+        for _ in 0..64 {
+            window.request(FrontendRequest::Create);
+        }
+        draft.imp().confirm_button.emit_clicked();
+        assert_eq!(editor(&window), draft); // A full request queue keeps the draft open.
+        assert_eq!(draft.imp().description.text(), "my peer description");
+        assert!(window.imp().authorization_next.borrow().is_none());
+        while requests.try_recv().is_ok() {}
+        draft.imp().confirm_button.emit_clicked();
+        assert!(
+            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "my peer description" && fp == "peer-a")
+        );
+        assert!(window.imp().fingerprint_window.borrow().is_none());
+        advance(&window);
+        assert_eq!(prompt(&window).imp().fingerprint.text(), "peer-b");
+        window.set_authorized_keys(HashMap::from([
+            ("peer-b".into(), "b".into()),
+            ("peer-c".into(), "c".into()),
+        ]));
+        advance(&window);
+        assert!(window.imp().authorization_window.borrow().is_none());
+
+        window.open_fingerprint_dialog(None);
+        let manual = editor(&window);
+        manual.imp().fingerprint.set_text("manual-key");
+        manual.imp().description.set_text("manual description");
+        window.request_authorization("peer-d");
+        assert_eq!(editor(&window), manual);
+        assert!(window.imp().authorization_window.borrow().is_none());
+        manual.imp().confirm_button.emit_clicked();
+        assert!(
+            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "manual description" && fp == "manual-key")
+        );
+        advance(&window);
+        prompt(&window).imp().cancel_button.emit_clicked();
+        advance(&window);
+        for _ in 0..1000 {
+            window.request_authorization("peer-d");
+        }
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.request_authorization("peer-e");
+        window.request_authorization("peer-f");
+        prompt(&window).close(); // Window-manager close also advances the queue.
+        advance(&window);
+        let stale_prompt = prompt(&window);
+        assert_eq!(stale_prompt.imp().fingerprint.text(), "peer-f");
+        stale_prompt.imp().confirm_button.emit_clicked();
+        let stale_editor = editor(&window);
+        window.request_authorization("peer-g");
+        current.store(0, Ordering::Release);
+        window.daemon_disconnected("fixture EOF");
+        assert!(window.imp().authorization_window.borrow().is_none());
+        assert!(window.imp().fingerprint_window.borrow().is_none());
+        assert!(!stale_editor.is_visible());
+        assert!(window.imp().authorization_next.borrow().is_none());
+        stale_editor.imp().confirm_button.emit_clicked();
+        stale_prompt.imp().confirm_button.emit_clicked();
+        assert!(requests.try_recv().is_err());
+        current.store(2, Ordering::Release);
+        window.daemon_connected(2);
+        window.request_authorization("peer-d"); // Previous dismissal belongs to the old session.
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.daemon_synced();
+        assert_eq!(prompt(&window).imp().fingerprint.text(), "peer-d");
+        window.request_authorization("never-replay");
+        prompt(&window).close();
+        assert!(window.imp().authorization_next.borrow().is_some());
+        current.store(0, Ordering::Release);
+        window.daemon_disconnected("before pending idle");
+        assert!(window.imp().authorization_next.borrow().is_none());
+        current.store(3, Ordering::Release);
+        window.daemon_connected(3);
+        window.daemon_synced();
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.set_authorized_keys(HashMap::new());
+        let weak = window.downgrade();
+        window.stop_daemon_client();
+        window.close();
+        drop(window);
+        assert!(
+            weak.upgrade().is_none(),
+            "authorization callbacks must not retain the parent window"
+        );
+    }
 
     #[test]
     #[ignore = "requires a GTK display; run separately"]
