@@ -1468,3 +1468,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全局连接/任务上限、R60 原生恢复、真机千次往返、完整 p95/p99 和 8h RSS 尚未验收，不认定达到 90 分。
 
 日志：capture-error-notice-baseline.log、capture-error-context-baseline.log、capture-error-notice-workspace.log、capture-error-notice-clippy.log。
+
+
+## 第六十轮：异步后端清理等待期间给出进度
+
+### R81 / P1：异步等待路径已修复，原生阻塞恢复仍未验收
+
+- 基线将真实调用的 terminate 等待提取为 await_capture_termination，使用 oneshot 控制 cleanup future：已知 ActivationClosed 后等待 350ms 仍无事件，完成才收到 CaptureFailed。日志 capture-pending-notice-baseline.log。这是生产等待阶段模型，不是真实 backend hang。
+- [x] 创建边界失败和运行退出的 terminate 等待统一使用同一 helper。异步等待超过 250ms 时发一次内部 CaptureCleanupPending，包含已有主错误或“backend termination has not completed”。立即完成的清理不发进度。
+- [x] Service 对 pending 事件设置 capture_status=Disabled，并用既有 CaptureStatus/Error 协议通知前端：仍在等待 backend cleanup。最终结果仍通过第 59 轮统一 CaptureFailed 报告，保留两阶段失败文本；进度与最终失败是两种含义，不声称整个尝试只有一条消息。
+- [x] 计时器只做反馈，不取消、drop 或更换清理 future；仍 poll 同一个 future，原 owner 保持存活。do_capture 不提前返回，run 不进入 re-enable/create 分支，因此不以进度计时结束作为创建第二个 backend 的许可。没有添加后台清理任务或改动 wire encoding。
+
+### 验证与证据边界
+
+- 2 个回归覆盖主结果成功/失败 × cleanup 成功/失败，计时事件、owner Drop guard、最终 continuation、原/二次错误信息、无重复进度，以及立即完成无 pending。受控 continuation 在 cleanup 完成前不执行；测试不是物理 backend 的 lease/资源释放证明。
+- 新隔离真实 Service fixture 确认 pending 事件转为 Disabled 状态和一条进度 Error，最终 CaptureFailed 另转为一条终止 Error。临时 runtime/config/cert、port=0、Dummy capture/emulation，无用户显示或已安装服务变更。fixture 独立运行通过；常规 workspace 将其忽略。没有 GTK toast 渲染/完整 socket 接收回归。
+- 全工作区 all-features 通过：root 145 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。b74f6ac Rust 37213421185 / Nix 37213421095 检查时 in_progress，新 HEAD 需自己 CI。
+- [ ] 250ms 为异步反馈计时，不是 native cleanup deadline。同步 native 调用阻塞同一 executor 时 timer 不能运行；服务整体 shutdown 若正 await capture.terminate，也不再消费 event_rx，前端进度不保证可见。R60 全链路原生阻塞恢复仍未完成。
+- [ ] R82 待复现：一般捕获错误在 finish_capture_session 中 await release_capture_with 后才 abort 原传输；若 native release 异步挂起，连接取消和本轮 terminate 进度均尚未开始。需检查原目标取消顺序和 release 等待反馈，不能把 terminate 回归覆盖范围扩展到 release。
+- [ ] R13 全服务连接/任务上限、其他 backend 会话隔离、真机千次往返、完整 p95/p99 与 8h RSS 仍未验收，不认定达到 90 分。
+
+日志：capture-pending-notice-baseline.log、capture-pending-notice-library.log、capture-pending-notice-workspace.log、capture-pending-notice-clippy.log、capture-pending-notice-service.log。

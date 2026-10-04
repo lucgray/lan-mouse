@@ -36,6 +36,8 @@ pub(crate) enum ICaptureEvent {
     CaptureDisabled,
     /// A backend failed and capture was disabled until explicitly re-enabled.
     CaptureFailed(String),
+    /// Cleanup is still owned by this attempt; capture cannot resume yet.
+    CaptureCleanupPending(String),
     /// capture disabled
     CaptureEnabled,
     /// A (new) client was entered.
@@ -351,7 +353,8 @@ impl CaptureTask {
         /* create barriers for active clients */
         let r = self.create_captures(&mut capture).await;
         if let Err(e) = r {
-            return capture_result_after_termination(Err(e.into()), capture.terminate().await);
+            return await_capture_termination(&self.event_tx, Err(e.into()), capture.terminate())
+                .await;
         }
 
         let result = self.do_capture_session(&mut capture).await;
@@ -389,7 +392,7 @@ impl CaptureTask {
         }
 
         // FIXME replace with async drop when stabilized
-        capture_result_after_termination(r, capture.terminate().await)
+        await_capture_termination(&self.event_tx, r, capture.terminate()).await
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -744,6 +747,33 @@ impl CaptureTask {
     }
 }
 
+async fn await_capture_termination<F>(
+    event_tx: &Sender<ICaptureEvent>,
+    result: Result<(), InputCaptureError>,
+    termination: F,
+) -> Result<(), InputCaptureError>
+where
+    F: std::future::Future<Output = Result<(), CaptureError>>,
+{
+    tokio::pin!(termination);
+    let cleanup = tokio::select! {
+        biased;
+        cleanup = &mut termination => cleanup,
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {
+            let reason = match &result {
+                Err(error) => error.to_string(),
+                Ok(()) => "backend termination has not completed".into(),
+            };
+            log::warn!("input capture cleanup is still pending: {reason}");
+            event_tx.send(ICaptureEvent::CaptureCleanupPending(reason)).expect("channel closed");
+            // Keep ownership and keep polling the SAME future. The feedback
+            // timer is not cancellation or permission to recreate the backend.
+            termination.await
+        }
+    };
+    capture_result_after_termination(result, cleanup)
+}
+
 fn capture_result_after_termination(
     result: Result<(), InputCaptureError>,
     termination: Result<(), CaptureError>,
@@ -833,6 +863,99 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_capture_cleanup_reports_progress_and_retains_owner_until_completion() {
+        struct CleanupGuard<'a>(&'a Cell<bool>);
+        impl Drop for CleanupGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        for primary_error in [false, true] {
+            for cleanup_error in [false, true] {
+                let (tx, mut events) = channel();
+                let (done, receiver) = tokio::sync::oneshot::channel();
+                let finished = Cell::new(false);
+                let dropped = Cell::new(false);
+                let guard = CleanupGuard(&dropped);
+                let wait = async {
+                    let result = if primary_error {
+                        Err(CaptureError::ActivationClosed.into())
+                    } else {
+                        Ok(())
+                    };
+                    let result = await_capture_termination(&tx, result, async move {
+                        let _guard = guard;
+                        receiver.await.unwrap();
+                        if cleanup_error {
+                            Err(CaptureError::Io(std::io::Error::other("cleanup failed")))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await;
+                    finished.set(true);
+                    report_capture_exit(&tx, &result);
+                };
+                tokio::pin!(wait);
+                let notice = tokio::time::timeout(Duration::from_millis(650), async {
+                    tokio::select! {
+                        _ = &mut wait => panic!("cleanup must remain pending"),
+                        event = events.recv() => event.unwrap(),
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    matches!(notice, ICaptureEvent::CaptureCleanupPending(reason) if
+                    reason.contains(if primary_error { "activation stream" } else { "termination has not completed" }))
+                );
+                assert!(!finished.get());
+                assert!(!dropped.get()); // no cancel/drop/replacement of pending cleanup.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), events.recv())
+                        .await
+                        .is_err()
+                );
+                done.send(()).unwrap();
+                wait.await;
+                assert!(finished.get());
+                assert!(dropped.get());
+                if primary_error || cleanup_error {
+                    let event = events.recv().await.unwrap();
+                    assert!(matches!(event, ICaptureEvent::CaptureFailed(message) if
+                        (!primary_error || message.contains("activation stream")) &&
+                        (!cleanup_error || message.contains("cleanup failed"))));
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), events.recv())
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_capture_cleanup_emits_no_pending_notice() {
+        let (tx, mut events) = channel();
+        let result =
+            await_capture_termination(&tx, Err(CaptureError::ActivationClosed.into()), async {
+                Ok(())
+            })
+            .await;
+        report_capture_exit(&tx, &result);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ICaptureEvent::CaptureFailed(_)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn capture_exit_preserves_primary_and_cleanup_failures() {

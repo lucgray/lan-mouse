@@ -854,3 +854,24 @@ termination can delay the notification; this is still an acceptance issue,
 including the extra wait relative to the former runtime-only error notice.
 Result-stage tests verify notification/content, not actual GUI display or
 physical backend failure/cleanup.
+
+
+### Pending asynchronous backend termination
+
+While awaiting backend termination, capture sends one internal cleanup-pending
+event after 250ms of asynchronous waiting. Service marks capture Disabled and
+forwards a progress message using existing frontend event types. Immediate
+completion emits no progress. Final returned errors still emit the separate
+CaptureFailed message, including both processing and cleanup failures.
+
+The feedback timer retains and polls the same cleanup future. It neither cancels
+cleanup nor returns the attempt early, so re-enable cannot create a new backend
+while that attempt is still awaiting termination. The retained owner is tested
+with a controlled Drop guard; physical native cleanup is not proven.
+
+This is not a native timeout. A synchronous call blocking the executor prevents
+the timer from running. Whole-service shutdown may also stop consuming capture
+events while awaiting termination. Native release waits before termination are
+not covered here. The isolated Service fixture verifies status/message forwarding
+with Dummy backends, not GTK rendering or physical backend recovery. Wire encoding
+and public APIs are unchanged.

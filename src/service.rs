@@ -682,6 +682,13 @@ impl Service {
                     self.emulation.send_leave_event(incoming.addr, t);
                 }
             }
+            ICaptureEvent::CaptureCleanupPending(reason) => {
+                self.capture_status = Status::Disabled;
+                self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Input capture cleanup is still pending: {reason}. Waiting for backend cleanup before capture can be re-enabled."
+                )));
+            }
             ICaptureEvent::CaptureFailed(error) => {
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Input capture stopped: {error}"
@@ -1627,6 +1634,51 @@ mod tests {
             service.hooks.terminate().await;
             service.resolver.terminate().await;
             cancel.cancel(); peer_task.await.unwrap();
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR / XDG_RUNTIME_DIR"]
+    async fn pending_capture_cleanup_disables_status_and_forwards_progress_then_failure() {
+        let runtime = std::env::var("LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR").unwrap();
+        assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), runtime);
+        assert!(std::path::Path::new(&runtime).starts_with(std::env::temp_dir()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let cert = directory.path().join("test.pem");
+        std::fs::write(&path, "port = 0\nenable_clipboard = false\n").unwrap();
+        let config = Config::new_with_args([
+            "lan-mouse",
+            "--config",
+            path.to_str().unwrap(),
+            "--cert-path",
+            cert.to_str().unwrap(),
+            "--capture-backend",
+            "dummy",
+            "--emulation-backend",
+            "dummy",
+        ])
+        .unwrap();
+        tokio::task::LocalSet::new().run_until(async move {
+            let mut service = Service::new(config).await.unwrap();
+            service.handle_capture_event(ICaptureEvent::CaptureEnabled);
+            service.pending_frontend_events.clear();
+            service.handle_capture_event(ICaptureEvent::CaptureCleanupPending("activation stream closed unexpectedly".into()));
+            assert!(matches!(service.capture_status, Status::Disabled));
+            assert_eq!(service.pending_frontend_events.len(), 2);
+            assert!(matches!(&service.pending_frontend_events[0], FrontendEvent::CaptureStatus(Status::Disabled)));
+            assert!(matches!(&service.pending_frontend_events[1], FrontendEvent::Error(message) if
+                message.contains("cleanup is still pending") && message.contains("activation stream")));
+            service.pending_frontend_events.clear();
+            service.handle_capture_event(ICaptureEvent::CaptureFailed("activation stream closed unexpectedly; backend termination also failed: cleanup failed".into()));
+            assert_eq!(service.pending_frontend_events.len(), 1);
+            assert!(matches!(&service.pending_frontend_events[0], FrontendEvent::Error(message) if
+                message.contains("Input capture stopped") && message.contains("cleanup failed")));
+            service.capture.terminate().await;
+            service.emulation.terminate().await;
+            service.conn_sender.terminate().await;
+            service.hooks.terminate().await;
+            service.resolver.terminate().await;
         }).await;
     }
 
