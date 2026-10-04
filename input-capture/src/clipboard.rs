@@ -2,7 +2,7 @@ use arboard::{Clipboard, ImageData};
 use input_event::{ClipboardEvent, Event, encode_image_rgba};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -25,17 +25,18 @@ pub struct ClipboardMonitor {
     last_content: Arc<Mutex<Option<ClipboardEvent>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
-    remote_write: Arc<AtomicBool>,
+    remote_write: Arc<AtomicUsize>,
     write_revision: Arc<AtomicU64>,
     refresh_local: Arc<AtomicU64>,
 }
 
-/// Shared suppression state for one serial remote clipboard writer.
+/// Shared suppression state for one serial remote clipboard writer. Each
+/// pending/active request owns a lease; sampling resumes after all leases end.
 #[derive(Clone)]
 pub struct ClipboardFeedback {
     last_content: Arc<Mutex<Option<ClipboardEvent>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
-    remote_write: Arc<AtomicBool>,
+    remote_write: Arc<AtomicUsize>,
     write_revision: Arc<AtomicU64>,
     refresh_local: Arc<AtomicU64>,
 }
@@ -44,10 +45,14 @@ pub struct ClipboardWriteGuard(ClipboardFeedback, bool);
 
 impl ClipboardFeedback {
     pub fn begin_write(self) -> ClipboardWriteGuard {
-        self.remote_write.store(true, Ordering::SeqCst);
+        self.remote_write.fetch_add(1, Ordering::SeqCst);
         self.write_revision.fetch_add(1, Ordering::SeqCst);
         ClipboardWriteGuard(self, false)
     }
+    pub fn is_writing(&self) -> bool {
+        self.remote_write.load(Ordering::SeqCst) != 0
+    }
+
     fn publish_sample(
         &self,
         enabled: &Mutex<bool>,
@@ -65,9 +70,7 @@ impl ClipboardFeedback {
         }
         let mut last_content = self.last_content.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
-        if self.remote_write.load(Ordering::SeqCst)
-            || self.write_revision.load(Ordering::SeqCst) != read_revision
-        {
+        if self.is_writing() || self.write_revision.load(Ordering::SeqCst) != read_revision {
             reader.images.0 = None;
             return None;
         }
@@ -137,7 +140,7 @@ impl Drop for ClipboardWriteGuard {
         if !self.1 {
             self.0.refresh_local.store(revision, Ordering::SeqCst);
         }
-        self.0.remote_write.store(false, Ordering::SeqCst);
+        self.0.remote_write.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -228,7 +231,7 @@ impl ClipboardMonitor {
         let last_content: Arc<Mutex<Option<ClipboardEvent>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
-        let remote_write = Arc::new(AtomicBool::new(false));
+        let remote_write = Arc::new(AtomicUsize::new(0));
         let writing = remote_write.clone();
         let write_revision = Arc::new(AtomicU64::new(0));
         let revisions = write_revision.clone();
@@ -259,7 +262,7 @@ impl ClipboardMonitor {
                     *enabled
                 };
 
-                if !is_enabled || writing.load(Ordering::SeqCst) {
+                if !is_enabled || writing.load(Ordering::SeqCst) != 0 {
                     continue;
                 }
 
@@ -322,7 +325,7 @@ impl ClipboardMonitor {
     pub async fn recv(&mut self) -> Option<CaptureEvent> {
         while let Some(queued) = self.event_rx.recv().await {
             if *self.enabled.lock().unwrap()
-                && !self.remote_write.load(Ordering::SeqCst)
+                && self.remote_write.load(Ordering::SeqCst) == 0
                 && queued.revision == self.write_revision.load(Ordering::SeqCst)
             {
                 return Some(queued.event);
@@ -484,7 +487,7 @@ mod tests {
         ClipboardFeedback {
             last_content: Arc::new(Mutex::new(Some(ClipboardEvent::Text("local".into())))),
             last_change: Arc::new(Mutex::new(None)),
-            remote_write: Arc::new(AtomicBool::new(false)),
+            remote_write: Arc::new(AtomicUsize::new(0)),
             write_revision: Arc::new(AtomicU64::new(0)),
             refresh_local: Arc::new(AtomicU64::new(0)),
         }
@@ -715,13 +718,41 @@ mod tests {
     }
 
     #[test]
+    fn one_completed_lease_cannot_resume_sampling_while_another_request_is_pending() {
+        let feedback = feedback();
+        let first = feedback.clone().begin_write();
+        let pending = feedback.clone().begin_write();
+        first.finish(Some(ClipboardEvent::Text("first remote".into())));
+        assert!(feedback.is_writing());
+        // Exclude the debounce as an alternative reason for suppressing this sample.
+        *feedback.last_change.lock().unwrap() = None;
+        let mut reader = ClipboardReader::default();
+        assert!(
+            feedback
+                .publish_sample(
+                    &Mutex::new(true),
+                    &mut reader,
+                    feedback.write_revision.load(Ordering::SeqCst),
+                    ClipboardEvent::Text("intermediate local".into())
+                )
+                .is_none()
+        );
+        pending.finish(Some(ClipboardEvent::Text("latest remote".into())));
+        assert!(!feedback.is_writing());
+        assert_eq!(
+            *feedback.last_content.lock().unwrap(),
+            Some(ClipboardEvent::Text("latest remote".into()))
+        );
+    }
+
+    #[test]
     fn successful_remote_write_commits_cache_before_resuming_monitor() {
         let feedback = feedback();
         let guard = feedback.clone().begin_write();
-        assert!(feedback.remote_write.load(Ordering::SeqCst));
+        assert!(feedback.is_writing());
         let read_revision = feedback.write_revision.load(Ordering::SeqCst);
         guard.finish(Some(ClipboardEvent::Text("remote".into())));
-        assert!(!feedback.remote_write.load(Ordering::SeqCst));
+        assert!(!feedback.is_writing());
         assert_eq!(
             *feedback.last_content.lock().unwrap(),
             Some(ClipboardEvent::Text("remote".into()))
@@ -742,12 +773,12 @@ mod tests {
             *feedback.last_content.lock().unwrap(),
             Some(ClipboardEvent::Text("local".into()))
         );
-        assert!(!feedback.remote_write.load(Ordering::SeqCst));
+        assert!(!feedback.is_writing());
         let refresh = feedback.refresh_local.load(Ordering::SeqCst);
         assert_ne!(refresh, 0);
         assert_eq!(refresh, feedback.write_revision.load(Ordering::SeqCst));
         drop(feedback.clone().begin_write());
-        assert!(!feedback.remote_write.load(Ordering::SeqCst));
+        assert!(!feedback.is_writing());
         assert!(feedback.last_change.lock().unwrap().is_none());
         assert_ne!(feedback.refresh_local.load(Ordering::SeqCst), refresh);
     }

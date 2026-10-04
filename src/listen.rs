@@ -58,9 +58,9 @@ pub(crate) type ArcConn = Arc<dyn Conn + Send + Sync>;
 /// Create a DTLS listener per address family.
 ///
 /// A socket bound to `[::]` accepts IPv4-mapped peers only on platforms
-/// with dual-stack sockets (Linux). Windows and macOS default IPv6
-/// sockets to `IPV6_V6ONLY`, so an IPv4-only peer would never be able
-/// to connect. A separate IPv4 listener is therefore always created;
+/// with dual-stack sockets. Socket defaults depend on the platform and
+/// configuration; v6-only sockets cannot accept an IPv4-only peer.
+/// A separate IPv4 listener is therefore always attempted;
 /// where `[::]` is already dual-stack its bind fails with EADDRINUSE
 /// and the attempt is skipped.
 async fn bind_dtls(
@@ -748,13 +748,29 @@ mod tests {
             let certificate = Certificate::generate_self_signed(vec![]).unwrap();
             let cfg = Config { certificates: vec![certificate.clone()], ..Default::default() };
             let listeners = bind_dtls(0, &cfg).await.unwrap();
-            #[cfg(any(windows, target_os = "macos"))]
-            assert_eq!(listeners.len(), 2, "v6-only CI must exercise both real families");
+
             let first = listeners[0].addr().await.unwrap().port();
             assert_ne!(first, 0);
             for listener in &listeners { assert_eq!(listener.addr().await.unwrap().port(), first); }
-            // On v6-only platforms this exercises both real sockets. On a
-            // dual-stack platform one socket covers both address families.
+            // Verify both families functionally, whether the OS uses one dual-stack
+            // socket or two v6-only/v4 sockets. Socket count is not the contract.
+            for ip in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
+                let bind_ip = if ip.is_ipv4() { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V6(Ipv6Addr::UNSPECIFIED) };
+                let socket = Arc::new(tokio::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await.unwrap());
+                socket.connect(SocketAddr::new(ip, first)).await.unwrap();
+                let client_cfg = Config {
+                    certificates: vec![certificate.clone()],
+                    insecure_skip_verify: true,
+                    ..Default::default()
+                };
+                let (client, server) = tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(DTLSConn::new(socket, client_cfg, true, None), accept_any(&listeners))
+                }).await.expect("both address families must complete a DTLS handshake");
+                let client = client.unwrap();
+                let (server, _) = server.unwrap();
+                client.close().await.unwrap();
+                server.close().await.unwrap();
+            }
             close_listeners(listeners).await;
             let mut listener = LanMouseListener::new(0, certificate, Default::default()).await.unwrap();
             let initial = listener.port();

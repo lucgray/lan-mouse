@@ -119,8 +119,10 @@ Releasing the target, terminating, or dropping the backend stops its repeat task
 Remote clipboard updates use one serial writer outside the service event loop.
 While a write is busy, only the latest pending clipboard snapshot is retained.
 Received notifications follow successful platform writes; failed writes report
-an error. Monitoring pauses feedback during a remote write and commits its cache
-only on success. Disabling sharing discards pending snapshots; a platform write
+an error. Monitoring pauses feedback as soon as a remote snapshot is submitted,
+including while it waits behind an active write or a full completion channel.
+Each pending/active request owns a suppression lease; sampling resumes after all
+leases end, and the cache is committed only on success. Disabling sharing discards pending snapshots; a platform write
 that has already started is allowed to finish to preserve ordering.
 
 Clipboard monitoring reuses platform access and compares dimensions and raw
@@ -370,7 +372,9 @@ the completed revision for a fresh local observation; an older sample cannot cle
 that refresh. Image reuse is reset when a fresh observation is needed. Publication
 releases enabled/content/time/reader locks before waiting for queue capacity.
 
-This handles queued samples across writes that have started and monitor toggles.
-The interval between accepting a remote request and starting its serial OS write,
-plus connection readiness/latest-value replay, still requires service-level ordering
+This handles queued samples across submitted remote writes and monitor toggles.
+Replacing or clearing an unstarted request releases its suppression lease; an
+active OS write retains its lease until completion. Dropping the writer prevents
+its last unseen request from starting, while a write already in progress finishes.
+Connection readiness/latest-value replay still requires service-level ordering
 work. These changes do not retract a sample already delivered to its consumer.

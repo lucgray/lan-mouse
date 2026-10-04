@@ -720,3 +720,25 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [x] 临时端口原生回归在 Windows/macOS 增加两个实际地址族 socket 的数量断言，避免只验证可用单族而把结果描述为双族；新断言尚需本轮原生 CI。
 
 日志：clipboard-monitor-epoch-workspace.log、clipboard-monitor-epoch-clippy.log、clipboard-monitor-epoch-service.log、windows-clippy-fc03572.log。重连补发未完成，本轮先完成必要的队列顺序修复；整体 90 分验收仍未完成，不部署运行程序。
+
+
+## 第三十轮：剪贴板提交窗口与双地址族 CI 回归
+
+### R41 / P1 修复与验收
+
+- [x] ClipboardWriter.submit 同步取得监控暂停 lease，再替换 watch 请求；旧待写项被合并时释放自己的 lease，新项已持有 lease，没有中间恢复窗口。
+- [x] 将暂停布尔状态改为活动/待写计数。前序写入完成不能解除后序请求的暂停；结果通道满时最新待写项仍持有暂停。成功写入先提交缓存，再释放 lease。
+- [x] 工作器取走请求中的 guard 后才写系统剪贴板；watch 保存已完成请求不会延长暂停。清除待写项保留正在执行的写入；owner Drop 检查结果接收端关闭，避免 watch 关闭后最后未读项仍启动新的 OS 写入。
+- [x] 四条真实 submit/worker 回归覆盖提交即时暂停、1,000 项合并、错误报告/清除、完成反压、活动写入清理和退出未启动项；监控回归排除 debounce 干扰，证明另一 lease 存在时中间样本不发布。受控 setter 不写用户系统剪贴板。
+- [ ] 连接就绪代次与最后有效内容重连补发仍未实现；R07/R13 仍部分完成。已经开始的系统写入不能撤回，真实系统写入挂起及输入 p99 门槛仍待验。
+
+- [x] 最终 Linux 全特性工作区通过：input-capture 33 通过、1 默认忽略，root 100 通过、1 默认忽略，GTK 11 通过、3 默认忽略；隔离 Service fixture 显式通过。严格 Clippy、格式、diff 检查通过；包含修正后的真实 IPv4/IPv6 DTLS 握手。
+
+### 6885935 原生 CI 证据与修正
+
+- Windows 测试和严格 Clippy 成功，确认 Unix-only last_port_request helper 修正生效。
+- macOS Intel/ARM 测试实际失败均为 src/listen.rs 的 socket 数量断言：实际 1、预期 2。上一轮把 macOS 默认行为当成 v6-only 的假设错误；一个双栈 socket 也可以覆盖两个地址族。
+- [x] 删除 OS 名称推导 socket 数量的断言，改用真实 IPv4 和 IPv6 UDP 客户端分别在同一非零端口完成 DTLS 握手；保留所有已绑定监听器同端口检查、端口切换及运行状态检查。修正 bind_dtls 注释的默认行为假设。
+- [ ] 新提交必须由自己的 Windows/macOS CI 验证，旧 head 的失败不会被描述为成功。
+
+验证日志：clipboard-pending-scope-workspace.log、clipboard-pending-scope-clippy.log、clipboard-pending-scope-service.log；原生失败证据 macos-arm-6885935.log、macos-intel-6885935.log。本轮不部署本机程序，整体 90 分的真机、延迟和长时间资源验收仍未完成。
