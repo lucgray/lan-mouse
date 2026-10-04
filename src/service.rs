@@ -32,6 +32,8 @@ use tokio::{signal, sync::Notify};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
+    #[error("input cleanup incomplete; some native input state may remain pressed")]
+    InputCleanupIncomplete,
     #[error(transparent)]
     IpcListen(#[from] IpcListenerCreationError),
     #[error(transparent)]
@@ -312,7 +314,7 @@ impl Service {
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
-        self.emulation.terminate().await;
+        let input_cleanup_complete = self.emulation.terminate().await;
         self.conn_sender.terminate().await;
         self.hooks.terminate().await;
         log::debug!("terminating dns resolver ...");
@@ -325,6 +327,13 @@ impl Service {
             ),
         }
 
+        if !input_cleanup_complete {
+            let error = ServiceError::InputCleanupIncomplete;
+            log::error!("{error}");
+            self.notify_frontend(FrontendEvent::Error(error.to_string()));
+            self.handle_frontend_pending().await;
+            return Err(error);
+        }
         Ok(())
     }
 

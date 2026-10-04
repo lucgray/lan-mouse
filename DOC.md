@@ -559,3 +559,30 @@ Ordinary backend delivery errors also cancel the failing reader before entering
 the existing backend failure path, allowing the sender to release capture rather
 than retain a live transport to disabled emulation. Native OS cleanup failures
 and failed final termination remain separate acceptance requirements.
+
+
+### Retained cleanup after backend failure
+
+`InputEmulation::terminate_bounded()` returns an explicit completion result. Each
+attempt has a one-second aggregate deadline and rotates the starting handle on
+retry so early stalled peers cannot indefinitely starve later peers. Confirmed
+key/button releases immediately leave the ledger; failed or canceled transitions
+remain tracked. Repeating tasks stop before cleanup, while the backend transport
+stays available until all tracked handles have been released and destroyed.
+The existing unit-returning `terminate()` remains a compatibility wrapper.
+
+After a fatal emulation error the worker retains the original backend instance.
+Explicit reenable retries its cleanup before constructing a replacement; failure
+keeps emulation disabled and reports why. Disconnect requests can still retry
+individual retained handles while disabled. Worker shutdown transfers incomplete
+cleanup to the service owner, whose repeated termination calls can retry it.
+An incomplete final attempt returns `ServiceError::InputCleanupIncomplete` rather
+than successful shutdown. No new wire fields or IPC event variants are added.
+
+macOS repeat cancellation uses persistent task abort, including before the task
+first runs; backend termination/drop also stops repeats. Windows repeat tasks
+are stopped before retained cleanup as well. Already posted native events cannot
+be undone by abort. The deadlines cover yielding operations; synchronous native
+calls, ignored native close errors, forced process exit and task panics cannot
+provide a guaranteed physical release or a durable cleanup ledger. Native
+Windows/macOS/Linux fault recovery remains a separate acceptance requirement.

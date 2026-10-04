@@ -66,6 +66,10 @@ impl WindowsEmulation {
 
 #[async_trait]
 impl Emulation for WindowsEmulation {
+    fn stop_repeating(&mut self) {
+        self.kill_repeat_task();
+        self.repeat_target = RepeatTarget::default();
+    }
     async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {

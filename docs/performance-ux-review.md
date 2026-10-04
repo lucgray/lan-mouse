@@ -1073,3 +1073,35 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - R13 其他无界事件/连接资源、原生 API 阻塞和失败清理、真实千次切换、完整 p95/p99 和八小时 RSS 尚未闭环。保持目标未完成，不认定 90 分。
 
 日志：handle-session-baseline.log、handle-session-focused.log、handle-session-workspace.log、handle-session-clippy.log、handle-session-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、handle-session-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+
+## 第四十三轮：fatal 清理状态保留与部分释放进度
+
+### R60 / P1：失败状态跨后端生命周期保留
+
+- [x] 新增兼容性 API terminate_bounded -> bool，旧 terminate() 保留；单次清理有默认 1s 总期限，按上次尝试的 handle 轮换起点，避免每次只尝试最早的失败 peer。仍有未清理 handle 时不关闭用于释放的后端。
+- [x] EmulationTask fatal 路径保留原 InputEmulation 实例和 ledger；显式重新启用先重试旧实例，失败则拒绝构造替代后端并报告原因。禁用期间 Remove 仍可尝试旧 handle。
+- [x] 终止时通过 worker / listener JoinHandle 将未完成实例移交 Emulation owner；重复 terminate 可继续重试，不重复轮询已完成 JoinHandle。task join 错误明确保持失败。
+- [x] Service 最终清理未完成时返回 InputCleanupIncomplete 并记录/投递现有 Error 事件；不再以 Ok 报告完成。实例在 owner 存活期间保留，永久失败后进程退出仍不能保证物理按键释放或持久化 ledger。
+- [x] 保留失败实例前停止自动重复任务，避免持续产生重复输入；Windows 重用已有停止逻辑。
+
+### R61 / P1：确认释放后及时更新 ledger
+
+- 源码证据：旧 release_tracked 直接调用原 backend，直到全部释放、destroy 完成才移除整个 handle；先前已成功的 key-up 若后续按钮释放/销毁失败，仍在 ledger 被视作按下，可能抑制下一次正常 key-down。
+- [x] 每个 release 先记录未知 transition，后端确认成功即移除该键/按钮；失败或 future 被取消仍保留未知状态，不把不确定释放当完成。
+
+### R62 / P1：macOS repeat 停止信号启动竞态
+
+- 源码证据：notify_waiters 只唤醒已注册 waiter；spawn_local 创建后未执行就停止时，信号可能丢失，等待 join 永不完成。清理超时丢弃 JoinHandle 后任务可继续重复。旧 macOS terminate 为空且无 Drop 停止逻辑。
+- [x] 使用 task.abort + await，停止操作在首次 poll 前也有效；terminate 和 Drop 都 abort。移除不再使用的 Notify 分支。该修复依据代码与 Tokio 任务取消语义，尚未做 macOS 原生按键验收。
+
+### 验证
+
+- 新增 library 三个回归：失败 release 的实例/传输保留与恢复、部分 key-up 成功而 button-up 停滞后的 ledger 与重新按下、总期限和轮换不饿死后续健康 handle；现有 backend terminate 永久 Pending 用例增加 false/恢复 true 断言。
+- 新增 root ownership 用例：多次失败不 drop，worker->owner 移交仍可重试，成功才 drop；Complete 不重复清理，join Failed 不误报成功。
+- Linux all-features 工作区通过：主包 134 / 2 默认忽略，input-emulation 23，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略；严格 all-targets Clippy、格式及 diff 检查通过。
+- 两个隔离真实 Service-DTLS 授权/活跃撤销及双向剪贴板重播/来源/禁用/重连用例均通过。
+- 上一 HEAD b4ab687 Rust run 37196491561 与 Nix run 37196491505 都成功。本轮新 HEAD 必须用自己的跨平台 CI 验证，Linux 检查不能代表 Windows/macOS 原生路径。
+- [ ] 永久 native failure、同步阻塞、强制退出/task panic 后物理状态与持久 ledger 无法由本次保证；R60 原生验收仍待完成。R13 其他无界事件/连接资源、真机千次切换、完整 p95/p99 与八小时 RSS 继续未闭环，不认定 90 分。
+
+日志：retained-cleanup-library.log、retained-cleanup-workspace.log、retained-cleanup-clippy.log、retained-cleanup-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、retained-cleanup-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

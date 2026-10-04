@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
-    task: JoinHandle<()>,
+    task: JoinHandle<CleanupState<InputEmulation>>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
     clipboard_tx: tokio::sync::mpsc::Sender<ClipboardRequest>,
@@ -40,6 +40,8 @@ pub(crate) struct Emulation {
     authorization: crate::listen::IncomingAuthorization,
     clipboard_generation: AtomicU64,
     clipboard_cancel: Mutex<CancellationToken>,
+    terminated: bool,
+    cleanup: CleanupState<InputEmulation>,
 }
 
 pub(crate) enum EmulationEvent {
@@ -153,6 +155,8 @@ impl Emulation {
             port_requests,
             clipboard_generation: AtomicU64::new(0),
             clipboard_cancel: Mutex::new(CancellationToken::new()),
+            terminated: false,
+            cleanup: CleanupState::Complete,
         }
     }
 
@@ -259,16 +263,22 @@ impl Emulation {
         self.event_rx.recv().await.expect("channel closed")
     }
 
-    /// wait for termination
-    pub(crate) async fn terminate(&mut self) {
-        self.clear_clipboard();
-        log::debug!("terminating emulation");
-        self.request_tx
-            .send(EmulationRequest::Terminate)
-            .expect("channel closed");
-        if let Err(e) = (&mut self.task).await {
-            log::warn!("{e}");
+    /// Failed cleanup remains owned here so repeated termination can retry.
+    pub(crate) async fn terminate(&mut self) -> bool {
+        if !self.terminated {
+            self.clear_clipboard();
+            log::debug!("terminating emulation");
+            let _ = self.request_tx.send(EmulationRequest::Terminate);
+            self.cleanup = match (&mut self.task).await {
+                Ok(cleanup) => cleanup,
+                Err(e) => {
+                    log::warn!("emulation task failed during cleanup: {e}");
+                    CleanupState::Failed
+                }
+            };
+            self.terminated = true;
         }
+        self.cleanup.retry().await
     }
 }
 
@@ -291,7 +301,7 @@ struct ListenTask {
 }
 
 impl ListenTask {
-    async fn run(mut self) {
+    async fn run(mut self) -> CleanupState<InputEmulation> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         let mut last_response = HashMap::new();
         // peers that entered this device: addr -> (edge, fingerprint).
@@ -480,8 +490,9 @@ impl ListenTask {
         }
         drop(control_jobs);
         drop(clipboard_jobs);
-        self.emulation_proxy.terminate().await;
+        let cleanup = self.emulation_proxy.terminate().await;
         self.listener.terminate().await;
+        cleanup
     }
 }
 
@@ -519,7 +530,7 @@ pub(crate) struct EmulationProxy {
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
     event_rx: Receiver<EmulationEvent>,
-    task: JoinHandle<()>,
+    task: JoinHandle<CleanupState<InputEmulation>>,
     input_config: InputConfig,
 }
 
@@ -564,6 +575,7 @@ impl EmulationProxy {
             handle_sessions: Default::default(),
             next_id: 0,
             operation_timeout: Duration::from_millis(500),
+            cleanup: CleanupState::Complete,
             input_config,
         };
         let task = spawn_local(emulation_task.run());
@@ -639,12 +651,50 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
-    async fn terminate(&mut self) {
+    async fn terminate(&mut self) -> CleanupState<InputEmulation> {
         self.exit_requested.replace(true);
-        self.request_tx
-            .send(ProxyRequest::Terminate)
-            .expect("channel closed");
-        let _ = (&mut self.task).await;
+        let _ = self.request_tx.send(ProxyRequest::Terminate);
+        match (&mut self.task).await {
+            Ok(cleanup) => cleanup,
+            Err(e) => {
+                log::warn!("input worker failed during cleanup: {e}");
+                CleanupState::Failed
+            }
+        }
+    }
+}
+
+trait CleanupBackend {
+    async fn cleanup(&mut self) -> bool;
+}
+
+impl CleanupBackend for InputEmulation {
+    async fn cleanup(&mut self) -> bool {
+        self.terminate_bounded().await
+    }
+}
+
+// Carry the original native instance and its ledger through worker shutdown.
+// Never construct a replacement while its predecessor still needs release.
+enum CleanupState<T> {
+    Complete,
+    Pending(T),
+    Failed,
+}
+
+impl<T: CleanupBackend> CleanupState<T> {
+    async fn retry(&mut self) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Failed => false,
+            Self::Pending(backend) => {
+                if !backend.cleanup().await {
+                    return false;
+                }
+                *self = Self::Complete;
+                true
+            }
+        }
     }
 }
 
@@ -748,10 +798,11 @@ struct EmulationTask {
     next_id: EmulationHandle,
     operation_timeout: Duration,
     input_config: InputConfig,
+    cleanup: CleanupState<InputEmulation>,
 }
 
 impl EmulationTask {
-    async fn run(mut self) {
+    async fn run(mut self) -> CleanupState<InputEmulation> {
         loop {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
@@ -762,53 +813,70 @@ impl EmulationTask {
             if self.exit_requested.get() {
                 break;
             }
-            // wait for reenable request
+            // Only explicit reenable may create a replacement backend.
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
+                let Some(request) = self.request_rx.recv().await else {
+                    let _ = self.cleanup.retry().await;
+                    return self.cleanup;
+                };
+                match request {
                     ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Warp(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Terminate => {
+                        let _ = self.cleanup.retry().await;
+                        return self.cleanup;
+                    }
+                    ProxyRequest::Input(..) | ProxyRequest::Warp(..) => {}
+                    ProxyRequest::Remove(addr) => {
+                        if let (CleanupState::Pending(backend), Some(&handle)) =
+                            (&mut self.cleanup, self.handles.get(&addr))
+                        {
+                            if backend.destroy_bounded(handle).await {
+                                self.handles.remove(&addr);
+                                self.handle_sessions.remove(&addr);
+                            }
+                        }
+                    }
                     ProxyRequest::UpdateConfig(input_config) => {
                         self.input_config = input_config;
                     }
                 }
             }
         }
+        let _ = self.cleanup.retry().await;
+        self.cleanup
     }
 
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
+        if !self.cleanup.retry().await {
+            return Err(input_emulation::EmulationError::Io(std::io::Error::other(
+                "previous input backend cleanup is incomplete; replacement was refused",
+            ))
+            .into());
+        }
+        if self.exit_requested.get() {
+            return Ok(());
+        }
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
             r = InputEmulation::new(self.backend, self.options, self.input_config) => r?,
-            // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
 
-        // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
             EmulationEvent::EmulationEnabled,
             EmulationEvent::EmulationDisabled,
         );
 
-        // create active handles
-        match self.create_clients(&mut emulation).await {
-            Ok(true) => {}
-            Ok(false) => {
-                emulation.terminate().await;
-                return Ok(());
-            }
-            Err(e) => {
-                emulation.terminate().await;
-                return Err(e);
-            }
+        let res = match self.create_clients(&mut emulation).await {
+            Ok(true) => self.do_emulation_session(&mut emulation).await,
+            Ok(false) => Ok(()),
+            Err(e) => Err(e),
+        };
+        self.cleanup = CleanupState::Pending(emulation);
+        if !self.cleanup.retry().await {
+            log::warn!("input cleanup incomplete; retaining backend and pressed state for retry");
         }
-
-        let res = self.do_emulation_session(&mut emulation).await;
-        // FIXME replace with async drop when stabilized
-        emulation.terminate().await;
         res
     }
 
@@ -1088,11 +1156,53 @@ mod resume_tests {
                 handle_sessions: Default::default(),
                 next_id: 0,
                 operation_timeout: Duration::from_millis(20),
+                cleanup: CleanupState::Complete,
                 input_config: Default::default(),
             },
             tx,
             event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn cleanup_ownership_survives_failed_retries_and_moves_to_owner() {
+        struct Backend {
+            ready: Rc<Cell<bool>>,
+            drops: Rc<Cell<usize>>,
+            attempts: Rc<Cell<usize>>,
+        }
+        impl CleanupBackend for Backend {
+            async fn cleanup(&mut self) -> bool {
+                self.attempts.set(self.attempts.get() + 1);
+                self.ready.get()
+            }
+        }
+        impl Drop for Backend {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let ready = Rc::new(Cell::new(false));
+        let drops = Rc::new(Cell::new(0));
+        let attempts = Rc::new(Cell::new(0));
+        let mut worker = CleanupState::Pending(Backend {
+            ready: ready.clone(),
+            drops: drops.clone(),
+            attempts: attempts.clone(),
+        });
+        assert!(!worker.retry().await);
+        assert_eq!(drops.get(), 0);
+        let mut owner = worker;
+        assert!(!owner.retry().await);
+        assert_eq!(drops.get(), 0);
+        ready.set(true);
+        assert!(owner.retry().await);
+        assert_eq!(drops.get(), 1);
+        assert!(owner.retry().await);
+        assert_eq!(attempts.get(), 3);
+        let mut failed: CleanupState<Backend> = CleanupState::Failed;
+        assert!(!failed.retry().await);
+        assert!(!failed.retry().await);
     }
 
     fn press() -> Event {
@@ -1613,6 +1723,7 @@ mod resume_tests {
             next_id: 0,
             operation_timeout: Duration::from_millis(20),
             input_config: Default::default(),
+            cleanup: CleanupState::Complete,
         };
         let mut emulation = InputEmulation::new(
             Some(input_emulation::Backend::Dummy),

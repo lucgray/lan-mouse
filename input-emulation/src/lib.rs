@@ -44,6 +44,7 @@ pub type EmulationHandle = u64;
 /// Cleanup must not block the emulation task forever, e.g. when a backend connection is
 /// backed up and flushing the key/button releases keeps returning `WouldBlock`.
 const DEFAULT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+const DEFAULT_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default delay before a held key begins repeating.
 pub const DEFAULT_KEY_REPEAT_DELAY: Duration = Duration::from_millis(500);
@@ -172,6 +173,8 @@ pub struct InputEmulation {
     input_config: InputConfig,
     /// Bound applied to each backend operation during cleanup.
     cleanup_timeout: Duration,
+    termination_timeout: Duration,
+    last_cleanup_handle: Option<EmulationHandle>,
 }
 
 /// Delivery state for one key or pointer-button transition.
@@ -225,6 +228,8 @@ impl InputEmulation {
             handles: HashMap::new(),
             input_config,
             cleanup_timeout: DEFAULT_CLEANUP_TIMEOUT,
+            termination_timeout: DEFAULT_TERMINATION_TIMEOUT,
+            last_cleanup_handle: None,
         })
     }
 
@@ -332,8 +337,9 @@ impl InputEmulation {
     /// Both steps are bounded by an internal timeout so that a stalled backend cannot block
     /// cleanup indefinitely. Returns `false` when releasing the tracked input or destroying
     /// the backend did not complete successfully (including a timeout); in that case the
-    /// handle and its tracked input remain registered so a later
-    /// [`terminate`](Self::terminate) (or another `destroy_bounded`) can retry.
+    /// handle and unconfirmed input remain registered so a later
+    /// [`terminate_bounded`](Self::terminate_bounded) (or another `destroy_bounded`)
+    /// can retry. Confirmed individual releases leave the ledger immediately.
     pub async fn destroy_bounded(&mut self, handle: EmulationHandle) -> bool {
         let Some(tracked) = self.handles.get(&handle) else {
             return true;
@@ -343,7 +349,7 @@ impl InputEmulation {
 
         let released = tokio::time::timeout(
             self.cleanup_timeout,
-            Self::release_tracked(&mut *self.emulation, handle, &keys, &buttons),
+            self.release_tracked(handle, &keys, &buttons),
         )
         .await;
 
@@ -363,23 +369,41 @@ impl InputEmulation {
         true
     }
 
-    /// Release all tracked input for every handle and terminate the backend.
-    ///
-    /// Each per-handle cleanup and the final backend terminate are bounded by an internal
-    /// timeout, so a stalled backend cannot block termination indefinitely. The total time is
-    /// therefore bounded by `cleanup_timeout * (2 * handles + 1)`, i.e. linear in the handle
-    /// count, which is itself bounded by the number of known peer addresses. The handle set is
-    /// snapshotted once, so a failing cleanup cannot extend the loop.
+    /// Compatibility wrapper; use `terminate_bounded` when failed cleanup must
+    /// remain observable and the instance must be kept for retry.
     pub async fn terminate(&mut self) {
-        for handle in self.handles.keys().copied().collect::<Vec<_>>() {
-            let _ = self.destroy_bounded(handle).await;
-        }
-        if tokio::time::timeout(self.cleanup_timeout, self.emulation.terminate())
-            .await
-            .is_err()
-        {
-            log::warn!("terminating emulation did not complete in time");
-        }
+        let _ = self.terminate_bounded().await;
+    }
+
+    /// Try cleanup within one aggregate deadline (one second by default).
+    /// Returns true only after all handles and the backend termination complete.
+    /// Failed input remains tracked and the backend is not terminated while
+    /// unreleased handles remain. Retain this instance to retry a false result.
+    /// Cleanup rotates between handles so an early stalled peer cannot starve
+    /// every later peer on each retry. Deadlines cover yielding operations only.
+    pub async fn terminate_bounded(&mut self) -> bool {
+        self.emulation.stop_repeating();
+        tokio::time::timeout(self.termination_timeout, async {
+            let mut handles = self.handles.keys().copied().collect::<Vec<_>>();
+            handles.sort_unstable();
+            let start = self
+                .last_cleanup_handle
+                .and_then(|last| handles.iter().position(|&handle| handle > last))
+                .unwrap_or(0);
+            for offset in 0..handles.len() {
+                let handle = handles[(start + offset) % handles.len()];
+                self.last_cleanup_handle = Some(handle);
+                let _ = self.destroy_bounded(handle).await;
+            }
+            if !self.handles.is_empty() {
+                return false;
+            }
+            tokio::time::timeout(self.cleanup_timeout, self.emulation.terminate())
+                .await
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Release all keys currently tracked as pressed for `handle`.
@@ -392,13 +416,7 @@ impl InputEmulation {
             .get(&handle)
             .map(|tracked| tracked.keys.keys().copied().collect::<Vec<_>>())
             .unwrap_or_default();
-        Self::release_tracked(&mut *self.emulation, handle, &keys, &[]).await?;
-        if let Some(tracked) = self.handles.get_mut(&handle) {
-            for key in keys {
-                tracked.keys.remove(&key);
-            }
-        }
-        Ok(())
+        self.release_tracked(handle, &keys, &[]).await
     }
 
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {
@@ -485,7 +503,7 @@ impl InputEmulation {
     /// Sending a release for input the backend never applied is harmless, so a superset of
     /// the actual backend state is released.
     async fn release_tracked(
-        emulation: &mut dyn Emulation,
+        &mut self,
         handle: EmulationHandle,
         keys: &[u32],
         buttons: &[u32],
@@ -499,7 +517,9 @@ impl InputEmulation {
                 key,
                 state: 0,
             });
-            emulation.consume(event, handle).await?;
+            self.track_key(handle, key, 0);
+            self.emulation.consume(event, handle).await?;
+            self.complete_key_transition(handle, key, 0);
         }
 
         for &button in buttons {
@@ -509,7 +529,9 @@ impl InputEmulation {
                 button,
                 state: 0,
             });
-            emulation.consume(event, handle).await?;
+            self.track_button(handle, button, 0);
+            self.emulation.consume(event, handle).await?;
+            self.complete_button_transition(handle, button, 0);
         }
 
         let event = Event::Keyboard(KeyboardEvent::Modifiers {
@@ -518,7 +540,7 @@ impl InputEmulation {
             locked: 0,
             group: 0,
         });
-        emulation.consume(event, handle).await
+        self.emulation.consume(event, handle).await
     }
 
     pub fn update_config(&mut self, input_config: InputConfig) {
@@ -528,6 +550,8 @@ impl InputEmulation {
 
 #[async_trait]
 trait Emulation: Send {
+    /// Stop generating repeats without closing the backend needed for release.
+    fn stop_repeating(&mut self) {}
     async fn consume(
         &mut self,
         event: Event,
@@ -561,6 +585,7 @@ mod tests {
         consumed: Vec<(EmulationHandle, Event)>,
         destroyed: Vec<EmulationHandle>,
         terminated: bool,
+        repeat_stopped: bool,
         /// `consume` waits forever for this event instead of recording it
         stall_on: Option<Event>,
         /// `consume` records this event and then returns an error
@@ -588,6 +613,9 @@ mod tests {
 
     #[async_trait]
     impl Emulation for MockEmulation {
+        fn stop_repeating(&mut self) {
+            self.control.lock().unwrap().repeat_stopped = true;
+        }
         async fn consume(
             &mut self,
             event: Event,
@@ -644,6 +672,8 @@ mod tests {
             handles: HashMap::new(),
             input_config: InputConfig::default(),
             cleanup_timeout: Duration::from_millis(20),
+            termination_timeout: Duration::from_millis(60),
+            last_cleanup_handle: None,
         }
     }
 
@@ -876,6 +906,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_termination_retains_backend_until_releases_recover() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+        emulation.consume(key_event(29, 1), 0).await.unwrap();
+        control.lock().unwrap().stall_on = Some(key_event(29, 0));
+        assert!(!emulation.terminate_bounded().await);
+        assert!(emulation.has_pressed_keys(0));
+        {
+            let mut control = control.lock().unwrap();
+            assert!(control.repeat_stopped);
+            assert!(
+                !control.terminated,
+                "release transport must remain available"
+            );
+            control.stall_on = None;
+        }
+        assert!(emulation.terminate_bounded().await);
+        assert!(emulation.handles.is_empty());
+        assert!(control.lock().unwrap().terminated);
+    }
+
+    #[tokio::test]
+    async fn cleanup_commits_partial_release_before_later_failure() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+        emulation.consume(key_event(29, 1), 0).await.unwrap();
+        emulation.consume(button_event(272, 1), 0).await.unwrap();
+        control.lock().unwrap().stall_on = Some(button_event(272, 0));
+        assert!(!emulation.destroy_bounded(0).await);
+        assert!(!emulation.has_pressed_keys(0));
+        assert!(emulation.handles[&0].buttons.contains_key(&272));
+        // A confirmed key release must not suppress a later legitimate press.
+        emulation.consume(key_event(29, 1), 0).await.unwrap();
+        assert!(emulation.has_pressed_keys(0));
+        control.lock().unwrap().stall_on = None;
+        assert!(emulation.destroy_bounded(0).await);
+        let control = control.lock().unwrap();
+        assert_eq!(
+            control
+                .consumed
+                .iter()
+                .filter(|(_, e)| *e == key_event(29, 1))
+                .count(),
+            2
+        );
+        assert_eq!(
+            control
+                .consumed
+                .iter()
+                .filter(|(_, e)| *e == key_event(29, 0))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_cleanup_deadline_rotates_to_later_healthy_handles() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        for handle in 0..8 {
+            emulation.create(handle).await;
+            emulation
+                .consume(key_event(if handle == 7 { 31 } else { 30 }, 1), handle)
+                .await
+                .unwrap();
+        }
+        control.lock().unwrap().stall_on = Some(key_event(30, 0));
+        let start = Instant::now();
+        assert!(!emulation.terminate_bounded().await);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for _ in 0..4 {
+            assert!(!emulation.terminate_bounded().await);
+            if !emulation.handles.contains_key(&7) {
+                break;
+            }
+        }
+        assert!(
+            !emulation.handles.contains_key(&7),
+            "stalled early peers starved a healthy later peer"
+        );
+        assert!(emulation.has_pressed_keys(0));
+        assert!(!control.lock().unwrap().terminated);
+        control.lock().unwrap().stall_on = None;
+        assert!(emulation.terminate_bounded().await);
+    }
+
+    #[tokio::test]
     async fn terminate_is_bounded_across_many_stalled_handles() {
         let (_, control) = MockEmulation::new();
         let mut emulation = emulation_with(&control);
@@ -886,8 +1005,7 @@ mod tests {
             emulation.consume(key_event(30, 1), handle).await.unwrap();
         }
 
-        // Every release stalls, so each handle adds one cleanup timeout to the
-        // worst-case total; the snapshot loop is still finite and completes.
+        // One aggregate deadline bounds the attempt despite 32 stalled peers.
         control.lock().unwrap().stall_on = Some(key_event(30, 0));
         let start = Instant::now();
         tokio::time::timeout(Duration::from_secs(10), emulation.terminate())
@@ -914,11 +1032,15 @@ mod tests {
 
         control.lock().unwrap().stall_terminate = true;
         // terminate must return even though the backend terminate never completes
-        tokio::time::timeout(Duration::from_secs(1), emulation.terminate())
-            .await
-            .expect("terminate must be bounded");
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), emulation.terminate_bounded())
+                .await
+                .expect("terminate must be bounded")
+        );
         assert!(control.lock().unwrap().terminated);
         assert!(emulation.handles.is_empty());
+        control.lock().unwrap().stall_terminate = false;
+        assert!(emulation.terminate_bounded().await);
     }
 
     #[test]
