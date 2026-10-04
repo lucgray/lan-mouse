@@ -115,8 +115,16 @@ coalesce to one per configured target and carry weak connection identity plus
 target revision; a stale close cannot release a replacement or another target.
 The heartbeat worker also performs current-session cleanup directly when it
 ends, without relying on recv waking after close. Heartbeat sends have a
-one-second deadline and reject incomplete sends. Ordinary input send waits still
-need a separate bounded policy, and native cursor recovery needs hardware tests.
+one-second deadline and reject incomplete sends. Ordinary input sends (including connection-table lookup) share a 250 ms deadline
+and reject short writes. Failure retires only the captured session; transport
+close runs independently of local pointer release. Capture shutdown cancels
+in-flight sends. Local release happens before cleanup network traffic; all key
+releases, zero modifiers and Leave share one 250 ms cleanup budget pinned to the
+original transport and target revision. Cleanup never opens a new connection.
+Input buffered after release or for another handle cannot send Enter without a
+fresh Begin. An empty release key binding is disabled. These deadlines bound
+network waits and are not an end-to-end latency measurement; native cursor
+recovery still requires hardware tests.
 
 Frontend notifications use an ordered writer per IPC connection, with a queue
 of 64 messages and a two-second write deadline. Each JSON line is written in

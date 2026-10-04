@@ -15,7 +15,9 @@
 | R46 | 已实现并通过真实 GTK 属性回归 | 认证说明 GtkLabel.wrap 原非法 word-wrap 已改布尔 True，wrap-mode=word-char；最终测试无原模板警告 |
 | R48 | 已实现并通过真实 DTLS / Service 回归 | 剪贴板接收脱离捕获任务；Pong(false) 不阻断共享，入站无需 Enter；旧目标/连接消息过滤，最终已接收 Leave 仍可释放捕获 |
 | R49 | 已实现并通过真实 DTLS 捕获会话回归 | 断线独立通知、每目标一项合并、Weak/配置版本校验；无输入/Leave 仍释放、清修饰键及 remap；心跳结束直接清理，发送一秒期限/短发送检查；真实后端光标与输入等待见 R50 |
-| R50 | 待修复 | 普通输入 send 没有期限，在捕获会话处理器内 await；挂起时不能处理释放绑定、断线通知或退出，需有界失败策略及真正会话回归 |
+| R50 | 已实现并通过发送/生产捕获会话回归 | 输入/锁等待共享 250ms 期限、短发送错误、退出取消；本机先释放，清理批次 250ms 且固定旧 Arc/目标版本；真实后端/完整延迟仍待验 |
+| R51 | 已实现并通过生产捕获会话回归 | 释放后或其他 handle 的旧 Input 被过滤；需新的 Begin 才可进入；Dummy 持续产生旧输入仍无后续发送 |
+| R52 | 已实现并通过生产捕获会话回归 | 空 release_bind 不再被 all(empty) 误当按下；夹具确实发送 Enter，不进入错误的释放清理路径 |
 | R47 | 待修复 | 人工指纹输入只 trim，服务直接存储原字符串；空值、错误长度/大小写格式可被存入授权但不匹配运行指纹，应做统一格式校验和用户反馈 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
 | R40 | 已实现并通过监控队列回归 | 本地队列携带监控/写入代次，消费时过滤旧事件/禁用/远端写入；切换重新采样；失败保持缓存并标记新代次刷新，旧采样不能清除；阻塞发送前释放锁 |
@@ -35,7 +37,7 @@
 | R28 | 已实现并通过错误后恢复回归 | watcher 错误传播而非 panic，服务提示失败并保留旧状态；后续有效编辑仍能读取 |
 | R24 | 已实现并通过 Windows 原生 CI | 通知 ready 前以 PeekMessage 创建线程队列；原生测试在首个投递前禁止其他建队列 API，af0ff03 的 Windows 测试已通过 |
 | R02 | 已实现并通过队列/连接状态回归 | 256 条保序有界队列，积压时合并相邻 motion；超载立即恢复本机透传，清空旧队列并禁用捕获，取消目标连接/心跳并提示；Windows CI 编译、队列与启动原生回归通过；hook 拥塞及双机人工验收待实测 |
-| R03 | 已实现并通过回归 | transport 发送拒绝时输入/剪贴板均返回 Err 并清理 active_addr |
+| R03 | 已实现并通过回归 | transport 拒绝、输入短发送及超时返回 Err 并清理当前会话；发送/表锁期限和批次清理见 R50 |
 | R04 | 已实现并通过回归 | 100 次小数运动累计 40，反向运动总量归零；真机低速体验待验 |
 | R05、R06 | 已实现并通过回归 | 两个接收方向共用帧解码；图片、截断帧、后续 Ping、旧式 padded 帧测试通过 |
 | R10 | 已实现 | blocking_send 前释放缓存锁；工作区编译/测试通过，调度拥塞复现仍待补 |
@@ -863,3 +865,29 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 上一 HEAD 33fb133 的 Rust run 37189451064 当次检查：除 macOS Intel build 尚运行，其他 16 项均成功；本轮需要新 HEAD CI。评分和完整性能/长期门槛仍未闭环，不认定 90 分。
 
 日志：disconnect-release-workspace.log、disconnect-release-clippy.log、disconnect-release-clipboard-service.log。
+
+
+## 第三十五轮：输入发送期限与先释放再清理
+
+### R50 / P1
+
+- [x] 普通固定帧发送、连接表和握手队列锁等待共享从请求开始算起的 250 ms 期限；目标取消可打断等待。短发送不再当成功。拒绝/超时只清理具体 Arc，不清替换连接或其他设备。
+- [x] 正常失败先同步 try_lock 清理会话状态并发布关闭通知，网络 close 独立执行；表锁忙时清理另行排队，不延长捕获处理器的发送等待。关闭有原有一秒上限。
+- [x] CaptureTask 的普通输入和 Ack 后补发修饰键统一走可被捕获退出取消的 forward_input；失败立即走不通知远端的本地释放。断线路径和一般释放均清 pending modifiers、remap 和 WaitingForAck 状态。
+- [x] 先 drain 已按键并根据 remap 构造释放消息，再恢复本机指针；网络按键释放/修饰键清零/Leave 只在指针释放以后发送，全部合计一个 250 ms 期限。清理目标在释放前固定到原连接/配置版本，不尝试建立连接；连接替换时不误发新会话。退出取消无需等完整网络期限。
+
+### R51 / P1 与 R52 / P2
+
+- [x] 释放后残留 Input 原来仍能在 WaitingForAck 状态发送 Enter，可能反复进入/连接；多个 handle 共享边缘时也可能转发给非当前设备。现在只有当前 active_client 的 Input 可以转发，其他/已释放输入被过滤，必须有新的 Begin。
+- [x] 空 release_bind 被 keys_pressed 的 all(empty) 判断成已按下，会每次释放。现在空组合明确禁用；新的生产会话测试验证第一帧确实是 Enter，排除了误测网络清理路径。
+
+### 验证与边界
+
+- Linux all-features 工作区通过：主包 114 / 2 默认忽略；GTK 14 / 4 默认忽略；input-capture 33 / 1 默认忽略。严格 all-targets Clippy、格式和 diff 检查通过。
+- 发送夹具验证永不完成的 send 与 close、短发送、锁拥塞超时后清理、100 条清理消息只消费一个总期限、替换连接不接收旧清理、健康连接批次顺序。
+- 生产 CaptureTask 会话使用 Dummy 和受控 Conn：真实 Enter 发送挂起，排队 Release 在发送期限内恢复；shutdown 可取消等待；持续消费释放后的 Dummy 旧输入没有后续发送；active/pending/state 清理，健康 release_to 后发送零修饰键再 Leave。
+- 真实 DTLS 的静止捕获断线回归继续通过；默认忽略的真实 DTLS 剪贴板双路/重连 Service 回归另行执行通过。
+- 250 ms 是网络等待失败上限，不是 p95/p99 性能成绩。Dummy 的 release/release_to 是空实现，不能证明 Windows/Hyprland 原生光标移动或系统调用延迟；真实后端挂起、网络抖动时期限选择、千次双机往返、输入延迟与八小时 RSS 仍需验收。
+- 上一 HEAD 63dbe48 Rust run 37189908037 已完成成功，Linux/Windows/macOS Intel/ARM 的测试、构建、check、Clippy 与格式 17 项通过；33fb133 run 37189451064 被后续 push 取消，不记为完整成功。本轮 HEAD 仍需自己的 CI。
+
+日志：input-send-deadline-workspace.log、input-send-deadline-clippy.log、input-send-deadline-service.log；审查和修复继续推进，整体 90 分仍未获完整证据。

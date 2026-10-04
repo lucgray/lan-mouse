@@ -40,9 +40,13 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
+    #[error("incomplete input send: {sent} of {expected} bytes")]
+    Incomplete { sent: usize, expected: usize },
     #[error("clipboard send is busy; copy again")]
     ClipboardBusy,
 }
+
+const INPUT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -104,6 +108,12 @@ async fn connect_any(
             },
         };
     }
+}
+
+pub(crate) struct CleanupTarget {
+    target: Target,
+    addr: SocketAddr,
+    conn: Connection,
 }
 
 type Connection = Arc<dyn Conn + Send + Sync>;
@@ -289,6 +299,56 @@ impl LanMouseConnection {
         }
     }
 
+    pub(crate) fn prepare_cleanup(&self, handle: ClientHandle) -> Option<CleanupTarget> {
+        let target = self.sender.target(handle)?;
+        let addr = self.sender.client_manager.active_addr(handle)?;
+        let table = self.sender.conns.try_lock().ok()?;
+        let (_, conn) = table.get(&handle).filter(|(current, _)| *current == addr)?;
+        Some(CleanupTarget {
+            target,
+            addr,
+            conn: conn.clone(),
+        })
+    }
+
+    pub(crate) async fn send_cleanup(
+        &self,
+        cleanup: CleanupTarget,
+        events: Vec<ProtoEvent>,
+    ) -> Result<(), LanMouseConnectionError> {
+        let deadline = tokio::time::Instant::now() + INPUT_SEND_TIMEOUT;
+        for event in events {
+            if !self
+                .sender
+                .client_manager
+                .target_is_current(cleanup.target.handle, cleanup.target.revision)
+                || !self.sender.conns.try_lock().ok().is_some_and(|table| {
+                    table
+                        .get(&cleanup.target.handle)
+                        .is_some_and(|(_, conn)| Arc::ptr_eq(conn, &cleanup.conn))
+                })
+            {
+                return Err(LanMouseConnectionError::NotConnected);
+            }
+            let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+            let result = tokio::select! {
+                _ = cleanup.target.cancellation.cancelled() => Err(LanMouseConnectionError::NotConnected),
+                result = tokio::time::timeout_at(deadline, cleanup.conn.send(&bytes[..len])) => match result {
+                    Ok(Ok(sent)) if sent == len => Ok(()),
+                    Ok(Ok(sent)) => Err(LanMouseConnectionError::Incomplete { sent, expected: len }),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(LanMouseConnectionError::Timeout),
+                }
+            };
+            if let Err(error) = result {
+                self.sender
+                    .queue_disconnect(cleanup.target.handle, cleanup.addr, cleanup.conn);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -424,6 +484,57 @@ impl LanMouseConnectionSender {
         }
     }
 
+    fn queue_disconnect(&self, handle: ClientHandle, addr: SocketAddr, conn: Connection) {
+        if let Ok(mut current) = self.conns.try_lock() {
+            if current
+                .get(&handle)
+                .is_some_and(|(_, old)| Arc::ptr_eq(old, &conn))
+            {
+                current.remove(&handle);
+                self.closed.publish(&self.client_manager, handle, &conn);
+                if self.client_manager.active_addr(handle) == Some(addr) {
+                    self.client_manager.set_active_addr(handle, None);
+                    self.client_manager.set_peer_commit(handle, None);
+                    self.client_manager.set_alive(handle, false);
+                }
+            }
+            drop(current);
+            // Only transport close is detached; current-session state is already
+            // invalidated before the failed send returns to capture.
+            tokio::spawn(async move {
+                close_connection(&conn).await;
+            });
+        } else {
+            let sender = self.clone();
+            spawn_local(async move {
+                disconnect(
+                    &sender.client_manager,
+                    handle,
+                    addr,
+                    &conn,
+                    &sender.conns,
+                    &sender.closed,
+                )
+                .await;
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_test_connection(
+        &self,
+        handle: ClientHandle,
+        addr: SocketAddr,
+        conn: Connection,
+    ) {
+        self.client_manager.set_active_addr(handle, Some(addr));
+        self.client_manager.set_alive(handle, true);
+        self.peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&conn), "fixture".into()));
+        self.conns.lock().await.insert(handle, (addr, conn));
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
@@ -432,12 +543,23 @@ impl LanMouseConnectionSender {
         let target = self
             .target(handle)
             .ok_or(LanMouseConnectionError::NotConnected)?;
+        let deadline = tokio::time::Instant::now() + INPUT_SEND_TIMEOUT;
         log::trace!("sending {event} to client {handle}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
             let conn = {
-                let conns = self.conns.lock().await;
+                let conns = tokio::select! {
+                    _ = target.cancellation.cancelled() => return Err(LanMouseConnectionError::NotConnected),
+                    result = tokio::time::timeout_at(deadline, self.conns.lock()) => match result {
+                        Ok(table) => table,
+                        Err(_) => {
+                            let conn = self.peer_identities.borrow().get(&handle).and_then(|(conn, _)| conn.upgrade());
+                            if let Some(conn) = conn { self.queue_disconnect(handle, addr, conn); }
+                            return Err(LanMouseConnectionError::Timeout);
+                        }
+                    },
+                };
                 conns
                     .get(&handle)
                     .filter(|(a, _)| *a == addr)
@@ -447,31 +569,28 @@ impl LanMouseConnectionSender {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                let sent = tokio::select! {
-                    _ = target.cancellation.cancelled() => return Err(LanMouseConnectionError::NotConnected),
-                    result = conn.send(buf) => result,
+                let result = tokio::select! {
+                    _ = target.cancellation.cancelled() => Err(LanMouseConnectionError::NotConnected),
+                    result = tokio::time::timeout_at(deadline, conn.send(buf)) => match result {
+                        Ok(Ok(sent)) if sent == len => Ok(()),
+                        Ok(Ok(sent)) => Err(LanMouseConnectionError::Incomplete { sent, expected: len }),
+                        Ok(Err(error)) => Err(error.into()),
+                        Err(_) => Err(LanMouseConnectionError::Timeout),
+                    },
                 };
-                match sent {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(
-                            &self.client_manager,
-                            handle,
-                            addr,
-                            &conn,
-                            &self.conns,
-                            &self.closed,
-                        )
-                        .await;
-                        return Err(e.into());
-                    }
+                if let Err(error) = result {
+                    log::warn!("client {handle} input send failed: {error}");
+                    self.queue_disconnect(handle, addr, conn);
+                    return Err(error);
                 }
                 return Ok(());
             }
         }
 
-        let mut connecting = self.connecting.lock().await;
+        let mut connecting = tokio::select! {
+            _ = target.cancellation.cancelled() => return Err(LanMouseConnectionError::NotConnected),
+            result = tokio::time::timeout_at(deadline, self.connecting.lock()) => result.map_err(|_| LanMouseConnectionError::Timeout)?,
+        };
         if !self
             .client_manager
             .target_is_current(handle, target.revision)
@@ -796,15 +915,17 @@ async fn disconnect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct RefusedConnection {
-        closed: std::sync::atomic::AtomicBool,
-        short_send: bool,
-        stall_send: bool,
-        stall_close: bool,
+    pub(crate) struct RefusedConnection {
+        pub(crate) closed: std::sync::atomic::AtomicBool,
+        pub(crate) short_send: bool,
+        pub(crate) stall_send: bool,
+        pub(crate) stall_close: bool,
+        pub(crate) succeed_send: bool,
+        pub(crate) sent: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     #[async_trait::async_trait]
@@ -818,12 +939,15 @@ mod tests {
         async fn recv_from(&self, _: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
             unreachable!()
         }
-        async fn send(&self, _: &[u8]) -> webrtc_util::Result<usize> {
+        async fn send(&self, bytes: &[u8]) -> webrtc_util::Result<usize> {
+            self.sent.lock().unwrap().push(bytes.to_vec());
             if self.stall_send {
                 return std::future::pending().await;
             }
             if self.short_send {
                 Ok(0)
+            } else if self.succeed_send {
+                Ok(bytes.len())
             } else {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "test refusal").into())
             }
@@ -1142,6 +1266,154 @@ mod tests {
         assert!(!connection.sender.conns.lock().await.contains_key(&handle));
         assert!(connection.sender.conns.lock().await.contains_key(&other));
         connection.abort_capture(handle).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_connection_table_wait_is_bounded_and_cleans_after_contention() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let connection = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = connection.sender();
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let transport = Arc::new(RefusedConnection {
+                    succeed_send: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(handle, addr, transport.clone())
+                    .await;
+                let guard = sender.conns.lock().await;
+                assert!(matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(400),
+                        sender.send(ProtoEvent::Ping, handle)
+                    )
+                    .await
+                    .unwrap(),
+                    Err(LanMouseConnectionError::Timeout)
+                ));
+                assert!(transport.sent.lock().unwrap().is_empty());
+                drop(guard);
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    while clients.active_addr(handle).is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(connection.take_disconnected(), vec![handle]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_deadline_short_send_cleanup_budget_and_replacement_are_safe() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        for (stall, short) in [(true, false), (false, true)] {
+            let conn = Arc::new(RefusedConnection {
+                stall_send: stall,
+                stall_close: true,
+                short_send: short,
+                ..Default::default()
+            });
+            sender
+                .install_test_connection(handle, addr, conn.clone())
+                .await;
+            let result = tokio::time::timeout(
+                Duration::from_millis(400),
+                sender.send(ProtoEvent::Ack(0), handle),
+            )
+            .await
+            .unwrap();
+            if stall {
+                assert!(matches!(result, Err(LanMouseConnectionError::Timeout)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(LanMouseConnectionError::Incomplete { .. })
+                ));
+            }
+            assert!(clients.active_addr(handle).is_none());
+            assert_eq!(connection.take_disconnected(), vec![handle]);
+        }
+        let stalled = Arc::new(RefusedConnection {
+            stall_send: true,
+            ..Default::default()
+        });
+        sender
+            .install_test_connection(handle, addr, stalled.clone())
+            .await;
+        let cleanup = connection.prepare_cleanup(handle).unwrap();
+        let events = vec![ProtoEvent::Ack(0); 100];
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(400),
+                connection.send_cleanup(cleanup, events)
+            )
+            .await
+            .unwrap(),
+            Err(LanMouseConnectionError::Timeout)
+        ));
+        assert_eq!(stalled.sent.lock().unwrap().len(), 1);
+        let old = Arc::new(RefusedConnection {
+            succeed_send: true,
+            ..Default::default()
+        });
+        sender
+            .install_test_connection(handle, addr, old.clone())
+            .await;
+        let cleanup = connection.prepare_cleanup(handle).unwrap();
+        let replacement = Arc::new(RefusedConnection {
+            succeed_send: true,
+            ..Default::default()
+        });
+        sender
+            .install_test_connection(handle, addr, replacement.clone())
+            .await;
+        assert!(
+            connection
+                .send_cleanup(cleanup, vec![ProtoEvent::Leave(0, 0.5)])
+                .await
+                .is_err()
+        );
+        assert!(old.sent.lock().unwrap().is_empty());
+        assert!(replacement.sent.lock().unwrap().is_empty());
+        assert_eq!(clients.active_addr(handle), Some(addr));
+        let cleanup = connection.prepare_cleanup(handle).unwrap();
+        let events = vec![
+            ProtoEvent::Ack(0),
+            ProtoEvent::Pong(true),
+            ProtoEvent::Leave(0, 0.5),
+        ];
+        connection
+            .send_cleanup(cleanup, events.clone())
+            .await
+            .unwrap();
+        let received: Vec<_> = replacement
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|bytes| lan_mouse_proto::decode_event_frame(bytes).unwrap())
+            .collect();
+        assert_eq!(received.len(), events.len());
+        for (actual, expected) in received.iter().zip(events) {
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

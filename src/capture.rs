@@ -419,10 +419,7 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             if let Some(mods) = self.pending_modifiers.take() {
-                                let _ = self
-                                    .conn
-                                    .send(ProtoEvent::Input(Event::Keyboard(mods)), handle)
-                                    .await;
+                                self.forward_input(capture, ProtoEvent::Input(Event::Keyboard(mods)), handle).await?;
                             }
                         }
                         // client disconnected
@@ -506,7 +503,11 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
-        if capture.keys_pressed(&self.release_bind.borrow()) {
+        let release_engaged = {
+            let bind = self.release_bind.borrow();
+            !bind.is_empty() && capture.keys_pressed(&bind)
+        };
+        if release_engaged {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture, None).await;
         }
@@ -538,6 +539,12 @@ impl CaptureTask {
                 capture.release().await?;
             }
             // we dont care about events from incoming handles except for releasing the capture
+            return Ok(());
+        }
+
+        // Input buffered before release or routed for another handle must not
+        // re-enter a peer without a fresh Begin for that target.
+        if matches!(event, CaptureEvent::Input(_)) && self.active_client != Some(handle) {
             return Ok(());
         }
 
@@ -584,20 +591,30 @@ impl CaptureTask {
         };
 
         for event in events {
-            if let Err(e) = self.conn.send(event, handle).await {
-                const DUR: Duration = Duration::from_millis(500);
-                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-                // Funnel through release_capture so the leave_hook
-                // fires and active_client is cleared (without this the
-                // active_client field would stay stale until the next
-                // Begin from a different handle). The send just failed, so
-                // skip the key-up/Leave messages: they fail the same way and
-                // each logs a warning on every edge crossing.
-                self.release_capture_with(capture, false, None).await?;
+            if !self.forward_input(capture, event, handle).await? {
                 break;
             }
         }
         Ok(())
+    }
+
+    async fn forward_input(
+        &mut self,
+        capture: &mut InputCapture,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+    ) -> Result<bool, CaptureError> {
+        let result = tokio::select! {
+            _ = self.cancellation_token.cancelled() => Err(crate::connect::LanMouseConnectionError::NotConnected),
+            result = self.conn.send(event, handle) => result,
+        };
+        if let Err(error) = result {
+            const DUR: Duration = Duration::from_millis(500);
+            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {error}"));
+            self.release_capture_with(capture, false, None).await?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     async fn handle_disconnected(
@@ -634,79 +651,51 @@ impl CaptureTask {
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
         self.pending_modifiers = None;
-        // If we have an active client, notify them we're leaving
-        if let Some(handle) = self.active_client.take() {
-            // Surface the leave to the service layer so it can fire
-            // the per-client leave_hook. Sent before the network
-            // teardown below so we never race against the peer
-            // disappearing.
-            self.event_tx
-                .send(ICaptureEvent::ClientLeft(handle))
-                .expect("channel closed");
-            if !notify_peer {
-                capture.take_pressed_keys();
-                return match warp_to {
-                    Some(t) => capture.release_to(t).await,
-                    None => capture.release().await,
-                };
-            }
-            // Synthesize key-up events for every key still held in the
-            // capture's pressed_keys set BEFORE sending Leave. Without
-            // this, pressing the release-bind chord (typically all four
-            // modifiers) leaves the peer with phantom held modifiers:
-            // the down events were forwarded while capture was active,
-            // but the matching up events arrive after the local tap
-            // flips to passthrough and never reach the peer. The peer
-            // then runs every subsequent keystroke through those held
-            // mods until its watchdog times out (1+ s) or our Leave
-            // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
-                // `pressed_keys` holds the *physical* keys, so these
-                // have to go through the same remap the down events
-                // did — otherwise the peer is released from a key it
-                // was never pressed with and keeps holding the one it
-                // actually got. A key still `pending` on an unresolved
-                // chord never had a down event sent for it at all —
-                // `release_key` reports `None` for those, and no
-                // key-up should be synthesized either.
-                let Some(target) = self.remap.release_key(key) else {
-                    continue;
-                };
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+        self.state = State::WaitingForAck;
+        let active = self.active_client.take();
+        let cleanup = active
+            .filter(|_| notify_peer)
+            .and_then(|handle| self.conn.prepare_cleanup(handle));
+        let mut events = Vec::new();
+        for key in capture.take_pressed_keys() {
+            if let Some(target) = self.remap.release_key(key) {
+                events.push(ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: target as u32,
                     state: 0,
-                }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
-                    log::warn!("failed to send key-up to client {handle}: {e}");
-                }
-            }
-            // Reset the modifier mask too. The peer's input-emulation
-            // layer keeps a separate XKB-style modifier state that's
-            // updated by KeyboardEvent::Modifiers, distinct from the
-            // pressed_keys set drained above. Without this, an
-            // already-locked CapsLock would survive the release.
-            let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                depressed: 0,
-                latched: 0,
-                locked: 0,
-                group: 0,
-            }));
-            if let Err(e) = self.conn.send(mods_zero, handle).await {
-                log::warn!("failed to reset modifiers on client {handle}: {e}");
-            }
-
-            log::info!("sending Leave event to client {handle}");
-            // the peer doesn't act on this `t` — it's *our* Leave,
-            // stopping capture towards them, not a hand-back to us
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0, 0.5), handle).await {
-                log::warn!("failed to send Leave to client {handle}: {e}");
+                })));
             }
         }
+        self.remap.reset_session();
+        if let Some(handle) = active {
+            self.event_tx
+                .send(ICaptureEvent::ClientLeft(handle))
+                .expect("channel closed");
+        }
+        // Restore the local pointer before any network cleanup. Key-ups, modifier
+        // reset and Leave share one deadline and stay pinned to the old transport.
         match warp_to {
-            Some(t) => capture.release_to(t).await,
-            None => capture.release().await,
+            Some(t) => capture.release_to(t).await?,
+            None => capture.release().await?,
         }
+        if let Some(cleanup) = cleanup {
+            events.push(ProtoEvent::Input(Event::Keyboard(
+                KeyboardEvent::Modifiers {
+                    depressed: 0,
+                    latched: 0,
+                    locked: 0,
+                    group: 0,
+                },
+            )));
+            events.push(ProtoEvent::Leave(0, 0.5));
+            tokio::select! {
+                _ = self.cancellation_token.cancelled() => {},
+                result = self.conn.send_cleanup(cleanup, events) => if let Err(error) = result {
+                    log::warn!("capture release network cleanup failed: {error}");
+                },
+            }
+        }
+        Ok(())
     }
 }
 
@@ -775,6 +764,74 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_input_releases_on_deadline_and_shutdown_cancels_without_waiting() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            for shutdown in [false, true] {
+                let clients = ClientManager::default(); let handle = clients.add_client(); clients.activate_client(handle);
+                let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients.clone());
+                let sender = conn.sender();
+                let transport = Arc::new(RefusedConnection { stall_send: true, stall_close: true, ..Default::default() });
+                sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+                let (event_tx, mut events) = channel(); let (requests, request_rx) = channel();
+                let token = CancellationToken::new();
+                let mut task = CaptureTask {
+                    active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                    cancellation_token: token.clone(), captures: vec![(handle, Position::Left, CaptureType::Default)], conn,
+                    event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                    remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                    jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                    window_identifier: Default::default(), enter_t: 0.5,
+                    pending_modifiers: Some(KeyboardEvent::Modifiers { depressed: 64, latched: 0, locked: 0, group: 0 }),
+                };
+                let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+                capture.create(handle, Position::Left).await.unwrap();
+                tokio::time::timeout(Duration::from_millis(700), async {
+                    let session = task.do_capture_session(&mut capture); tokio::pin!(session);
+                    let control = async {
+                        while transport.sent.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+                        if shutdown { token.cancel(); }
+                        else {
+                            requests.send(CaptureRequest::Release).unwrap();
+                            loop { if matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle) { break; } }
+                            // Dummy keeps emitting input after release. Those old
+                            // events cannot send Enter or reconnect the failed peer.
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            token.cancel();
+                        }
+                    };
+                    tokio::pin!(control);
+                    tokio::select! {
+                        result = &mut session => { assert!(shutdown); result.unwrap(); },
+                        _ = &mut control => { session.await.unwrap(); },
+                    }
+                }).await.unwrap();
+                assert!(task.active_client.is_none()); assert!(task.pending_modifiers.is_none());
+                assert_eq!(task.state, State::WaitingForAck);
+                assert_eq!(transport.sent.lock().unwrap().len(), 1); // no key-up reconnect/extra sends after failure.
+                assert!(matches!(lan_mouse_proto::decode_event_frame(&transport.sent.lock().unwrap()[0]).unwrap(), ProtoEvent::Enter(..))); // actual input path, not empty-bind cleanup.
+                if shutdown {
+                    assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureBegin(..)));
+                    assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+                }
+                assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+                let healthy = Arc::new(RefusedConnection { succeed_send: true, ..Default::default() });
+                sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), healthy.clone()).await;
+                task.active_client = Some(handle);
+                task.cancellation_token = CancellationToken::new();
+                task.release_capture(&mut capture, Some(0.25)).await.unwrap();
+                let packets: Vec<_> = healthy.sent.lock().unwrap().iter().map(|bytes| lan_mouse_proto::decode_event_frame(bytes).unwrap()).collect();
+                assert_eq!(packets.len(), 2);
+                assert!(matches!(packets[0], ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers { depressed: 0, latched: 0, locked: 0, group: 0 }))));
+                assert!(matches!(packets[1], ProtoEvent::Leave(..)));
+                assert!(task.active_client.is_none());
+                capture.terminate().await.unwrap(); sender.terminate().await;
+            }
+        }).await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn real_dtls_close_releases_idle_capture_without_input_or_leave() {
