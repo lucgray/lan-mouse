@@ -35,6 +35,7 @@ pub(crate) struct Emulation {
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
     clipboard_tx: tokio::sync::mpsc::Sender<ClipboardRequest>,
+    port_requests: tokio::sync::watch::Sender<Option<u16>>,
     clipboard_conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
     clipboard_generation: AtomicU64,
     clipboard_cancel: Mutex<CancellationToken>,
@@ -95,7 +96,6 @@ enum EmulationRequest {
     /// release the peer's capture, handing the cursor back at the
     /// given normalized cross-axis position
     Release(SocketAddr, f64),
-    ChangePort(u16),
     Terminate,
     UpdateScrollingInversion(bool),
     UpdateMouseSensitivity(f64),
@@ -117,6 +117,7 @@ impl Emulation {
         let (event_tx, event_rx) = channel();
         let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::channel(32);
         let clipboard_conns = listener.clipboard_connections();
+        let port_requests = listener.port_requests();
         let emulation_task = ListenTask {
             listener,
             emulation_proxy,
@@ -131,6 +132,7 @@ impl Emulation {
             event_rx,
             clipboard_tx,
             clipboard_conns,
+            port_requests,
             clipboard_generation: AtomicU64::new(0),
             clipboard_cancel: Mutex::new(CancellationToken::new()),
         }
@@ -202,9 +204,7 @@ impl Emulation {
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
-        self.request_tx
-            .send(EmulationRequest::ChangePort(port))
-            .expect("channel closed")
+        self.port_requests.send_replace(Some(port));
     }
 
     pub(crate) fn request_scrolling_inversion(&self, invert_scroll: bool) {
@@ -385,6 +385,9 @@ impl ListenTask {
                         self.emulation_proxy.remove(addr);
                         self.event_tx.send(EmulationEvent::ConnectionClosed { addr }).expect("channel closed");
                     }
+                    Some(ListenEvent::PortChanged(result)) => {
+                        self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                    }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
                             .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
@@ -409,11 +412,6 @@ impl ListenTask {
                         self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
                         self.emulation_proxy.update_config();
                     }
-                    EmulationRequest::ChangePort(port) => {
-                        self.listener.request_port_change(port);
-                        let result = self.listener.port_changed().await;
-                        self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
-                    }
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
@@ -437,8 +435,8 @@ impl ListenTask {
         }
         drop(control_jobs);
         drop(clipboard_jobs);
-        self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
+        self.listener.terminate().await;
     }
 }
 

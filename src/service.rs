@@ -826,11 +826,8 @@ impl Service {
     }
 
     fn change_port(&mut self, port: u16) {
-        if self.port != port {
-            self.emulation.request_port_change(port);
-        } else {
-            self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
-        }
+        // Even the current port supersedes an in-flight request for another port.
+        self.emulation.request_port_change(port);
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {

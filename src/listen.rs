@@ -1,4 +1,4 @@
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
@@ -29,6 +29,10 @@ pub enum ListenerCreationError {
     WebrtcUtil(#[from] webrtc_util::Error),
     #[error(transparent)]
     WebrtcDtls(#[from] webrtc_dtls::Error),
+    #[error("listener binding exceeded two seconds")]
+    BindTimeout,
+    #[error(transparent)]
+    Task(#[from] tokio::task::JoinError),
 }
 
 #[derive(Error, Debug)]
@@ -108,6 +112,7 @@ pub(crate) enum ListenEvent {
     Rejected {
         fingerprint: String,
     },
+    PortChanged(Result<u16, ListenerCreationError>),
 }
 
 pub(crate) struct LanMouseListener {
@@ -116,8 +121,45 @@ pub(crate) struct LanMouseListener {
     listen_task: JoinHandle<()>,
     cancellation: CancellationToken,
     conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
-    request_port_change: Sender<u16>,
-    port_changed: Receiver<Result<u16, ListenerCreationError>>,
+    request_port_change: tokio::sync::watch::Sender<Option<u16>>,
+}
+
+type BoundListeners = Vec<Box<dyn Listener>>;
+type BindingResult = (u16, Result<BoundListeners, ListenerCreationError>);
+type ListenerBinder = Rc<
+    dyn Fn(
+        u16,
+        Config,
+    ) -> futures::future::LocalBoxFuture<
+        'static,
+        Result<BoundListeners, ListenerCreationError>,
+    >,
+>;
+
+// Aborting the owner also aborts binding/cleanup; JoinHandle drop alone detaches.
+struct OwnedListenerTask<T>(JoinHandle<T>);
+impl<T> Drop for OwnedListenerTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+async fn listener_task_completed<T>(
+    task: &mut Option<OwnedListenerTask<T>>,
+) -> Result<T, tokio::task::JoinError> {
+    match task {
+        Some(task) => (&mut task.0).await,
+        None => std::future::pending().await,
+    }
+}
+async fn close_listeners(listeners: Vec<Box<dyn Listener>>) {
+    futures::future::join_all(listeners.iter().map(|listener| async move {
+        match tokio::time::timeout(Duration::from_secs(1), listener.close()).await {
+            Err(_) => log::warn!("listener cleanup exceeded one second"),
+            Ok(Err(error)) => log::warn!("listener cleanup failed: {error}"),
+            Ok(Ok(())) => {}
+        }
+    }))
+    .await;
 }
 
 type VerifyPeerCertificateFn = Arc<
@@ -132,9 +174,23 @@ impl LanMouseListener {
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     ) -> Result<Self, ListenerCreationError> {
+        Self::new_with_binder(
+            port,
+            cert,
+            authorized_keys,
+            Rc::new(|port, cfg| async move { bind_dtls(port, &cfg).await }.boxed_local()),
+        )
+        .await
+    }
+
+    async fn new_with_binder(
+        port: u16,
+        cert: Certificate,
+        authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        binder: ListenerBinder,
+    ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
-        let (request_port_change, mut request_port_change_rx) = channel();
-        let (port_changed_tx, port_changed) = channel();
+        let (request_port_change, mut request_port_change_rx) = tokio::sync::watch::channel(None);
         let connection_attempts: Arc<Mutex<VecDeque<String>>> = Default::default();
 
         let authorized = authorized_keys.clone();
@@ -172,7 +228,7 @@ impl LanMouseListener {
             ..Default::default()
         };
 
-        let mut listeners = bind_dtls(port, &cfg).await?;
+        let mut listeners = binder(port, cfg.clone()).await?;
 
         let conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -183,6 +239,9 @@ impl LanMouseListener {
             let listen_tx = listen_tx.clone();
             let connection_attempts = connection_attempts.clone();
             spawn_local(async move {
+                let mut current_port = port;
+                let mut binding: Option<OwnedListenerTask<BindingResult>> = None;
+                let mut cleanup = None;
                 loop {
                     let sleep = tokio::time::sleep(Duration::from_secs(2));
                     tokio::select! {
@@ -225,24 +284,52 @@ impl LanMouseListener {
                                 }
                             }
                         },
-                        port = request_port_change_rx.recv() => {
-                            let port = port.expect("channel closed");
-                            match bind_dtls(port, &cfg).await {
-                                Ok(new_listeners) => {
-                                    for l in &listeners {
-                                        let _ = l.close().await;
-                                    }
-                                    listeners = new_listeners;
-                                    port_changed_tx.send(Ok(port)).expect("channel closed");
-                                }
-                                Err(e) => {
-                                    log::warn!("unable to change port: {e}");
-                                    port_changed_tx.send(Err(e)).expect("channel closed");
-                                }
-                            };
+                        _ = readers_cancel.cancelled() => break,
+                        changed = request_port_change_rx.changed(), if binding.is_none() && cleanup.is_none() => {
+                            if changed.is_err() { break; }
+                            let port = (*request_port_change_rx.borrow_and_update()).expect("port request");
+                            if port == current_port {
+                                let _ = listen_tx.send(ListenEvent::PortChanged(Ok(port)));
+                                continue;
+                            }
+                            let cfg = cfg.clone();
+                            let binder = binder.clone();
+                            binding = Some(OwnedListenerTask(spawn_local(async move {
+                                let result = tokio::time::timeout(Duration::from_secs(2), binder(port, cfg))
+                                    .await.unwrap_or(Err(ListenerCreationError::BindTimeout));
+                                (port, result)
+                            })));
                         },
+                        completed = listener_task_completed(&mut binding) => {
+                            binding = None;
+                            match completed {
+                                Ok((port, Ok(new_listeners))) => {
+                                    if *request_port_change_rx.borrow() != Some(port) {
+                                        // A newer request superseded this bind. Dispose of its
+                                        // sockets before admitting another bind/cleanup batch.
+                                        cleanup = Some(OwnedListenerTask(spawn_local(close_listeners(new_listeners))));
+                                        continue;
+                                    }
+                                    let previous = std::mem::replace(&mut listeners, new_listeners);
+                                    current_port = port;
+                                    cleanup = Some(OwnedListenerTask(spawn_local(close_listeners(previous))));
+                                    let _ = listen_tx.send(ListenEvent::PortChanged(Ok(port)));
+                                }
+                                Ok((port, Err(error))) => {
+                                    if *request_port_change_rx.borrow() == Some(port) {
+                                        log::warn!("unable to change port: {error}");
+                                        let _ = listen_tx.send(ListenEvent::PortChanged(Err(error)));
+                                    }
+                                }
+                                Err(error) => { let _ = listen_tx.send(ListenEvent::PortChanged(Err(error.into()))); }
+                            }
+                        },
+                        _ = listener_task_completed(&mut cleanup) => { cleanup = None; },
                     };
                 }
+                drop(binding);
+                drop(cleanup);
+                close_listeners(listeners).await;
             })
         };
 
@@ -252,7 +339,6 @@ impl LanMouseListener {
             listen_tx,
             listen_task,
             cancellation,
-            port_changed,
             request_port_change,
         })
     }
@@ -265,26 +351,31 @@ impl LanMouseListener {
         self.conns.borrow().iter().any(|(a, _)| *a == addr)
     }
 
-    pub(crate) fn request_port_change(&mut self, port: u16) {
-        self.request_port_change.send(port).expect("channel closed");
-    }
-
-    pub(crate) async fn port_changed(&mut self) -> Result<u16, ListenerCreationError> {
-        self.port_changed.recv().await.expect("channel closed")
+    pub(crate) fn port_requests(&self) -> tokio::sync::watch::Sender<Option<u16>> {
+        self.request_port_change.clone()
     }
 
     pub(crate) async fn terminate(&mut self) {
         self.cancellation.cancel();
-        self.listen_task.abort();
+
         let conns: Vec<_> = self
             .conns
             .borrow_mut()
             .drain(..)
             .map(|(_, conn)| conn)
             .collect();
-        for conn in conns {
-            close_incoming(&conn).await;
-        }
+        let task = async {
+            if tokio::time::timeout(Duration::from_secs(2), &mut self.listen_task)
+                .await
+                .is_err()
+            {
+                self.listen_task.abort();
+                let _ = (&mut self.listen_task).await;
+                log::warn!("listener shutdown exceeded two seconds");
+            }
+        };
+        let connections = futures::future::join_all(conns.iter().map(close_incoming));
+        tokio::join!(task, connections);
         self.listen_tx.close();
     }
 
@@ -575,17 +666,359 @@ mod tests {
 
     fn control_listener(conns: Vec<(SocketAddr, ArcConn)>) -> LanMouseListener {
         let (listen_tx, listen_rx) = channel();
-        let (request_port_change, _) = channel();
-        let (_, port_changed) = channel();
+        let (request_port_change, _) = tokio::sync::watch::channel(None);
+        let cancellation = CancellationToken::new();
+        let task_cancel = cancellation.clone();
         LanMouseListener {
             listen_rx,
             listen_tx,
-            listen_task: spawn_local(std::future::pending()),
-            cancellation: CancellationToken::new(),
+            listen_task: spawn_local(async move {
+                task_cancel.cancelled().await;
+            }),
+            cancellation,
             conns: Rc::new(RefCell::new(conns)),
             request_port_change,
-            port_changed,
         }
+    }
+
+    #[tokio::test]
+    async fn port_requests_coalesce_without_blocking_real_input_dispatch() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let conn: ArcConn = Arc::new(TestConn::new(None));
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let listener = control_listener(vec![(addr, conn.clone())]);
+                let incoming = listener.listen_tx.clone();
+                let mut requested = listener.port_requests().subscribe();
+                let mut emulation = crate::emulation::Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                for port in 4000..5000 {
+                    emulation.request_port_change(port);
+                }
+                requested.changed().await.unwrap();
+                assert_eq!(*requested.borrow_and_update(), Some(4999));
+                assert!(!requested.has_changed().unwrap());
+                // No completion is delivered yet. The real dispatcher still has
+                // to process messages rather than waiting for the port operation.
+                incoming
+                    .send(ListenEvent::Msg {
+                        addr,
+                        conn,
+                        event: ProtoEvent::Input(input_event::Event::Clipboard(
+                            input_event::ClipboardEvent::Text("during port change".into()),
+                        )),
+                    })
+                    .unwrap_or_else(|_| panic!());
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    loop {
+                        if let crate::emulation::EmulationEvent::ClipboardReceived(_) =
+                            emulation.event().await
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                incoming
+                    .send(ListenEvent::PortChanged(Err(
+                        ListenerCreationError::BindTimeout,
+                    )))
+                    .unwrap_or_else(|_| panic!());
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    loop {
+                        if let crate::emulation::EmulationEvent::PortChanged(Err(
+                            ListenerCreationError::BindTimeout,
+                        )) = emulation.event().await
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_millis(100), emulation.terminate())
+                    .await
+                    .unwrap();
+            })
+            .await;
+    }
+
+    struct SlowListener(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl Listener for SlowListener {
+        async fn accept(&self) -> webrtc_util::Result<(ArcConn, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Ok("127.0.0.1:2".parse().unwrap())
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            struct Guard(Arc<AtomicBool>);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            self.0.store(true, Ordering::SeqCst);
+            let _guard = Guard(self.0.clone());
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn port_cleanup_has_independent_parallel_deadline_and_owner_cancellation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let one = Arc::new(AtomicBool::new(false));
+                let two = Arc::new(AtomicBool::new(false));
+                let mut cleanup = Some(OwnedListenerTask(spawn_local(close_listeners(vec![
+                    Box::new(SlowListener(one.clone())),
+                    Box::new(SlowListener(two.clone())),
+                ]))));
+                tokio::task::yield_now().await;
+                assert!(one.load(Ordering::SeqCst) && two.load(Ordering::SeqCst));
+                // No polling of the manager; both deadlines still finish together.
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                assert!(!one.load(Ordering::SeqCst) && !two.load(Ordering::SeqCst));
+                listener_task_completed(&mut cleanup).await.unwrap();
+                drop(cleanup);
+                let task = OwnedListenerTask(spawn_local(close_listeners(vec![Box::new(
+                    SlowListener(one.clone()),
+                )])));
+                tokio::task::yield_now().await;
+                assert!(one.load(Ordering::SeqCst));
+                drop(task);
+                tokio::task::yield_now().await;
+                assert!(!one.load(Ordering::SeqCst));
+            })
+            .await;
+    }
+
+    struct TrackedListener(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Listener for TrackedListener {
+        async fn accept(&self) -> webrtc_util::Result<(ArcConn, SocketAddr)> {
+            std::future::pending().await
+        }
+        async fn addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Ok("127.0.0.1:4000".parse().unwrap())
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn port_switch_discards_obsolete_bind_and_applies_latest_pending_request() {
+        use std::sync::atomic::AtomicUsize;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let started = Arc::new(tokio::sync::Notify::new());
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let initial = Arc::new(AtomicUsize::new(0));
+                let obsolete = Arc::new(AtomicUsize::new(0));
+                let latest = Arc::new(AtomicUsize::new(0));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let binder: ListenerBinder = {
+                    let (started, gate, initial, obsolete, latest, calls) = (
+                        started.clone(),
+                        gate.clone(),
+                        initial.clone(),
+                        obsolete.clone(),
+                        latest.clone(),
+                        calls.clone(),
+                    );
+                    Rc::new(move |port, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let (started, gate) = (started.clone(), gate.clone());
+                        let closed = match port {
+                            4000 => initial.clone(),
+                            5000 => obsolete.clone(),
+                            6000 => latest.clone(),
+                            _ => panic!("intermediate port was not coalesced"),
+                        };
+                        async move {
+                            if port == 5000 {
+                                started.notify_one();
+                                gate.acquire().await.unwrap().forget();
+                            }
+                            Ok(vec![Box::new(TrackedListener(closed)) as Box<dyn Listener>])
+                        }
+                        .boxed_local()
+                    })
+                };
+                let mut listener = LanMouseListener::new_with_binder(
+                    4000,
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    Default::default(),
+                    binder,
+                )
+                .await
+                .unwrap();
+                let requests = listener.port_requests();
+                requests.send_replace(Some(5000));
+                tokio::time::timeout(Duration::from_millis(100), started.notified())
+                    .await
+                    .unwrap();
+                for port in 5001..=6000 {
+                    requests.send_replace(Some(port));
+                }
+                gate.add_permits(1);
+                // No completion for the obsolete successful bind is published.
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), listener.next())
+                        .await
+                        .unwrap(),
+                    Some(ListenEvent::PortChanged(Ok(6000)))
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert_eq!(obsolete.load(Ordering::SeqCst), 1);
+                tokio::task::yield_now().await;
+                assert_eq!(initial.load(Ordering::SeqCst), 1);
+                assert_eq!(latest.load(Ordering::SeqCst), 0);
+                // Restoring the running port supersedes an unfinished bind.
+                requests.send_replace(Some(5000));
+                tokio::time::timeout(Duration::from_millis(100), started.notified())
+                    .await
+                    .unwrap();
+                requests.send_replace(Some(6000));
+                gate.add_permits(1);
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), listener.next())
+                        .await
+                        .unwrap(),
+                    Some(ListenEvent::PortChanged(Ok(6000)))
+                ));
+                assert_eq!(calls.load(Ordering::SeqCst), 4);
+                assert_eq!(obsolete.load(Ordering::SeqCst), 2);
+                assert_eq!(latest.load(Ordering::SeqCst), 0);
+                listener.terminate().await;
+                assert_eq!(latest.load(Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn port_binding_timeout_keeps_current_listener_and_allows_retry() {
+        use std::sync::atomic::AtomicUsize;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let running = Arc::new(AtomicBool::new(false));
+                let started = Arc::new(tokio::sync::Notify::new());
+                let initial = Arc::new(AtomicUsize::new(0));
+                let replacement = Arc::new(AtomicUsize::new(0));
+                let binder: ListenerBinder = {
+                    let (running, started, initial, replacement) = (
+                        running.clone(),
+                        started.clone(),
+                        initial.clone(),
+                        replacement.clone(),
+                    );
+                    Rc::new(move |port, _| {
+                        let (running, started) = (running.clone(), started.clone());
+                        let closed = if port == 4000 {
+                            initial.clone()
+                        } else {
+                            replacement.clone()
+                        };
+                        async move {
+                            if port == 5000 {
+                                struct Guard(Arc<AtomicBool>);
+                                impl Drop for Guard {
+                                    fn drop(&mut self) {
+                                        self.0.store(false, Ordering::SeqCst);
+                                    }
+                                }
+                                running.store(true, Ordering::SeqCst);
+                                let _guard = Guard(running);
+                                started.notify_one();
+                                std::future::pending::<()>().await;
+                            }
+                            Ok(vec![Box::new(TrackedListener(closed)) as Box<dyn Listener>])
+                        }
+                        .boxed_local()
+                    })
+                };
+                let mut listener = LanMouseListener::new_with_binder(
+                    4000,
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    Default::default(),
+                    binder,
+                )
+                .await
+                .unwrap();
+                let requests = listener.port_requests();
+                requests.send_replace(Some(5000));
+                tokio::time::timeout(Duration::from_millis(100), started.notified())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(2100)).await;
+                assert!(!running.load(Ordering::SeqCst));
+                assert!(matches!(
+                    listener.next().await,
+                    Some(ListenEvent::PortChanged(Err(
+                        ListenerCreationError::BindTimeout
+                    )))
+                ));
+                assert_eq!(initial.load(Ordering::SeqCst), 0);
+                requests.send_replace(Some(6000));
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), listener.next())
+                        .await
+                        .unwrap(),
+                    Some(ListenEvent::PortChanged(Ok(6000)))
+                ));
+                listener.terminate().await;
+                assert_eq!(initial.load(Ordering::SeqCst), 1);
+                assert_eq!(replacement.load(Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn port_switch_real_sockets_keep_old_port_on_failure_and_release_on_shutdown() {
+        tokio::task::LocalSet::new().run_until(async {
+            let initial_socket = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let initial_port = initial_socket.local_addr().unwrap().port();
+            drop(initial_socket);
+            let mut listener = LanMouseListener::new(initial_port, Certificate::generate_self_signed(vec![]).unwrap(), Default::default()).await.unwrap();
+            let requests = listener.port_requests();
+            // Holding both wildcard families ensures the requested port cannot bind.
+            let occupied_v6 = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let occupied_port = occupied_v6.local_addr().unwrap().port();
+            let _occupied_v4 = tokio::net::UdpSocket::bind(SocketAddr::from(([0,0,0,0], occupied_port))).await.ok();
+            requests.send_replace(Some(occupied_port));
+            let failure = tokio::time::timeout(Duration::from_secs(3), listener.next()).await.unwrap();
+            assert!(matches!(failure, Some(ListenEvent::PortChanged(Err(_)))));
+            // Returning to the running port is a no-op success, superseding the
+            // failed target without closing the original sockets.
+            assert!(tokio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), initial_port)).await.is_err());
+            requests.send_replace(Some(initial_port));
+            assert!(matches!(tokio::time::timeout(Duration::from_secs(3), listener.next()).await.unwrap(), Some(ListenEvent::PortChanged(Ok(p))) if p == initial_port));
+            let candidate = tokio::net::UdpSocket::bind("[::]:0").await.unwrap();
+            let new_port = candidate.local_addr().unwrap().port();
+            drop(candidate);
+            requests.send_replace(Some(new_port));
+            assert!(matches!(tokio::time::timeout(Duration::from_secs(3), listener.next()).await.unwrap(), Some(ListenEvent::PortChanged(Ok(p))) if p == new_port));
+            listener.terminate().await;
+            // The dependency's UDP receive task exits after close, not at the
+            // exact instant the API returns. Verify actual socket release.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::from(([0,0,0,0], new_port))).await {
+                        drop(socket);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+        }).await;
     }
 
     #[tokio::test]

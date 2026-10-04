@@ -316,6 +316,23 @@ A failure from an old session cannot remove its replacement. Replacements cancel
 stale queued/active replies, and shutdown aborts the pool before listener cleanup.
 
 These limits cover this reply pipeline. Listener input and emulation event channels
-still need separate overload review; changing the listening port also still awaits
-rebinding in the incoming dispatch loop. Real cross-machine return behavior and
+still need separate overload review. Real cross-machine return behavior and
 complete-service latency remain acceptance work.
+
+
+## Listening-port changes
+
+Port requests use one latest-value slot rather than an unbounded request queue.
+Binding and old-listener cleanup run as owned tasks while the existing listeners
+continue accepting and incoming input dispatch continues. Binding has a two-second
+deadline; old listeners close concurrently with a one-second deadline each. At most
+one bind or cleanup batch runs at a time; a newer requested port remains in the
+single pending slot. A successful obsolete bind is cleaned up without replacing
+the active listeners or publishing success. Failed binding preserves the current
+listeners, and choosing the running port also supersedes an unfinished request.
+Installed-port results are delivered as events instead of awaiting in input dispatch.
+
+Shutdown stops the emulation backend and releases its inputs before waiting for
+listener cleanup. Listening sockets are closed explicitly; accepted connections
+close concurrently. Binding/cleanup tasks are aborted when their owner is dropped.
+These network deadlines are not a deadline for every OS backend shutdown operation.
