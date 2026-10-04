@@ -262,3 +262,22 @@ Saving through a symlink also rechecks the resolved target after temp-file sync.
 Retargeting during preparation rejects the save even if both files have identical
 bytes. The remaining final-check-to-rename race with an uncoordinated external
 editor is unchanged.
+
+
+## Clipboard send feedback
+
+Incoming-session clipboard sharing is reported after the network send completes,
+rather than when its request is queued. Missing connections, encoding errors,
+transport errors and incomplete sends produce a failure message while sharing is
+enabled. A complete send produces the shared hint; completions after sharing is
+disabled do not produce a stale success hint. Outgoing clipboard sends also
+reject incomplete sends and disconnect only that target. Success means that the
+local transport accepted the full encoded packet; this protocol has no remote
+system-clipboard write acknowledgement. Network sends currently still run in
+the service/emulation dispatch paths; moving them to bounded cancellable workers,
+reconnect replay and notification deduplication remain review work.
+
+
+On Windows, watcher path matching treats ordinary and verbatim drive/UNC
+prefixes as equivalent (`C:\...` / `\\?\C:\...` and UNC / verbatim UNC). It does
+not fold file-name case or treat different drives/shares as the same file.

@@ -31,6 +31,18 @@ pub enum ListenerCreationError {
     WebrtcDtls(#[from] webrtc_dtls::Error),
 }
 
+#[derive(Error, Debug)]
+pub(crate) enum ClipboardSendError {
+    #[error("clipboard peer is no longer connected")]
+    NotConnected,
+    #[error(transparent)]
+    Encode(#[from] lan_mouse_proto::ProtocolError),
+    #[error(transparent)]
+    Transport(#[from] webrtc_util::Error),
+    #[error("clipboard send wrote {sent} of {expected} bytes")]
+    Incomplete { sent: usize, expected: usize },
+}
+
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
 /// Create a DTLS listener per address family.
@@ -291,34 +303,18 @@ impl LanMouseListener {
         }
     }
 
-    pub(crate) async fn reply_clipboard(&self, addr: SocketAddr, event: ProtoEvent) {
-        use lan_mouse_proto::encode_clipboard_event;
-
-        let buf = match encode_clipboard_event(&event) {
-            Ok(b) => b,
-            Err(e) => {
-                log::error!("Failed to encode clipboard event: {}", e);
-                return;
-            }
-        };
-
-        log::info!(
-            "Sending clipboard ({} bytes) >=>=>=>=>=> {}",
-            buf.len(),
-            addr
-        );
-
+    pub(crate) async fn reply_clipboard(
+        &self,
+        addr: SocketAddr,
+        event: ProtoEvent,
+    ) -> Result<(), ClipboardSendError> {
         let conn = self
             .conns
             .borrow()
             .iter()
             .find(|(a, _)| *a == addr)
             .map(|(_, conn)| conn.clone());
-        if let Some(conn) = conn {
-            if let Err(error) = conn.send(&buf).await {
-                log::warn!("clipboard reply to {addr} failed: {error}");
-            }
-        }
+        send_clipboard_reply(conn, event).await
     }
 
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
@@ -338,6 +334,22 @@ impl LanMouseListener {
             None
         }
     }
+}
+
+async fn send_clipboard_reply(
+    conn: Option<ArcConn>,
+    event: ProtoEvent,
+) -> Result<(), ClipboardSendError> {
+    let conn = conn.ok_or(ClipboardSendError::NotConnected)?;
+    let bytes = lan_mouse_proto::encode_clipboard_event(&event)?;
+    let sent = conn.send(&bytes).await?;
+    if sent != bytes.len() {
+        return Err(ClipboardSendError::Incomplete {
+            sent,
+            expected: bytes.len(),
+        });
+    }
+    Ok(())
 }
 
 impl Drop for LanMouseListener {
@@ -452,12 +464,16 @@ mod tests {
     struct TestConn {
         packet: Mutex<Option<Vec<u8>>>,
         closed: AtomicBool,
+        send_result: Mutex<Option<webrtc_util::Result<usize>>>,
+        sent: Mutex<Vec<Vec<u8>>>,
     }
     impl TestConn {
         fn new(packet: Option<Vec<u8>>) -> Self {
             Self {
                 packet: Mutex::new(packet),
                 closed: AtomicBool::new(false),
+                send_result: Mutex::new(None),
+                sent: Mutex::new(Vec::new()),
             }
         }
     }
@@ -478,7 +494,12 @@ mod tests {
             unreachable!()
         }
         async fn send(&self, bytes: &[u8]) -> webrtc_util::Result<usize> {
-            Ok(bytes.len())
+            self.sent.lock().unwrap().push(bytes.to_vec());
+            self.send_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(bytes.len()))
         }
         async fn send_to(&self, _: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
             unreachable!()
@@ -496,6 +517,50 @@ mod tests {
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
+    }
+
+    #[tokio::test]
+    async fn clipboard_reply_reports_missing_refused_short_and_valid_sends() {
+        let event = ProtoEvent::Input(input_event::Event::Clipboard(
+            input_event::ClipboardEvent::Text("test clipboard".into()),
+        ));
+        assert!(matches!(
+            send_clipboard_reply(None, event.clone()).await,
+            Err(ClipboardSendError::NotConnected)
+        ));
+        let conn = Arc::new(TestConn::new(None));
+        *conn.send_result.lock().unwrap() = Some(Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "test refusal",
+        )
+        .into()));
+        assert!(matches!(
+            send_clipboard_reply(Some(conn.clone()), event.clone()).await,
+            Err(ClipboardSendError::Transport(_))
+        ));
+        *conn.send_result.lock().unwrap() = Some(Ok(0));
+        assert!(
+            matches!(send_clipboard_reply(Some(conn.clone()), event.clone()).await,
+            Err(ClipboardSendError::Incomplete { sent: 0, expected }) if expected > 0)
+        );
+        send_clipboard_reply(Some(conn.clone()), event.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.sent.lock().unwrap().last().unwrap(),
+            &lan_mouse_proto::encode_clipboard_event(&event).unwrap()
+        );
+        let before = conn.sent.lock().unwrap().len();
+        let oversized = ProtoEvent::Input(input_event::Event::Clipboard(
+            input_event::ClipboardEvent::Text("x".repeat(lan_mouse_proto::MAX_CLIPBOARD_SIZE + 1)),
+        ));
+        assert!(matches!(
+            send_clipboard_reply(Some(conn.clone()), oversized).await,
+            Err(ClipboardSendError::Encode(
+                lan_mouse_proto::ProtocolError::ClipboardTooLarge(_)
+            ))
+        ));
+        assert_eq!(conn.sent.lock().unwrap().len(), before);
     }
 
     #[tokio::test]

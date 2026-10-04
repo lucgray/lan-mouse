@@ -617,15 +617,16 @@ impl Config {
             }
             let event = self.watch_rx.recv().await.expect("channel closed");
             let event = event?;
-            if (event.paths.contains(&self.config_path) || event.paths.contains(&self.watch_target))
-                && matches!(
-                    event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Modify(ModifyKind::Name(_))
-                        | EventKind::Remove(_)
-                )
-            {
+            if event.paths.iter().any(|path| {
+                same_watch_path(path, &self.config_path)
+                    || same_watch_path(path, &self.watch_target)
+            }) && matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Modify(ModifyKind::Data(_))
+                    | EventKind::Modify(ModifyKind::Name(_))
+                    | EventKind::Remove(_)
+            ) {
                 self.start_read();
             }
         }
@@ -987,6 +988,37 @@ impl Config {
             .as_ref()
             .and_then(|c| c.enable_clipboard)
             .unwrap_or(true)
+    }
+}
+
+#[cfg(not(windows))]
+fn same_watch_path(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn same_watch_path(left: &Path, right: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    fn equivalent_prefix(left: Prefix<'_>, right: Prefix<'_>) -> bool {
+        match (left, right) {
+            (
+                Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+            ) => a.eq_ignore_ascii_case(&b),
+            (
+                Prefix::UNC(a, b) | Prefix::VerbatimUNC(a, b),
+                Prefix::UNC(c, d) | Prefix::VerbatimUNC(c, d),
+            ) => a == c && b == d,
+            (a, b) => a == b,
+        }
+    }
+    let mut left = left.components();
+    let mut right = right.components();
+    match (left.next(), right.next()) {
+        (Some(Component::Prefix(a)), Some(Component::Prefix(b))) => {
+            equivalent_prefix(a.kind(), b.kind()) && left.eq(right)
+        }
+        (a, b) => a == b && left.eq(right),
     }
 }
 
@@ -1567,15 +1599,17 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn relative_single_filename_receives_absolute_watcher_events() {
         let cwd = env::current_dir().unwrap();
-        let file = tempfile::NamedTempFile::new_in(&cwd).unwrap();
-        fs::write(file.path(), "enable_clipboard = false").unwrap();
-        let relative = file.path().strip_prefix(&cwd).unwrap();
+        let file = tempfile::NamedTempFile::new_in(&cwd)
+            .unwrap()
+            .into_temp_path();
+        fs::write(&file, "enable_clipboard = false").unwrap();
+        let relative = file.strip_prefix(&cwd).unwrap();
         assert!(!relative.is_absolute());
         assert_eq!(relative.components().count(), 1);
         let mut config =
             Config::new_with_args(["lan-mouse", "--config", relative.to_str().unwrap()]).unwrap();
-        assert_eq!(config.config_path(), fs::canonicalize(file.path()).unwrap());
-        fs::write(file.path(), "enable_clipboard = true").unwrap();
+        assert_eq!(config.config_path(), fs::canonicalize(&file).unwrap());
+        fs::write(&file, "enable_clipboard = true").unwrap();
         await_semantic_reload(&mut config).await;
         assert!(config.clipboard_enabled());
     }
@@ -1693,6 +1727,27 @@ mod tests {
         assert_eq!(fs::read_to_string(&first).unwrap(), "same bytes");
         assert_eq!(fs::read_to_string(&second).unwrap(), "same bytes");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watcher_path_matching_accepts_verbatim_disk_and_unc_prefixes() {
+        assert!(same_watch_path(
+            Path::new(r"C:\settings\config.toml"),
+            Path::new(r"\\?\C:\settings\config.toml")
+        ));
+        assert!(same_watch_path(
+            Path::new(r"\\server\share\config.toml"),
+            Path::new(r"\\?\UNC\server\share\config.toml")
+        ));
+        assert!(!same_watch_path(
+            Path::new(r"C:\settings\config.toml"),
+            Path::new(r"\\?\D:\settings\config.toml")
+        ));
+        assert!(!same_watch_path(
+            Path::new(r"C:\settings\other.toml"),
+            Path::new(r"\\?\C:\settings\config.toml")
+        ));
     }
 
     fn parse(toml: &str) -> ConfigToml {

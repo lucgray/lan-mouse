@@ -1,5 +1,5 @@
 use crate::config::local_commit;
-use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::listen::{ClipboardSendError, LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{
     EmulationHandle, EmulationOptions, InputConfig, InputEmulation, InputEmulationError,
@@ -72,6 +72,12 @@ pub(crate) enum EmulationEvent {
     },
     /// clipboard data received from remote
     ClipboardReceived(input_event::ClipboardEvent),
+    /// Completion of a network send, not acknowledgement of a remote OS write.
+    ClipboardSendCompleted {
+        addr: SocketAddr,
+        event: input_event::ClipboardEvent,
+        result: Result<(), ClipboardSendError>,
+    },
 }
 
 enum EmulationRequest {
@@ -304,8 +310,11 @@ impl ListenTask {
                     }
                     // send clipboard to a specific address
                     EmulationRequest::SendClipboard(addr, clipboard_event) => {
-                        let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
-                        self.listener.reply_clipboard(addr, proto_event).await;
+                        let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event.clone()));
+                        let result = self.listener.reply_clipboard(addr, proto_event).await;
+                        self.event_tx.send(EmulationEvent::ClipboardSendCompleted {
+                            addr, event: clipboard_event, result,
+                        }).expect("channel closed");
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);

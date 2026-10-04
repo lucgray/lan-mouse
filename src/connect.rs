@@ -34,6 +34,8 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
+    #[error("clipboard send wrote {sent} of {expected} bytes")]
+    IncompleteClipboard { sent: usize, expected: usize },
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -312,7 +314,14 @@ impl LanMouseConnectionSender {
                     result = conn.send(&buf) => result,
                 };
                 match sent {
-                    Ok(_) => {}
+                    Ok(sent) if sent == buf.len() => {}
+                    Ok(sent) => {
+                        disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
+                        return Err(LanMouseConnectionError::IncompleteClipboard {
+                            sent,
+                            expected: buf.len(),
+                        });
+                    }
                     Err(e) => {
                         log::warn!("client {handle} failed to send clipboard: {e}");
                         disconnect(&self.client_manager, handle, addr, &conn, &self.conns).await;
@@ -525,6 +534,7 @@ mod tests {
     #[derive(Default)]
     struct RefusedConnection {
         closed: std::sync::atomic::AtomicBool,
+        short_send: bool,
     }
 
     #[async_trait::async_trait]
@@ -539,7 +549,11 @@ mod tests {
             unreachable!()
         }
         async fn send(&self, _: &[u8]) -> webrtc_util::Result<usize> {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "test refusal").into())
+            if self.short_send {
+                Ok(0)
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test refusal").into())
+            }
         }
         async fn send_to(&self, _: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
             unreachable!()
@@ -557,6 +571,54 @@ mod tests {
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomplete_clipboard_send_is_an_error_and_disconnects_only_that_target() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let addr = "127.0.0.1:2".parse().unwrap();
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let conn = Arc::new(RefusedConnection {
+            short_send: true,
+            ..Default::default()
+        });
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, conn.clone()));
+        let other = clients.add_client();
+        let other_addr = "127.0.0.1:3".parse().unwrap();
+        clients.set_active_addr(other, Some(other_addr));
+        let other_conn = Arc::new(RefusedConnection::default());
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(other, (other_addr, other_conn.clone()));
+        let result = sender
+            .send_clipboard(
+                ProtoEvent::Input(input_event::Event::Clipboard(
+                    input_event::ClipboardEvent::Text("test".into()),
+                )),
+                handle,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(LanMouseConnectionError::IncompleteClipboard { sent: 0, expected }) if expected > 0)
+        );
+        assert!(clients.active_addr(handle).is_none());
+        assert!(conn.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(clients.active_addr(other), Some(other_addr));
+        assert!(!other_conn.closed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "current_thread")]

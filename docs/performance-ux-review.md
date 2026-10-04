@@ -8,6 +8,8 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R34 | Windows 路径修正已实现，待新原生 CI | 2c89d32 Windows 两条 watcher 测试超时；普通/verbatim drive/UNC 前缀比较，新增 Windows 回归并关闭 relative fixture 额外句柄；不得以 Linux 通过替代 Windows 成功 |
+| R33 | 已实现并通过发送/服务回归 | 两方向剪贴板发送检查返回字节数；入站请求排队不再直接提示共享，完整发送才回传成功；远端系统写入没有协议 ACK；网络等待/队列与代次取消仍待处理 |
 | R31 | 已实现并通过实际 notify 回归 | 相对文件名绝对化并规范父目录；监听最终链接及实际目标的父目录，重新指向非法文件后也刷新监听；悬空链接不写默认值，目标出现能重载；中间链接链/祖先别名/缺失目录仍待处理 |
 | R32 | 已实现并通过提交前改指向回归 | 临时文件 sync 后重查原 symlink 的解析目标；即使内容相同，改指向也拒绝保存；最后校验到 rename 的窗口仍保留 |
 | R29 | 已实现并通过冲突回归 | 写前和临时文件 fsync 后校验已加载/已保存的文件字节；外部编辑拒绝覆盖并清除旧待写快照；最终校验与 rename 的第三方竞态仍存在 |
@@ -25,8 +27,8 @@
 | R15 | 已实现 | info 日志仅输出 kind 与字节数；诊断日志实测待验 |
 | R16、R17 | 已实现并通过回归 | 三字节 duplex 短写保序；停止读取的 writer 不阻塞正常 writer，超时断开 |
 | R23 | 已实现 | destroy_bounded 成功才删除代理映射；代理层超时调度测试待补 |
-| R07 | 部分实现 | 未连接或发送失败不再返回 Ok；重连补发和 incoming 成功反馈仍待实现 |
-| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；结果反馈及去重仍待实现 |
+| R07 | 部分实现 | 未连接或发送失败不再返回 Ok；入站发送已回传结果并仅成功后提示；重连补发及网络发送离开输入循环仍待实现 |
+| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；控制反馈、去重、网络队列/取消和重连补发仍待实现 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
 | R14 | 已实现并通过故障注入 | 临时文件原子替换；写入失败保留旧文件；失败后恢复监听，并支持 rename 型外部更新；符号链接和权限测试通过；保存失败在界面显示提示 |
 | R22 | 已实现并通过状态回归 | 只有当前连发键的释放停止任务，修饰键和锁定键不取代目标；Windows 集成 CI 待本轮提交 |
@@ -546,3 +548,29 @@ Linux 工作区测试通过（root 73 个通过 + 1 个默认忽略），隔离�
 Linux 工作区全特性测试通过（root 77 个通过 + 1 个默认忽略），隔离 Service 回归单独通过；严格 Clippy、格式及 diff 检查通过。检查时前一轮 4f13fa8 Rust run 37173400146 仍 queued，45ae3e8 的 CI 已 cancelled，不能记为成功。
 
 日志：work/diagnostics/config-path-tests.log、config-path-workspace.log、config-path-clippy.log、config-path-service.log。实际输入延迟、剪贴板重连/反馈及长期资源门槛仍待完成，90 分目标继续保留。
+
+
+## 第二十三轮：入站剪贴板排队误报成功与短发送
+
+### R33 / P2：请求入队即提示共享，缺连接/失败没有结果
+
+- 原始证据：Service::handle_clipboard_event 的入站分支调用 Emulation::send_clipboard 后无条件 shared = true；listener.reply_clipboard 缺连接或发送失败只有日志，不返回 Result；出站 clipboard send 忽略 Ok 中的字节数。
+- [x] 入站 listener 返回 NotConnected、Encode、Transport 或 Incomplete；完整编码包送入 conn.send 后，核对返回字节数才报告成功。
+- [x] Emulation 将完成结果送到 Service，Service 仅对 enabled 状态的成功提示 ClipboardShared，失败显示错误；原排队点不再设置 shared = true。关闭后迟到结果不显示成功提示。
+- [x] 出站方向短发送返回 IncompleteClipboard 并清理该目标连接，保留另一设备地址与连接。
+- [x] Conn mock 覆盖缺连接、BrokenPipe、零字节短发送、实际编码包完整提交和超限编码不调用 send；出站回归覆盖短发送/本目标清理/其他目标保留。
+- [x] 隔离真实 Service fixture 通过实际 Emulation 请求队列发送到缺失连接，收到完成错误并验证无成功提示、存在失败提示；额外合成成功完成验证提示及关闭后抑制。成功那一段只证明 Service 分支，不声称真实配对设备收到剪贴板。
+- [x] Linux 工作区全特性测试通过（root 79 个通过 + 1 个默认忽略），扩展隔离 Service fixture 单独通过；严格 Clippy、格式和 diff 检查通过。
+- [ ] success 只表示本端 transport 接受完整包，远端 OS 写入没有协议 ACK。本轮未修改线协议。
+- [ ] 网络发送仍 await 在 service/emulation 分发循环内，未增加等待上限或有界重连 worker；大包/慢发送可延迟输入。完成消息仍携带剪贴板对象，队列无界问题仍须处理；连接代次、禁用时取消、重连最新内容补发及通知去重/限流均继续保留。
+
+日志：work/diagnostics/clipboard-feedback-tests.log、clipboard-feedback-workspace.log、clipboard-feedback-clippy.log、clipboard-feedback-service.log。R07/R13 保持部分完成；性能/长时间/真实 Windows/Linux 验收未闭环，不能据此认定 90 分。
+
+
+### R34 / P2：Windows 规范路径与事件路径前缀不一致
+
+- CI 证据：2c89d32 run 37173782686 的 Windows test job 111352099101 失败；watcher_error_is_reported_and_next_valid_edit_can_reload 和 relative_single_filename_receives_absolute_watcher_events 超时。Windows check/build/clippy 已通过；失败日志保存在 work/diagnostics/windows-ci-2c89d32.log。
+- [x] 注入事件路径为普通盘符路径，而 Config 已通过 canonicalize 保存 verbatim 路径，精确 Path 比较会跳过同一文件的事件。新比较只规范 Disk/VerbatimDisk 与 UNC/VerbatimUNC 前缀，其余组件仍精确比较。
+- [x] 相对路径 fixture 使用 TempPath，释放 NamedTempFile 的额外打开句柄；保留原实际 notify 检查，不把 timeout 调长来掩盖问题。
+- [x] 增加 Windows 原生前缀回归，覆盖盘符/UNC 等价，以及不同盘符/文件名不相等；Linux 工作区与严格 Clippy 保持通过。
+- [ ] 第二条实际 notify 超时是否由额外句柄或其他 Windows 后端行为造成，仍需新 CI 确认；两条原生失败与新增 Windows 用例尚未确认修复。下一轮优先检查这个 gate。
