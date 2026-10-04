@@ -8,6 +8,8 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R37 | 入站控制回复已独立、有界并通过真实分发回归 | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；完整真机时延仍待验 |
+| R38 | 待修复 | ChangePort 在 ListenTask 中等待 port_changed；监听任务换端口还等待旧 listener.close，期间输入分发停止 |
 | R36 | 出站剪贴板有界异步发送已实现并通过任务/服务回归 | 独立 4 并发/32 待发 peer；目标代次取消、捕获连接清理、try_lock 不等待；超限在克隆/编码前拒绝；重连补发和完整输入时延仍待验 |
 | R35 | 入站剪贴板有界异步发送已实现并通过任务/服务回归 | 32 请求、4 并发任务、32 最新待发 peer 槽；2 秒期限独立轮询；连接快照、过期会话取消、开关代次隔离、完成只保留元数据；出站发送见 R36，全服务时延仍待验 |
 | R34 | 已实现并通过原生 CI | 6a3f52b / run 37175403023 完整 Rust 矩阵成功；Windows 原两条 watcher 回归执行通过，Any 事件及规范路径修复已验证 |
@@ -30,7 +32,7 @@
 | R16、R17 | 已实现并通过回归 | 三字节 duplex 短写保序；停止读取的 writer 不阻塞正常 writer，超时断开 |
 | R23 | 已实现 | destroy_bounded 成功才删除代理映射；代理层超时调度测试待补 |
 | R07 | 部分实现 | 未连接或发送失败不再返回 Ok；入站发送已回传结果并仅成功后提示；两个方向的发送均已离开输入分发循环；重连补发仍待实现 |
-| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制反馈、去重和重连补发仍待实现 |
+| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；详细界面反馈、去重和重连补发仍待实现 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
 | R14 | 已实现并通过故障注入 | 临时文件原子替换；写入失败保留旧文件；失败后恢复监听，并支持 rename 型外部更新；符号链接和权限测试通过；保存失败在界面显示提示 |
 | R22 | 已实现并通过状态回归 | 只有当前连发键的释放停止任务，修饰键和锁定键不取代目标；Windows 集成 CI 待本轮提交 |
@@ -624,3 +626,27 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 本轮 R36 的新提交仍需要自己的 CI，不以旧 HEAD 成功替代新提交验收。
 
 日志：work/diagnostics/clipboard-outgoing-workspace.log、clipboard-outgoing-clippy.log、clipboard-outgoing-service.log、windows-ci-6a3f52b.log。本轮不部署运行程序，尚不能证明整体达到 90 分。
+
+
+## 第二十六轮：控制回复、过期返回包与队列隔离
+
+### R37 / P1：Ack/Pong/Hello/Leave 网络等待阻塞入站分发
+
+- 原始证据：ListenTask 对 Enter/Leave/Ping/Hello 和 Release 请求直接 await listener.reply；reply 内 Conn::send 无期限，只检查 Err 不检查短发送。网络停滞期间后续输入、释放请求和终止不能被消费。
+- [x] 同步准备固定大小控制包并提交独立 ControlJobs；最多 4 活跃任务、128 全局待发、每地址 32 待发，避免单 peer 占满全局等待队列。每 peer FIFO，Ack/Leave 不做最新值合并。
+- [x] 一秒期限从入队起计算，包含排队时间；过期任务在调用 send 前拒绝发送，不将迟到 Leave/Ack 送到已变化的交互状态。活跃任务独立运行期限，管理器不轮询期间仍能取消 send。
+- [x] 拒绝、短发送、超时及满载只删除捕获的当前 Arc，先发布 Disconnected 走现有按设备输入释放/返回元数据清理，再独立关闭连接；日志显示失败原因。过期旧连接失败不清理替换连接。
+- [x] 替换/断开取消过期任务和待发包；失败取消该 Arc 后续包，但保留同地址新 Arc 队列；退出 drop 取消并 abort 活跃任务，先于 listener 清理。
+- [x] 七条回归覆盖全局/单 peer 上限和 Ack FIFO、慢 peer 与健康 peer 并行、独立超时及失败尾部删除、入队期限避免迟发、替换/Drop 取消、短发送/拒绝身份清理和断开通知、满载清理隔离。
+- [x] 上述七条中包含实际 Emulation/ListenTask + dummy backend：Hello 回复被 fake Conn 阻塞后，后续收到的剪贴板消息仍经真实分发传播，Terminate 在 100 ms 测试期限内完成。这是受控回归，不是 OS 鼠标 p99 实测。
+- [x] 最终 Linux 全特性工作区测试：root 91 通过、1 默认忽略；严格 Clippy、格式及 diff 检查通过。隔离 Service fixture 单独运行通过；未接触用户输入设备或服务配置。
+- [ ] 新提交原生 CI、真实 Windows/Linux 返回路径、完整服务延迟、长时间资源和统一事件通道拥塞仍待验。
+
+### R38 / P1：动态端口切换仍等待监听器重建
+
+- 证据：ListenTask 的 ChangePort 分支直接 await listener.port_changed；listen_task 在绑定成功后逐个 await 旧 listener.close，既无关闭期限也无该阶段取消选择。慢重建/关闭仍可停止入站消息分发。
+- [ ] 下一轮将端口完成事件纳入 select，并检查请求合并、旧监听器关闭期限及退出释放；本轮不将其他异步分支描述为全部已消除阻塞。
+
+日志：work/diagnostics/control-reply-workspace.log、control-reply-clippy.log、control-reply-service.log。目标继续保持未完成，源码修复不等于已达到整体 90 分。
+
+原生 CI 更新：上一轮出站修复 aab28fc / Rust run 37176389000 已完整成功（Linux、Windows、macOS Intel/ARM check/build/test/clippy 及格式）。本轮控制回复提交仍需独立 CI。

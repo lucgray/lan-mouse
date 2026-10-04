@@ -267,6 +267,7 @@ impl ListenTask {
         let mut dormant: HashSet<SocketAddr> = HashSet::new();
         let mut accepted_clients = HashSet::new();
         let mut clipboard_jobs = ClipboardJobs::default();
+        let mut control_jobs = crate::control_network::ControlJobs::default();
         loop {
             select! {
                 Some(request) = self.clipboard_rx.recv() => {
@@ -281,6 +282,9 @@ impl ListenTask {
                             ).into())),
                         })).expect("channel closed");
                     }
+                },
+                completed = control_jobs.completed() => {
+                    self.listener.finish_control_reply(completed);
                 },
                 completed = clipboard_jobs.completed() => {
                     self.event_tx.send(EmulationEvent::ClipboardSendCompleted(completed)).expect("channel closed");
@@ -310,7 +314,7 @@ impl ListenTask {
                                     dormant.remove(&addr);
                                     entered_clients.insert(addr, (pos, fingerprint.clone()));
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                    self.listener.reply(&mut control_jobs, addr, ProtoEvent::Ack(0));
                                     if !self.listener.is_current(addr, &conn) { continue; }
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
@@ -320,7 +324,7 @@ impl ListenTask {
                                 entered_clients.remove(&addr);
                                 dormant.remove(&addr);
                                 self.emulation_proxy.remove(addr);
-                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                self.listener.reply(&mut control_jobs, addr, ProtoEvent::Ack(0));
                             }
                             ProtoEvent::Input(input_event) => {
                                 // Clipboard events bypass the emulation
@@ -339,7 +343,7 @@ impl ListenTask {
                                     }
                                 }
                             }
-                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            ProtoEvent::Ping => self.listener.reply(&mut control_jobs, addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())),
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
                             // receive_loop populates its `peer_commit`,
@@ -352,7 +356,7 @@ impl ListenTask {
                             // otherwise silently say "unknown" while
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
-                                self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                                self.listener.reply(&mut control_jobs, addr, ProtoEvent::Hello { commit: local_commit() });
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             _ => {}
@@ -361,6 +365,7 @@ impl ListenTask {
                     Some(ListenEvent::Accept { addr, fingerprint, conn }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
                         clipboard_jobs.cancel_stale(addr, Some(&conn));
+                        control_jobs.cancel_stale(addr, Some(&conn));
                         let remembered = forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
                         if !accepted_clients.insert(addr) || remembered {
                             self.emulation_proxy.remove(addr);
@@ -371,6 +376,7 @@ impl ListenTask {
                     Some(ListenEvent::Disconnected { addr }) => {
                         let current = self.listener.clipboard_connection(addr);
                         clipboard_jobs.cancel_stale(addr, current.as_ref());
+                        control_jobs.cancel_stale(addr, current.as_ref());
                         // A new connection may already have replaced this one
                         // while its disconnect notification was queued.
                         if self.listener.has_connection(addr) { continue; }
@@ -394,7 +400,7 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr, t) => self.listener.reply(addr, ProtoEvent::Leave(0, t)).await,
+                    EmulationRequest::Release(addr, t) => self.listener.reply(&mut control_jobs, addr, ProtoEvent::Leave(0, t)),
                     EmulationRequest::UpdateScrollingInversion(invert_scroll) => {
                         self.emulation_proxy.input_config.invert_scroll = invert_scroll;
                         self.emulation_proxy.update_config();
@@ -429,6 +435,7 @@ impl ListenTask {
                 }
             }
         }
+        drop(control_jobs);
         drop(clipboard_jobs);
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;

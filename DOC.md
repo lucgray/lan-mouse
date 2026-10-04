@@ -301,3 +301,21 @@ Generic watcher modification events (`Modify(Any)`, emitted by the Windows notif
 backend) trigger a config read just like specific data/rename events. The injected
 error-recovery fixture uses the registered canonical path, avoiding platform temp
 path aliases; the separate actual notify test continues to check native delivery.
+
+
+## Incoming control replies
+
+Ack, Pong, Hello and cursor-return Leave replies run in an independent pool instead
+of awaiting network sends in incoming input dispatch. Replies stay FIFO per peer;
+they are not coalesced. There are at most four active sends, 128 pending packets
+globally and 32 pending packets per peer. A one-second deadline starts at admission,
+including time in the queue; expired packets are not sent later. Refused, short,
+timed-out or overloaded replies remove only the captured current session, publish
+its disconnect for local key/return-edge cleanup, and close it asynchronously.
+A failure from an old session cannot remove its replacement. Replacements cancel
+stale queued/active replies, and shutdown aborts the pool before listener cleanup.
+
+These limits cover this reply pipeline. Listener input and emulation event channels
+still need separate overload review; changing the listening port also still awaits
+rebinding in the incoming dispatch loop. Real cross-machine return behavior and
+complete-service latency remain acceptance work.

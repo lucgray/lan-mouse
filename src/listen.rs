@@ -1,5 +1,5 @@
 use futures::{Stream, StreamExt};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
@@ -288,23 +288,56 @@ impl LanMouseListener {
         self.listen_tx.close();
     }
 
-    pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
+    pub(crate) fn reply(
+        &self,
+        jobs: &mut crate::control_network::ControlJobs,
+        addr: SocketAddr,
+        event: ProtoEvent,
+    ) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let conn = self
-            .conns
-            .borrow()
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, conn)| conn.clone());
-        match conn {
-            Some(conn) => {
-                if let Err(e) = conn.send(&buf[..len]).await {
-                    log::warn!("control reply to {addr} failed: {e}");
-                }
-            }
-            None => log::debug!("control reply to {addr} skipped: connection missing"),
+        let Some(conn) = self.clipboard_connection(addr) else {
+            log::debug!("control reply to {addr} skipped: connection missing");
+            return;
+        };
+        if let Err(error) = jobs.submit(addr, conn.clone(), event) {
+            self.finish_control_reply(crate::control_network::ControlCompletion {
+                addr,
+                conn,
+                result: Err(error),
+            });
+            jobs.cancel_stale(addr, None);
         }
+    }
+
+    pub(crate) fn finish_control_reply(
+        &self,
+        completed: crate::control_network::ControlCompletion,
+    ) {
+        if completed.result.is_ok()
+            || matches!(
+                completed.result,
+                Err(crate::control_network::ControlSendError::Canceled)
+            )
+            || !self.is_current(completed.addr, &completed.conn)
+        {
+            return;
+        }
+        log::warn!(
+            "control reply to {} failed: {}",
+            completed.addr,
+            completed.result.unwrap_err()
+        );
+        // Remove before notifying so queued input from this failed session is
+        // ignored. Releasing its emulation state does not wait for socket close.
+        self.conns
+            .borrow_mut()
+            .retain(|(addr, conn)| *addr != completed.addr || !Arc::ptr_eq(conn, &completed.conn));
+        let _ = self.listen_tx.send(ListenEvent::Disconnected {
+            addr: completed.addr,
+        });
+        spawn_local(async move {
+            close_incoming(&completed.conn).await;
+        });
     }
 
     pub(crate) fn clipboard_connection(&self, addr: SocketAddr) -> Option<ArcConn> {
@@ -461,6 +494,7 @@ async fn close_incoming(conn: &ArcConn) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lan_mouse_proto::MAX_EVENT_SIZE;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct TestConn {
@@ -537,6 +571,313 @@ mod tests {
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
+    }
+
+    fn control_listener(conns: Vec<(SocketAddr, ArcConn)>) -> LanMouseListener {
+        let (listen_tx, listen_rx) = channel();
+        let (request_port_change, _) = channel();
+        let (_, port_changed) = channel();
+        LanMouseListener {
+            listen_rx,
+            listen_tx,
+            listen_task: spawn_local(std::future::pending()),
+            cancellation: CancellationToken::new(),
+            conns: Rc::new(RefCell::new(conns)),
+            request_port_change,
+            port_changed,
+        }
+    }
+
+    #[tokio::test]
+    async fn control_replies_keep_fifo_and_allow_other_peer_during_slow_send() {
+        use crate::control_network::{ControlJobs, ControlSendError};
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow = Arc::new(TestConn {
+            send_gate: Some(gate.clone()),
+            ..TestConn::new(None)
+        });
+        let healthy = Arc::new(TestConn::new(None));
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let other = "127.0.0.1:3".parse().unwrap();
+        let mut jobs = ControlJobs::default();
+        jobs.submit(addr, slow.clone(), ProtoEvent::Ack(0)).unwrap();
+        jobs.submit(other, healthy.clone(), ProtoEvent::Pong(true))
+            .unwrap();
+        for serial in 1..=32 {
+            jobs.submit(addr, slow.clone(), ProtoEvent::Ack(serial))
+                .unwrap();
+        }
+        assert_eq!(jobs.sizes(), (2, 32));
+        assert!(matches!(
+            jobs.submit(addr, slow.clone(), ProtoEvent::Leave(0, 0.5)),
+            Err(ControlSendError::Busy)
+        ));
+        let completed = tokio::time::timeout(Duration::from_millis(100), jobs.completed())
+            .await
+            .unwrap();
+        assert_eq!(completed.addr, other);
+        completed.result.unwrap();
+        // Completion is independent of a slow peer. Every accepted Ack must
+        // retain its position; no latest-value replacement is valid here.
+        gate.add_permits(33);
+        for _ in 0..33 {
+            jobs.completed().await.result.unwrap();
+        }
+        let expected: Vec<_> = (0..=32)
+            .map(|serial| {
+                let (buf, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) =
+                    ProtoEvent::Ack(serial).into();
+                buf[..len].to_vec()
+            })
+            .collect();
+        assert_eq!(*slow.sent.lock().unwrap(), expected);
+        assert_eq!(jobs.sizes(), (0, 0));
+        // Multiple peers still cannot exceed the global capacity.
+        let mut full = ControlJobs::default();
+        for port in 2..6 {
+            let conn = Arc::new(TestConn {
+                send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+                ..TestConn::new(None)
+            });
+            for serial in 0..=32 {
+                full.submit(
+                    SocketAddr::from(([127, 0, 0, 1], port)),
+                    conn.clone(),
+                    ProtoEvent::Ack(serial),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(full.sizes(), (4, 128));
+        assert!(matches!(
+            full.submit(
+                "127.0.0.1:6".parse().unwrap(),
+                healthy,
+                ProtoEvent::Pong(true)
+            ),
+            Err(ControlSendError::Busy)
+        ));
+    }
+
+    #[tokio::test]
+    async fn control_deadline_runs_without_manager_polling_and_discards_failed_tail() {
+        use crate::control_network::{ControlJobs, ControlSendError};
+        let slow = Arc::new(TestConn {
+            send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..TestConn::new(None)
+        });
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut jobs = ControlJobs::default();
+        jobs.submit(addr, slow.clone(), ProtoEvent::Ack(0)).unwrap();
+        jobs.submit(addr, slow.clone(), ProtoEvent::Leave(0, 0.5))
+            .unwrap();
+        slow.send_entered.notified().await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(!slow.sending.load(Ordering::SeqCst));
+        assert!(matches!(
+            jobs.completed().await.result,
+            Err(ControlSendError::Timeout)
+        ));
+        assert_eq!(slow.sent.lock().unwrap().len(), 1);
+        assert_eq!(jobs.sizes(), (0, 0));
+        assert!(!slow.closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn control_queue_deadline_prevents_late_send_to_waiting_peer() {
+        use crate::control_network::{ControlJobs, ControlSendError};
+        let mut jobs = ControlJobs::default();
+        for port in 2..6 {
+            let conn = Arc::new(TestConn {
+                send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+                ..TestConn::new(None)
+            });
+            jobs.submit(
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                conn,
+                ProtoEvent::Ack(0),
+            )
+            .unwrap();
+        }
+        let waiting = Arc::new(TestConn::new(None));
+        jobs.submit(
+            "127.0.0.1:6".parse().unwrap(),
+            waiting.clone(),
+            ProtoEvent::Leave(0, 0.5),
+        )
+        .unwrap();
+        // All slots are occupied; this packet's own deadline starts at admission.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        for _ in 0..5 {
+            assert!(matches!(
+                jobs.completed().await.result,
+                Err(ControlSendError::Timeout)
+            ));
+        }
+        assert!(waiting.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_replacement_cancels_old_work_and_drop_aborts_sends() {
+        use crate::control_network::{ControlJobs, ControlSendError};
+        let slow = Arc::new(TestConn {
+            send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..TestConn::new(None)
+        });
+        let replacement: ArcConn = Arc::new(TestConn::new(None));
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut jobs = ControlJobs::default();
+        jobs.submit(addr, slow.clone(), ProtoEvent::Ack(0)).unwrap();
+        jobs.submit(addr, slow.clone(), ProtoEvent::Leave(0, 0.5))
+            .unwrap();
+        jobs.submit(
+            addr,
+            replacement.clone(),
+            ProtoEvent::Hello {
+                commit: *b"new-test",
+            },
+        )
+        .unwrap();
+        slow.send_entered.notified().await;
+        jobs.cancel_stale(addr, Some(&replacement));
+        assert!(matches!(
+            jobs.completed().await.result,
+            Err(ControlSendError::Canceled)
+        ));
+        let completed = jobs.completed().await;
+        assert!(Arc::ptr_eq(&completed.conn, &replacement));
+        completed.result.unwrap();
+        assert_eq!(slow.sent.lock().unwrap().len(), 1);
+        jobs.submit(addr, slow.clone(), ProtoEvent::Ack(1)).unwrap();
+        slow.send_entered.notified().await;
+        drop(jobs);
+        tokio::task::yield_now().await;
+        assert!(!slow.sending.load(Ordering::SeqCst));
+        assert!(!slow.closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn control_failures_remove_only_current_session_and_notify_release() {
+        use crate::control_network::{ControlCompletion, ControlJobs, ControlSendError};
+        tokio::task::LocalSet::new().run_until(async {
+            for short in [false, true] {
+                let failed = Arc::new(TestConn::new(None));
+                *failed.send_result.lock().unwrap() = Some(if short { Ok(0) } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "refused").into())
+                });
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let other = "127.0.0.1:3".parse().unwrap();
+                let healthy: ArcConn = Arc::new(TestConn::new(None));
+                let mut listener = control_listener(vec![(addr, failed.clone()), (other, healthy.clone())]);
+                let mut jobs = ControlJobs::default();
+                listener.reply(&mut jobs, addr, ProtoEvent::Ack(0));
+                let completed = jobs.completed().await;
+                assert!(if short { matches!(completed.result, Err(ControlSendError::Incomplete { .. })) }
+                    else { matches!(completed.result, Err(ControlSendError::Transport(_))) });
+                listener.finish_control_reply(completed);
+                assert!(!listener.has_connection(addr));
+                assert!(listener.is_current(other, &healthy));
+                assert!(matches!(listener.next().await, Some(ListenEvent::Disconnected { addr: a }) if a == addr));
+                tokio::task::yield_now().await;
+                assert!(failed.closed.load(Ordering::SeqCst));
+                // A stale error cannot remove a newer connection at the address.
+                listener.conns.borrow_mut().push((addr, healthy.clone()));
+                listener.finish_control_reply(ControlCompletion {
+                    addr, conn: failed.clone(), result: Err(ControlSendError::Timeout),
+                });
+                assert!(listener.is_current(addr, &healthy));
+            }
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn control_overload_disconnects_only_rejected_session() {
+        use crate::control_network::ControlJobs;
+        tokio::task::LocalSet::new().run_until(async {
+            let slow = Arc::new(TestConn {
+                send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+                ..TestConn::new(None)
+            });
+            let rejected = Arc::new(TestConn::new(None));
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let other = "127.0.0.1:3".parse().unwrap();
+            let mut listener = control_listener(vec![(addr, slow.clone()), (other, rejected.clone())]);
+            let mut jobs = ControlJobs::default();
+            for serial in 0..=32 {
+                jobs.submit(addr, slow.clone(), ProtoEvent::Ack(serial)).unwrap();
+            }
+            listener.reply(&mut jobs, addr, ProtoEvent::Leave(0, 0.5));
+            assert!(!listener.has_connection(addr));
+            assert!(listener.has_connection(other));
+            assert!(matches!(listener.next().await, Some(ListenEvent::Disconnected { addr: a }) if a == addr));
+            tokio::task::yield_now().await;
+            assert!(slow.closed.load(Ordering::SeqCst));
+            assert!(!rejected.closed.load(Ordering::SeqCst));
+            assert!(rejected.sent.lock().unwrap().is_empty());
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn control_wait_does_not_block_real_listen_dispatch_or_termination() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let slow = Arc::new(TestConn {
+                    send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+                    ..TestConn::new(None)
+                });
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let listener = control_listener(vec![(addr, slow.clone())]);
+                let incoming = listener.listen_tx.clone();
+                let mut emulation = crate::emulation::Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                incoming
+                    .send(ListenEvent::Msg {
+                        addr,
+                        conn: slow.clone(),
+                        event: ProtoEvent::Hello {
+                            commit: *b"peertest",
+                        },
+                    })
+                    .unwrap_or_else(|_| panic!("listener stopped"));
+                tokio::time::timeout(Duration::from_millis(100), slow.send_entered.notified())
+                    .await
+                    .unwrap();
+                // Actual ListenTask must continue consuming messages while the
+                // Hello response is held inside Conn::send.
+                incoming
+                    .send(ListenEvent::Msg {
+                        addr,
+                        conn: slow.clone(),
+                        event: ProtoEvent::Input(input_event::Event::Clipboard(
+                            input_event::ClipboardEvent::Text("after blocked hello".into()),
+                        )),
+                    })
+                    .unwrap_or_else(|_| panic!("listener stopped"));
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    loop {
+                        if let crate::emulation::EmulationEvent::ClipboardReceived(
+                            input_event::ClipboardEvent::Text(text),
+                        ) = emulation.event().await
+                        {
+                            assert_eq!(text, "after blocked hello");
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                emulation.send_leave_event(addr, 0.5);
+                tokio::time::timeout(Duration::from_millis(100), emulation.terminate())
+                    .await
+                    .unwrap();
+                assert!(!slow.sending.load(Ordering::SeqCst));
+                assert!(slow.closed.load(Ordering::SeqCst));
+            })
+            .await;
     }
 
     #[tokio::test]

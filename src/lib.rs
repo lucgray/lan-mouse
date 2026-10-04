@@ -5,6 +5,7 @@ mod clipboard_network;
 mod clipboard_writer;
 pub mod config;
 mod connect;
+mod control_network;
 mod crypto;
 mod dns;
 mod emulation;
