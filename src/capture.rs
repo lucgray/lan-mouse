@@ -373,20 +373,29 @@ impl CaptureTask {
         capture: &mut InputCapture,
         r: Result<(), InputCaptureError>,
     ) -> Result<(), InputCaptureError> {
-        if r.is_err() {
-            // Cancel the failed transport before waiting for native release.
-            // This mode snapshots the original generation and never sends stale input.
-            if let Err(cleanup) = self
-                .release_capture_with(capture, ReleaseMode::AbortPeer, None)
-                .await
-            {
-                log::warn!("failed to release capture after backend error: {cleanup}");
+        let event_tx = self.event_tx.clone();
+        let reason = r
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "backend termination has not completed".into());
+        await_capture_cleanup(&event_tx, &reason, async {
+            let mut result = r;
+            if result.is_err() {
+                // AbortPeer cancels the saved transport before native release.
+                let release = self
+                    .release_capture_with(capture, ReleaseMode::AbortPeer, None)
+                    .await;
+                if let Err(error) = &release {
+                    log::warn!("failed to release capture after backend error: {error}");
+                }
+                result = capture_result_after_cleanup(result, release, "native release");
+                self.remap.reset_session();
             }
-            self.remap.reset_session();
-        }
-
-        // FIXME replace with async drop when stabilized
-        await_capture_termination(&self.event_tx, r, capture.terminate()).await
+            // Retain one owner/progress timer across release and termination.
+            capture_result_after_termination(result, capture.terminate().await)
+        })
+        .await
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -765,6 +774,28 @@ where
     result
 }
 
+async fn await_capture_cleanup<F>(
+    event_tx: &Sender<ICaptureEvent>,
+    reason: &str,
+    cleanup: F,
+) -> Result<(), InputCaptureError>
+where
+    F: std::future::Future<Output = Result<(), InputCaptureError>>,
+{
+    tokio::pin!(cleanup);
+    tokio::select! {
+        biased;
+        result = &mut cleanup => result,
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {
+            log::warn!("input capture cleanup is still pending: {reason}");
+            event_tx.send(ICaptureEvent::CaptureCleanupPending(reason.into())).expect("channel closed");
+            // Feedback does not cancel cleanup or allow a replacement owner.
+            // Continue polling this same chain, with no second progress timer.
+            cleanup.await
+        }
+    }
+}
+
 async fn await_capture_termination<F>(
     event_tx: &Sender<ICaptureEvent>,
     result: Result<(), InputCaptureError>,
@@ -773,32 +804,32 @@ async fn await_capture_termination<F>(
 where
     F: std::future::Future<Output = Result<(), CaptureError>>,
 {
-    tokio::pin!(termination);
-    let cleanup = tokio::select! {
-        biased;
-        cleanup = &mut termination => cleanup,
-        _ = tokio::time::sleep(Duration::from_millis(250)) => {
-            let reason = match &result {
-                Err(error) => error.to_string(),
-                Ok(()) => "backend termination has not completed".into(),
-            };
-            log::warn!("input capture cleanup is still pending: {reason}");
-            event_tx.send(ICaptureEvent::CaptureCleanupPending(reason)).expect("channel closed");
-            // Keep ownership and keep polling the SAME future. The feedback
-            // timer is not cancellation or permission to recreate the backend.
-            termination.await
-        }
-    };
-    capture_result_after_termination(result, cleanup)
+    let reason = result
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "backend termination has not completed".into());
+    await_capture_cleanup(event_tx, &reason, async {
+        capture_result_after_termination(result, termination.await)
+    })
+    .await
 }
 
 fn capture_result_after_termination(
     result: Result<(), InputCaptureError>,
     termination: Result<(), CaptureError>,
 ) -> Result<(), InputCaptureError> {
-    match (result, termination) {
+    capture_result_after_cleanup(result, termination, "backend termination")
+}
+
+fn capture_result_after_cleanup(
+    result: Result<(), InputCaptureError>,
+    cleanup: Result<(), CaptureError>,
+    stage: &str,
+) -> Result<(), InputCaptureError> {
+    match (result, cleanup) {
         (Err(error), Err(cleanup)) => Err(CaptureError::Io(std::io::Error::other(format!(
-            "{error}; backend termination also failed: {cleanup}"
+            "{error}; {stage} also failed: {cleanup}"
         )))
         .into()),
         (Err(error), Ok(())) => Err(error),
@@ -881,6 +912,82 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_and_termination_share_one_progress_timer_and_keep_all_errors() {
+        struct Owner<'a>(&'a Cell<bool>);
+        impl Drop for Owner<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let (tx, mut events) = channel();
+        let (release_done, release_wait) = tokio::sync::oneshot::channel();
+        let (terminate_done, terminate_wait) = tokio::sync::oneshot::channel();
+        let (terminate_started, started_wait) = tokio::sync::oneshot::channel();
+        let dropped = Cell::new(false);
+        let owner = Owner(&dropped);
+        let wait = await_capture_cleanup(&tx, "activation stream closed unexpectedly", async {
+            let _owner = owner;
+            let primary = Err(CaptureError::ActivationClosed.into());
+            release_wait.await.unwrap();
+            let result = capture_result_after_cleanup(
+                primary,
+                Err(CaptureError::Io(std::io::Error::other("release failure"))),
+                "native release",
+            );
+            terminate_started.send(()).unwrap();
+            terminate_wait.await.unwrap();
+            capture_result_after_termination(
+                result,
+                Err(CaptureError::Io(std::io::Error::other(
+                    "termination failure",
+                ))),
+            )
+        });
+        tokio::pin!(wait);
+        let notice = tokio::time::timeout(Duration::from_millis(650), async {
+            tokio::select! {
+                _ = &mut wait => panic!("release must remain pending"),
+                event = events.recv() => event.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(notice, ICaptureEvent::CaptureCleanupPending(reason) if reason.contains("activation stream"))
+        );
+        assert!(!dropped.get());
+        release_done.send(()).unwrap();
+        tokio::select! {
+            _ = &mut wait => panic!("termination must remain pending"),
+            started = started_wait => started.unwrap(),
+        }
+        tokio::select! {
+            _ = &mut wait => panic!("termination must remain pending"),
+            _ = events.recv() => panic!("second stage must not repeat progress"),
+            _ = tokio::time::sleep(Duration::from_millis(350)) => {},
+        }
+        assert!(!dropped.get());
+        terminate_done.send(()).unwrap();
+        let result = wait.await;
+        assert!(dropped.get());
+        let message = result.as_ref().unwrap_err().to_string();
+        assert!(message.contains("activation stream"));
+        assert!(message.contains("native release also failed"));
+        assert!(message.contains("release failure"));
+        assert!(message.contains("backend termination also failed"));
+        assert!(message.contains("termination failure"));
+        report_capture_exit(&tx, &result);
+        assert!(
+            matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureFailed(message) if message.contains("release failure"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fatal_release_cancels_original_before_wait_and_preserves_late_replacement() {

@@ -849,9 +849,9 @@ If capture/barrier processing and backend termination both fail, the existing
 Io(Other) error contains both messages. A single failure retains its original
 error variant. There is no protocol or public variant addition.
 
-Reporting currently waits for backend termination to return. A pending native
-termination can delay the notification; this is still an acceptance issue,
-including the extra wait relative to the former runtime-only error notice.
+Final failure reporting waits for backend termination to return. The shared
+asynchronous cleanup timer described below can report pending progress before
+that result; synchronous native blocking remains an acceptance issue.
 Result-stage tests verify notification/content, not actual GUI display or
 physical backend failure/cleanup.
 
@@ -871,8 +871,8 @@ with a controlled Drop guard; physical native cleanup is not proven.
 
 This is not a native timeout. A synchronous call blocking the executor prevents
 the timer from running. Whole-service shutdown may also stop consuming capture
-events while awaiting termination. Native release waits before termination are
-not covered here. The isolated Service fixture verifies status/message forwarding
+events while awaiting termination. Fatal native release waits before termination
+are now included in the shared chain below; ordinary release waits remain separate. The isolated Service fixture verifies status/message forwarding
 with Dummy backends, not GTK rendering or physical backend recovery. Wire encoding
 and public APIs are unchanged.
 
@@ -894,3 +894,22 @@ A synchronous native call may prevent scheduled transport close from running.
 Release-phase pending feedback remains separate from the termination timer.
 Controlled native futures/transports verify this order; public APIs and wire
 encoding are unchanged.
+
+
+### Shared fatal release/termination progress
+
+Fatal capture cleanup awaits one retained release/termination chain under the
+same 250ms progress timer. A delayed native release can now produce the existing
+cleanup-pending event; moving to termination does not emit a second progress
+notice. Backend creation failures reuse that timer for their termination stage.
+This does not alter AbortPeer cancellation ordering or return early to re-enable.
+
+Final error text preserves the primary fault plus native-release and termination
+failures, with stage labels. Multiple failures use existing Io(Other); a single
+failure retains its type. Controlled chained futures and an owner Drop guard
+verify sequencing and messages, not physical backend release.
+
+Ordinary NotifyPeer/Silent releases are outside this fatal cleanup chain. Native
+synchronous calls can still block the timer, and service shutdown can pause
+frontend event consumption. Those recovery/feedback gates remain open. Wire
+encoding and public APIs are unchanged.

@@ -12,8 +12,9 @@
 | R78 | 已实现并通过替代连接回归 | 一般 capture error 使用原 snapshot，不按迟到当前句柄误断新连接；故障释放等待的取消顺序由 R82 补充 |
 | R79 | 已实现并通过 EOF 最终处理回归 | 意外 EOF 进入失败清理，清 active/modifiers/remap；shutdown EOF 不误报，真实 native receiver 关闭未验收 |
 | R80 | 已实现并通过通知/错误上下文回归 | 创建/运行/退出返回错误统一 CaptureFailed，双失败保留两原因；实际 GUI toast 待验 |
-| R81 | 异步 terminate 进度已实现 | 250ms 后报 pending、保留原 future/owner；隔离 Service 转发通过；同步阻塞和服务 shutdown 的反馈未闭环 |
+| R81 | 异步清理链进度已实现 | fatal release/terminate 共用 250ms 进度计时、保留 future/owner；隔离 Service 转发通过；普通 release、同步阻塞和服务 shutdown 的反馈未闭环 |
 | R82 | 故障取消顺序已实现并通过受控等待回归 | AbortPeer 在 native release 首次 poll 前请求取消旧 snapshot；健康/迟到替代连接保留；锁竞争及物理释放边界见第 61 轮 |
+| R83 | fatal release 反馈/错误上下文已实现 | 整条 fatal 清理链只发一次进度；释放/退出连续等待保持 owner，最终保留三个阶段原因；生产 helper 模型验证，物理故障未验收 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1514,3 +1515,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务连接/任务资源上限、R60 原生阻塞/故障恢复、真机千次往返、完整延迟和 8h RSS 未完成，不认定达到 90 分。
 
 日志：capture-fatal-release-baseline.log、capture-fatal-release-library.log、capture-fatal-release-workspace.log、capture-fatal-release-clippy.log。
+
+
+## 第六十二轮：释放和退出共用一条反馈/错误清理链
+
+### R83 / P2
+
+- 基线在实际最终处理前插入保持原语义的 await_capture_cleanup 调用，控制 release future 350ms：没有反馈，现有 terminate timer 只有 release 完成后才开始。日志 capture-release-feedback-baseline.log。它验证生产等待阶段，未强制真实 native backend hang。另核对 finish_capture_session：release Err 只 warn，最终消息只合并主错误与 terminate Err，释放原因未进入最终前端错误。
+- [x] await_capture_cleanup 保留并 poll 整条 release→terminate future，共用一个 250ms timer；创建失败的 terminate wrapper 也复用该 helper。fatal release 还没返回时也会通知 pending；进入 terminate 不另起计时器/重复提示。整条链完成前不返回到 run 的 re-enable 分支。
+- [x] 原连接取消顺序保持第 61 轮 AbortPeer 行为；本轮只扩大异步反馈范围。通用结果合并方法按 stage 收集 native release 与 backend termination 错误，最终消息同时保留主故障和两个清理原因。单阶段失败仍保留原 variant，多失败用既有 Io(Other) 文本。无 public API/protocol 变化。
+
+### 验证和边界
+
+- 新回归将 release 和 terminate 分别卡在 oneshot：release pending 时收到一次进度；release 放行后 terminate 再等 350ms 无重复进度；Owner Drop guard 在两个阶段保持存活，只有全部结束才释放；最终 CaptureFailed 含 activation/release/termination 原因且仅一条最终失败。它调用生产通用等待/结果处理 helper，阶段本身是模型，不是实机完整 cleanup 链。
+- 原 terminate 成功/失败矩阵、立即完成无 pending、EOF 状态清理、fatal early abort/替代连接和正常 release 回归继续通过。全工作区 all-features：root 147 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。
+- 2e99f0a Rust 37214414271 检查时 queued、Nix 37214414275 in_progress；新 HEAD 需对应 CI。第 60 轮已独立验证的 Service 事件映射本轮未改，也未重复当作本轮 native/UI 实测。
+- [ ] 普通 NotifyPeer/Silent 的 release 等待不在这个 fatal 最终处理链内，尚未有本轮 pending 提示；同步 native 阻塞 runtime 仍让 timer 无法运行。全服务 shutdown 等待 capture 时事件消费也可能暂停；R60 物理恢复未完成。
+- [ ] 下一轮转向 R13：检查 accepted connection、reader 和后台 cleanup 生命周期的全局资源上限，而不是仅依靠普通输入队列已有额度。真机千次往返、完整 p95/p99 和 8h RSS 仍缺少证明，不认定达到 90 分。
+
+日志：capture-release-feedback-baseline.log、capture-release-feedback-library.log、capture-release-feedback-workspace.log、capture-release-feedback-clippy.log。
