@@ -1159,3 +1159,29 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R64 X11 额外合法按钮 fallback、R13 资源总上限、R60 原生失败/退出、真机千次往返、完整 p95/p99 与 8h RSS 仍未完成；本轮数值修复不能证明软件已达 90 分。
 
 日志：numeric-input-baseline.log、numeric-scroll-baseline.log、numeric-input-library.log、numeric-input-config.log、numeric-input-reader.log、numeric-input-clippy.log、numeric-input-workspace.log（中间版本）。
+
+
+## 第四十六轮：X11 按钮身份与第 45 轮验证恢复
+
+### R64 / P2
+
+- 基线提取生产 emulate_mouse_button 原有转换逻辑，验证合法未知编号 0x116/0x117/0x2ff 和 0 均转换为 X button 1；实际 native 调用将按这个结果发左键。这个基线验证转换决策，没有在用户桌面注入点击。
+- [x] 改为 Option 转换；不支持的按钮在调用 XTestFakeButtonEvent 之前返回，不会回退左键。left/middle/right/back/forward 仍对应 1/2/3/8/9。
+- [x] X11 capture 旧 helper 只有 1/2/3，导致侧键 8/9 的按下/释放被忽略；添加 back/forward 映射，通过现有 ButtonPress / ButtonRelease 请求路径发送。未知按钮仍不是 pointer button transition。
+- [x] 两个 emulation 转换回归覆盖全部五个支持按钮和未知/越界编号；capture 增加侧键覆盖，并保留滚轮 4..7 不应被误当普通按住按钮的断言。
+- [ ] 物理 X11/XTest 事件发送和真实浏览器侧键行为未验；本机未发现 Xvfb/Xephyr，不把纯转换测试称为 native 验收。
+
+### 第 45 轮最终门槛恢复
+
+- [x] 自动审批之前提示的账户恢复时间已过，重新通过正常 require_escalated 审批运行 98f9919 的最终全工作区：root 136 / 2 忽略，input-emulation 30，input-capture 33 / 1 忽略，GTK 14 / 4 忽略，CLI 3、IPC 4。日志 numeric-input-workspace-final.log。
+- [x] 两个隔离 Service-DTLS fixture 都通过；新增非法灵敏度 Service 请求的 Error/Settings、保持原值、磁盘原文不变等断言已实际执行。45 轮原“仅编译、网络回归待执行”的历史限制已解除。日志 numeric-input-external_reload_preserves_file_and_applies_authorization_and_clipboard.log / numeric-input-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+- [x] 外部读取审批恢复，核对第 44 轮 HEAD 66481eb Rust 37198641952、Nix 37198641958 均 completed/success；b8c9d91 的 Rust/Nix 都被后续提交取消，不称为已通过。
+- PR 目标再次核对为 lucgray/lan-mouse:main ← lucgray/lan-mouse:fix/input-reliability-review；远端核对时 head=66481eb，本地 98f9919 与本轮后续提交准备合并推送。旧 HEAD CI 不替代新提交。
+
+### 本轮验证和下一条线索
+
+- Linux all-features 工作区通过：root 136 / 2 忽略，input-emulation 32，input-capture 34 / 1 忽略，GTK 14 / 4 忽略，CLI 3、IPC 4；严格 all-targets Clippy、格式/diff 检查通过。第 45 轮刚执行的两个真实 Service fixtures 针对本轮未改动的协议/Service 路径仍提供回归证据；本轮新增 X11 路径只覆盖转换与编译/单元门槛。
+- [ ] R67 / P1：按本仓库 emulation 的 SCROLL_UP/DOWN/LEFT/RIGHT 常量定义，wheel button 4..7 没有被 capture 转成 AxisDiscrete120。当前 capture ButtonPress/Release 仅调用普通按钮转换，结果 None，滚轮被忽略。Emulation emulate_scroll 对任意 magnitude（含 0、小数和多 detent）只按方向发一次 XTest press/release；高分辨率及零位移处理不正确。下一轮需实际事件决策故障注入、正确的分数/倍数处理与公平调度，不能让巨大输入在同步循环里占住 dispatcher。
+- [ ] R13 全服务连接/handle/其他队列资源上限、R60 永久原生故障/退出、真实 Win/Linux 千次切换、完整 p95/p99 和 8h RSS 仍未闭环，不认定达到 90 分。
+
+日志：x11-buttons-baseline.log、x11-buttons-workspace.log、x11-buttons-clippy.log。

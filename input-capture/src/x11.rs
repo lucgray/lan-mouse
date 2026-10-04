@@ -419,11 +419,13 @@ pub(crate) fn clamp_to_screen(pos: (i32, i32), w: i32, h: i32) -> (i32, i32) {
 }
 
 pub(crate) fn x11_button_to_evdev(button: u32) -> Option<u32> {
-    use input_event::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+    use input_event::{BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
     match button {
         1 => Some(BTN_LEFT),
         2 => Some(BTN_MIDDLE),
         3 => Some(BTN_RIGHT),
+        8 => Some(BTN_BACK),
+        9 => Some(BTN_FORWARD),
         _ => None,
     }
 }
@@ -512,7 +514,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_button_returns_none() {
-        assert_eq!(x11_button_to_evdev(8), None);
+    fn back_and_forward_buttons_keep_their_identity() {
+        assert_eq!(x11_button_to_evdev(8), Some(input_event::BTN_BACK));
+        assert_eq!(x11_button_to_evdev(9), Some(input_event::BTN_FORWARD));
+    }
+
+    #[test]
+    fn unknown_and_wheel_buttons_are_not_pointer_button_transitions() {
+        for button in [0, 4, 5, 6, 7, 10, u32::MAX] {
+            assert_eq!(x11_button_to_evdev(button), None);
+        }
     }
 }

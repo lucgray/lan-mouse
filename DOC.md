@@ -637,3 +637,17 @@ sub-120 remainder. Extreme values can lose excess at native representation
 limits, while subsequent ordinary input remains usable. These are source/logic
 protections, not a claim that giant finite displacements are useful native input
 or that physical device behavior has been verified on every OS.
+
+
+### X11 button identity
+
+X11 capture and emulation map left/middle/right buttons to native 1/2/3 and
+back/forward to 8/9. Unsupported evdev buttons are ignored before XTest delivery;
+they never fall back to a left click. Capture forwards the back/forward press
+and release through the existing event path. The complete pipeline's overflow
+and native delivery behavior still need target-OS acceptance.
+
+Known X11 scroll gaps are recorded in the review checklist: capture does not yet
+translate wheel button 4..7 to axis events, and emulation currently emits one
+wheel click per scroll event rather than preserving its magnitude/remainder.
+The button fix does not imply scroll support is complete.

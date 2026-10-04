@@ -39,15 +39,11 @@ impl X11Emulation {
     }
 
     fn emulate_mouse_button(&self, button: u32, state: u32) {
+        let Some(x11_button) = evdev_button_to_x11(button) else {
+            // Unsupported buttons must never turn into an unrelated click.
+            return;
+        };
         unsafe {
-            let x11_button = match button {
-                BTN_RIGHT => 3,
-                BTN_MIDDLE => 2,
-                BTN_BACK => 8,
-                BTN_FORWARD => 9,
-                BTN_LEFT => 1,
-                _ => 1,
-            };
             xtest::XTestFakeButtonEvent(self.display, x11_button, state as i32, 0);
         };
     }
@@ -150,5 +146,41 @@ impl Emulation for X11Emulation {
 
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+}
+
+fn evdev_button_to_x11(button: u32) -> Option<u32> {
+    match button {
+        BTN_RIGHT => Some(3),
+        BTN_MIDDLE => Some(2),
+        BTN_BACK => Some(8),
+        BTN_FORWARD => Some(9),
+        BTN_LEFT => Some(1),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_buttons_keep_their_native_identity() {
+        for (evdev, x11) in [
+            (BTN_LEFT, 1),
+            (BTN_MIDDLE, 2),
+            (BTN_RIGHT, 3),
+            (BTN_BACK, 8),
+            (BTN_FORWARD, 9),
+        ] {
+            assert_eq!(evdev_button_to_x11(evdev), Some(x11));
+        }
+    }
+
+    #[test]
+    fn unsupported_buttons_cannot_become_left_clicks() {
+        for button in [0, 0x116, 0x117, input_event::MAX_EVDEV_CODE, u32::MAX] {
+            assert_eq!(evdev_button_to_x11(button), None);
+        }
     }
 }
