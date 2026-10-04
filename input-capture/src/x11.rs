@@ -300,33 +300,14 @@ fn handle_event(state: &mut X11State, ev: XEvent) {
             let m: XMotionEvent = unsafe { ev.motion };
             handle_motion(state, m);
         }
-        ButtonPress => {
+        ButtonPress | ButtonRelease => {
             if let Some(pos) = state.active_client {
                 let b: XButtonEvent = unsafe { ev.button };
-                if let Some(button) = x11_button_to_evdev(b.button) {
-                    let _ = state.event_tx.try_send((
-                        pos,
-                        CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
-                            time: 0,
-                            button,
-                            state: 1,
-                        })),
-                    ));
-                }
-            }
-        }
-        ButtonRelease => {
-            if let Some(pos) = state.active_client {
-                let b: XButtonEvent = unsafe { ev.button };
-                if let Some(button) = x11_button_to_evdev(b.button) {
-                    let _ = state.event_tx.try_send((
-                        pos,
-                        CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
-                            time: 0,
-                            button,
-                            state: 0,
-                        })),
-                    ));
+                let pressed = u32::from(unsafe { ev.type_ } == ButtonPress);
+                if let Some(pointer) = x11_pointer_button_event(b.button, pressed) {
+                    let _ = state
+                        .event_tx
+                        .try_send((pos, CaptureEvent::Input(Event::Pointer(pointer))));
                 }
             }
         }
@@ -430,11 +411,83 @@ pub(crate) fn x11_button_to_evdev(button: u32) -> Option<u32> {
     }
 }
 
+fn x11_pointer_button_event(button: u32, pressed: u32) -> Option<PointerEvent> {
+    let (axis, value) = match button {
+        4 => (0, -120),
+        5 => (0, 120),
+        6 => (1, -120),
+        7 => (1, 120),
+        _ => {
+            return x11_button_to_evdev(button).map(|button| PointerEvent::Button {
+                time: 0,
+                button,
+                state: pressed,
+            });
+        }
+    };
+    // Core X11 wheel events are click pairs; forward the press exactly once.
+    (pressed == 1).then_some(PointerEvent::AxisDiscrete120 { axis, value })
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn button_fixture() -> (X11State, tokio_mpsc::Receiver<(Position, CaptureEvent)>) {
+        let (event_tx, event_rx) = tokio_mpsc::channel(64);
+        let (_request_tx, request_rx) = mpsc::channel();
+        (
+            X11State {
+                display: std::ptr::null_mut(),
+                root: 0,
+                screen_w: 100,
+                screen_h: 100,
+                clients: HashSet::new(),
+                active_client: Some(Position::Left),
+                entry_point: (0, 0),
+                prev_pos: (0, 0),
+                event_tx,
+                request_rx,
+            },
+            event_rx,
+        )
+    }
+
+    fn button_event(kind: i32, button: u32) -> XEvent {
+        XEvent {
+            button: XButtonEvent {
+                type_: kind,
+                button,
+                ..unsafe { std::mem::zeroed() }
+            },
+        }
+    }
+
+    #[test]
+    fn x11_scroll_capture_forwards_one_axis_event_per_wheel_click() {
+        let (mut state, mut events) = button_fixture();
+        for (button, axis, value) in [(4, 0, -120), (5, 0, 120), (6, 1, -120), (7, 1, 120)] {
+            handle_event(&mut state, button_event(ButtonPress, button));
+            handle_event(&mut state, button_event(ButtonRelease, button));
+            assert!(
+                matches!(events.try_recv(), Ok((Position::Left, CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { axis: actual_axis, value: actual_value }))))
+                if actual_axis == axis && actual_value == value)
+            );
+            assert!(events.try_recv().is_err());
+        }
+        for kind in [ButtonPress, ButtonRelease] {
+            handle_event(&mut state, button_event(kind, 8));
+            assert!(
+                matches!(events.try_recv(), Ok((Position::Left, CaptureEvent::Input(Event::Pointer(PointerEvent::Button { button, state: pressed, .. }))))
+                if button == input_event::BTN_BACK && pressed == u32::from(kind == ButtonPress))
+            );
+        }
+        state.active_client = None;
+        handle_event(&mut state, button_event(ButtonPress, 5));
+        assert!(events.try_recv().is_err());
+    }
 
     #[test]
     fn crosses_left_boundary() {

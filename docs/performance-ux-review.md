@@ -1185,3 +1185,31 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务连接/handle/其他队列资源上限、R60 永久原生故障/退出、真实 Win/Linux 千次切换、完整 p95/p99 和 8h RSS 仍未闭环，不认定达到 90 分。
 
 日志：x11-buttons-baseline.log、x11-buttons-workspace.log、x11-buttons-clippy.log。
+
+
+## 第四十七轮：X11 滚轮捕获、步数和可取消批次
+
+### R67 / P1
+
+- 两个生产决策基线复现：构造 XEvent ButtonPress/Release 4..7 并调用实际 handle_event，捕获事件队列无任何滚动；提取生产 scroll click 决策，value=0 / 0.4 / 24 / 120 / 240 都返回一格，下游每次固定发一次 XTest 按下/释放。不使用显示服务器或真实鼠标。
+- [x] Capture 将 wheel 4/5 转为垂直 -120/+120、6/7 转为水平 -120/+120；仅处理 press，一对 X11 core wheel click 不重复转发 release。普通/侧键仍保持原有 press/release，未激活 client 不转发。
+- [x] Emulation 的 AxisDiscrete120 按完整 120-unit 累加，多格实际发多次，零值不发送，分数保留，反向输入取消余量。规范来源：[Wayland axis_value120](https://wayland.freedesktop.org/docs/html/apa.html) / [libei discrete scroll](https://libinput.pages.freedesktop.org/libei/interfaces/ei_scroll/index.html)。
+- [x] ScrollState 按 EmulationHandle 登记，横/纵与 continuous/discrete 分别保留余量；destroy / terminate 清理，旧 peer 的半格不能影响另一设备或复用生命周期。
+- [x] Continuous Axis 使用 10 logical units 近似一个 core X11 wheel click；这是 [历史 Wayland 约定](https://cgit.freedesktop.org/wayland/wayland/commit/?id=c5356e9016aa814a873a765bb2cbe57e804e5ea7)，不是统一的 pixels/mm 原生精度规范。保留小数与反转，极端输出在 i32 范围截断且不遗留巨量余数，NaN 不污染后续输入。没有把这种近似称为真正 smooth native scrolling。
+- [x] 发 native click 时最多 32 个完整 press/release pair 后让出 Tokio 调度，开始前也让出；每对之间没有 await，并 flush 完整对。已取消的未发送点击不继续后台重播，输入 lease 的现有年龄/取消策略可生效；同步 XFlush / XTest 仍不可被 Tokio deadline 抢占。
+
+### 回归证据
+
+- capture 的实际 handle_event / channel 用例覆盖四种滚轮方向，按下/释放只得到一次对应 axis，侧键 press/release 仍在，未激活停止投递。
+- emulation 用例覆盖 zero、五次 24 -> 一格、-240 -> 两个向上、横向 240 -> 两个向右、余量方向抵消和轴隔离；连续四次 2.5 -> 一格、反转抵消、极值/NaN 后正常恢复。另一个生命周期用例验证不同 handle 的半格和 remove/recreate 不串。
+- 大 i32::MAX 滚动使用相同生产 emit_scroll_steps、计数 callback 和 5ms timeout；验证其他 task 可运行、投递在完整 pair callback 之间被取消、取消后计数不继续增长。此为调度/取消模型测试，不是 native X server 输入延迟或物理 p95/p99。
+- Linux all-features 工作区通过：root 136 / 2 忽略，input-emulation 35，input-capture 35 / 1 忽略，GTK 14 / 4 忽略，CLI 3、IPC 4；严格 all-targets Clippy、fmt/diff 检查通过；两个隔离 Service-DTLS 授权/活跃撤销和双向剪贴板重播/来源/禁用/重连回归通过。
+- 前一 HEAD c35de9c Rust run 37205103874 已 completed/success，Nix 37205104057 检查时仍 in_progress；新 HEAD 需自己的 CI。无 Xvfb/Xephyr/物理 X11 设备验收；连续触摸板感觉待验证，不宣称 R67 native 验收完成。
+
+### 下一輪源码风险
+
+- [ ] R68 / P1：X11 capture event_tx 是容量 64 的队列，handle_event / handle_motion 的 try_send 失败被忽略；离散 release 在高频运动积压时可能丢失，发送端仍持有 capture，不能靠接收端 input budget 恢复被源端丢失的 release。需要队列饱和注入和恢复本机输入策略，不能只增加容量。
+- [ ] R69 / P2：X11 relative_motion 使用 dx/dy as i32，没有每 handle 小数余量；小于 1 的合法 motion 可能连续被截断为 0。Windows rel_mouse 同类截断路径需一起核对。下一轮应验证慢移动、方向反转与设备生命周期。
+- [ ] R13 全服务资源上限、同步 native 调用与失败返回、R60 原生退出、真机千次往返、完整 p95/p99 和 8h RSS 仍未闭环。不以此次逻辑与模拟调度通过认定达到 90 分。
+
+日志：x11-scroll-baseline.log、x11-scroll-workspace.log、x11-scroll-clippy.log、x11-scroll-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、x11-scroll-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

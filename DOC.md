@@ -647,7 +647,22 @@ they never fall back to a left click. Capture forwards the back/forward press
 and release through the existing event path. The complete pipeline's overflow
 and native delivery behavior still need target-OS acceptance.
 
-Known X11 scroll gaps are recorded in the review checklist: capture does not yet
-translate wheel button 4..7 to axis events, and emulation currently emits one
-wheel click per scroll event rather than preserving its magnitude/remainder.
-The button fix does not imply scroll support is complete.
+Core X11 wheel presses 4/5/6/7 become vertical -120/+120 and horizontal
+-120/+120 events; the matching release is ignored to avoid double scrolling.
+Emulation accumulates AxisDiscrete120 to complete 120-unit wheel clicks, keeps
+fractions and sign changes per handle and axis, and emits the actual click count.
+Zero sends no clicks. Handle destruction/termination clears the residual state.
+This follows the [Wayland 120-unit definition](https://wayland.freedesktop.org/docs/html/apa.html).
+
+Core X11 only provides wheel clicks. Continuous Axis values are approximated by
+10 logical units per click, following a [historic Wayland convention](https://cgit.freedesktop.org/wayland/wayland/commit/?id=c5356e9016aa814a873a765bb2cbe57e804e5ea7).
+That heuristic retains fractions and reversals, but does not reproduce native
+pixel/mm precision; touchpad feel still needs target-device verification.
+Continuous and discrete residuals remain independent.
+
+Large scroll deliveries yield before each batch of at most 32 complete native
+press/release pairs. Each pair is flushed without an await in between; a canceled
+operation does not keep replaying its undelivered clicks. This keeps yielding
+work compatible with the existing input deadline, while synchronous Xlib calls
+still cannot be preempted. Native delivery and capture-queue overload behavior
+remain separate acceptance requirements.
