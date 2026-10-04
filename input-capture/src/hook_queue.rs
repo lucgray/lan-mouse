@@ -12,11 +12,14 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(any(windows, test))]
 const CAPACITY: usize = 256;
 const COALESCE_AFTER: usize = 32;
 type Item = (Position, CaptureEvent);
 
 struct Shared {
+    capacity: usize,
+    failure: fn() -> CaptureError,
     events: Mutex<VecDeque<Item>>,
     failed: AtomicBool,
     closed: AtomicBool,
@@ -29,9 +32,21 @@ pub(crate) struct HookReceiver {
     failure_reported: bool,
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn channel() -> (HookSender, HookReceiver) {
+    channel_with(CAPACITY, || CaptureError::HookQueueOverloaded)
+}
+
+#[cfg(x11)]
+pub(crate) fn x11_channel() -> (HookSender, HookReceiver) {
+    channel_with(64, || CaptureError::X11QueueOverloaded)
+}
+
+fn channel_with(capacity: usize, failure: fn() -> CaptureError) -> (HookSender, HookReceiver) {
     let shared = Arc::new(Shared {
-        events: Mutex::new(VecDeque::with_capacity(CAPACITY)),
+        capacity,
+        failure,
+        events: Mutex::new(VecDeque::with_capacity(capacity)),
         failed: AtomicBool::new(false),
         closed: AtomicBool::new(false),
         waker: AtomicWaker::new(),
@@ -81,7 +96,7 @@ impl HookSender {
             false
         };
         if !merged {
-            if events.len() == CAPACITY {
+            if events.len() == self.0.capacity {
                 self.0.failed.store(true, Ordering::Release);
                 drop(events);
                 self.0.waker.wake();
@@ -103,6 +118,11 @@ impl Drop for HookSender {
 }
 
 impl HookReceiver {
+    #[cfg(any(windows, x11))]
+    pub(crate) fn failed(&self) -> bool {
+        self.shared.failed.load(Ordering::Acquire)
+    }
+
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
@@ -114,7 +134,7 @@ impl HookReceiver {
             if std::mem::replace(&mut self.failure_reported, true) {
                 return Poll::Ready(None);
             }
-            return Poll::Ready(Some(Err(CaptureError::HookQueueOverloaded)));
+            return Poll::Ready(Some(Err((self.shared.failure)())));
         }
         if let Some(event) = events.pop_front() {
             return Poll::Ready(Some(Ok(event)));

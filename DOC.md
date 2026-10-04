@@ -666,3 +666,21 @@ operation does not keep replaying its undelivered clicks. This keeps yielding
 work compatible with the existing input deadline, while synchronous Xlib calls
 still cannot be preempted. Native delivery and capture-queue overload behavior
 remain separate acceptance requirements.
+
+
+### Native capture queue overload
+
+X11 capture uses a bounded 64-event queue; Windows retains 256 events. After
+32 queued events, adjacent motion for the same target can be coalesced without
+crossing button/key/target boundaries. Queue locks cover only bounded queue
+operations, never I/O or awaiting. If a discrete event cannot be admitted, the
+queue latches a backend-specific overload error, discards stale events and stops
+capture. X11 requests native pointer/keyboard ungrab and refuses another grab
+with the failed queue. The service disables capture until explicitly re-enabled.
+
+InputCapture prioritizes a latched native queue failure over its expanded fanout
+cache. Already tracked pressed keys remain available for cleanup. This applies
+to both Windows and X11. X11QueueOverloaded is an additive CaptureError variant;
+wire encoding and protocol version are unchanged. Tests prove queue/state/error
+behavior using release callbacks; synchronous native ungrab/flush success and
+physical device recovery still require target-desktop verification.

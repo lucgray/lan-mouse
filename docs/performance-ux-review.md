@@ -1213,3 +1213,31 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务资源上限、同步 native 调用与失败返回、R60 原生退出、真机千次往返、完整 p95/p99 和 8h RSS 仍未闭环。不以此次逻辑与模拟调度通过认定达到 90 分。
 
 日志：x11-scroll-baseline.log、x11-scroll-workspace.log、x11-scroll-clippy.log、x11-scroll-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、x11-scroll-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+
+## 第四十八轮：X11 捕获队列饱和与缓存错误优先级
+
+### R68 / P1
+
+- 基线通过实际 XEvent dispatcher 先投递 Ctrl 按下，再填满原容量 64 的队列，最后投递 Ctrl 释放：释放被静默丢弃，active_client 仍为 Left。日志 x11-overload-baseline.log；未向用户桌面注入事件。
+- [x] X11 复用 Windows 的有界捕获队列，保留原容量 64（Windows 256）。积压达到 32 后，只合并同目标相邻运动，保留位移总和，不跨按键/按钮或目标边界。
+- [x] 离散事件无法入队时锁存 X11QueueOverloaded，丢弃旧队列，唤醒消费者并优先报告一次错误；停止后续捕获，拒绝再次 grab，调用 native ungrab 路径。现有 Service 错误路径中止当前捕获会话并禁用捕获，需显式重新开启。
+- [x] 公共 InputCapture 检查已锁存的错误，先清空展开后的 fanout 缓存，防止 Windows/X11 backend 失败后仍发送缓存旧按下。已经跟踪的按下状态保留，供后续清理。
+- [x] 队列锁仅覆盖有界 push/pop/尾部合并，不在锁内执行 I/O 或 await。
+
+### 回归与验证
+
+- 离散队列满的实际 dispatcher 回归：释放回调一次、active_client 清空、错误优先于旧输入、后续结束且拒绝重新抓取。
+- 8,000 个运动事件积压后 Ctrl 释放仍保留，位移总和精确为 (2000, -2000)，按键状态顺序为 [1, 0]。
+- 实际公共 wrapper 的 fanout 缓存回归：错误优先，旧 Ctrl 按下不输出，已跟踪 Ctrl 仍可取出用于清理。
+- Linux all-features 工作区通过：input-capture 38 / 1 忽略，input-emulation 35，root 136 / 2 忽略，GTK 14 / 4 忽略，CLI 3、IPC 4、input-event 5、proto 11。严格 workspace/all-targets/all-features Clippy、input-capture 无默认功能 Clippy、fmt/diff 通过。两个独立 Service-DTLS fixtures 均通过。
+- 上述 native release 使用测试回调证明调用与状态转换，没有证明真实 XUngrab/XFlush 成功或物理鼠标恢复。同步 Xlib I/O 仍可能阻塞；错误消息只称捕获已禁用。
+- 推送目标：lucgray/lan-mouse:main ← lucgray/lan-mouse:fix/input-reliability-review，更新现有 draft PR #6；新 HEAD 的跨平台 CI 需另行验证。
+
+### 未完成门槛
+
+- [ ] R69 / P2：X11/Windows 小数运动截断，需验证慢移动、方向反转与 handle 生命周期。
+- [ ] X11 控制通道同步 send、线程 join、native I/O 阻塞及 XGrabKeyboard 返回处理仍需审查。
+- [ ] R13 全服务资源上限、R60 原生故障/退出、真机千次往返、完整 p95/p99 和 8h RSS 未闭环，尚不认定达到 90 分。
+
+日志：x11-overload-baseline.log、x11-overload-workspace.log、x11-overload-clippy.log、x11-overload-minimal-clippy.log、x11-overload-fanout.log，以及两个 x11-overload-* Service fixture 日志。

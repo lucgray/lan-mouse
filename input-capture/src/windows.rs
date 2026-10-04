@@ -20,6 +20,10 @@ pub struct WindowsInputCapture {
 
 #[async_trait]
 impl Capture for WindowsInputCapture {
+    fn pending_failure(&self) -> bool {
+        self.event_rx.failed()
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.event_thread.create(pos);
         Ok(())

@@ -31,7 +31,7 @@ mod layer_shell;
 #[cfg(windows)]
 mod windows;
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, x11, test))]
 mod hook_queue;
 
 #[cfg(x11)]
@@ -325,6 +325,10 @@ impl Stream for InputCapture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        if !self.pending.is_empty() && self.capture.pending_failure() {
+            // A failed native queue invalidates already-expanded fanout too.
+            self.pending.clear();
+        }
         if let Some(e) = self.pending.pop_front() {
             return Poll::Ready(Some(Ok(e)));
         }
@@ -383,6 +387,11 @@ impl Stream for InputCapture {
 
 #[async_trait]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
+    /// Report a latched queue failure before wrapper fanout can deliver stale input.
+    fn pending_failure(&self) -> bool {
+        false
+    }
+
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
 

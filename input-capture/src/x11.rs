@@ -5,9 +5,9 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
 
+use crate::hook_queue::{HookReceiver, HookSender, x11_channel};
 use async_trait::async_trait;
 use futures_core::Stream;
-use tokio::sync::mpsc as tokio_mpsc;
 
 use x11::xlib::{
     ButtonMotionMask, ButtonPress, ButtonPressMask, ButtonRelease, ButtonReleaseMask, CurrentTime,
@@ -42,7 +42,10 @@ struct X11State {
     active_client: Option<Position>,
     entry_point: (i32, i32),
     prev_pos: (i32, i32),
-    event_tx: tokio_mpsc::Sender<(Position, CaptureEvent)>,
+    event_tx: HookSender,
+    release_grabs: fn(&mut X11State),
+    #[cfg(test)]
+    release_calls: usize,
     request_rx: mpsc::Receiver<Request>,
 }
 
@@ -52,7 +55,7 @@ unsafe impl Send for X11State {}
 // ── Public struct ─────────────────────────────────────────────────────────────
 
 pub struct X11InputCapture {
-    event_rx: tokio_mpsc::Receiver<(Position, CaptureEvent)>,
+    event_rx: HookReceiver,
     request_tx: mpsc::SyncSender<Request>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -69,7 +72,7 @@ impl X11InputCapture {
         let screen_w = unsafe { XDisplayWidth(display, screen) };
         let screen_h = unsafe { XDisplayHeight(display, screen) };
 
-        let (event_tx, event_rx) = tokio_mpsc::channel(64);
+        let (event_tx, event_rx) = x11_channel();
         let (request_tx, request_rx) = mpsc::sync_channel(16);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
@@ -83,6 +86,9 @@ impl X11InputCapture {
             entry_point: (0, 0),
             prev_pos: (0, 0),
             event_tx,
+            release_grabs: release_native_grabs,
+            #[cfg(test)]
+            release_calls: 0,
             request_rx,
         };
 
@@ -114,6 +120,10 @@ impl Drop for X11InputCapture {
 
 #[async_trait]
 impl Capture for X11InputCapture {
+    fn pending_failure(&self) -> bool {
+        self.event_rx.failed()
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let _ = self.request_tx.send(Request::Create(pos));
         Ok(())
@@ -147,11 +157,7 @@ impl Stream for X11InputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.event_rx.poll_recv(cx) {
-            Poll::Ready(Some(e)) => Poll::Ready(Some(Ok(e))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
+        self.event_rx.poll_recv(cx)
     }
 }
 
@@ -159,6 +165,15 @@ impl Stream for X11InputCapture {
 
 fn run_event_loop(mut state: X11State) {
     loop {
+        if !state.event_tx.available() {
+            if state.active_client.is_some() {
+                do_release(&mut state);
+            }
+            unsafe {
+                XCloseDisplay(state.display);
+            }
+            return;
+        }
         if drain_requests(&mut state) {
             return;
         }
@@ -238,6 +253,9 @@ fn query_pointer(state: &X11State) -> (i32, i32) {
 }
 
 fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
+    if !state.event_tx.available() {
+        return;
+    }
     let grab_mask =
         (PointerMotionMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask) as u32;
     let result = unsafe {
@@ -279,18 +297,30 @@ fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
             normalized_cross_axis(entry.0 as f64, 0.0, state.screen_w as f64)
         }
     };
-    let _ = state.event_tx.try_send((pos, CaptureEvent::Begin(t)));
-    log::debug!("x11: grabbed pointer for client {pos:?} at {entry:?}");
+    send_event(state, pos, CaptureEvent::Begin(t));
+    if state.active_client == Some(pos) {
+        log::debug!("x11: grabbed pointer for client {pos:?} at {entry:?}");
+    }
 }
 
-fn do_release(state: &mut X11State) {
+fn release_native_grabs(state: &mut X11State) {
     unsafe {
         XUngrabPointer(state.display, CurrentTime);
         XUngrabKeyboard(state.display, CurrentTime);
         XFlush(state.display);
     }
+}
+
+fn do_release(state: &mut X11State) {
+    (state.release_grabs)(state);
     log::debug!("x11: released pointer (was {:?})", state.active_client);
     state.active_client = None;
+}
+
+fn send_event(state: &mut X11State, pos: Position, event: CaptureEvent) {
+    if state.event_tx.send(pos, event).is_err() && state.active_client.is_some() {
+        do_release(state);
+    }
 }
 
 #[allow(non_upper_case_globals)]
@@ -305,36 +335,36 @@ fn handle_event(state: &mut X11State, ev: XEvent) {
                 let b: XButtonEvent = unsafe { ev.button };
                 let pressed = u32::from(unsafe { ev.type_ } == ButtonPress);
                 if let Some(pointer) = x11_pointer_button_event(b.button, pressed) {
-                    let _ = state
-                        .event_tx
-                        .try_send((pos, CaptureEvent::Input(Event::Pointer(pointer))));
+                    send_event(state, pos, CaptureEvent::Input(Event::Pointer(pointer)));
                 }
             }
         }
         KeyPress => {
             if let Some(pos) = state.active_client {
                 let k: XKeyEvent = unsafe { ev.key };
-                let _ = state.event_tx.try_send((
+                send_event(
+                    state,
                     pos,
                     CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                         time: 0,
                         key: k.keycode.saturating_sub(8),
                         state: 1,
                     })),
-                ));
+                );
             }
         }
         KeyRelease => {
             if let Some(pos) = state.active_client {
                 let k: XKeyEvent = unsafe { ev.key };
-                let _ = state.event_tx.try_send((
+                send_event(
+                    state,
                     pos,
                     CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                         time: 0,
                         key: k.keycode.saturating_sub(8),
                         state: 0,
                     })),
-                ));
+                );
             }
         }
         _ => {}
@@ -355,10 +385,11 @@ fn handle_motion(state: &mut X11State, m: XMotionEvent) {
         XFlush(state.display);
     }
     if let Some(pos) = state.active_client {
-        let _ = state.event_tx.try_send((
+        send_event(
+            state,
             pos,
             CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy })),
-        ));
+        );
     }
 }
 
@@ -435,8 +466,8 @@ fn x11_pointer_button_event(button: u32, pressed: u32) -> Option<PointerEvent> {
 mod tests {
     use super::*;
 
-    fn button_fixture() -> (X11State, tokio_mpsc::Receiver<(Position, CaptureEvent)>) {
-        let (event_tx, event_rx) = tokio_mpsc::channel(64);
+    fn button_fixture() -> (X11State, HookReceiver) {
+        let (event_tx, event_rx) = x11_channel();
         let (_request_tx, request_rx) = mpsc::channel();
         (
             X11State {
@@ -449,6 +480,8 @@ mod tests {
                 entry_point: (0, 0),
                 prev_pos: (0, 0),
                 event_tx,
+                release_grabs: |state| state.release_calls += 1,
+                release_calls: 0,
                 request_rx,
             },
             event_rx,
@@ -465,6 +498,132 @@ mod tests {
         }
     }
 
+    fn ready_event(rx: &mut HookReceiver) -> Option<(Position, CaptureEvent)> {
+        let waker = futures::task::noop_waker();
+        match rx.poll_recv(&mut Context::from_waker(&waker)) {
+            Poll::Ready(Some(Ok(event))) => Some(event),
+            Poll::Pending | Poll::Ready(None) => None,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_discrete_queue_releases_capture_and_reports_failure_before_stale_input() {
+        let (mut state, mut events) = button_fixture();
+        let key = |kind| XEvent {
+            key: XKeyEvent {
+                type_: kind,
+                keycode: 37,
+                ..unsafe { std::mem::zeroed() }
+            },
+        };
+        handle_event(&mut state, key(KeyPress));
+        for _ in 0..63 {
+            handle_event(&mut state, button_event(ButtonPress, 1));
+        }
+        handle_event(&mut state, key(KeyRelease));
+        assert_eq!(state.active_client, None);
+        assert_eq!(state.release_calls, 1);
+        assert!(!state.event_tx.available());
+        let waker = futures::task::noop_waker();
+        assert!(matches!(
+            events.poll_recv(&mut Context::from_waker(&waker)),
+            Poll::Ready(Some(Err(CaptureError::X11QueueOverloaded)))
+        ));
+        assert!(matches!(
+            events.poll_recv(&mut Context::from_waker(&waker)),
+            Poll::Ready(None)
+        ));
+        do_grab(&mut state, Position::Left, (0, 0)); // latched queue refuses before any native call.
+        assert_eq!(state.active_client, None);
+        assert_eq!(state.release_calls, 1);
+    }
+
+    #[test]
+    fn public_capture_prioritizes_queue_failure_over_cached_fanout() {
+        let (mut state, events) = button_fixture();
+        for _ in 0..64 {
+            handle_event(&mut state, button_event(ButtonPress, 1));
+        }
+        handle_event(&mut state, button_event(ButtonRelease, 1));
+        assert_eq!(state.release_calls, 1);
+        let (request_tx, _request_rx) = mpsc::sync_channel(16);
+        let backend = X11InputCapture {
+            event_rx: events,
+            request_tx,
+            thread: None,
+        };
+        let mut capture = crate::InputCapture {
+            capture: Box::new(backend),
+            enter_only_handles: Default::default(),
+            enter_only_positions: Default::default(),
+            pressed_keys: HashSet::from([input_event::scancode::Linux::KeyLeftCtrl]),
+            position_map: std::collections::HashMap::from([(Position::Left, vec![6, 7])]),
+            id_map: std::collections::HashMap::from([(6, Position::Left), (7, Position::Left)]),
+            pending: std::collections::VecDeque::from([(
+                7,
+                CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key: 29,
+                    state: 1,
+                })),
+            )]),
+        };
+        let waker = futures::task::noop_waker();
+        assert!(matches!(
+            Pin::new(&mut capture).poll_next(&mut Context::from_waker(&waker)),
+            Poll::Ready(Some(Err(CaptureError::X11QueueOverloaded)))
+        ));
+        assert!(capture.pending.is_empty());
+        assert_eq!(
+            capture.take_pressed_keys(),
+            HashSet::from([input_event::scancode::Linux::KeyLeftCtrl])
+        );
+    }
+
+    #[test]
+    fn coalesced_motion_keeps_release_after_a_large_stalled_burst() {
+        let (mut state, mut events) = button_fixture();
+        let key = |kind| XEvent {
+            key: XKeyEvent {
+                type_: kind,
+                keycode: 37,
+                ..unsafe { std::mem::zeroed() }
+            },
+        };
+        handle_event(&mut state, key(KeyPress));
+        for _ in 0..8000 {
+            send_event(
+                &mut state,
+                Position::Left,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 0.25,
+                    dy: -0.25,
+                })),
+            );
+        }
+        handle_event(&mut state, key(KeyRelease));
+        assert_eq!(state.active_client, Some(Position::Left));
+        assert_eq!(state.release_calls, 0);
+        let mut total = (0.0, 0.0);
+        let mut transitions = Vec::new();
+        while let Some((_, event)) = ready_event(&mut events) {
+            match event {
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) => {
+                    total.0 += dx;
+                    total.1 += dy;
+                }
+                CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { state, .. })) => {
+                    transitions.push(state)
+                }
+                _ => panic!("unexpected event"),
+            }
+        }
+        assert_eq!(total, (2000.0, -2000.0));
+        assert_eq!(transitions, vec![1, 0]);
+    }
+
     #[test]
     fn x11_scroll_capture_forwards_one_axis_event_per_wheel_click() {
         let (mut state, mut events) = button_fixture();
@@ -472,21 +631,21 @@ mod tests {
             handle_event(&mut state, button_event(ButtonPress, button));
             handle_event(&mut state, button_event(ButtonRelease, button));
             assert!(
-                matches!(events.try_recv(), Ok((Position::Left, CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { axis: actual_axis, value: actual_value }))))
+                matches!(ready_event(&mut events), Some((Position::Left, CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { axis: actual_axis, value: actual_value }))))
                 if actual_axis == axis && actual_value == value)
             );
-            assert!(events.try_recv().is_err());
+            assert!(ready_event(&mut events).is_none());
         }
         for kind in [ButtonPress, ButtonRelease] {
             handle_event(&mut state, button_event(kind, 8));
             assert!(
-                matches!(events.try_recv(), Ok((Position::Left, CaptureEvent::Input(Event::Pointer(PointerEvent::Button { button, state: pressed, .. }))))
+                matches!(ready_event(&mut events), Some((Position::Left, CaptureEvent::Input(Event::Pointer(PointerEvent::Button { button, state: pressed, .. }))))
                 if button == input_event::BTN_BACK && pressed == u32::from(kind == ButtonPress))
             );
         }
         state.active_client = None;
         handle_event(&mut state, button_event(ButtonPress, 5));
-        assert!(events.try_recv().is_err());
+        assert!(ready_event(&mut events).is_none());
     }
 
     #[test]
