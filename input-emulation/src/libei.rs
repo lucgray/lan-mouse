@@ -217,7 +217,7 @@ impl Emulation for LibeiEmulation {
                 PointerEvent::Motion { time: _, dx, dy } => {
                     let pointer_device = self.devices.pointer.read().unwrap();
                     if let Some((d, p)) = pointer_device.as_ref() {
-                        p.motion_relative(dx as f32, dy as f32);
+                        p.motion_relative(finite_f32(dx), finite_f32(dy));
                         d.frame(self.conn.serial(), now);
                     }
                 }
@@ -246,8 +246,8 @@ impl Emulation for LibeiEmulation {
                     let scroll_device = self.devices.scroll.read().unwrap();
                     if let Some((d, s)) = scroll_device.as_ref() {
                         match axis {
-                            0 => s.scroll(0., value as f32),
-                            _ => s.scroll(value as f32, 0.),
+                            0 => s.scroll(0., finite_f32(value)),
+                            _ => s.scroll(finite_f32(value), 0.),
                         }
                         d.frame(self.conn.serial(), now);
                     }
@@ -261,7 +261,7 @@ impl Emulation for LibeiEmulation {
                     if steps != 0 {
                         let scroll_device = self.devices.scroll.read().unwrap();
                         if let Some((d, s)) = scroll_device.as_ref() {
-                            let value = steps * 120;
+                            let value = steps.saturating_mul(120);
                             match axis {
                                 0 => s.scroll_discrete(0, value),
                                 _ => s.scroll_discrete(value, 0),
@@ -444,8 +444,34 @@ async fn ei_event_handler(
     }
 }
 
+// InputEmulation rejects nonfinite input; finite f64 values can still overflow
+// libei's f32 wire representation, so cap at the representable native boundary.
+fn finite_f32(value: f64) -> f32 {
+    value.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finite_pointer_values_stay_finite_in_libei_wire_representation() {
+        for value in [
+            f64::MAX,
+            -f64::MAX,
+            f64::from(f32::MAX),
+            -f64::from(f32::MAX),
+            0.4,
+            -0.4,
+            0.0,
+        ] {
+            let native = super::finite_f32(value);
+            assert!(native.is_finite());
+            assert_eq!(native.is_sign_negative(), value.is_sign_negative());
+        }
+        assert_eq!(super::finite_f32(f64::MAX), f32::MAX);
+        assert_eq!(super::finite_f32(-f64::MAX), -f32::MAX);
+        assert_eq!(super::finite_f32(1.0), 1.0);
+    }
+
     use super::*;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;

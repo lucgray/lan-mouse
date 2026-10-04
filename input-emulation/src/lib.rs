@@ -146,14 +146,14 @@ fn post_process_event(event: Event, config: InputConfig) -> Event {
         Event::Pointer(PointerEvent::Motion { time, dx, dy }) => {
             Event::Pointer(PointerEvent::Motion {
                 time,
-                dx: dx * config.mouse_sensitivity,
-                dy: dy * config.mouse_sensitivity,
+                dx: (dx * config.mouse_sensitivity).clamp(-f64::MAX, f64::MAX),
+                dy: (dy * config.mouse_sensitivity).clamp(-f64::MAX, f64::MAX),
             })
         }
         Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) if config.invert_scroll => {
             Event::Pointer(PointerEvent::AxisDiscrete120 {
                 axis,
-                value: -value,
+                value: value.saturating_neg(),
             })
         }
         Event::Pointer(PointerEvent::Axis { time, axis, value }) if config.invert_scroll => {
@@ -223,6 +223,11 @@ impl InputEmulation {
             Backend::MacOs => Box::new(macos::MacOSEmulation::new(options)?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
+        let mut input_config = input_config;
+        if !input_config.mouse_sensitivity.is_finite() {
+            log::warn!("nonfinite mouse sensitivity; using 1.0");
+            input_config.mouse_sensitivity = 1.0;
+        }
         Ok(Self {
             emulation,
             handles: HashMap::new(),
@@ -281,8 +286,9 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
-        event.validate_transition()?;
+        event.validate_input()?;
         let event = post_process_event(event, self.input_config);
+        event.validate_input()?;
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // suppress duplicate presses and unmatched releases
@@ -321,6 +327,10 @@ impl InputEmulation {
     /// Backends that can't perform an absolute warp leave the cursor
     /// wherever it already was, same as before this existed.
     pub async fn warp(&mut self, handle: EmulationHandle, pos: Position, t: f64) {
+        if !t.is_finite() {
+            log::warn!("ignoring nonfinite cursor warp position");
+            return;
+        }
         self.emulation.warp(handle, pos, t).await
     }
 
@@ -544,7 +554,11 @@ impl InputEmulation {
         self.emulation.consume(event, handle).await
     }
 
-    pub fn update_config(&mut self, input_config: InputConfig) {
+    pub fn update_config(&mut self, mut input_config: InputConfig) {
+        if !input_config.mouse_sensitivity.is_finite() {
+            log::warn!("nonfinite mouse sensitivity; preserving previous multiplier");
+            input_config.mouse_sensitivity = self.input_config.mouse_sensitivity;
+        }
         self.input_config = input_config;
     }
 }
@@ -585,6 +599,7 @@ mod tests {
     struct MockControl {
         consumed: Vec<(EmulationHandle, Event)>,
         destroyed: Vec<EmulationHandle>,
+        warps: Vec<(EmulationHandle, Position, f64)>,
         terminated: bool,
         repeat_stopped: bool,
         /// `consume` waits forever for this event instead of recording it
@@ -638,6 +653,10 @@ mod tests {
                 return Err(EmulationError::EndOfStream);
             }
             Ok(())
+        }
+
+        async fn warp(&mut self, handle: EmulationHandle, pos: Position, t: f64) {
+            self.control.lock().unwrap().warps.push((handle, pos, t));
         }
 
         async fn create(&mut self, _: EmulationHandle) {}
@@ -748,6 +767,134 @@ mod tests {
         );
         assert!(!emulation.has_pressed_keys(0));
         assert!(!emulation.has_pressed_keys(1));
+    }
+
+    #[tokio::test]
+    async fn nonfinite_pointer_input_is_rejected_without_touching_held_state() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+        emulation.consume(key_event(29, 1), 0).await.unwrap();
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for event in [
+                Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: invalid,
+                    dy: 1.0,
+                }),
+                Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: 1.0,
+                    dy: invalid,
+                }),
+                Event::Pointer(PointerEvent::Axis {
+                    time: 0,
+                    axis: 0,
+                    value: invalid,
+                }),
+            ] {
+                assert!(matches!(
+                    emulation.consume(event, 0).await,
+                    Err(EmulationError::InvalidInput(_))
+                ));
+            }
+            emulation.warp(0, Position::Left, invalid).await;
+        }
+        for event in [
+            Event::Pointer(PointerEvent::Axis {
+                time: 0,
+                axis: 2,
+                value: 1.0,
+            }),
+            Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: u8::MAX,
+                value: 120,
+            }),
+        ] {
+            assert!(emulation.consume(event, 0).await.is_err());
+        }
+        assert_eq!(control.lock().unwrap().consumed.len(), 1);
+        assert!(control.lock().unwrap().warps.is_empty());
+        assert!(emulation.has_pressed_keys(0));
+        let normal = Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: -1.0,
+        });
+        emulation.consume(normal.clone(), 0).await.unwrap();
+        assert_eq!(control.lock().unwrap().consumed.last().unwrap().1, normal);
+        emulation.warp(0, Position::Left, 0.5).await;
+        assert_eq!(
+            control.lock().unwrap().warps,
+            vec![(0, Position::Left, 0.5)]
+        );
+        assert!(emulation.terminate_bounded().await);
+    }
+
+    #[tokio::test]
+    async fn sensitivity_overflow_and_minimum_scroll_remain_finite_and_bounded() {
+        let direct = InputEmulation::with_backend(
+            Backend::Dummy,
+            Default::default(),
+            InputConfig {
+                mouse_sensitivity: f64::NAN,
+                invert_scroll: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(direct.input_config.mouse_sensitivity, 1.0);
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+        emulation.update_config(InputConfig {
+            mouse_sensitivity: 2.0,
+            invert_scroll: true,
+        });
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            emulation.update_config(InputConfig {
+                mouse_sensitivity: value,
+                invert_scroll: true,
+            });
+            assert_eq!(emulation.input_config.mouse_sensitivity, 2.0);
+        }
+        emulation
+            .consume(
+                Event::Pointer(PointerEvent::Motion {
+                    time: 0,
+                    dx: f64::MAX,
+                    dy: -f64::MAX,
+                }),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            control.lock().unwrap().consumed.last().unwrap().1,
+            Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: f64::MAX,
+                dy: -f64::MAX
+            })
+        );
+        emulation
+            .consume(
+                Event::Pointer(PointerEvent::AxisDiscrete120 {
+                    axis: 0,
+                    value: i32::MIN,
+                }),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            control.lock().unwrap().consumed.last().unwrap().1,
+            Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: i32::MAX
+            })
+        );
+        assert!(emulation.terminate_bounded().await);
     }
 
     #[tokio::test]

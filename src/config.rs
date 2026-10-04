@@ -803,6 +803,7 @@ impl Config {
             .as_ref()
             .and_then(|c| c.input_post_processing.as_ref())
             .and_then(|i| i.mouse_sensitivity)
+            .filter(|value| value.is_finite())
             .unwrap_or(1.0)
     }
 
@@ -937,6 +938,10 @@ impl Config {
 
     /// persist the mouse sensitivity multiplier
     pub fn set_mouse_sensitivity(&mut self, sensitivity: f64) {
+        if !sensitivity.is_finite() {
+            log::warn!("ignoring nonfinite mouse sensitivity");
+            return;
+        }
         self.toml_mut()
             .input_post_processing
             .get_or_insert_with(Default::default)
@@ -1820,6 +1825,33 @@ mod tests {
         assert_eq!(chord.modifier, KeyLeftMeta);
         assert_eq!(chord.trigger, KeyTab);
         assert_eq!(chord.to, KeyLeftAlt);
+    }
+
+    #[test]
+    fn nonfinite_sensitivity_uses_default_and_cannot_replace_valid_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for raw in ["nan", "inf", "-inf"] {
+            fs::write(
+                &path,
+                format!("[input_post_processing]\nmouse_sensitivity = {raw}\n"),
+            )
+            .unwrap();
+            let mut config =
+                Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+            assert_eq!(config.mouse_sensitivity(), 1.0);
+            config.set_mouse_sensitivity(1.5);
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                config.set_mouse_sensitivity(value);
+                assert_eq!(config.mouse_sensitivity(), 1.5);
+            }
+            config.write_back().unwrap();
+            let persisted = parse(&fs::read_to_string(&path).unwrap());
+            assert_eq!(
+                persisted.input_post_processing.unwrap().mouse_sensitivity,
+                Some(1.5)
+            );
+        }
     }
 
     #[test]

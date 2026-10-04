@@ -704,13 +704,21 @@ async fn read_loop(
         };
 
         if let ProtoEvent::Input(input) = &event {
-            if let Err(error) = input.validate_transition() {
+            if let Err(error) = input.validate_input() {
                 let _ = dtls_tx.send(ListenEvent::InputRejected {
                     addr,
                     reason: error.to_string(),
                 });
                 break;
             }
+        }
+
+        if matches!(&event, ProtoEvent::Enter(_, t) | ProtoEvent::Leave(_, t) if !t.is_finite()) {
+            let _ = dtls_tx.send(ListenEvent::InputRejected {
+                addr,
+                reason: "cursor edge position must be finite".into(),
+            });
+            break;
         }
 
         let budget = if matches!(
@@ -1980,9 +1988,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn invalid_transition_closes_only_its_reader_before_queue_admission() {
+    async fn invalid_input_closes_only_its_reader_before_queue_admission() {
         use input_event::{Event, KeyboardEvent, PointerEvent};
-        for input in [
+        let mut invalid = vec![
             Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
                 key: u32::MAX,
@@ -2003,11 +2011,37 @@ mod tests {
                 button: 272,
                 state: u32::MAX,
             }),
-        ] {
+            Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: f64::NAN,
+                dy: 1.0,
+            }),
+            Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.0,
+                dy: f64::INFINITY,
+            }),
+            Event::Pointer(PointerEvent::Axis {
+                time: 0,
+                axis: 0,
+                value: f64::NEG_INFINITY,
+            }),
+            Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 2,
+                value: 120,
+            }),
+        ]
+        .into_iter()
+        .map(ProtoEvent::Input)
+        .collect::<Vec<_>>();
+        invalid.extend([
+            ProtoEvent::Enter(lan_mouse_proto::Position::Left, f64::NAN),
+            ProtoEvent::Leave(0, f64::INFINITY),
+        ]);
+        for event in invalid {
             let addr = "127.0.0.1:2".parse().unwrap();
             let healthy_addr = "127.0.0.1:3".parse().unwrap();
-            let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) =
-                ProtoEvent::Input(input).into();
+            let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = event.into();
             let conn = Arc::new(TestConn {
                 repeat_packet: true,
                 ..TestConn::new(Some(bytes[..len].to_vec()))

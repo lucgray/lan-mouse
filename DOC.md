@@ -606,3 +606,34 @@ and prevents invalid codes/states from reaching native casts or keycode offsets.
 Each handle's key and button ledgers can each hold at most 768 distinct codes.
 The number of accepted connections/handles and other event queues still need
 separate resource limits. Wire encoding and the protocol version are unchanged.
+
+
+### Numeric pointer boundaries
+
+`Event::validate_input()` extends transition validation with finite motion/scroll
+values and vertical/horizontal axis validation (0/1). Readers call it before
+queue admission; nonfinite Enter/Leave edge positions also close only that
+reader. Direct InputEmulation calls reject invalid pointer input before native
+delivery and verify the processed event as well. Direct nonfinite warp requests
+are ignored before calling the native backend. The narrower
+`validate_transition()` remains available with its original scope.
+
+Sensitivity must be finite. A nonfinite value in a raw config reads as the
+1.0 default; setters ignore it, and a service settings request reports an error
+and republishes the current settings without saving the bad value. Direct backend
+construction defaults to 1.0; an invalid backend config update preserves the
+previous finite multiplier. Finite zero/negative/custom values retain their
+existing semantics. Overflow during finite motion scaling saturates to finite
+f64 limits. libei converts finite f64 motion/scroll to finite f32 limits.
+
+Evdev emits saturated i32 motion when displacement is too large for its native
+representation, discarding unrepresentable excess rather than carrying it into
+future motion. Its residual always contains a finite fraction of at most 0.5;
+invalid residuals reset, and a nonfinite direct quantizer delta emits no motion.
+These defenses preserve ordinary fractional movement and axis independence.
+Discrete scroll inversion and libei unit conversion use saturation at integer
+boundaries; scroll accumulation uses i64 intermediates and retains the exact
+sub-120 remainder. Extreme values can lose excess at native representation
+limits, while subsequent ordinary input remains usable. These are source/logic
+protections, not a claim that giant finite displacements are useful native input
+or that physical device behavior has been verified on every OS.

@@ -10,8 +10,8 @@
 /// which is exactly one detent's worth of scrolling.
 #[derive(Default, Debug)]
 pub(crate) struct Scroll120Accumulator {
-    vertical: i32,
-    horizontal: i32,
+    vertical: i64,
+    horizontal: i64,
 }
 
 impl Scroll120Accumulator {
@@ -27,16 +27,33 @@ impl Scroll120Accumulator {
         } else {
             &mut self.horizontal
         };
-        *acc += value;
+        *acc += i64::from(value);
         let steps = *acc / 120;
-        *acc -= steps * 120;
-        steps
+        *acc %= 120;
+        // |acc before addition| < 120; an i32 delta produces i32 step counts.
+        steps as i32
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::Scroll120Accumulator;
+
+    #[test]
+    fn large_scroll_preserves_total_and_bounded_remainder_without_overflow() {
+        let mut a = Scroll120Accumulator::default();
+        let mut input = 0i64;
+        let mut output = 0i64;
+        for value in [119, i32::MAX, i32::MIN, -119, i32::MIN, i32::MAX, 120] {
+            input += i64::from(value);
+            output += i64::from(a.accumulate(0, value)) * 120;
+            assert_eq!(output + a.vertical, input);
+            assert!(a.vertical.abs() < 120);
+            assert_eq!(a.horizontal, 0);
+        }
+        assert_eq!(a.accumulate(1, 120), 1);
+        assert_eq!(a.accumulate(0, 120), 1);
+    }
 
     #[test]
     fn whole_steps_pass_straight_through() {

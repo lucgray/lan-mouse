@@ -118,9 +118,28 @@ impl Emulation for EvdevEmulation {
 }
 
 fn quantize_motion((dx, dy): (f64, f64), (rx, ry): (f64, f64)) -> ((i32, i32), (f64, f64)) {
-    let (x, y) = (dx + rx, dy + ry);
-    let (ix, iy) = (x.round() as i32, y.round() as i32);
-    ((ix, iy), (x - f64::from(ix), y - f64::from(iy)))
+    let (x, rx) = quantize_axis(dx, rx);
+    let (y, ry) = quantize_axis(dy, ry);
+    ((x, y), (rx, ry))
+}
+
+fn quantize_axis(delta: f64, residual: f64) -> (i32, f64) {
+    // Residuals contain fractions only, never unrepresentable displacement.
+    let residual = if residual.is_finite() && residual.abs() <= 0.5 {
+        residual
+    } else {
+        0.0
+    };
+    if !delta.is_finite() {
+        return (0, residual);
+    }
+    let sum = delta + residual;
+    let rounded = sum.round();
+    let integer = rounded as i32;
+    if rounded < f64::from(i32::MIN) || rounded > f64::from(i32::MAX) {
+        return (integer, 0.0);
+    }
+    (integer, sum - f64::from(integer))
 }
 
 const ALL_KEYS: [KeyCode; 549] = [
@@ -766,6 +785,37 @@ const ALL_KEYS: [KeyCode; 549] = [
 #[cfg(test)]
 mod motion_tests {
     use super::quantize_motion;
+
+    #[test]
+    fn invalid_or_saturated_motion_does_not_poison_next_normal_motion() {
+        for dx in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            let (_, residual) = quantize_motion((dx, 0.4), (0.0, 0.0));
+            assert!(residual.0.is_finite() && residual.0.abs() <= 0.5);
+            let (next, residual) = quantize_motion((1.0, 0.4), residual);
+            assert_eq!(next, (1, 1));
+            assert!(residual.0.abs() <= 0.5 && residual.1.abs() <= 0.5);
+        }
+        for residual in [f64::NAN, f64::INFINITY, 10.0, -10.0] {
+            assert_eq!(
+                quantize_motion((1.0, -1.0), (residual, residual)),
+                ((1, -1), (0.0, 0.0))
+            );
+        }
+        assert_eq!(
+            quantize_motion((f64::NAN, 0.0), (0.4, 0.0)),
+            ((0, 0), (0.4, 0.0))
+        );
+        assert_eq!(
+            quantize_motion((f64::MAX, -f64::MAX), (0.0, 0.0)),
+            ((i32::MAX, i32::MIN), (0.0, 0.0))
+        );
+    }
 
     #[test]
     fn slow_motion_preserves_total_displacement_and_reversals() {

@@ -197,6 +197,32 @@ impl Display for ClipboardEvent {
 }
 
 impl Event {
+    /// Validate input transitions and numeric pointer payloads before delivery.
+    pub fn validate_input(&self) -> Result<(), error::InvalidInputEvent> {
+        use error::InvalidInputEvent;
+        self.validate_transition()?;
+        match self {
+            Self::Pointer(PointerEvent::Motion { dx, dy, .. }) => {
+                if !dx.is_finite() || !dy.is_finite() {
+                    return Err(InvalidInputEvent::NonFiniteMotion);
+                }
+            }
+            Self::Pointer(PointerEvent::Axis { axis, value, .. }) => {
+                if *axis > 1 {
+                    return Err(InvalidInputEvent::Axis(*axis));
+                }
+                if !value.is_finite() {
+                    return Err(InvalidInputEvent::NonFiniteScroll);
+                }
+            }
+            Self::Pointer(PointerEvent::AxisDiscrete120 { axis, .. }) if *axis > 1 => {
+                return Err(InvalidInputEvent::Axis(*axis));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Validate the bounded EV_KEY code domain and press/release wire states.
     /// This does not validate motion, modifier or clipboard payloads.
     pub fn validate_transition(&self) -> Result<(), error::InvalidInputEvent> {

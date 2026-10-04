@@ -1132,3 +1132,30 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 连接/handle 数量与其他事件队列仍有无界路径；本轮单 handle ledger 限制不能代替全服务资源上限。R60 永久原生故障、强制退出，真机千次往返、完整 p95/p99 与八小时 RSS 均未闭环，不能确认达到 90 分。
 
 日志：input-validation-baseline.log、input-validation-library.log、input-validation-workspace.log、input-validation-clippy.log、input-validation-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、input-validation-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+
+## 第四十五轮：非有限位移、缩放和滚动累加边界
+
+### R65 / P1：鼠标余量被异常数值污染
+
+- 实际 quantize_motion 基线：NaN -> residual=NaN，随后合法 dx=1 输出 0；Infinity -> residual=Infinity，随后 dx=1 输出 i32::MAX；f64::MAX -> residual≈f64::MAX，随后 dx=1 同样持续饱和。上一段口头说明将 Infinity 的后果也概括为 0，基线日志证明其实际结果是饱和，应以这里和日志为准。
+- [x] 新增 Event.validate_input，复用按键/按钮校验并检查 motion/scroll finite 和 axis=0/1；reader 入队前拒绝并关闭仅该连接，Enter/Leave 非有限边缘位置同样拒绝。validate_transition API 保留原职责。
+- [x] InputEmulation 直接 consume 在处理前后校验，坏输入不改变原 held state；非有限直接 warp 不调用 backend。合法后续 motion / warp 与最终按键释放的 Mock 用例通过。
+- [x] 灵敏度 config getter 对 TOML nan/inf/-inf 使用 1.0；setter 忽略非有限值，Service 更新报告错误并回送当前 Settings，不保存非法值。直接 backend 创建采用 1.0，config 更新保留此前有限 multiplier。保持零/负/其他有限 multiplier 原语义。
+- [x] 有限乘法 overflow 的运动缩放结果饱和到 f64 范围；libei f64 -> f32 在原生表示边界截断，避免有限极值转换为 Infinity。极值损失超过 native 范围的位移，不把此行为称为完整保留任意巨大输入。
+- [x] evdev 余量只保存有限 |r|<=0.5 的小数；异常余量重置，非有限量化请求不发运动，超出 i32 的输出饱和并清除不可表示的多余位移。下一个 dx=1 恢复为 1；另一轴的小数累加保留。
+
+### R66 / P1：整数滚动边界
+
+- 基线已有 119 单位余量后 accumulate(i32::MAX) 在 debug 下发生加法溢出，catch_unwind 回归确认。另有 post_process_event invert 对 i32::MIN 直接取负与 libei steps*120 的边界溢出路径。
+- [x] invert 使用 saturating_neg；累加器内部使用 i64，保持实际输入 = emitted_steps*120 + remainder，且 |remainder|<120；libei whole-step native units 使用 saturating_mul。普通高分辨率滚轮/方向反转原有回归保持通过。
+
+### 当前验证及审批限制（未完成门槛）
+
+- 最终源代码的 input-emulation all-features 30 tests 通过；root 的 numeric config、decode/read_loop 隔离坏连接两个 focused tests 通过；严格 workspace/all-targets/all-features Clippy 通过，fmt/diff 检查通过。
+- 最终新增滚动/转换修复之前的中间版本全工作区通过：root 136 / 2 忽略，input-emulation 28，GTK 14 / 4 忽略，CLI 3、IPC 4、input-capture 33 / 1 忽略。此证据不能替代最终源码全工作区与 Service 集成门槛。
+- [ ] 最终全工作区真实 UDP/DTLS 回归与两个独立 Service fixtures 尚未运行，新增非法灵敏度 Service 集成断言仅已编译。请求 require_escalated 运行最终全工作区时，自动审批审查器因账户用量限制不能完成审查，命令未执行；该次复合命令中的额外编辑也未执行，随后已用普通本地工具完成编辑与上述离线检查。
+- [ ] PR 推送/外部 CI 状态核对等待审批能力恢复；不通过其他渠道绕过审批，不把旧 CI 或中间版本结果当作最终结果。第 44 轮 HEAD 66481eb 的 Rust 37198641952 queued / Nix 37198641958 pending 是最后一次已核对状态；b8c9d91 Rust 37198145748 已被后续提交取消，Nix 37198145625 当时仍运行。
+- [ ] R64 X11 额外合法按钮 fallback、R13 资源总上限、R60 原生失败/退出、真机千次往返、完整 p95/p99 与 8h RSS 仍未完成；本轮数值修复不能证明软件已达 90 分。
+
+日志：numeric-input-baseline.log、numeric-scroll-baseline.log、numeric-input-library.log、numeric-input-config.log、numeric-input-reader.log、numeric-input-clippy.log、numeric-input-workspace.log（中间版本）。

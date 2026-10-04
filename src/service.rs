@@ -1294,6 +1294,13 @@ impl Service {
     }
 
     fn update_mouse_sensitivity(&mut self, mouse_sensitivity: f64) {
+        if !mouse_sensitivity.is_finite() {
+            self.notify_frontend(FrontendEvent::Error(
+                "Mouse sensitivity must be finite".into(),
+            ));
+            self.notify_settings();
+            return;
+        }
         self.emulation
             .request_mouse_sensitivity_change(mouse_sensitivity);
         self.config.set_mouse_sensitivity(mouse_sensitivity);
@@ -1694,6 +1701,19 @@ mod tests {
             let original_raw = service.config.authorized_fingerprints();
             service.update_mouse_sensitivity(1.15);
             service.config.flush().await.unwrap();
+            let settings_on_disk = std::fs::read_to_string(&path).unwrap();
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                service.update_mouse_sensitivity(invalid);
+                assert_eq!(service.config.mouse_sensitivity(), 1.15);
+                assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                    FrontendEvent::Error(message) if message.contains("sensitivity must be finite")
+                )));
+                assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                    FrontendEvent::Settings { mouse_sensitivity, .. } if *mouse_sensitivity == 1.15
+                )));
+                service.config.flush().await.unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), settings_on_disk);
+            }
             let persisted = Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
             assert_eq!(persisted.authorized_fingerprints(), original_raw); // no implicit authorization migration.
             // Invalid raw IPC requests cannot change trust or persist a bad key.
