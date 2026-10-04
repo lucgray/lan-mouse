@@ -705,3 +705,16 @@ vertical direction and horizontal units are preserved. The positive equivalent
 of i32::MIN is outside the native i32 representation and becomes i32::MAX,
 losing one extreme unit instead of panicking or wrapping direction. Conversion
 tests do not establish kernel/native delivery of enormous scroll values.
+
+
+### X11 capture acquisition
+
+X11 begins a capture session only after both XGrabPointer and XGrabKeyboard
+return GrabSuccess. A keyboard refusal requests rollback through pointer/keyboard
+ungrab and returns without warping, activating a client or publishing Begin.
+A pointer refusal does not attempt keyboard acquisition. A later edge crossing
+can retry a transient refusal. If both grabs succeed but Begin cannot enter the
+bounded queue, the overload path requests release and disables capture.
+
+State-machine tests use native-operation callbacks; actual Xlib release success,
+blocking calls and physical keyboard/pointer recovery remain target-OS gates.

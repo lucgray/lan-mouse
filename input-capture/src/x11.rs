@@ -46,6 +46,8 @@ struct X11State {
     release_grabs: fn(&mut X11State),
     #[cfg(test)]
     release_calls: usize,
+    #[cfg(test)]
+    warp_calls: usize,
     request_rx: mpsc::Receiver<Request>,
 }
 
@@ -89,6 +91,8 @@ impl X11InputCapture {
             release_grabs: release_native_grabs,
             #[cfg(test)]
             release_calls: 0,
+            #[cfg(test)]
+            warp_calls: 0,
             request_rx,
         };
 
@@ -252,13 +256,22 @@ fn query_pointer(state: &X11State) -> (i32, i32) {
     (root_x, root_y)
 }
 
-fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
-    if !state.event_tx.available() {
-        return;
-    }
+struct GrabOps {
+    pointer: fn(&mut X11State) -> i32,
+    keyboard: fn(&mut X11State) -> i32,
+    warp: fn(&mut X11State, (i32, i32)),
+}
+
+const NATIVE_GRAB_OPS: GrabOps = GrabOps {
+    pointer: grab_native_pointer,
+    keyboard: grab_native_keyboard,
+    warp: warp_native_pointer,
+};
+
+fn grab_native_pointer(state: &mut X11State) -> i32 {
     let grab_mask =
         (PointerMotionMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask) as u32;
-    let result = unsafe {
+    unsafe {
         XGrabPointer(
             state.display,
             state.root,
@@ -270,11 +283,10 @@ fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
             0, // no cursor change
             CurrentTime,
         )
-    };
-    if result != GrabSuccess {
-        log::warn!("x11: XGrabPointer failed with code {result}");
-        return;
     }
+}
+
+fn grab_native_keyboard(state: &mut X11State) -> i32 {
     unsafe {
         XGrabKeyboard(
             state.display,
@@ -283,10 +295,37 @@ fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
             GrabModeAsync,
             GrabModeAsync,
             CurrentTime,
-        );
+        )
+    }
+}
+
+fn warp_native_pointer(state: &mut X11State, entry: (i32, i32)) {
+    unsafe {
         XWarpPointer(state.display, 0, state.root, 0, 0, 0, 0, entry.0, entry.1);
         XFlush(state.display);
     }
+}
+
+fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
+    do_grab_with(state, pos, entry, &NATIVE_GRAB_OPS);
+}
+
+fn do_grab_with(state: &mut X11State, pos: Position, entry: (i32, i32), ops: &GrabOps) {
+    if !state.event_tx.available() {
+        return;
+    }
+    let result = (ops.pointer)(state);
+    if result != GrabSuccess {
+        log::warn!("x11: XGrabPointer failed with code {result}");
+        return;
+    }
+    let result = (ops.keyboard)(state);
+    if result != GrabSuccess {
+        log::warn!("x11: XGrabKeyboard failed with code {result}; rolling back pointer grab");
+        do_release(state);
+        return;
+    }
+    (ops.warp)(state, entry);
     state.entry_point = entry;
     state.active_client = Some(pos);
     let t = match pos {
@@ -482,6 +521,7 @@ mod tests {
                 event_tx,
                 release_grabs: |state| state.release_calls += 1,
                 release_calls: 0,
+                warp_calls: 0,
                 request_rx,
             },
             event_rx,
@@ -505,6 +545,84 @@ mod tests {
             Poll::Pending | Poll::Ready(None) => None,
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn keyboard_grab_failure_rolls_back_pointer_without_begin_or_warp() {
+        for keyboard in [
+            (|_: &mut X11State| x11::xlib::AlreadyGrabbed) as fn(&mut X11State) -> i32,
+            |_| x11::xlib::GrabInvalidTime,
+            |_| x11::xlib::GrabNotViewable,
+            |_| x11::xlib::GrabFrozen,
+        ] {
+            let (mut state, mut events) = button_fixture();
+            state.active_client = None;
+            state.entry_point = (10, 20);
+            let ops = GrabOps {
+                pointer: |_| GrabSuccess,
+                keyboard,
+                warp: |state, _| state.warp_calls += 1,
+            };
+            do_grab_with(&mut state, Position::Left, (0, 25), &ops);
+            assert_eq!(state.active_client, None);
+            assert_eq!(state.entry_point, (10, 20));
+            assert_eq!(state.warp_calls, 0);
+            assert_eq!(state.release_calls, 1);
+            assert!(ready_event(&mut events).is_none());
+            assert!(state.event_tx.available());
+            // A later attempt may recover when the other grab owner is gone.
+            let success = GrabOps {
+                keyboard: |_| GrabSuccess,
+                ..ops
+            };
+            do_grab_with(&mut state, Position::Left, (0, 25), &success);
+            assert_eq!(state.active_client, Some(Position::Left));
+            assert_eq!(state.warp_calls, 1);
+            assert_eq!(state.release_calls, 1);
+            assert!(
+                matches!(ready_event(&mut events), Some((Position::Left, CaptureEvent::Begin(t))) if t == 0.25)
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_grab_failure_never_attempts_keyboard_or_publishes_begin() {
+        let (mut state, mut events) = button_fixture();
+        state.active_client = None;
+        let ops = GrabOps {
+            pointer: |_| x11::xlib::AlreadyGrabbed,
+            keyboard: |_| panic!("must not attempt keyboard after pointer refusal"),
+            warp: |_, _| panic!("must not warp after pointer refusal"),
+        };
+        do_grab_with(&mut state, Position::Top, (25, 0), &ops);
+        assert_eq!(state.active_client, None);
+        assert_eq!(state.release_calls, 0);
+        assert!(ready_event(&mut events).is_none());
+    }
+
+    #[test]
+    fn successful_grabs_roll_back_if_begin_cannot_be_published() {
+        let (mut state, mut events) = button_fixture();
+        state.active_client = None;
+        for _ in 0..64 {
+            state
+                .event_tx
+                .send(Position::Left, CaptureEvent::Begin(0.5))
+                .unwrap();
+        }
+        let ops = GrabOps {
+            pointer: |_| GrabSuccess,
+            keyboard: |_| GrabSuccess,
+            warp: |state, _| state.warp_calls += 1,
+        };
+        do_grab_with(&mut state, Position::Left, (0, 25), &ops);
+        assert_eq!(state.active_client, None);
+        assert_eq!(state.release_calls, 1);
+        let waker = futures::task::noop_waker();
+        assert!(matches!(
+            events.poll_recv(&mut Context::from_waker(&waker)),
+            Poll::Ready(Some(Err(CaptureError::X11QueueOverloaded)))
+        ));
     }
 
     #[test]

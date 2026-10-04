@@ -1281,3 +1281,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] X11 同步控制通道/线程退出/native 阻塞、R13 资源总上限、R60 原生退出、真机千次往返、完整 p95/p99 与 8h RSS 仍待完成，尚不认定达到 90 分。
 
 日志：evdev-scroll-overflow-baseline.log、evdev-scroll-overflow-library.log、evdev-scroll-overflow-workspace.log、evdev-scroll-overflow-clippy.log。
+
+
+## 第五十一轮：X11 鼠标/键盘的整组捕获回退
+
+### R70 / P1
+
+- 将实际 do_grab 的 native pointer/keyboard/warp 调用提取为 GrabOps seam，生产仍调用原 Xlib API。保持忽略 keyboard 返回的基线，通过实际状态/发布路径模拟 pointer=GrabSuccess、keyboard=AlreadyGrabbed：active_client 变为 Left、warp 一次、Begin 发布、release 零次。日志 x11-partial-grab-baseline.log；未注入真实桌面。
+- [x] 检查 XGrabKeyboard 返回值；第二阶段非 GrabSuccess 时警告并调用 native ungrab 路径，直接返回，不 warp、不更新 entry_point、不激活 client、不发布 Begin。后续边缘穿越可再次尝试，暂时被其他 grab owner 占用不锁存整队列失败。
+- [x] 保持 pointer 拒绝后不尝试 keyboard。两项成功后若 Begin admission 溢出，R68 错误路径仍释放整组 capture。
+- [x] 回归覆盖 AlreadyGrabbed、GrabInvalidTime、GrabNotViewable、GrabFrozen，失败后下一次成功恢复及正确 cross-axis t=0.25；pointer 拒绝不调用后续操作，成功 grab 后 Begin 无法发布会释放并报告队列失败。
+
+### 验证与未完成门槛
+
+- 全工作区 all-features 通过：capture 41 / 1 忽略、emulation 40、root 136 / 2 忽略、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11；严格 all-targets Clippy、fmt/diff 通过。
+- 测试验证实际 do_grab 状态机的调用与事件，不证明真实 XUngrab/XFlush 成功、同步 native 调用不阻塞，或当时用户故障确实运行在 X11 backend。不能把源码路径上的可能症状当成已经证实的历史原因。
+- 第 50 轮 3debb74 检查时 Rust queued、Nix in_progress；本轮 HEAD 需要独立 CI。R70 逻辑回退已修复，native 回退验收仍开放。
+- [ ] R72 / P1：root release_capture_with(Some(t)) 调用公共 capture.release_to(t)，公共 wrapper 清空 pressed_keys 后委托 backend；X11 release_to 只返回 Ok，没有 Request::Release、warp 或 ungrab。实际返程链路可能在上层宣布离开后仍持有原生捕获。下一轮必须对请求/状态链路做故障基线，实现匹配位置的 release，并避免边缘立即重新抓取。
+- [ ] X11 同步控制通道/线程退出/native 阻塞、R13 全服务资源上限、R60 原生退出、真机千次往返、完整 p95/p99 与 8h RSS 未完成，尚不认定达到 90 分。
+
+日志：x11-partial-grab-baseline.log、x11-partial-grab-library.log、x11-partial-grab-workspace.log、x11-partial-grab-clippy.log。
