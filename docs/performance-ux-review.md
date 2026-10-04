@@ -20,7 +20,7 @@
 | R52 | 已实现并通过生产捕获会话回归 | 空 release_bind 不再被 all(empty) 误当按下；夹具确实发送 Enter，不进入错误的释放清理路径 |
 | R47 | 新授权入口已实现并通过 GTK / CLI / Service / DTLS 回归 | 共享 SHA-256 解析，大小写/64 连续 hex 规范化到 95 字符；坏输入保留草稿并提示、不写授权/配置；原文件加载路径见 R53 |
 | R53 | 已实现并通过模型/真实 Service-DTLS 回归 | 启动/重载以校验后标准指纹建立信任；坏项排除并汇总提示；别名描述选择确定；普通保存保留原表，明确添加整理该摘要，撤销清全部别名 |
-| R55 | 已实现并通过代理异步阻塞回归 | create/consume/warp 每次 500ms 期限，超时走有界终止并禁用/报告原因；部分 create 保留映射；同步原生调用不能被 Tokio 期限抢占 |
+| R55 | 已实现并通过代理异步阻塞回归 | create/consume/warp 有 500ms 兜底，普通入站由 R57 的更严格 50ms 共享期限约束；失败走有界清理/反馈，部分 create 保留映射；同步原生调用不能被 Tokio 期限抢占 |
 | R56 | 已实现并通过重建退出回归 | create_clients 区分完成与已消费 Terminate；后者清理后直接返回，不再进入等不到退出消息的输入循环 |
 | R54 | 已实现并通过会话/队列/真实 Service-DTLS 回归 | 撤销同步移除入站连接、取消会话 token；空闲 reader 唤醒清理，旧输入/warp/通知/剪贴板过滤，返回边缘销毁；重新授权只允许新握手；已开始原生调用及真机释放仍待验 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
@@ -50,8 +50,10 @@
 | R16、R17 | 已实现并通过回归 | 三字节 duplex 短写保序；停止读取的 writer 不阻塞正常 writer，超时断开 |
 | R23 | 已实现并通过代理请求循环故障注入 | 首次 Remove 超时保留地址/handle，再次 Input 复用同一 handle，第二次 Remove 清理；底层真实 tracked-input 释放测试已覆盖，原生故障重试待验 |
 | R07 | 已实现并通过真实 DTLS / Service 回归 | 单份最多 64 KiB 最新有效值；就绪补发、忙队列重试、双路同身份去重、来源排除、远端完成顺序和禁用清空；真实系统剪贴板/跨平台验收仍待验 |
-| R57 | 待修复 / 源码等待路径确认 | R13 普通输入虽有额度，只有入队等待和单次 backend 操作期限；没有已排队事件年龄检查，持续慢于到达速度的后端可保持过时运动/按键，仍需时延及安全过载策略 |
-| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；普通 Input/Enter 帧现有全局 256 / 每会话 64 贯穿额度，超额等待 250ms 后关闭并清理；协议控制/剪贴板接收/生命周期及其他事件链仍未全部有界，旧输入年龄见 R57，完整风暴资源及界面验收仍待验 |
+| R57 | 已实现并通过慢后端/实际 tracked-input 回归 | 入队起本地 50ms 期限覆盖排队/create/delivery；到期取消会话、一次错误反馈、即时 bounded 清理；旧输入不重播，活动操作可取消；同步原生与完整端到端时延仍待验 |
+| R58 | 已实现并通过身份/真实 DTLS Enter 回归 | Enter 复用握手验证时存下的指纹，核对 Weak/实际 Arc 与 token；不在 dispatcher 重读 DTLS 状态或 rehash，也无错误 downcast expect |
+| R59 | 待修复 / 条件性源码路径确认 | 地址对应的 handle 在 destroy_bounded 失败后保留，但没有 native handle 的会话身份；同地址新连接的有效 token 可在 handle_for 复用旧状态，需区分同会话重试与替换会话 |
+| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；普通 Input/Enter 帧现有全局 256 / 每会话 64 贯穿额度，超额等待受 50ms freshness 剩余时间约束，过期关闭并清理；协议控制/剪贴板接收/生命周期及其他事件链仍未全部有界，旧输入年龄见 R57，完整风暴资源及界面验收仍待验 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
 | R14 | 已实现并通过故障注入 | 临时文件原子替换；写入失败保留旧文件；失败后恢复监听，并支持 rename 型外部更新；符号链接和权限测试通过；保存失败在界面显示提示 |
 | R22 | 已实现并通过状态回归 | 只有当前连发键的释放停止任务，修饰键和锁定键不取代目标；Windows 集成 CI 待本轮提交 |
@@ -1011,3 +1013,33 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 真机 1000 次切换、完整延迟、8h RSS 和同步原生阻塞保持未验，不认定目标达到 90 分。
 
 日志：input-budget-workspace.log、input-budget-clippy.log、input-budget-saturation.log、input-budget-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、input-budget-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+## 第四十一轮：队列年龄、活动交付取消与 Enter 元数据
+
+### R57 / P1
+
+- 基线实际请求循环复现：20 条已有 lease 的输入，模拟 consume 10ms；旧代码全部开始并完成耗时 224.169ms。每次仍低于旧 500ms 操作期限，没有新的 admission 请求去触发 250ms 等待失败，证明数量上限不能保证新鲜度。
+- [x] InputLease 保存本地 monotonic deadline 和原会话 cancellation token。50ms 从开始申请额度算起，覆盖容量等待、排队、创建和交付；容量等待期限取原等待上限和剩余新鲜度的较小值，不在每段重置时钟。
+- [x] 代理在轮询 future 前检查已过期，避免 timeout_at 先轮询 ready future 导致迟到输入被执行。未取消的活动操作受剩余时间和 session.cancelled 共同约束；结束后再检查年龄。同步原生操作仍不能被 Tokio 抢占。
+- [x] 过期取消仅该 session，reader 退出并拒绝其旧队列；前端只投递一次过载反馈。代理立即 destroy_bounded 释放未知按下状态，不等待后续 Remove 排到队首。失败时仍保留地址/handle 供重试。一般取消无多余过载提示，其他会话保持启用。
+- [x] 已取消但尚未开始的旧输入直接丢弃且不清理其他 handle；同地址新 token 的输入可继续，旧 warp 不能触及新 native handle。此处保护同地址正常清理后的替换，不把失败清理下的会话混用问题称为已关闭（见 R59）。
+
+### 三个新增代理回归
+
+- 同一慢后端场景现只开始 5 次 consume，约 52.051ms 后清理取消；其余旧输入不执行，handle/按住状态清空，256/64 额度恢复且只有一次过载事件。此数值是模拟故障策略验证，不是局域网 p95/p99。
+- 实际 InputEmulation Dummy 先跟踪 Ctrl 按下，再消费过期 release，验证通过 cleanup 释放旧 Ctrl；同地址 fresh scope 创建新 handle 并接受 Ctrl，迟到旧 warp 不销毁新 handle；最终 terminate 释放新键。
+- 永久 Pending consume 在 5ms 后取消原 token，代理取消交付并清理，不等 500ms operation deadline；没有过载误报或额度泄漏。已有容量/饱和/同设备销毁重试回归保留。
+
+### R58 / P2
+
+- 源码发现：每次 Enter 在 ListenTask 中 await get_certificate_fingerprint；旧方法 downcast.expect 并读取 DTLS connection_state、复制证书再生成 SHA-256，串行 dispatcher 可能等待内部状态锁。指纹实际已在 accept 完成验证时存储。
+- [x] 从 IncomingAuthorization 已验证身份快照同步取指纹；严格校验 Weak/实际 Arc 与未取消 token。撤销/旧 Arc 查不到指纹，替换的新 Arc 可取自己的身份；Enter 无 await/重复 rehash。真实 DTLS Enter/Ack/返回边缘回归通过。
+
+### 验证与剩余发现
+
+- Linux all-features 工作区通过：主包 129 / 2 默认忽略，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略；严格 all-targets Clippy、格式和 diff 检查通过。
+- 隔离真实 Service-DTLS 授权/活跃撤销及双向剪贴板重播/来源/禁用/重连两个回归均通过；上一 HEAD 26ce9ca Rust run 37194196473 已完成成功；本轮新 HEAD 仍需自己的跨平台 CI。
+- R59 条件性源码证据：ProxyRequest::Remove 与 finish_input_delivery 在 destroy_bounded=false 时保留 self.handles；该表仅按地址索引。handle_for 发现地址便返回现有 handle，未检查创建它的会话；新 token 可复用未清理旧 pressed state，导致新 Ctrl 按下被底层重复按下保护抑制。尚未有实际 native-failure/same-address replacement 验收，下一轮需要故障注入与修复。
+- R13 其他无界事件及连接数量、同步原生调用、真机千次往返、完整 p95/p99 和八小时 RSS 保持未闭环，不认定达到 90 分。
+
+日志：input-freshness-baseline.log、input-freshness-focused.log、input-freshness-workspace.log、input-freshness-clippy.log、input-freshness-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、input-freshness-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

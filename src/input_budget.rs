@@ -1,15 +1,38 @@
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 const GLOBAL_INPUT_LIMIT: usize = 256;
 const PEER_INPUT_LIMIT: usize = 64;
+const MAX_INPUT_AGE: Duration = Duration::from_millis(50);
 
 /// Admission follows the frame through both listener and proxy queues, and is
 /// released only after delivery (or rejection), not merely after forwarding.
 pub(crate) struct InputLease {
+    deadline: Instant,
+    cancellation: CancellationToken,
     _global: OwnedSemaphorePermit,
     _peer: OwnedSemaphorePermit,
+}
+
+impl InputLease {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+    pub(crate) fn cancel(&self) -> bool {
+        if self.cancellation.is_cancelled() {
+            false
+        } else {
+            self.cancellation.cancel();
+            true
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -38,13 +61,15 @@ impl InputBudget {
     }
 
     pub(crate) async fn acquire(&self, cancellation: &CancellationToken) -> Option<InputLease> {
+        let deadline = Instant::now() + MAX_INPUT_AGE;
+        let admission_deadline = deadline.min(Instant::now() + self.timeout);
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => None,
-            result = tokio::time::timeout(self.timeout, async {
+            result = tokio::time::timeout_at(admission_deadline, async {
                 let peer = self.peer.clone().acquire_owned().await.ok()?;
                 let global = self.global.clone().acquire_owned().await.ok()?;
-                Some(InputLease { _global: global, _peer: peer })
+                Some(InputLease { deadline, cancellation: cancellation.clone(), _global: global, _peer: peer })
             }) => result.ok().flatten(),
         }
     }

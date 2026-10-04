@@ -163,6 +163,13 @@ impl IncomingAuthorization {
             .filter(|(_, old, token)| !token.is_cancelled() && old.ptr_eq(&Arc::downgrade(conn)))
             .map(|(_, _, token)| token.clone())
     }
+    pub(crate) fn fingerprint(&self, addr: SocketAddr, conn: &ArcConn) -> Option<String> {
+        self.identities
+            .borrow()
+            .get(&addr)
+            .filter(|(_, old, token)| !token.is_cancelled() && old.ptr_eq(&Arc::downgrade(conn)))
+            .map(|(fingerprint, _, _)| fingerprint.clone())
+    }
     pub(crate) fn revoke_untrusted(&self) -> Vec<SocketAddr> {
         let keys = self.keys.read().expect("authorized keys");
         let identities = self.identities.borrow();
@@ -602,22 +609,14 @@ impl LanMouseListener {
         self.conns.clone()
     }
 
-    pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        let conn = self
-            .conns
-            .borrow()
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone());
-        if let Some(conn) = conn {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-            let certs = conn.connection_state().await.peer_certificates;
-            let cert = certs.first()?;
-            let fingerprint = crypto::generate_fingerprint(cert);
-            Some(fingerprint)
-        } else {
-            None
-        }
+    pub(crate) fn get_certificate_fingerprint(
+        &self,
+        addr: SocketAddr,
+        conn: &ArcConn,
+    ) -> Option<String> {
+        // Identity was verified and recorded before Accept. Enter must not wait
+        // on DTLS state or accidentally read a same-address replacement's cert.
+        self.authorization.fingerprint(addr, conn)
     }
 }
 
@@ -2025,6 +2024,8 @@ mod tests {
                 auth.keys.write().unwrap().remove("old");
                 assert_eq!(auth.revoke_untrusted(), vec![addr]);
                 assert!(old_token.is_cancelled());
+                assert!(auth.fingerprint(addr, &old).is_none());
+                assert_eq!(auth.fingerprint(other, &peer).as_deref(), Some("peer"));
                 assert!(!peer_token.is_cancelled());
                 assert!(is_current(&auth.conns.borrow(), other, &peer));
                 assert!(!is_current(&auth.conns.borrow(), addr, &old));
@@ -2043,6 +2044,8 @@ mod tests {
                 assert!(!fresh.is_cancelled());
                 assert!(auth.token(addr, &old).is_none());
                 assert!(auth.token(addr, &replacement).is_some());
+                assert!(auth.fingerprint(addr, &old).is_none());
+                assert_eq!(auth.fingerprint(addr, &replacement).as_deref(), Some("old"));
                 let queued = auth.take_revoked();
                 assert_eq!(queued.len(), 1);
                 assert!(is_current(&auth.conns.borrow(), addr, &replacement));

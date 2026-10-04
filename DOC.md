@@ -493,7 +493,10 @@ The emulation worker allows 500 ms for each asynchronous per-handle creation,
 input delivery and cursor warp. A deadline returns an input error, runs the
 existing bounded backend cleanup and disables emulation until explicitly enabled
 again. The frontend receives the failure reason as well as the disabled status.
-An uncertain input delivery is not automatically retried. Partial handle creation
+An uncertain input delivery is not automatically retried. Admitted incoming frames
+add a stricter shared 50 ms deadline covering admission, queueing, handle creation
+and delivery. Expiry cancels that session and invokes its bounded input cleanup;
+it does not automatically disable an otherwise working backend. Partial handle creation
 retains its address mapping so cleanup can reach the handle. Failed destruction
 also retains that mapping for a subsequent Remove to retry the same handle.
 
@@ -511,16 +514,26 @@ Normal keyboard/pointer frames and Enter (cursor warp) share 256 outstanding
 admission slots across the listener, with 64 slots per accepted connection.
 Each slot follows its frame through the listener and emulation request queues
 until backend processing or rejection ends. Forwarding alone does not free it.
-Readers wait up to 250 ms for admission, observing session cancellation. A
-persistent backlog closes that incoming session, reports a frontend error and
-uses normal disconnect/key cleanup instead of silently discarding an essential release. No frame encoding
-or normal FIFO ordering changes. Idle readers do not reserve slots.
+A local 50 ms deadline starts before admission and follows the frame through
+queueing, handle creation and delivery. Admission is bounded by the remaining
+freshness time as well as its capacity deadline. Cancellation interrupts waits.
+Already expired work never starts; expiry while delivering cancels the session,
+reports an overload error once and invokes bounded key cleanup immediately.
+Other sessions remain enabled. Stale messages from the canceled session cannot
+affect a fresh connection at the same address. No frame encoding or normal FIFO
+ordering changes. Idle readers do not reserve slots.
 
 This bounds these application input frames, not every process queue. Clipboard,
 protocol bookkeeping and connection lifecycle notifications retain their existing
 paths; concurrent connection count and native resources require separate bounds.
 The pinned DTLS dependency has a one-item decrypted application channel, but its
 transport buffers are not included in this application budget. Bounded queue
-length also does not prove the latency target: steadily slow backend work can
-still keep admitted input waiting. Complete-service latency and storm tests
-remain required.
+length and a freshness deadline do not prove end-to-end latency: capture, network,
+transport buffers, scheduling and synchronous native calls remain outside this
+local yielding-operation guarantee. Native calls already started cannot be undone,
+and failed cleanup retains state for retry. Complete-service latency and storm
+tests remain required.
+
+Enter uses the fingerprint recorded at the verified handshake, checked against
+the exact connection identity and uncanceled session. It no longer rehashes a
+certificate or waits on DTLS connection state in the input dispatcher.
