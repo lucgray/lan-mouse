@@ -9,9 +9,10 @@ use std::{
 };
 use tokio::sync::{mpsc, watch};
 
-type Applied = (ClipboardEvent, Result<(), ClipboardError>);
+type Applied = (ClipboardEvent, Result<(), ClipboardError>, u64);
 
 struct PendingWrite {
+    revision: u64,
     event: ClipboardEvent,
     // The receiver takes the lease before applying. The watch value may remain
     // stored afterwards, but must not retain a finished write's suppression.
@@ -32,7 +33,7 @@ impl ClipboardWriter {
         })
     }
 
-    fn with_apply<F, Fut>(feedback: Option<ClipboardFeedback>, apply: F) -> Self
+    pub(crate) fn with_apply<F, Fut>(feedback: Option<ClipboardFeedback>, apply: F) -> Self
     where
         F: FnMut(ClipboardEvent) -> Fut + 'static,
         Fut: Future<Output = Result<(), ClipboardError>> + 'static,
@@ -47,11 +48,17 @@ impl ClipboardWriter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn submit(&self, event: ClipboardEvent) {
+        self.submit_with_revision(event, 0);
+    }
+
+    pub(crate) fn submit_with_revision(&self, event: ClipboardEvent, revision: u64) {
         // Reserve suppression synchronously, before scheduling the serial worker.
         // Replacement drops an unstarted request's lease; the new one remains.
         let guard = self.feedback.clone().map(ClipboardFeedback::begin_write);
         self.pending.send_replace(Some(Arc::new(PendingWrite {
+            revision,
             event,
             guard: Mutex::new(guard),
         })));
@@ -88,7 +95,11 @@ async fn run_writer<F, Fut>(
             if let Some(guard) = guard {
                 guard.finish(result.is_ok().then(|| event.clone()));
             }
-            if completed.send((event, result)).await.is_err() {
+            if completed
+                .send((event, result, request.revision))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -167,7 +178,7 @@ mod tests {
                 tokio::task::yield_now().await;
                 assert!(writer.completed.try_recv().is_err());
                 writer.submit(text("fail"));
-                let (event, result) = writer.completed().await.unwrap();
+                let (event, result, _) = writer.completed().await.unwrap();
                 assert_eq!(event, text("fail"));
                 assert!(result.is_err());
                 assert!(!feedback.is_writing());

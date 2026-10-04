@@ -921,7 +921,7 @@ mod tests {
                     .unwrap_or_else(|_| panic!());
                 tokio::time::timeout(Duration::from_millis(100), async {
                     loop {
-                        if let crate::emulation::EmulationEvent::ClipboardReceived(_) =
+                        if let crate::emulation::EmulationEvent::ClipboardReceived { .. } =
                             emulation.event().await
                         {
                             break;
@@ -1502,9 +1502,10 @@ mod tests {
                     .unwrap_or_else(|_| panic!("listener stopped"));
                 tokio::time::timeout(Duration::from_millis(100), async {
                     loop {
-                        if let crate::emulation::EmulationEvent::ClipboardReceived(
-                            input_event::ClipboardEvent::Text(text),
-                        ) = emulation.event().await
+                        if let crate::emulation::EmulationEvent::ClipboardReceived {
+                            event: input_event::ClipboardEvent::Text(text),
+                            ..
+                        } = emulation.event().await
                         {
                             assert_eq!(text, "after blocked hello");
                             break;

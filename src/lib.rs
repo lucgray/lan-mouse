@@ -3,6 +3,7 @@ mod capture;
 pub mod capture_test;
 pub mod client;
 mod clipboard_network;
+mod clipboard_replay;
 mod clipboard_writer;
 pub mod config;
 mod connect;

@@ -89,9 +89,23 @@ A truncated clipboard message is rejected without reading another message as
 its continuation. Existing compact and padded fixed-size frames remain accepted;
 the wire event IDs and encoding are unchanged.
 
-Input and clipboard send failures propagate to their callers. Clipboard sends
-while disconnected return an error rather than reporting a successful transfer;
-reconnect replay is not provided by this change.
+Input and clipboard send failures propagate to their callers. While clipboard
+sharing is enabled, the service keeps one latest valid snapshot (up to 64 KiB)
+and sends it when an authenticated transport becomes ready. Disconnected edits
+replace that snapshot, so reconnection replays only the latest value. Receipt
+of a remote write invalidates the prior snapshot immediately; only the current
+successful OS write becomes replayable. Disabling sharing clears the snapshot
+and pending receipts. This cache is in memory and does not survive service exit.
+
+Clipboard reception uses a latest-value channel independent of input capture.
+An authenticated incoming transport can share clipboard before an input Enter,
+and outgoing sharing does not require a positive input-emulation heartbeat.
+Target revisions and exact connection identity reject queued stale messages.
+The source certificate fingerprint is excluded from forwarding over either route;
+per-peer/session receipts avoid duplicate replay. Busy send queues retry the
+latest snapshot at 250 ms intervals and rate-limit busy notices to two seconds.
+Queue admission and complete network sends do not confirm the remote OS write;
+simultaneous copies on different devices have no global conflict ordering.
 
 Frontend notifications use an ordered writer per IPC connection, with a queue
 of 64 messages and a two-second write deadline. Each JSON line is written in

@@ -25,7 +25,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{signal, sync::Notify};
@@ -57,6 +57,13 @@ pub struct Service {
     clipboard_emulation: Option<ClipboardEmulation>,
     clipboard_writer: Option<ClipboardWriter>,
     clipboard_outgoing: crate::clipboard_network::ClipboardJobs,
+    clipboard_replay: crate::clipboard_replay::ClipboardReplay,
+    clipboard_ready: Arc<Notify>,
+    clipboard_received: tokio::sync::watch::Receiver<Option<crate::connect::ReceivedEvent>>,
+    clipboard_retry: bool,
+    clipboard_busy_notice: Option<Instant>,
+    incoming_clipboard:
+        HashMap<SocketAddr, (String, std::sync::Weak<dyn webrtc_util::Conn + Send + Sync>)>,
     /// clipboard enabled
     clipboard_enabled: bool,
     /// dns resolver
@@ -121,6 +128,8 @@ impl Service {
         let authentication_notices = listener.authentication_notices();
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
         let conn_sender = conn.sender();
+        let clipboard_ready = conn_sender.clipboard_ready_signal();
+        let clipboard_received = conn_sender.clipboard_events();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -148,6 +157,7 @@ impl Service {
 
         // clipboard monitor + emulation
         let clipboard_enabled = config.clipboard_enabled();
+        conn_sender.set_clipboard_receiving(clipboard_enabled);
         let (clipboard_monitor, clipboard_emulation) = if clipboard_enabled {
             Self::create_clipboard_parts()
         } else {
@@ -174,6 +184,12 @@ impl Service {
             clipboard_emulation,
             clipboard_writer,
             clipboard_outgoing: Default::default(),
+            clipboard_replay: Default::default(),
+            clipboard_ready,
+            clipboard_received,
+            clipboard_retry: false,
+            clipboard_busy_notice: None,
+            incoming_clipboard: Default::default(),
             authentication_notices,
             clipboard_enabled,
             frontend_listener,
@@ -216,8 +232,18 @@ impl Service {
             self.activate_client(handle);
         }
 
+        let mut clipboard_retry = tokio::time::interval(Duration::from_millis(250));
+        clipboard_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                changed = self.clipboard_received.changed() => {
+                    if changed.is_ok() {
+                        self.clipboard_received.borrow_and_update();
+                        if let Some(received) = self.conn_sender.take_received_clipboard() { self.handle_outgoing_clipboard(received); }
+                    }
+                },
+                _ = self.clipboard_ready.notified() => self.replay_clipboard(),
+                _ = clipboard_retry.tick(), if self.clipboard_retry => self.replay_clipboard(),
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 fingerprint = self.authentication_notices.next() => self.handle_authentication_attempt(fingerprint),
@@ -254,13 +280,8 @@ impl Service {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some((event, result)) = result {
-                        match result {
-                            Ok(()) if self.clipboard_enabled => self.notify_clipboard_shared(&event, true),
-                            Ok(()) => {},
-                            Err(e) => { log::warn!("Failed to apply remote clipboard: {e}");
-                                self.notify_frontend(FrontendEvent::Error(format!("Failed to apply clipboard: {e}"))); }
-                        }
+                    if let Some((event, result, revision)) = result {
+                        self.handle_clipboard_applied(event, result, revision);
                     } else {
                         self.clipboard_writer = None;
                         self.notify_frontend(FrontendEvent::Error("Clipboard writer stopped unexpectedly".into()));
@@ -504,8 +525,18 @@ impl Service {
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
-            EmulationEvent::Connected { addr, fingerprint } => {
+            EmulationEvent::Connected {
+                addr,
+                fingerprint,
+                conn,
+            } => {
+                if !self.emulation.clipboard_session_is_current(addr, &conn) {
+                    return;
+                }
+                self.incoming_clipboard
+                    .insert(addr, (fingerprint.clone(), Arc::downgrade(&conn)));
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
+                self.replay_clipboard();
             }
             EmulationEvent::PeerHello { addr, commit } => {
                 // Map the peer's source addr back to its client handle
@@ -518,7 +549,23 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
-            EmulationEvent::ClipboardReceived(event) => self.receive_clipboard(event),
+            EmulationEvent::ClipboardReceived { event, addr, conn } => {
+                if !self.emulation.clipboard_session_is_current(addr, &conn) {
+                    return;
+                }
+                let origin = self
+                    .incoming_clipboard
+                    .get(&addr)
+                    .filter(|(_, current)| {
+                        current
+                            .upgrade()
+                            .is_some_and(|current| Arc::ptr_eq(&current, &conn))
+                    })
+                    .map(|(origin, _)| origin.clone());
+                if let Some(origin) = origin {
+                    self.receive_clipboard(event, origin);
+                }
+            }
             EmulationEvent::ClipboardSendCompleted(completed) => {
                 self.handle_clipboard_completion(completed)
             }
@@ -535,6 +582,22 @@ impl Service {
         }
         if let Some((handle, revision)) = completed.outgoing {
             if !self.client_manager.target_is_current(handle, revision) {
+                return;
+            }
+        }
+        if let Some(conn) = &completed.conn {
+            let current = match completed.outgoing {
+                Some((handle, revision)) => self.conn_sender.clipboard_session_is_current(
+                    handle,
+                    revision,
+                    completed.addr,
+                    conn,
+                ),
+                None => self
+                    .emulation
+                    .clipboard_session_is_current(completed.addr, conn),
+            };
+            if !current {
                 return;
             }
         }
@@ -590,14 +653,76 @@ impl Service {
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
-            ICaptureEvent::ClipboardReceived(event) => self.receive_clipboard(event),
         }
     }
 
-    fn receive_clipboard(&self, event: input_event::ClipboardEvent) {
-        if self.clipboard_enabled {
-            if let Some(writer) = &self.clipboard_writer {
-                writer.submit(event);
+    fn handle_outgoing_clipboard(&mut self, received: crate::connect::ReceivedEvent) {
+        let crate::connect::ReceivedEvent {
+            event,
+            handle,
+            revision,
+            addr,
+            conn,
+        } = received;
+        if !self
+            .conn_sender
+            .clipboard_session_is_current(handle, revision, addr, &conn)
+        {
+            return;
+        }
+        if let (
+            lan_mouse_proto::ProtoEvent::Input(input_event::Event::Clipboard(event)),
+            Some(origin),
+        ) = (event, self.conn_sender.clipboard_peer(handle, &conn))
+        {
+            self.receive_clipboard(event, origin);
+        }
+    }
+
+    fn receive_clipboard(&mut self, event: input_event::ClipboardEvent, origin: String) {
+        if !self.clipboard_enabled {
+            return;
+        }
+        if event.content_len() > lan_mouse_proto::MAX_CLIPBOARD_SIZE {
+            return;
+        }
+        let Some(writer) = &self.clipboard_writer else {
+            self.notify_frontend(FrontendEvent::Error(
+                "Clipboard writer is unavailable".into(),
+            ));
+            return;
+        };
+        // Invalidate accepted local snapshots as soon as a remote intent arrives.
+        // Canceled network jobs cannot start a stale local send during OS writing.
+        self.emulation.clear_clipboard();
+        self.clipboard_retry = false;
+        let revision = self.clipboard_replay.begin_remote(origin);
+        writer.submit_with_revision(event, revision);
+    }
+
+    fn handle_clipboard_applied(
+        &mut self,
+        event: input_event::ClipboardEvent,
+        result: Result<(), input_emulation::clipboard::ClipboardError>,
+        revision: u64,
+    ) {
+        if !self.clipboard_enabled
+            || !self
+                .clipboard_replay
+                .applied(revision, event.clone(), result.is_ok())
+        {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.notify_clipboard_shared(&event, true);
+                self.replay_clipboard();
+            }
+            Err(error) => {
+                log::warn!("Failed to apply remote clipboard: {error}");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Failed to apply clipboard: {error}"
+                )));
             }
         }
     }
@@ -606,64 +731,120 @@ impl Service {
         if !self.clipboard_enabled {
             return;
         }
-        use input_capture::CaptureEvent;
-        use input_event::Event;
-
-        if let Some(CaptureEvent::Input(Event::Clipboard(clipboard_event))) = event {
-            // The protocol limit is payload bytes. Check before cloning or
-            // encoding a potentially huge image; encoding belongs in the job.
-            let bytes = clipboard_event.content_len();
+        if let Some(input_capture::CaptureEvent::Input(input_event::Event::Clipboard(event))) =
+            event
+        {
+            let bytes = event.content_len();
             if bytes > lan_mouse_proto::MAX_CLIPBOARD_SIZE {
+                self.clipboard_replay.invalidate();
+                self.emulation.clear_clipboard();
+                self.clipboard_retry = false;
                 self.notify_frontend(FrontendEvent::ClipboardTooLarge {
                     bytes,
                     limit: lan_mouse_proto::MAX_CLIPBOARD_SIZE,
                 });
                 return;
             }
+            self.clipboard_replay.local(event);
+            self.replay_clipboard();
+        }
+    }
 
-            log::info!("Clipboard changed locally, sending to all connected peers");
+    fn clipboard_send_busy(&mut self) {
+        self.clipboard_retry = true;
+        if self
+            .clipboard_busy_notice
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            self.clipboard_busy_notice = Some(Instant::now());
+            self.notify_frontend(FrontendEvent::Error(
+                "Clipboard send is busy; retrying the latest snapshot".into(),
+            ));
+        }
+    }
 
-            // Send clipboard to all active clients (machines we're controlling)
-            let active_clients: Vec<_> = self.client_manager.active_clients().into_iter().collect();
-
-            for handle in active_clients {
-                let (generation, cancellation) = self.emulation.clipboard_scope();
-                match self.conn_sender.prepare_clipboard(
-                    clipboard_event.clone(),
-                    handle,
-                    generation,
-                    cancellation,
-                ) {
-                    Ok(request) => {
-                        if self.clipboard_outgoing.submit(request).is_err() {
-                            self.notify_frontend(FrontendEvent::Error(
-                                "Clipboard send is busy; copy again".into(),
-                            ));
-                        }
-                    }
-                    Err(crate::connect::LanMouseConnectionError::ClipboardBusy) => {
-                        self.notify_frontend(FrontendEvent::Error(
-                            "Clipboard send is busy; copy again".into(),
-                        ));
-                    }
-                    Err(error) => log::debug!("clipboard target {handle} unavailable: {error}"),
+    fn replay_clipboard(&mut self) {
+        self.clipboard_retry = false;
+        if !self.clipboard_enabled {
+            return;
+        }
+        let Some(snapshot) = self.clipboard_replay.snapshot() else {
+            return;
+        };
+        let mut current_peers = self.conn_sender.clipboard_known_peers();
+        let mut peers = HashSet::new();
+        for handle in self.client_manager.active_clients() {
+            let (conn, peer) = match self.conn_sender.clipboard_current(handle) {
+                Ok(current) => current,
+                Err(crate::connect::LanMouseConnectionError::ClipboardBusy) => {
+                    self.clipboard_send_busy();
+                    continue;
                 }
+                Err(_) => continue,
+            };
+            if !peers.insert(peer.clone())
+                || !self.clipboard_replay.should_send(&snapshot, &peer, &conn)
+            {
+                continue;
             }
-
-            // Also send clipboard to all incoming connections (machines controlling us)
-            let incoming_addrs: Vec<_> = self
-                .incoming_conn_info
-                .values()
-                .map(|incoming| incoming.addr)
-                .collect();
-
-            for addr in incoming_addrs {
-                log::info!("Sending clipboard to incoming connection {}", addr);
-                if let Err(error) = self.emulation.send_clipboard(addr, clipboard_event.clone()) {
-                    self.notify_frontend(FrontendEvent::Error(error.into()));
+            let (generation, token) = self.emulation.clipboard_scope();
+            match self.conn_sender.prepare_clipboard(
+                (*snapshot.event).clone(),
+                handle,
+                generation,
+                token,
+            ) {
+                Ok(request) => {
+                    self.clipboard_outgoing
+                        .cancel_stale(request.addr, Some(&conn));
+                    if self.clipboard_outgoing.submit(request).is_ok() {
+                        self.clipboard_replay.accepted(&snapshot, peer, &conn);
+                    } else {
+                        peers.remove(&peer);
+                        self.clipboard_send_busy();
+                    }
+                }
+                Err(crate::connect::LanMouseConnectionError::ClipboardBusy) => {
+                    peers.remove(&peer);
+                    self.clipboard_send_busy();
+                }
+                Err(_) => {
+                    peers.remove(&peer);
                 }
             }
         }
+        // Authenticated incoming transport is ready even before Enter establishes
+        // a return edge. Validate queued Connected metadata against the exact Arc.
+        let incoming: HashMap<_, _> = self.emulation.clipboard_sessions().into_iter().collect();
+        self.incoming_clipboard.retain(|addr, (_, conn)| {
+            incoming.get(addr).is_some_and(|current| {
+                conn.upgrade()
+                    .is_some_and(|conn| Arc::ptr_eq(current, &conn))
+            })
+        });
+        let targets: Vec<_> = self
+            .incoming_clipboard
+            .iter()
+            .map(|(addr, (peer, _))| (*addr, peer.clone(), incoming[addr].clone()))
+            .collect();
+        for (addr, peer, conn) in targets {
+            current_peers.insert(peer.clone());
+            if !peers.insert(peer.clone())
+                || !self.clipboard_replay.should_send(&snapshot, &peer, &conn)
+            {
+                continue;
+            }
+            if self
+                .emulation
+                .send_clipboard(addr, (*snapshot.event).clone())
+                .is_ok()
+            {
+                self.clipboard_replay.accepted(&snapshot, peer, &conn);
+            } else {
+                self.clipboard_send_busy();
+            }
+        }
+        self.clipboard_replay.retain_peers(&current_peers);
     }
 
     fn handle_resolver_event(&mut self, event: DnsEvent) {
@@ -960,6 +1141,7 @@ impl Service {
             if enabled { "enabled" } else { "disabled" }
         );
         self.clipboard_enabled = enabled;
+        self.conn_sender.set_clipboard_receiving(enabled);
         if enabled {
             // lazily create the monitor/emulation if they were missing
             // (e.g. clipboard unavailable at daemon startup)
@@ -986,6 +1168,8 @@ impl Service {
                 monitor.enable();
             }
         } else {
+            self.clipboard_replay.invalidate();
+            self.clipboard_retry = false;
             self.emulation.clear_clipboard();
             if let Some(monitor) = &self.clipboard_monitor {
                 monitor.disable();
@@ -1046,6 +1230,292 @@ impl Service {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR / XDG_RUNTIME_DIR"]
+    async fn real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect() {
+        use crate::listen::{ArcConn, ListenEvent};
+        use futures::StreamExt;
+        use input_event::{ClipboardEvent, Event};
+        use lan_mouse_proto::ProtoEvent;
+        use webrtc_dtls::{
+            config::{Config as DtlsConfig, ExtendedMasterSecretType},
+            conn::DTLSConn,
+            crypto::Certificate,
+        };
+        fn text(value: &str) -> ClipboardEvent {
+            ClipboardEvent::Text(value.into())
+        }
+        fn local(service: &mut Service, event: ClipboardEvent) {
+            service.handle_clipboard_event(Some(input_capture::CaptureEvent::Input(
+                Event::Clipboard(event),
+            )));
+        }
+        async fn send(conn: &ArcConn, event: ClipboardEvent) {
+            crate::listen::send_clipboard_reply(
+                Some(conn.clone()),
+                ProtoEvent::Input(Event::Clipboard(event)),
+            )
+            .await
+            .unwrap();
+        }
+        async fn receive(conn: &ArcConn) -> ClipboardEvent {
+            let mut bytes = vec![0; lan_mouse_proto::MAX_CLIPBOARD_SIZE + 5];
+            let count = tokio::time::timeout(Duration::from_secs(2), conn.recv(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            match lan_mouse_proto::decode_event_frame(&bytes[..count]).unwrap() {
+                ProtoEvent::Input(Event::Clipboard(event)) => event,
+                _ => panic!("expected clipboard snapshot"),
+            }
+        }
+        async fn incoming(service: &mut Service, cert: Certificate) -> ArcConn {
+            service
+                .authorized_keys
+                .write()
+                .unwrap()
+                .insert(crypto::certificate_fingerprint(&cert), "fixture".into());
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket
+                .connect((std::net::Ipv4Addr::LOCALHOST, service.port))
+                .await
+                .unwrap();
+            let conn: ArcConn = Arc::new(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    DTLSConn::new(
+                        socket,
+                        DtlsConfig {
+                            certificates: vec![cert],
+                            insecure_skip_verify: true,
+                            extended_master_secret: ExtendedMasterSecretType::Require,
+                            ..Default::default()
+                        },
+                        true,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = service.emulation.event().await;
+                    let accepted = matches!(event, EmulationEvent::Connected { .. });
+                    service.handle_emulation_event(event).await;
+                    if accepted {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            conn
+        }
+        async fn outgoing_receive(service: &mut Service) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    service.clipboard_received.changed().await.unwrap();
+                    service.clipboard_received.borrow_and_update();
+                    if let Some(received) = service.conn_sender.take_received_clipboard() {
+                        service.handle_outgoing_clipboard(received);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        async fn network_done(service: &mut Service) {
+            let completed = tokio::time::timeout(
+                Duration::from_secs(2),
+                service.clipboard_outgoing.completed(),
+            )
+            .await
+            .unwrap();
+            service.handle_clipboard_completion(completed);
+        }
+        async fn applied(service: &mut Service) {
+            let (event, result, revision) = tokio::time::timeout(
+                Duration::from_secs(2),
+                service.clipboard_writer.as_mut().unwrap().completed(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            service.handle_clipboard_applied(event, result, revision);
+        }
+        let runtime = std::env::var("LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR").unwrap();
+        assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), runtime);
+        assert!(std::path::Path::new(&runtime).starts_with(std::env::temp_dir()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let cert = directory.path().join("test.pem");
+        std::fs::write(&path, "port = 0\nenable_clipboard = false\n").unwrap();
+        let config = Config::new_with_args([
+            "lan-mouse",
+            "--config",
+            path.to_str().unwrap(),
+            "--cert-path",
+            cert.to_str().unwrap(),
+            "--capture-backend",
+            "dummy",
+            "--emulation-backend",
+            "dummy",
+        ])
+        .unwrap();
+        tokio::task::LocalSet::new().run_until(async move {
+            let mut service = Service::new(config).await.unwrap();
+            service.clipboard_enabled = true;
+            service.conn_sender.set_clipboard_receiving(true);
+            let (started, mut starts) = tokio::sync::mpsc::channel(4);
+            let release = Arc::new(Notify::new());
+            let gate = release.clone();
+            service.clipboard_writer = Some(ClipboardWriter::with_apply(None, move |event| {
+                let started = started.clone(); let gate = gate.clone();
+                async move {
+                    started.send(event.clone()).await.unwrap();
+                    if event == text("first remote") { gate.notified().await; }
+                    if event == text("refused remote") { return Err(input_emulation::clipboard::ClipboardError::Set("fixture refusal".into())); }
+                    Ok(())
+                }
+            }));
+            let peer_cert = Certificate::generate_self_signed(vec![]).unwrap();
+            let peer_fingerprint = crypto::certificate_fingerprint(&peer_cert);
+            let mut peer = LanMouseListener::new(0, peer_cert.clone(), Arc::new(RwLock::new(HashMap::from([(service.public_key_fingerprint.clone(), "service".into())])))).await.unwrap();
+            let peer_port = peer.port();
+            let (accept_tx, mut accepts) = tokio::sync::mpsc::channel(4);
+            let (clip_tx, mut clips) = tokio::sync::mpsc::channel(8);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let peer_cancel = cancel.clone();
+            let peer_task = tokio::task::spawn_local(async move {
+                loop {
+                    tokio::select! {
+                        _ = peer_cancel.cancelled() => break,
+                        event = peer.next() => match event {
+                            Some(ListenEvent::Accept { conn, .. }) => accept_tx.send(conn).await.unwrap(),
+                            Some(ListenEvent::Msg { event: ProtoEvent::Input(Event::Clipboard(event)), .. }) => clip_tx.send(event).await.unwrap(),
+                            Some(ListenEvent::Msg { event: ProtoEvent::Ping, conn, .. }) => { let (bytes, count): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = ProtoEvent::Pong(false).into(); conn.send(&bytes[..count]).await.unwrap(); },
+                            None => break,
+                            _ => {}
+                        }
+                    }
+                }
+                peer.terminate().await;
+            });
+            let handle = service.client_manager.add_client();
+            service.client_manager.set_fix_ips(handle, vec![std::net::Ipv4Addr::LOCALHOST.into()]);
+            service.client_manager.set_port(handle, peer_port);
+            service.client_manager.activate_client(handle);
+            local(&mut service, text("offline old"));
+            local(&mut service, text("offline latest"));
+            assert!(service.conn_sender.send(ProtoEvent::Ping, handle).await.is_err());
+            let server_conn = tokio::time::timeout(Duration::from_secs(2), accepts.recv()).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), service.clipboard_ready.notified()).await.unwrap();
+            service.replay_clipboard();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(2), clips.recv()).await.unwrap().unwrap(), text("offline latest"));
+            network_done(&mut service).await;
+            assert!(!service.client_manager.alive(handle)); // clipboard does not require input emulation.
+            for _ in 0..1000 { service.replay_clipboard(); }
+            assert!(tokio::time::timeout(Duration::from_millis(20), clips.recv()).await.is_err());
+            // A second, incoming route uses the same authenticated certificate.
+            // No Enter is sent; established transport alone is sufficient.
+            let incoming_route = incoming(&mut service, peer_cert.clone()).await;
+            let mut no_data = [0u8; 32];
+            assert!(tokio::time::timeout(Duration::from_millis(20), incoming_route.recv(&mut no_data)).await.is_err());
+            send(&server_conn, text("first remote")).await;
+            outgoing_receive(&mut service).await;
+            assert!(service.clipboard_replay.snapshot().is_none());
+            assert_eq!(starts.recv().await.unwrap(), text("first remote"));
+            send(&server_conn, text("latest remote")).await;
+            outgoing_receive(&mut service).await;
+            release.notify_one();
+            applied(&mut service).await;
+            assert!(service.clipboard_replay.snapshot().is_none()); // first completion cannot commit newer intent.
+            applied(&mut service).await;
+            assert_eq!(*service.clipboard_replay.snapshot().unwrap().event, text("latest remote"));
+            assert_eq!(service.clipboard_replay.snapshot().unwrap().origin.as_deref(), Some(peer_fingerprint.as_str()));
+            assert!(tokio::time::timeout(Duration::from_millis(20), clips.recv()).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_millis(20), incoming_route.recv(&mut no_data)).await.is_err()); // no echo on either route.
+            send(&server_conn, text("refused remote")).await;
+            outgoing_receive(&mut service).await;
+            applied(&mut service).await;
+            assert!(service.clipboard_replay.snapshot().is_none());
+            let image = ClipboardEvent::Image(input_event::encode_image_rgba(1, 1, &[255, 0, 0, 255]).unwrap());
+            send(&server_conn, image.clone()).await;
+            outgoing_receive(&mut service).await;
+            applied(&mut service).await;
+            assert_eq!(*service.clipboard_replay.snapshot().unwrap().event, image);
+            send(&incoming_route, image.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = service.emulation.event().await;
+                    let received = matches!(event, EmulationEvent::ClipboardReceived { .. });
+                    service.handle_emulation_event(event).await;
+                    if received { break; }
+                }
+            }).await.unwrap();
+            applied(&mut service).await;
+            assert_eq!(*service.clipboard_replay.snapshot().unwrap().event, image);
+            let old_revision = service.client_manager.target_revision(handle).unwrap();
+            let old_client_conn = service.conn_sender.clipboard_current(handle).unwrap().0;
+            service.client_manager.invalidate_target(handle);
+            local(&mut service, text("offline after disconnect"));
+            service.handle_outgoing_clipboard(crate::connect::ReceivedEvent { handle, revision: old_revision, addr: (std::net::Ipv4Addr::LOCALHOST, peer_port).into(), conn: old_client_conn, event: ProtoEvent::Input(Event::Clipboard(text("stale queued remote"))) });
+            assert_eq!(*service.clipboard_replay.snapshot().unwrap().event, text("offline after disconnect"));
+            // Incoming-only fallback received the fresh local snapshot even with no Enter.
+            assert_eq!(receive(&incoming_route).await, text("offline after disconnect"));
+            local(&mut service, image.clone());
+            assert_eq!(receive(&incoming_route).await, image);
+            local(&mut service, text("offline after disconnect"));
+            assert_eq!(receive(&incoming_route).await, text("offline after disconnect"));
+            assert!(service.conn_sender.send(ProtoEvent::Ping, handle).await.is_err());
+            let _replacement = tokio::time::timeout(Duration::from_secs(2), accepts.recv()).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), service.clipboard_ready.notified()).await.unwrap();
+            service.replay_clipboard();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(2), clips.recv()).await.unwrap().unwrap(), text("offline after disconnect"));
+            network_done(&mut service).await;
+            local(&mut service, image.clone());
+            assert_eq!(tokio::time::timeout(Duration::from_secs(2), clips.recv()).await.unwrap().unwrap(), image);
+            let completed = service.clipboard_outgoing.completed().await;
+            service.handle_clipboard_completion(completed);
+            // Oversize content must not leave a previously valid replay value.
+            local(&mut service, ClipboardEvent::Text("x".repeat(lan_mouse_proto::MAX_CLIPBOARD_SIZE + 1)));
+            assert!(service.clipboard_replay.snapshot().is_none());
+            service.apply_clipboard_enabled(false);
+            assert!(service.clipboard_replay.snapshot().is_none());
+            let independent = incoming(&mut service, Certificate::generate_self_signed(vec![]).unwrap()).await;
+            assert!(tokio::time::timeout(Duration::from_millis(20), independent.recv(&mut no_data)).await.is_err());
+            // Re-enable is modeled without creating/reading the user's OS clipboard.
+            service.clipboard_enabled = true;
+            service.conn_sender.set_clipboard_receiving(true);
+            assert!(service.clipboard_replay.snapshot().is_none());
+            local(&mut service, text("fresh after enable"));
+            assert_eq!(receive(&independent).await, text("fresh after enable"));
+            // Occupy the real 32-request ingress before the worker is polled.
+            let missing: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            for _ in 0..32 { service.emulation.send_clipboard(missing, text("filler")).unwrap(); }
+            local(&mut service, text("busy older"));
+            local(&mut service, text("busy latest"));
+            assert!(service.clipboard_retry);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while service.clipboard_retry {
+                    tokio::task::yield_now().await;
+                    service.replay_clipboard();
+                }
+            }).await.unwrap();
+            assert_eq!(receive(&independent).await, text("busy latest")); // retry requires no new copy and uses only the latest snapshot.
+            independent.close().await.unwrap(); incoming_route.close().await.unwrap();
+            service.capture.terminate().await;
+            service.emulation.terminate().await;
+            service.conn_sender.terminate().await;
+            service.hooks.terminate().await;
+            service.resolver.terminate().await;
+            cancel.cancel(); peer_task.await.unwrap();
+        }).await;
+    }
 
     // This constructs the real service. Explicit isolation is required so the
     // fixture never binds to the user's frontend socket or uses input hardware.

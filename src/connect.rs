@@ -4,7 +4,13 @@ use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
-    cell::Cell, collections::HashMap, io, net::SocketAddr, rc::Rc, sync::Arc, time::Duration,
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    rc::Rc,
+    sync::{Arc, Weak},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{
@@ -102,6 +108,7 @@ async fn connect_any(
 
 type Connection = Arc<dyn Conn + Send + Sync>;
 type Connections = Mutex<HashMap<ClientHandle, (SocketAddr, Connection)>>;
+type PeerIdentities = HashMap<ClientHandle, (Weak<dyn Conn + Send + Sync>, String)>;
 type Attempts = Mutex<HashMap<ClientHandle, (u64, Rc<()>)>>;
 
 async fn close_connection(conn: &Connection) {
@@ -125,23 +132,66 @@ pub(crate) struct LanMouseConnectionSender {
     client_manager: ClientManager,
     conns: Rc<Connections>,
     connecting: Rc<Attempts>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_tx: ReceiveChannels,
+    peer_identities: Rc<RefCell<PeerIdentities>>,
+    clipboard_ready: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+struct ReceiveChannels {
+    events: Sender<ReceivedEvent>,
+    clipboard: tokio::sync::watch::Sender<Option<ReceivedEvent>>,
+    clipboard_enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReceiveChannels {
+    fn publish(&self, received: ReceivedEvent) {
+        if matches!(
+            received.event,
+            ProtoEvent::Input(input_event::Event::Clipboard(_))
+        ) {
+            if self
+                .clipboard_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.clipboard.send_replace(Some(received));
+            }
+        } else {
+            self.events.send(received).expect("channel closed");
+        }
+    }
+}
+
+pub(crate) struct ReceivedEvent {
+    pub handle: ClientHandle,
+    pub revision: u64,
+    pub addr: SocketAddr,
+    pub conn: Connection,
+    pub event: ProtoEvent,
 }
 
 pub(crate) struct LanMouseConnection {
     sender: LanMouseConnectionSender,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<ReceivedEvent>,
 }
 
 impl LanMouseConnection {
     pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
-        let (recv_tx, recv_rx) = channel();
+        let (events, recv_rx) = channel();
+        let (clipboard, _) = tokio::sync::watch::channel(None);
+        let recv_tx = ReceiveChannels {
+            events,
+            clipboard,
+            clipboard_enabled: Default::default(),
+        };
         let sender = LanMouseConnectionSender {
             cert,
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
             recv_tx,
+            peer_identities: Default::default(),
+            clipboard_ready: Default::default(),
         };
         Self { sender, recv_rx }
     }
@@ -150,8 +200,23 @@ impl LanMouseConnection {
         self.sender.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+    pub(crate) async fn recv(&mut self) -> ReceivedEvent {
+        loop {
+            let event = self.recv_rx.recv().await.expect("channel closed");
+            // Allow the final already-accepted Leave from a closed current session;
+            // a target revision or replacement identity still rejects old controls.
+            if self
+                .sender
+                .client_manager
+                .target_is_current(event.handle, event.revision)
+                && self
+                    .sender
+                    .clipboard_peer(event.handle, &event.conn)
+                    .is_some()
+            {
+                return event;
+            }
+        }
     }
 
     /// End only the failed capture's transport and heartbeat. A fresh token
@@ -187,6 +252,99 @@ impl Drop for LanMouseConnection {
 }
 
 impl LanMouseConnectionSender {
+    pub(crate) fn clipboard_events(&self) -> tokio::sync::watch::Receiver<Option<ReceivedEvent>> {
+        self.recv_tx.clipboard.subscribe()
+    }
+
+    pub(crate) fn set_clipboard_receiving(&self, enabled: bool) {
+        self.recv_tx
+            .clipboard_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+        if !enabled {
+            self.recv_tx.clipboard.send_replace(None);
+        }
+    }
+
+    pub(crate) fn take_received_clipboard(&self) -> Option<ReceivedEvent> {
+        let mut event = None;
+        // The sole Service consumer has already observed the change. Take the
+        // payload without another notification or retaining a closed-session Arc.
+        self.recv_tx.clipboard.send_if_modified(|pending| {
+            event = pending.take();
+            false
+        });
+        event
+    }
+
+    pub(crate) fn clipboard_ready_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.clipboard_ready.clone()
+    }
+
+    pub(crate) fn clipboard_peer(&self, handle: ClientHandle, conn: &Connection) -> Option<String> {
+        self.peer_identities
+            .borrow()
+            .get(&handle)
+            .filter(|(identity, _)| {
+                identity
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, conn))
+            })
+            .map(|(_, peer)| peer.clone())
+    }
+
+    pub(crate) fn clipboard_known_peers(&self) -> std::collections::HashSet<String> {
+        let identities = self.peer_identities.borrow();
+        self.client_manager
+            .active_clients()
+            .into_iter()
+            .filter_map(|handle| {
+                self.target(handle)?;
+                self.client_manager.active_addr(handle)?;
+                identities
+                    .get(&handle)
+                    .filter(|(conn, _)| conn.strong_count() != 0)
+                    .map(|(_, peer)| peer.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn clipboard_current(
+        &self,
+        handle: ClientHandle,
+    ) -> Result<(Connection, String), LanMouseConnectionError> {
+        let target = self
+            .target(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let addr = self
+            .client_manager
+            .active_addr(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let table = self
+            .conns
+            .try_lock()
+            .map_err(|_| LanMouseConnectionError::ClipboardBusy)?;
+        let (_, conn) = table
+            .get(&target.handle)
+            .filter(|(current, _)| *current == addr)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let peer = self
+            .clipboard_peer(handle, conn)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        Ok((conn.clone(), peer))
+    }
+
+    pub(crate) fn clipboard_session_is_current(
+        &self,
+        handle: ClientHandle,
+        revision: u64,
+        addr: SocketAddr,
+        conn: &Connection,
+    ) -> bool {
+        self.client_manager.target_is_current(handle, revision)
+            && self.client_manager.active_addr(handle) == Some(addr)
+            && self.clipboard_peer(handle, conn).is_some()
+    }
+
     fn target(&self, handle: ClientHandle) -> Option<Target> {
         let revision = self.client_manager.target_revision(handle)?;
         let cancellation = self.client_manager.target_token(handle)?;
@@ -296,9 +454,6 @@ impl LanMouseConnectionSender {
             .client_manager
             .active_addr(handle)
             .ok_or(LanMouseConnectionError::NotConnected)?;
-        if !self.client_manager.alive(handle) {
-            return Err(LanMouseConnectionError::TargetEmulationDisabled);
-        }
         let table = self
             .conns
             .try_lock()
@@ -366,6 +521,18 @@ async fn connect_to_handle(
         .map(|ip| SocketAddr::new(ip, port))
         .collect();
     let (conn, addr) = connect_any(&addrs, sender.cert.clone()).await?;
+    let peer = conn
+        .as_any()
+        .downcast_ref::<DTLSConn>()
+        .expect("DTLS connection")
+        .connection_state()
+        .await
+        .peer_certificates;
+    let Some(peer) = peer.first() else {
+        close_connection(&conn).await;
+        return Err(LanMouseConnectionError::NotConnected);
+    };
+    let fingerprint = crate::crypto::generate_fingerprint(peer);
     let mut current = sender.conns.lock().await;
     if !client_manager.target_is_current(handle, revision) {
         drop(current);
@@ -374,6 +541,14 @@ async fn connect_to_handle(
     }
     client_manager.set_active_addr(handle, Some(addr));
     let previous = current.insert(handle, (addr, conn.clone()));
+    sender
+        .peer_identities
+        .borrow_mut()
+        .retain(|_, (conn, _)| conn.strong_count() != 0);
+    sender
+        .peer_identities
+        .borrow_mut()
+        .insert(handle, (Arc::downgrade(&conn), fingerprint));
     drop(current);
 
     // Install cancellation-aware consumers before any post-publication await.
@@ -396,6 +571,8 @@ async fn connect_to_handle(
             _ = ping_pong(addr, ping_conn.clone(), ping_response) => {},
         }
     });
+    // Coalesced wake; Service rechecks the current Arc and target revision.
+    sender.clipboard_ready.notify_one();
     let (buf, len) = ProtoEvent::Hello {
         commit: local_commit(),
     }
@@ -445,7 +622,7 @@ async fn receive_loop(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     conns: Rc<Connections>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: ReceiveChannels,
     ping_response: Rc<Cell<bool>>,
 ) {
     let Target {
@@ -495,7 +672,16 @@ async fn receive_loop(
             ProtoEvent::Hello { commit } => {
                 client_manager.set_peer_commit(handle, Some(commit));
             }
-            event => tx.send((handle, event)).expect("channel closed"),
+            event => {
+                let received = ReceivedEvent {
+                    handle,
+                    revision,
+                    addr,
+                    conn: conn.clone(),
+                    event,
+                };
+                tx.publish(received);
+            }
         }
     }
 
@@ -570,6 +756,100 @@ mod tests {
         fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
             self
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_receiver_is_latest_only_independent_of_capture_and_disable_discards_it() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let mut connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let conn: Connection = Arc::new(RefusedConnection::default());
+        let replaced: Connection = Arc::new(RefusedConnection::default());
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let revision = clients.target_revision(handle).unwrap();
+        clients.set_active_addr(handle, Some(addr));
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, conn.clone()));
+        sender
+            .peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&conn), "peer".into()));
+        let event = |conn: &Connection, event| ReceivedEvent {
+            handle,
+            revision,
+            addr,
+            conn: conn.clone(),
+            event,
+        };
+        let mut notices = sender.clipboard_events();
+        sender.set_clipboard_receiving(true);
+        for index in 0..1000 {
+            sender.recv_tx.publish(event(
+                &conn,
+                ProtoEvent::Input(input_event::Event::Clipboard(
+                    input_event::ClipboardEvent::Text(format!("latest-{index}")),
+                )),
+            ));
+        }
+        notices.changed().await.unwrap();
+        assert!(
+            matches!(sender.take_received_clipboard().unwrap().event, ProtoEvent::Input(input_event::Event::Clipboard(input_event::ClipboardEvent::Text(value))) if value == "latest-999")
+        );
+        assert!(sender.take_received_clipboard().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), connection.recv_rx.recv())
+                .await
+                .is_err()
+        ); // capture never needs to poll these updates.
+        sender.recv_tx.publish(event(
+            &conn,
+            ProtoEvent::Input(input_event::Event::Clipboard(
+                input_event::ClipboardEvent::Text("discard on disable".into()),
+            )),
+        ));
+        sender.set_clipboard_receiving(false);
+        sender.recv_tx.publish(event(
+            &conn,
+            ProtoEvent::Input(input_event::Event::Clipboard(
+                input_event::ClipboardEvent::Text("disabled receipt".into()),
+            )),
+        ));
+        assert!(sender.take_received_clipboard().is_none());
+        sender.set_clipboard_receiving(true);
+        assert!(sender.take_received_clipboard().is_none());
+        sender
+            .recv_tx
+            .publish(event(&replaced, ProtoEvent::Leave(0, 0.5)));
+        sender.recv_tx.publish(event(&conn, ProtoEvent::Ack(0)));
+        assert!(matches!(connection.recv().await.event, ProtoEvent::Ack(0))); // old queued control cannot affect a replacement.
+        clients.set_active_addr(handle, None);
+        sender
+            .recv_tx
+            .publish(event(&conn, ProtoEvent::Leave(0, 0.5)));
+        assert!(matches!(
+            connection.recv().await.event,
+            ProtoEvent::Leave(..)
+        )); // the final current Leave remains usable after EOF.
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, false);
+        assert!(
+            sender
+                .prepare_clipboard(
+                    input_event::ClipboardEvent::Text("input disabled".into()),
+                    handle,
+                    1,
+                    CancellationToken::new()
+                )
+                .is_ok()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

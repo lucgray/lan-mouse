@@ -45,6 +45,7 @@ pub(crate) enum EmulationEvent {
     Connected {
         addr: SocketAddr,
         fingerprint: String,
+        conn: ArcConn,
     },
     /// new connection
     Entered {
@@ -76,7 +77,11 @@ pub(crate) enum EmulationEvent {
     /// this is the defensive fallback.
     PeerHello { addr: SocketAddr, commit: [u8; 8] },
     /// clipboard data received from remote
-    ClipboardReceived(input_event::ClipboardEvent),
+    ClipboardReceived {
+        event: input_event::ClipboardEvent,
+        addr: SocketAddr,
+        conn: ArcConn,
+    },
     /// Completion of a network send, not acknowledgement of a remote OS write.
     ClipboardSendCompleted(ClipboardCompletion),
 }
@@ -164,6 +169,17 @@ impl Emulation {
         self.clipboard_tx
             .try_send(request)
             .map_err(|_| "Clipboard send is busy or stopped; copy again")
+    }
+
+    pub(crate) fn clipboard_sessions(&self) -> Vec<(SocketAddr, ArcConn)> {
+        self.clipboard_conns.borrow().clone()
+    }
+
+    pub(crate) fn clipboard_session_is_current(&self, addr: SocketAddr, conn: &ArcConn) -> bool {
+        self.clipboard_conns
+            .borrow()
+            .iter()
+            .any(|(a, current)| *a == addr && std::sync::Arc::ptr_eq(current, conn))
     }
 
     pub(crate) fn clipboard_scope(&self) -> (u64, CancellationToken) {
@@ -327,9 +343,7 @@ impl ListenTask {
                                 match input_event {
                                     input_event::Event::Clipboard(clipboard_event) => {
                                         self.event_tx
-                                            .send(EmulationEvent::ClipboardReceived(
-                                                clipboard_event,
-                                            ))
+                                            .send(EmulationEvent::ClipboardReceived { event: clipboard_event, addr, conn })
                                             .expect("channel closed");
                                     }
                                     _ => {
@@ -365,7 +379,7 @@ impl ListenTask {
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::ConnectionClosed { addr }).expect("channel closed");
                         }
-                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint, conn }).expect("channel closed");
                     }
                     Some(ListenEvent::Disconnected { addr }) => {
                         let current = self.listener.clipboard_connection(addr);
