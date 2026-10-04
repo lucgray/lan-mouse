@@ -244,3 +244,21 @@ latest error. Normal shutdown releases input first, then allows up to two
 seconds for config flush. On timeout the pending latest snapshot may not have
 been persisted; the log explicitly reports unconfirmed disk completion. An
 already running filesystem call cannot be forcibly cancelled.
+
+
+Configuration paths are made absolute and their parent directory is canonicalized
+before watcher registration, including `--config config.toml`. The service watches
+both the configured file's directory and the canonical target directory of a
+final symlink. Each background read refreshes that target watch before parsing
+errors are reported, so retargeting to an invalid file does not prevent recovery.
+Old target-directory watches are retired; an unwatch failure is logged and its
+registration retained for a later retry. A dangling final symlink with an
+existing target parent is preserved, and target-file creation triggers reload.
+It is not populated with defaults. Intermediate symlink-chain retargets,
+ancestor-directory alias retargets and creation of a missing target directory
+are not covered by these watcher regressions.
+
+Saving through a symlink also rechecks the resolved target after temp-file sync.
+Retargeting during preparation rejects the save even if both files have identical
+bytes. The remaining final-check-to-rename race with an uncoordinated external
+editor is unchanged.
