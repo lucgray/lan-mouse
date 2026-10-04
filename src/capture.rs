@@ -17,7 +17,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{CleanupTarget, LanMouseConnection};
 use crate::remap::KeyRemap;
 use crate::scroll::ScrollInvert;
 
@@ -653,9 +653,12 @@ impl CaptureTask {
         self.pending_modifiers = None;
         self.state = State::WaitingForAck;
         let active = self.active_client.take();
-        let cleanup = active
-            .filter(|_| notify_peer)
-            .and_then(|handle| self.conn.prepare_cleanup(handle));
+        let abort = active.and_then(|handle| {
+            self.conn
+                .capture_revision(handle)
+                .map(|revision| (handle, revision))
+        });
+        let cleanup = active.and_then(|handle| self.conn.prepare_cleanup(handle));
         let mut events = Vec::new();
         for key in capture.take_pressed_keys() {
             if let Some(target) = self.remap.release_key(key) {
@@ -674,11 +677,13 @@ impl CaptureTask {
         }
         // Restore the local pointer before any network cleanup. Key-ups, modifier
         // reset and Leave share one deadline and stay pinned to the old transport.
-        match warp_to {
-            Some(t) => capture.release_to(t).await?,
-            None => capture.release().await?,
-        }
-        if let Some(cleanup) = cleanup {
+        let release = match warp_to {
+            Some(t) => capture.release_to(t).await,
+            None => capture.release().await,
+        };
+        self.complete_native_release(abort, cleanup.as_ref(), release)
+            .await?;
+        if let Some(cleanup) = cleanup.filter(|_| notify_peer) {
             events.push(ProtoEvent::Input(Event::Keyboard(
                 KeyboardEvent::Modifiers {
                     depressed: 0,
@@ -694,6 +699,22 @@ impl CaptureTask {
                     log::warn!("capture release network cleanup failed: {error}");
                 },
             }
+        }
+        Ok(())
+    }
+    async fn complete_native_release(
+        &self,
+        active: Option<(CaptureHandle, u64)>,
+        cleanup: Option<&CleanupTarget>,
+        result: Result<(), CaptureError>,
+    ) -> Result<(), CaptureError> {
+        if let Err(error) = result {
+            if let Some(cleanup) = cleanup {
+                self.conn.abort_cleanup(cleanup);
+            } else if let Some((handle, revision)) = active {
+                self.conn.abort_capture_at_revision(handle, revision);
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -764,6 +785,48 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_release_error_aborts_pinned_peer_after_active_handle_is_taken() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let other = clients.add_client(); clients.activate_client(other);
+            let other_token = clients.target_token(other).unwrap();
+            let old_token = clients.target_token(handle).unwrap();
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients.clone());
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { stall_close: true, ..Default::default() });
+            let healthy = Arc::new(RefusedConnection::default());
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            sender.install_test_connection(other, "127.0.0.1:3".parse().unwrap(), healthy.clone()).await;
+            let (event_tx, _events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let active = task.active_client.take();
+            let abort = active.and_then(|h| task.conn.capture_revision(h).map(|revision| (h, revision)));
+            let cleanup = active.and_then(|h| task.conn.prepare_cleanup(h));
+            let result = tokio::time::timeout(Duration::from_millis(50), task.complete_native_release(abort, cleanup.as_ref(),
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "native release failed").into()))).await.unwrap();
+            assert!(matches!(result, Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+            assert!(task.active_client.is_none());
+            assert!(old_token.is_cancelled());
+            assert!(clients.active_addr(handle).is_none());
+            assert!(!other_token.is_cancelled());
+            assert!(clients.active_addr(other).is_some());
+            assert!(!healthy.closed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(transport.sent.lock().unwrap().is_empty()); // failure sends no stale cleanup input.
+            sender.terminate().await;
+        }).await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn stalled_input_releases_on_deadline_and_shutdown_cancels_without_waiting() {

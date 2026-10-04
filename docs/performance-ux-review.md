@@ -1390,3 +1390,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 其他 backend 的 native/handoff 普通会话隔离需继续核对；R13 全服务资源上限、Xlib 并发初始化前提、R60 原生故障/退出、真机千次往返、完整延迟与 8h RSS 未完成，尚不认定达到 90 分。
 
 日志：x11-session-queue-baseline.log、capture-fanout-release-baseline.log、x11-session-queue-library.log、x11-session-queue-workspace.log、x11-session-queue-clippy.log、x11-session-queue-{x11,none}-clippy.log。
+
+
+## 第五十六轮：原生释放失败后取消原连接
+
+### R77 / P1
+
+- 基线在实际释放结果处理阶段注入 TimedOut：active_client 已被 take，原目标 token 未取消、active address 仍存在。准备的按键清理没有发送，上层错误处理也失去了原句柄。日志 capture-native-release-baseline.log。该验证使用受控传输和结果处理阶段，不是物理 backend 故障。
+- [x] 在原生 release/release_to 前保存连接快照和配置代次。原生释放失败时先取消原目标并排入旧连接关闭，再返回原错误；不依赖已清空的 active_client，不发送可能过时的清理输入。
+- [x] 有连接快照时按 Arc 身份和配置代次检查，保留同设备的新连接及其他健康设备；缺少快照时按原配置代次取消。连接表被占用时在后台重新检查，旧配置失败不会取消新配置。
+- [x] 关闭旧传输使用现有后台断开路径及关闭期限，不让卡住的 close 阻塞原生错误返回。正常成功路径仍执行原有清理；notify_peer=false 的成功路径不发清理。
+
+### 回归与限制
+
+- 3 个新增回归覆盖句柄已取走且 close 卡住的释放错误、连接表竞争、同/不同配置代次的新连接、另一个健康设备，以及无快照的配置代次检查。受控错误在 50ms 外层期限内返回；这不是全服务延迟指标。
+- 全工作区 all-features 通过：root 139 / 2 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy 通过。隔离 runtime 的配置重载与真实 DTLS 剪贴板 Service fixture 均通过。
+- 未向真实原生 backend 注入故障，未证明远端物理按键释放或永久卡住的原生调用恢复。连接表等待和后台清理任务的全局资源上限仍属于 R13；旧传输关闭有期限不等于所有任务有全局上限。
+- 上层一般捕获错误的按句柄 abort 路径仍需单独审查；R13、R60、真机千次往返、完整 p95/p99 和 8h RSS 尚未完成，不认定达到 90 分。协议编码不变。
+
+日志：capture-native-release-baseline.log、capture-native-release-library.log、capture-native-release-workspace.log、capture-native-release-clippy.log、capture-native-release-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、capture-native-release-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

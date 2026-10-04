@@ -794,3 +794,19 @@ Its real latency and X server failure behavior remain unverified. Callback tests
 exercise state/ordering and a modeled native backlog; they do not establish
 physical native queue cleanup. Other backends' ordinary native/handoff session
 isolation remains separate work. Wire encoding and protocol version do not change.
+
+
+### Native capture release errors
+
+The root capture task snapshots the original transport and target configuration
+revision before native release/release_to. On native error it cancels that original
+target and schedules transport closure before returning the error, even after
+the active handle has been taken. It does not send stale cleanup input on that
+failed path. Identity/revision checks preserve replacement connections and other
+clients; without a transport snapshot the original revision fences cancellation.
+
+Transport closure runs in the existing bounded background close path. Contended
+connection-table cleanup may remain pending, and these tasks do not establish a
+global resource bound. Controlled result-stage failure tests establish routing
+and cancellation behavior, not physical native or remote key release. Wire
+encoding and protocol version remain unchanged.
