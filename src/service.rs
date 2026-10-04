@@ -530,6 +530,9 @@ impl Service {
                 Err(e) => self
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
+            EmulationEvent::InputOverloaded { addr } => {
+                self.notify_frontend(FrontendEvent::Error(format!("Incoming input from {addr} is stalled; its connection was closed. Retry after the input backend recovers.")));
+            }
             EmulationEvent::BackendFailed(error) => {
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Input emulation failed: {error}"

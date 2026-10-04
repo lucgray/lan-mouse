@@ -59,19 +59,29 @@ pub(crate) enum EmulationEvent {
         conn: ArcConn,
     },
     /// connection closed
-    Disconnected { addr: SocketAddr },
+    Disconnected {
+        addr: SocketAddr,
+    },
     /// actual DTLS connection ended or was replaced
-    ConnectionClosed { addr: SocketAddr },
+    ConnectionClosed {
+        addr: SocketAddr,
+    },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
     EmulationDisabled,
     /// backend operation failed; surfaced separately from the disabled status
     BackendFailed(String),
+    InputOverloaded {
+        addr: SocketAddr,
+    },
     /// emulation was enabled
     EmulationEnabled,
     /// capture should be released
-    ReleaseNotify { addr: SocketAddr, conn: ArcConn },
+    ReleaseNotify {
+        addr: SocketAddr,
+        conn: ArcConn,
+    },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -328,7 +338,8 @@ impl ListenTask {
                     self.event_tx.send(EmulationEvent::ClipboardSendCompleted(completed)).expect("channel closed");
                 },
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::Msg { event, addr, conn }) => {
+                    Some(ListenEvent::InputOverloaded { addr }) => { self.event_tx.send(EmulationEvent::InputOverloaded { addr }).expect("channel closed"); },
+                    Some(ListenEvent::Msg { event, addr, conn, budget }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
@@ -355,7 +366,7 @@ impl ListenTask {
                                     self.event_tx.send(EmulationEvent::ReleaseNotify { addr, conn: conn.clone() }).expect("channel closed");
                                     self.listener.reply(&mut control_jobs, addr, ProtoEvent::Ack(0));
                                     if !self.listener.is_current(addr, &conn) { continue; }
-                                    self.emulation_proxy.warp(addr, to_emulation_pos(pos), t, self.listener.authorization().token(addr, &conn));
+                                    self.emulation_proxy.warp(addr, to_emulation_pos(pos), t, self.listener.authorization().token(addr, &conn), budget);
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint, conn: conn.clone()}).expect("channel closed");
                                 }
                             }
@@ -376,7 +387,7 @@ impl ListenTask {
                                             .expect("channel closed");
                                     }
                                     _ => {
-                                        self.emulation_proxy.consume(input_event, addr, self.listener.authorization().token(addr, &conn));
+                                        self.emulation_proxy.consume(input_event, addr, self.listener.authorization().token(addr, &conn), budget);
                                     }
                                 }
                             }
@@ -510,13 +521,19 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
-    Input(Event, SocketAddr, Option<CancellationToken>),
+    Input(
+        Event,
+        SocketAddr,
+        Option<CancellationToken>,
+        Option<crate::input_budget::InputLease>,
+    ),
     /// warp the cursor to a normalized cross-axis position along an edge
     Warp(
         SocketAddr,
         input_emulation::Position,
         f64,
         Option<CancellationToken>,
+        Option<crate::input_budget::InputLease>,
     ),
     Remove(SocketAddr),
     Terminate,
@@ -567,11 +584,17 @@ impl EmulationProxy {
         event
     }
 
-    fn consume(&self, event: Event, addr: SocketAddr, session: Option<CancellationToken>) {
+    fn consume(
+        &self,
+        event: Event,
+        addr: SocketAddr,
+        session: Option<CancellationToken>,
+        budget: Option<crate::input_budget::InputLease>,
+    ) {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Input(event, addr, session))
+                .send(ProxyRequest::Input(event, addr, session, budget))
                 .expect("channel closed");
         } else {
             log::warn!("emulation inactive, dropping event: {:?}", event);
@@ -584,11 +607,12 @@ impl EmulationProxy {
         pos: input_emulation::Position,
         t: f64,
         session: Option<CancellationToken>,
+        budget: Option<crate::input_budget::InputLease>,
     ) {
         // ignore if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Warp(addr, pos, t, session))
+                .send(ProxyRequest::Warp(addr, pos, t, session, budget))
                 .expect("channel closed");
         }
     }
@@ -764,13 +788,13 @@ impl EmulationTask {
         loop {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr, session) => {
+                    ProxyRequest::Input(event, addr, session, _budget) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let handle = self.handle_for(emulation, addr).await?;
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         backend_operation(self.operation_timeout, "consume", emulation.consume(event, handle)).await??;
                     },
-                    ProxyRequest::Warp(addr, pos, t, session) => {
+                    ProxyRequest::Warp(addr, pos, t, session, _budget) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let handle = self.handle_for(emulation, addr).await?;
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
@@ -960,10 +984,12 @@ mod resume_tests {
                     input_emulation::Position::Left,
                     0.5,
                     None,
+                    None,
                 ))
                 .unwrap();
             } else {
-                tx.send(ProxyRequest::Input(press(), addr, None)).unwrap();
+                tx.send(ProxyRequest::Input(press(), addr, None, None))
+                    .unwrap();
             }
             tx.send(ProxyRequest::Terminate).unwrap();
             let error = tokio::time::timeout(
@@ -1014,6 +1040,36 @@ mod resume_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn forwarded_input_budget_is_held_through_backend_wait_and_released_on_timeout() {
+        let (mut task, tx) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let budget = crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_millis(5));
+        let token = CancellationToken::new();
+        let lease = budget.acquire(&token).await.unwrap();
+        tx.send(ProxyRequest::Input(press(), addr, None, Some(lease)))
+            .unwrap();
+        let mut backend = StallingBackend {
+            stall: Some("consume"),
+            ..Default::default()
+        };
+        let operation = task.do_emulation_session(&mut backend);
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => panic!("backend should still be pending: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(2)) => {},
+        }
+        assert_eq!(
+            budget.available(),
+            (0, 0),
+            "forwarding must not release admission"
+        );
+        assert!(budget.acquire(&token).await.is_none());
+        operation.await.unwrap_err();
+        assert_eq!(budget.available(), (1, 1));
+        assert!(budget.acquire(&token).await.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn proxy_failed_remove_retains_address_and_retry_releases_same_handle() {
         let (mut task, tx) = worker();
         let addr = "127.0.0.1:2".parse().unwrap();
@@ -1021,9 +1077,11 @@ mod resume_tests {
             stall: Some("remove"),
             ..Default::default()
         };
-        tx.send(ProxyRequest::Input(press(), addr, None)).unwrap();
+        tx.send(ProxyRequest::Input(press(), addr, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Remove(addr)).unwrap();
-        tx.send(ProxyRequest::Input(press(), addr, None)).unwrap();
+        tx.send(ProxyRequest::Input(press(), addr, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Remove(addr)).unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         tokio::time::timeout(
@@ -1075,14 +1133,20 @@ mod resume_tests {
         let token = CancellationToken::new();
         token.cancel();
         for _ in 0..1000 {
-            tx.send(ProxyRequest::Input(key.clone(), other, Some(token.clone())))
-                .unwrap();
+            tx.send(ProxyRequest::Input(
+                key.clone(),
+                other,
+                Some(token.clone()),
+                None,
+            ))
+            .unwrap();
         }
         tx.send(ProxyRequest::Warp(
             other,
             input_emulation::Position::Left,
             0.5,
             Some(token),
+            None,
         ))
         .unwrap();
         tx.send(ProxyRequest::Remove(addr)).unwrap();

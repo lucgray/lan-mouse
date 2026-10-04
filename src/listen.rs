@@ -106,8 +106,12 @@ async fn accept_any(
 }
 
 pub(crate) enum ListenEvent {
+    InputOverloaded {
+        addr: SocketAddr,
+    },
     Msg {
         event: ProtoEvent,
+        budget: Option<crate::input_budget::InputLease>,
         addr: SocketAddr,
         conn: ArcConn,
     },
@@ -359,6 +363,7 @@ impl LanMouseListener {
         let conns_clone = conns.clone();
         let cancellation = CancellationToken::new();
         let readers_cancel = cancellation.clone();
+        let input_budget = crate::input_budget::InputBudget::default();
         let authorization = IncomingAuthorization {
             keys: authorized_keys,
             conns: conns.clone(),
@@ -395,7 +400,7 @@ impl LanMouseListener {
                                     previous
                                 };
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint, conn: conn.clone() }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session));
+                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session, input_budget.for_peer()));
                                 if let Some(previous) = previous { spawn_local(async move { close_incoming(&previous).await; }); }
                             },
                             Err(e) => {
@@ -656,6 +661,7 @@ async fn read_loop(
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
     cancellation: CancellationToken,
+    input_budget: crate::input_budget::InputBudget,
 ) -> Result<(), Error> {
     use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_event_frame};
 
@@ -694,9 +700,30 @@ async fn read_loop(
             }
         };
 
+        let budget = if matches!(
+            &event,
+            ProtoEvent::Enter(..)
+                | ProtoEvent::Input(
+                    input_event::Event::Keyboard(_) | input_event::Event::Pointer(_)
+                )
+        ) {
+            let Some(lease) = input_budget.acquire(&cancellation).await else {
+                if !cancellation.is_cancelled() {
+                    log::warn!(
+                        "incoming input from {addr} exceeded queue admission deadline; closing session"
+                    );
+                    let _ = dtls_tx.send(ListenEvent::InputOverloaded { addr });
+                }
+                break;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         if dtls_tx
             .send(ListenEvent::Msg {
                 event,
+                budget,
                 addr,
                 conn: conn.clone(),
             })
@@ -747,6 +774,7 @@ mod tests {
 
     struct TestConn {
         packet: Mutex<Option<Vec<u8>>>,
+        repeat_packet: bool,
         closed: AtomicBool,
         send_result: Mutex<Option<webrtc_util::Result<usize>>>,
         sent: Mutex<Vec<Vec<u8>>>,
@@ -758,6 +786,7 @@ mod tests {
         fn new(packet: Option<Vec<u8>>) -> Self {
             Self {
                 packet: Mutex::new(packet),
+                repeat_packet: false,
                 closed: AtomicBool::new(false),
                 send_result: Mutex::new(None),
                 sent: Mutex::new(Vec::new()),
@@ -773,7 +802,15 @@ mod tests {
             Ok(())
         }
         async fn recv(&self, buffer: &mut [u8]) -> webrtc_util::Result<usize> {
-            if let Some(packet) = self.packet.lock().unwrap().take() {
+            let packet = {
+                let mut stored = self.packet.lock().unwrap();
+                if self.repeat_packet {
+                    stored.clone()
+                } else {
+                    stored.take()
+                }
+            };
+            if let Some(packet) = packet {
                 buffer[..packet.len()].copy_from_slice(&packet);
                 Ok(packet.len())
             } else {
@@ -1015,6 +1052,7 @@ mod tests {
                 // to process messages rather than waiting for the port operation.
                 incoming
                     .send(ListenEvent::Msg {
+                        budget: None,
                         addr,
                         conn,
                         event: ProtoEvent::Input(input_event::Event::Clipboard(
@@ -1582,6 +1620,7 @@ mod tests {
                 );
                 incoming
                     .send(ListenEvent::Msg {
+                        budget: None,
                         addr,
                         conn: slow.clone(),
                         event: ProtoEvent::Hello {
@@ -1596,6 +1635,7 @@ mod tests {
                 // Hello response is held inside Conn::send.
                 incoming
                     .send(ListenEvent::Msg {
+                        budget: None,
                         addr,
                         conn: slow.clone(),
                         event: ProtoEvent::Input(input_event::Event::Clipboard(
@@ -1851,6 +1891,7 @@ mod tests {
             old.clone(),
             tx,
             CancellationToken::new(),
+            crate::input_budget::InputBudget::default(),
         )
         .await
         .unwrap();
@@ -1858,6 +1899,105 @@ mod tests {
         assert!(old.closed.load(Ordering::SeqCst));
         assert!(!replacement.closed.load(Ordering::SeqCst));
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_reader_closes_session_without_unbounded_input_or_silent_release_loss() {
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let event = ProtoEvent::Input(input_event::Event::Keyboard(
+            input_event::KeyboardEvent::Key {
+                time: 0,
+                key: 29,
+                state: 0,
+            },
+        ));
+        let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = event.into();
+        let conn = Arc::new(TestConn {
+            repeat_packet: true,
+            ..TestConn::new(Some(bytes[..len].to_vec()))
+        });
+        let conns = Rc::new(RefCell::new(vec![(addr, conn.clone() as ArcConn)]));
+        let (tx, mut rx) = channel();
+        let budget = crate::input_budget::InputBudget::default();
+        let token = CancellationToken::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            read_loop(
+                conns.clone(),
+                addr,
+                conn.clone(),
+                tx,
+                token.clone(),
+                budget.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(conns.borrow().is_empty());
+        assert!(token.is_cancelled());
+        assert!(conn.closed.load(Ordering::SeqCst));
+        assert_eq!(budget.available(), (192, 0));
+        let mut count = 0;
+        let mut disconnected = 0;
+        let mut overloaded = 0;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ListenEvent::InputOverloaded { addr: actual } => {
+                    assert_eq!(actual, addr);
+                    overloaded += 1;
+                }
+                ListenEvent::Msg {
+                    budget: Some(_lease),
+                    ..
+                } => {
+                    count += 1;
+                }
+                ListenEvent::Disconnected { addr: actual } => {
+                    assert_eq!(actual, addr);
+                    disconnected += 1;
+                }
+                _ => panic!("unexpected listener event"),
+            }
+        }
+        assert_eq!(count, 64);
+        assert_eq!(disconnected, 1);
+        assert_eq!(overloaded, 1);
+        assert_eq!(budget.available(), (256, 64));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn saturated_reader_cancellation_does_not_wait_for_admission_timeout() {
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let event = ProtoEvent::Enter(lan_mouse_proto::Position::Left, 0.5);
+        let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = event.into();
+        let conn = Arc::new(TestConn {
+            repeat_packet: true,
+            ..TestConn::new(Some(bytes[..len].to_vec()))
+        });
+        let conns = Rc::new(RefCell::new(vec![(addr, conn.clone() as ArcConn)]));
+        let (tx, mut rx) = channel();
+        let budget = crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_secs(60));
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let read = read_loop(conns.clone(), addr, conn.clone(), tx, token, budget.clone());
+        let control = async {
+            let first = rx.recv().await.unwrap(); // holds the only lease
+            cancel.cancel();
+            assert!(matches!(
+                rx.recv().await,
+                Some(ListenEvent::Disconnected { .. })
+            ));
+            drop(first);
+        };
+        tokio::time::timeout(Duration::from_millis(200), async {
+            let (result, ()) = tokio::join!(read, control);
+            result.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(conns.borrow().is_empty());
+        assert_eq!(budget.available(), (1, 1));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1924,15 +2064,23 @@ mod tests {
             conn.clone(),
             tx.clone(),
             CancellationToken::new(),
+            crate::input_budget::InputBudget::default(),
         )
         .await
         .unwrap();
         assert!(
             matches!(rx.recv().await, Some(ListenEvent::Disconnected { addr: actual }) if actual == addr)
         );
-        read_loop(conns.clone(), addr, conn, tx, CancellationToken::new())
-            .await
-            .unwrap();
+        read_loop(
+            conns.clone(),
+            addr,
+            conn,
+            tx,
+            CancellationToken::new(),
+            crate::input_budget::InputBudget::default(),
+        )
+        .await
+        .unwrap();
         assert!(rx.recv().await.is_none());
         assert!(conns.borrow().is_empty());
     }

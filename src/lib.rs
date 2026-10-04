@@ -14,6 +14,7 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod hooks;
+mod input_budget;
 mod listen;
 mod remap;
 mod scroll;

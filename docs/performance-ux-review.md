@@ -50,7 +50,8 @@
 | R16、R17 | 已实现并通过回归 | 三字节 duplex 短写保序；停止读取的 writer 不阻塞正常 writer，超时断开 |
 | R23 | 已实现并通过代理请求循环故障注入 | 首次 Remove 超时保留地址/handle，再次 Input 复用同一 handle，第二次 Remove 清理；底层真实 tracked-input 释放测试已覆盖，原生故障重试待验 |
 | R07 | 已实现并通过真实 DTLS / Service 回归 | 单份最多 64 KiB 最新有效值；就绪补发、忙队列重试、双路同身份去重、来源排除、远端完成顺序和禁用清空；真实系统剪贴板/跨平台验收仍待验 |
-| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；一般输入/控制事件通道仍无界，完整风暴资源及界面验收仍待验 |
+| R57 | 待修复 / 源码等待路径确认 | R13 普通输入虽有额度，只有入队等待和单次 backend 操作期限；没有已排队事件年龄检查，持续慢于到达速度的后端可保持过时运动/按键，仍需时延及安全过载策略 |
+| R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；普通 Input/Enter 帧现有全局 256 / 每会话 64 贯穿额度，超额等待 250ms 后关闭并清理；协议控制/剪贴板接收/生命周期及其他事件链仍未全部有界，旧输入年龄见 R57，完整风暴资源及界面验收仍待验 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
 | R14 | 已实现并通过故障注入 | 临时文件原子替换；写入失败保留旧文件；失败后恢复监听，并支持 rename 型外部更新；符号链接和权限测试通过；保存失败在界面显示提示 |
 | R22 | 已实现并通过状态回归 | 只有当前连发键的释放停止任务，修饰键和锁定键不取代目标；Windows 集成 CI 待本轮提交 |
@@ -983,3 +984,30 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 上一提交 230eca4 已推送 PR #6，其 Rust CI 正在运行，新 HEAD 将触发自己的检查。仍有 R13 无界一般事件链、同步原生阻塞和完整真机延迟/八小时资源要求，目标保持未完成。
 
 日志：proxy-operation-workspace.log、proxy-operation-clippy.log、proxy-operation-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、proxy-operation-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+## 第四十轮：普通入站输入的贯穿额度
+
+### R13 普通输入链 / P1
+
+- 源码证据：read_loop → ListenEvent::Msg → ListenTask → ProxyRequest::Input/Warp 原本均用无界 local-channel。后端 yielding 等待期间，监听仍能持续把输入转发到另一条无界队列；只给首段限流而转发即释放不能解决整个链的积压。
+- [x] 新增 InputBudget / InputLease：全局 256 条、每接受连接 64 条，lease 从读取后的普通 Keyboard/Pointer 和 Enter 帧随 Msg 带到代理消费。结束消费、旧会话过滤、禁用/丢弃或超时均释放额度；idle reader 不占额度。
+- [x] 一次入队等待共享 250ms 期限，取消能直接打断；持续饱和时停止该 reader、取消其会话 token、从实际连接表移除、发一次 InputOverloaded 前端失败提示、Disconnected 并有界关闭 transport。使用已有 pressed-key 和返回边缘清理，不把被拒绝的 key-up 静默忽略后继续旧会话。
+- [x] 正常 FIFO 不合并、不改协议，其他连接有独立每会话额度并共享总额。此轮不声称整个进程所有队列有界。
+
+### 四个回归与验证
+
+- [x] 跨 peer 共用总额，单 peer 无额不阻止另一 peer 使用剩余额度；总额耗尽时失败等待会归还已持有 peer 额度；取消和 drop 无泄漏。
+- [x] 实际 read_loop 使用默认额度及无限重复键释放帧：只排队 64 条，250ms 期限后恰好一次过载反馈及 Disconnected，token 取消、连接移除/关闭；丢弃队列后总额回到 256 / 64。
+- [x] reader 持有最后一个 Enter lease 并继续请求额度时，取消不等待测试中的 60 秒 admission 期限；按 200ms 外部保护内完成，容量恢复。
+- [x] 实际代理请求循环把输入交给永久 Pending 后端时，已转发 lease 仍占用额度；后端操作 deadline 错误返回后才释放，新的合法请求可获额度。
+- Linux all-features 工作区通过：主包 126 / 2 默认忽略，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略；默认额度饱和/取消夹具另行通过。严格 all-targets Clippy、格式及 diff 检查通过。
+- 两个隔离真实 Service-DTLS 授权/活跃撤销及双向剪贴板重播/断线回归仍通过。上一 HEAD 106618d Rust run 37193560374 已完成成功，新提交需自己的跨平台 CI。
+
+### 剩余源码发现 R57 / P1：队列有限但旧输入仍可滞留
+
+- InputLease 没有 admission 时间或消费年龄判断。入队等待 250ms 约束下一帧获得额度的时间，后端 500ms 约束单次操作；两者均不能保证已排队帧在 p99 50ms 内交付。每次消费持续慢、但能在 250ms 内释放一个槽时，队列可始终满而不触发 admission 关闭。
+- [ ] 下一轮复现队列滞留并实现保持按键/按钮正确性的过载恢复策略；不能靠静默丢旧 release 或无限自动重播解决。
+- [ ] 控制/Hello/Ping/Leave/剪贴板与 accept/disconnect/Service 事件仍有无界路径；accepted 连接和每 reader 固定缓冲也没有此额度提供的数量上限。查阅当前本地 webrtc-dtls 0.12.0 实现确认 decrypted_tx 为 mpsc::channel(1)，它不能替代应用其他链或底层 transport 资源验证。
+- [ ] 真机 1000 次切换、完整延迟、8h RSS 和同步原生阻塞保持未验，不认定目标达到 90 分。
+
+日志：input-budget-workspace.log、input-budget-clippy.log、input-budget-saturation.log、input-budget-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、input-budget-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

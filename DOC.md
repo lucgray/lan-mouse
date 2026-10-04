@@ -503,3 +503,24 @@ handle reconstruction now exits after cleanup rather than entering the input
 loop after its Terminate message was already consumed. These deadlines cover
 futures that yield to the runtime. They cannot interrupt synchronous native calls
 that block the runtime thread; native latency remains an acceptance requirement.
+
+
+### Incoming input admission
+
+Normal keyboard/pointer frames and Enter (cursor warp) share 256 outstanding
+admission slots across the listener, with 64 slots per accepted connection.
+Each slot follows its frame through the listener and emulation request queues
+until backend processing or rejection ends. Forwarding alone does not free it.
+Readers wait up to 250 ms for admission, observing session cancellation. A
+persistent backlog closes that incoming session, reports a frontend error and
+uses normal disconnect/key cleanup instead of silently discarding an essential release. No frame encoding
+or normal FIFO ordering changes. Idle readers do not reserve slots.
+
+This bounds these application input frames, not every process queue. Clipboard,
+protocol bookkeeping and connection lifecycle notifications retain their existing
+paths; concurrent connection count and native resources require separate bounds.
+The pinned DTLS dependency has a one-item decrypted application channel, but its
+transport buffers are not included in this application budget. Bounded queue
+length also does not prove the latency target: steadily slow backend work can
+still keep admitted input waiting. Complete-service latency and storm tests
+remain required.
