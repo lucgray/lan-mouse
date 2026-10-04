@@ -37,6 +37,7 @@ pub(crate) struct Emulation {
     clipboard_tx: tokio::sync::mpsc::Sender<ClipboardRequest>,
     port_requests: tokio::sync::watch::Sender<Option<u16>>,
     clipboard_conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
+    authorization: crate::listen::IncomingAuthorization,
     clipboard_generation: AtomicU64,
     clipboard_cancel: Mutex<CancellationToken>,
 }
@@ -55,6 +56,7 @@ pub(crate) enum EmulationEvent {
         pos: lan_mouse_ipc::Position,
         /// certificate fingerprint of the connection
         fingerprint: String,
+        conn: ArcConn,
     },
     /// connection closed
     Disconnected { addr: SocketAddr },
@@ -67,7 +69,7 @@ pub(crate) enum EmulationEvent {
     /// emulation was enabled
     EmulationEnabled,
     /// capture should be released
-    ReleaseNotify,
+    ReleaseNotify { addr: SocketAddr, conn: ArcConn },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -75,7 +77,11 @@ pub(crate) enum EmulationEvent {
     /// broken (one-way setups, asymmetric NAT, peer's TCP listener
     /// down). The connect-side path stays as the primary source;
     /// this is the defensive fallback.
-    PeerHello { addr: SocketAddr, commit: [u8; 8] },
+    PeerHello {
+        addr: SocketAddr,
+        commit: [u8; 8],
+        conn: ArcConn,
+    },
     /// clipboard data received from remote
     ClipboardReceived {
         event: input_event::ClipboardEvent,
@@ -112,6 +118,7 @@ impl Emulation {
         let (event_tx, event_rx) = channel();
         let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::channel(32);
         let clipboard_conns = listener.clipboard_connections();
+        let authorization = listener.authorization();
         let port_requests = listener.port_requests();
         let emulation_task = ListenTask {
             listener,
@@ -127,6 +134,7 @@ impl Emulation {
             event_rx,
             clipboard_tx,
             clipboard_conns,
+            authorization,
             port_requests,
             clipboard_generation: AtomicU64::new(0),
             clipboard_cancel: Mutex::new(CancellationToken::new()),
@@ -155,11 +163,13 @@ impl Emulation {
             .map(|(_, conn)| conn.clone());
         let request = ClipboardRequest {
             addr,
-            conn,
+            conn: conn.clone(),
             event,
             generation: self.clipboard_generation(),
             outgoing: None,
-            session_cancellation: None,
+            session_cancellation: conn
+                .as_ref()
+                .and_then(|conn| self.authorization.token(addr, conn)),
             cancellation: self
                 .clipboard_cancel
                 .lock()
@@ -278,8 +288,24 @@ impl ListenTask {
         let mut accepted_clients = HashSet::new();
         let mut clipboard_jobs = ClipboardJobs::default();
         let mut control_jobs = crate::control_network::ControlJobs::default();
+        let revoked = self.listener.revoked_signal();
         loop {
+            for (addr, _) in self.listener.take_revoked() {
+                let current = self.listener.clipboard_connection(addr);
+                clipboard_jobs.cancel_stale(addr, current.as_ref());
+                control_jobs.cancel_stale(addr, current.as_ref());
+                if current.is_some() {
+                    continue;
+                }
+                accepted_clients.remove(&addr);
+                forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
+                self.emulation_proxy.remove(addr);
+                self.event_tx
+                    .send(EmulationEvent::ConnectionClosed { addr })
+                    .expect("channel closed");
+            }
             select! {
+                _ = revoked.notified() => {},
                 Some(request) = self.clipboard_rx.recv() => {
                     if request.cancellation.is_cancelled() { continue; }
                     if let Err(request) = clipboard_jobs.submit(request) {
@@ -314,6 +340,7 @@ impl ListenTask {
                                 addr,
                                 pos: to_ipc_pos(pos),
                                 fingerprint,
+                                conn: conn.clone(),
                             }).expect("channel closed");
                         }
                         match event {
@@ -323,11 +350,11 @@ impl ListenTask {
                                     log::info!("releasing capture: {addr} entered this device");
                                     dormant.remove(&addr);
                                     entered_clients.insert(addr, (pos, fingerprint.clone()));
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                    self.event_tx.send(EmulationEvent::ReleaseNotify { addr, conn: conn.clone() }).expect("channel closed");
                                     self.listener.reply(&mut control_jobs, addr, ProtoEvent::Ack(0));
                                     if !self.listener.is_current(addr, &conn) { continue; }
-                                    self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                    self.emulation_proxy.warp(addr, to_emulation_pos(pos), t, self.listener.authorization().token(addr, &conn));
+                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint, conn: conn.clone()}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(..) => {
@@ -347,7 +374,7 @@ impl ListenTask {
                                             .expect("channel closed");
                                     }
                                     _ => {
-                                        self.emulation_proxy.consume(input_event, addr);
+                                        self.emulation_proxy.consume(input_event, addr, self.listener.authorization().token(addr, &conn));
                                     }
                                 }
                             }
@@ -365,7 +392,7 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(&mut control_jobs, addr, ProtoEvent::Hello { commit: local_commit() });
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit, conn: conn.clone() }).expect("channel closed");
                             }
                             _ => {}
                         }
@@ -481,9 +508,14 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
-    Input(Event, SocketAddr),
+    Input(Event, SocketAddr, Option<CancellationToken>),
     /// warp the cursor to a normalized cross-axis position along an edge
-    Warp(SocketAddr, input_emulation::Position, f64),
+    Warp(
+        SocketAddr,
+        input_emulation::Position,
+        f64,
+        Option<CancellationToken>,
+    ),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -532,22 +564,28 @@ impl EmulationProxy {
         event
     }
 
-    fn consume(&self, event: Event, addr: SocketAddr) {
+    fn consume(&self, event: Event, addr: SocketAddr, session: Option<CancellationToken>) {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Input(event, addr))
+                .send(ProxyRequest::Input(event, addr, session))
                 .expect("channel closed");
         } else {
             log::warn!("emulation inactive, dropping event: {:?}", event);
         }
     }
 
-    fn warp(&self, addr: SocketAddr, pos: input_emulation::Position, t: f64) {
+    fn warp(
+        &self,
+        addr: SocketAddr,
+        pos: input_emulation::Position,
+        t: f64,
+        session: Option<CancellationToken>,
+    ) {
         // ignore if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Warp(addr, pos, t))
+                .send(ProxyRequest::Warp(addr, pos, t, session))
                 .expect("channel closed");
         }
     }
@@ -662,12 +700,16 @@ impl EmulationTask {
         loop {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
+                    ProxyRequest::Input(event, addr, session) => {
+                        if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let handle = self.handle_for(emulation, addr).await;
+                        if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         emulation.consume(event, handle).await?;
                     },
-                    ProxyRequest::Warp(addr, pos, t) => {
+                    ProxyRequest::Warp(addr, pos, t, session) => {
+                        if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let handle = self.handle_for(emulation, addr).await;
+                        if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         emulation.warp(handle, pos, t).await;
                     },
                     ProxyRequest::Remove(addr) => {
@@ -727,8 +769,8 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Warp(_, _, _) => continue,
+            ProxyRequest::Input(..) => continue,
+            ProxyRequest::Warp(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
             ProxyRequest::UpdateConfig(_) => continue,
@@ -760,6 +802,59 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod resume_tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoked_proxy_input_and_warp_are_filtered_and_removal_releases_pressed_keys() {
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let other = "127.0.0.1:3".parse().unwrap();
+        let (tx, request_rx) = channel();
+        let (event_tx, _events) = channel();
+        let mut task = EmulationTask {
+            backend: Some(input_emulation::Backend::Dummy),
+            options: Default::default(),
+            exit_requested: Default::default(),
+            request_rx,
+            event_tx,
+            handles: Default::default(),
+            next_id: 0,
+            input_config: Default::default(),
+        };
+        let mut emulation = InputEmulation::new(
+            Some(input_emulation::Backend::Dummy),
+            Default::default(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let key = Event::Keyboard(input_event::KeyboardEvent::Key {
+            time: 0,
+            key: input_event::scancode::Linux::KeyLeftCtrl as u32,
+            state: 1,
+        });
+        let handle = task.handle_for(&mut emulation, addr).await;
+        emulation.consume(key.clone(), handle).await.unwrap();
+        assert!(emulation.has_pressed_keys(handle));
+        let token = CancellationToken::new();
+        token.cancel();
+        for _ in 0..1000 {
+            tx.send(ProxyRequest::Input(key.clone(), other, Some(token.clone())))
+                .unwrap();
+        }
+        tx.send(ProxyRequest::Warp(
+            other,
+            input_emulation::Position::Left,
+            0.5,
+            Some(token),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Remove(addr)).unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut emulation).await.unwrap();
+        assert!(!task.handles.contains_key(&other));
+        assert!(!task.handles.contains_key(&addr));
+        assert!(!emulation.has_pressed_keys(handle));
+        emulation.terminate().await;
+    }
 
     #[test]
     fn forgetting_real_connection_clears_only_its_return_metadata() {

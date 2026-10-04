@@ -470,5 +470,18 @@ reload cannot restore it; removing a malformed legacy key uses exact lookup.
 Unrelated entries remain intact. These rules preserve the raw authorization table,
 not file comments or formatting when a settings save serializes the configuration.
 
-Revocation currently rejects new handshakes. Enforcement against already accepted
-sessions remains tracked as R54 in the review checklist.
+Revoking incoming authorization also detaches already accepted sessions and
+cancels their readers and queued input, cursor warps, control replies and
+clipboard work. Return barriers and incoming clipboard metadata are removed;
+emulation cleanup releases tracked keys. Checks use the actual connection
+identity, so old notifications cannot recreate a barrier or release a replacement
+session. Idle readers are canceled without waiting for another input event.
+Reauthorizing the same fingerprint requires a new handshake and does not revive
+old session tokens. The handshake publication path rechecks current trust.
+
+This applies to incoming certificate grants. Separately configured outgoing
+targets retain their own activation policy. Already started native input or
+clipboard calls cannot be undone; a successful clipboard write still updates
+feedback suppression, but a revoked write cannot report success or become the
+latest replay snapshot. Existing local clipboard contents are not erased.
+Native backend stalls and complete-service latency remain acceptance work.

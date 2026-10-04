@@ -20,7 +20,7 @@
 | R52 | 已实现并通过生产捕获会话回归 | 空 release_bind 不再被 all(empty) 误当按下；夹具确实发送 Enter，不进入错误的释放清理路径 |
 | R47 | 新授权入口已实现并通过 GTK / CLI / Service / DTLS 回归 | 共享 SHA-256 解析，大小写/64 连续 hex 规范化到 95 字符；坏输入保留草稿并提示、不写授权/配置；原文件加载路径见 R53 |
 | R53 | 已实现并通过模型/真实 Service-DTLS 回归 | 启动/重载以校验后标准指纹建立信任；坏项排除并汇总提示；别名描述选择确定；普通保存保留原表，明确添加整理该摘要，撤销清全部别名 |
-| R54 | 待修复 / 已确认源码路径 | 授权撤销目前只更新握手校验表；现有 read_loop 没有重新检查指纹，需清理已接受会话、按键/返回边缘/剪贴板及排队旧消息 |
+| R54 | 已实现并通过会话/队列/真实 Service-DTLS 回归 | 撤销同步移除入站连接、取消会话 token；空闲 reader 唤醒清理，旧输入/warp/通知/剪贴板过滤，返回边缘销毁；重新授权只允许新握手；已开始原生调用及真机释放仍待验 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
 | R40 | 已实现并通过监控队列回归 | 本地队列携带监控/写入代次，消费时过滤旧事件/禁用/远端写入；切换重新采样；失败保持缓存并标记新代次刷新，旧采样不能清除；阻塞发送前释放锁 |
 | R41 | 已实现并通过提交/监控顺序回归 | submit 同步预留暂停 lease；待写/活动计数覆盖合并、完成反压、清除与退出未启动项；服务级提交/完成顺序与最新值重连补发已通过真实 DTLS 回归；真机时延仍待验 |
@@ -934,3 +934,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 上一 HEAD ca12260 Rust run 37191216308 已完成成功；本轮新 HEAD 仍需自己的跨平台 CI。真实硬件往返、端到端延迟、长期 RSS 和一般队列拥塞未闭环，整体 90 分继续保持未确认。
 
 日志：config-fingerprint-workspace.log、config-fingerprint-clippy.log、config-fingerprint-service.log、config-fingerprint-clipboard-service.log。
+
+## 第三十八轮：撤销运行中的入站授权
+
+### R54 / P1
+
+- [x] IncomingAuthorization 共享实际入站连接表，保存指纹、Weak 连接身份及独立子 token。撤销同步取消并移除仅已失去授权的会话；其他设备继续工作。关闭 transport 独立执行并沿用有界期限，空闲监听通过 Notify 清理，每地址最多一个待清理项。
+- [x] 发布握手结果前重新检查信任；同地址替换取消旧 token，reader 结束也取消其排队工作。重新授权不会恢复旧 token，只能建立新连接。
+- [x] Service 同步移除返回 capture 边缘及入站剪贴板元数据。Entered、ReleaseNotify、PeerHello 携带实际 Arc，旧通知无法复活边缘或释放其他会话。
+- [x] 输入代理消费/warp 前后检查会话取消；移除 handle 释放跟踪按键。入站网络剪贴板和系统写入队列携带 token，未启动的撤销写入不执行，撤销后的完成不通知成功或更新重播快照。
+- [x] 原生调用已经开始时不能撤回：剪贴板写成功仍记录实际值以抑制回声，但撤销后不记共享成功。不擦除用户已有剪贴板。此处作用于入站证书授权，用户配置的出站目标另按激活策略管理。
+
+### 验证与限制
+
+- Linux 工作区 all-features 通过：主包 119 / 2 默认忽略，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略。严格 all-targets Clippy、格式和 diff 检查通过。
+- 三个新增回归通过：单设备撤销与其他设备隔离、1000 次重复撤销及新旧 token；1000 条取消输入/warp 不创建 handle，移除释放 Ctrl；系统写入活动/待写撤销及新授权来源继续工作。
+- 隔离真实 Service-DTLS 回归另行通过：活跃 Enter/Ack 后撤销立即取消 token、清除返回/剪贴板元数据；排队网络剪贴板不会发给旧会话；注入旧 Connected/Entered/Clipboard/ReleaseNotify 被过滤；同证书新握手被拒绝，再授权新握手成功，旧 Arc 仍无效。夹具按服务器实际 IPv4-mapped 地址关联连接，未改生产地址语义。
+- 真实双向 DTLS 剪贴板重播、来源排除、禁用及断线重连 Service 回归另行通过。
+- 上一 HEAD 8011d3b Rust run 37191759059 已成功；新提交还需自己的跨平台 CI。一般事件队列无界（R13）、原生代理阻塞/超时调度（R23）、实际鼠标往返、完整 p95/p99 与八小时 RSS 均未闭环，整体 90 分仍未确认。
+
+日志：session-revocation-workspace.log、session-revocation-clippy.log、session-revocation-service.log、session-revocation-clipboard-service.log。

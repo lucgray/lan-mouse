@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     rc::Rc,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Weak},
     time::Duration,
 };
 use thiserror::Error;
@@ -122,6 +122,84 @@ pub(crate) enum ListenEvent {
     PortChanged(Result<u16, ListenerCreationError>),
 }
 
+type SessionIdentities =
+    HashMap<SocketAddr, (String, Weak<dyn Conn + Send + Sync>, CancellationToken)>;
+
+#[derive(Clone, Default)]
+pub(crate) struct IncomingAuthorization {
+    keys: Arc<RwLock<HashMap<String, String>>>,
+    conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
+    identities: Rc<RefCell<SessionIdentities>>,
+    pending: Rc<RefCell<HashMap<SocketAddr, ArcConn>>>,
+    ready: Rc<tokio::sync::Notify>,
+}
+
+impl IncomingAuthorization {
+    fn install(
+        &self,
+        addr: SocketAddr,
+        fingerprint: String,
+        conn: &ArcConn,
+        parent: &CancellationToken,
+    ) -> CancellationToken {
+        let token = parent.child_token();
+        let mut identities = self.identities.borrow_mut();
+        identities.retain(|_, (_, conn, _)| conn.strong_count() != 0);
+        if let Some((_, _, old)) =
+            identities.insert(addr, (fingerprint, Arc::downgrade(conn), token.clone()))
+        {
+            old.cancel();
+        }
+        token
+    }
+    pub(crate) fn token(&self, addr: SocketAddr, conn: &ArcConn) -> Option<CancellationToken> {
+        self.identities
+            .borrow()
+            .get(&addr)
+            .filter(|(_, old, token)| !token.is_cancelled() && old.ptr_eq(&Arc::downgrade(conn)))
+            .map(|(_, _, token)| token.clone())
+    }
+    pub(crate) fn revoke_untrusted(&self) -> Vec<SocketAddr> {
+        let keys = self.keys.read().expect("authorized keys");
+        let identities = self.identities.borrow();
+        let mut removed = Vec::new();
+        self.conns.borrow_mut().retain(|(addr, conn)| {
+            let revoked = identities
+                .get(addr)
+                .is_some_and(|(fingerprint, old, token)| {
+                    if old.ptr_eq(&Arc::downgrade(conn)) && !keys.contains_key(fingerprint) {
+                        token.cancel();
+                        true
+                    } else {
+                        false
+                    }
+                });
+            if revoked {
+                removed.push((*addr, conn.clone()));
+            }
+            !revoked
+        });
+        drop(identities);
+        drop(keys);
+        let result = removed.iter().map(|(addr, _)| *addr).collect();
+        for (addr, conn) in removed {
+            self.pending.borrow_mut().insert(addr, conn.clone());
+            spawn_local(async move {
+                close_incoming(&conn).await;
+            });
+        }
+        if !self.pending.borrow().is_empty() {
+            self.ready.notify_one();
+        }
+        result
+    }
+    fn take_revoked(&self) -> Vec<(SocketAddr, ArcConn)> {
+        std::mem::take(&mut *self.pending.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+}
+
 pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
@@ -131,6 +209,7 @@ pub(crate) struct LanMouseListener {
     request_port_change: tokio::sync::watch::Sender<Option<u16>>,
     port: Rc<Cell<u16>>,
     authentication_notices: crate::authentication::AuthenticationNotices,
+    authorization: IncomingAuthorization,
 }
 
 type BoundListeners = Vec<Box<dyn Listener>>;
@@ -280,6 +359,12 @@ impl LanMouseListener {
         let conns_clone = conns.clone();
         let cancellation = CancellationToken::new();
         let readers_cancel = cancellation.clone();
+        let authorization = IncomingAuthorization {
+            keys: authorized_keys,
+            conns: conns.clone(),
+            ..Default::default()
+        };
+        let accept_authorization = authorization.clone();
         let listen_task: JoinHandle<()> = {
             let listen_tx = listen_tx.clone();
             spawn_local(async move {
@@ -296,8 +381,12 @@ impl LanMouseListener {
                                 log::info!("dtls client connected, ip: {addr}");
                                 let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
+                                let Some(cert) = certs.first() else { close_incoming(&conn).await; continue; };
                                 let fingerprint = crypto::generate_fingerprint(cert);
+                                if !accept_authorization.keys.read().expect("keys").contains_key(&fingerprint) {
+                                    close_incoming(&conn).await; continue;
+                                }
+                                let session = accept_authorization.install(addr, fingerprint.clone(), &conn, &readers_cancel);
                                 let previous = {
                                     let mut current = conns_clone.borrow_mut();
                                     let index = current.iter().position(|(a, _)| *a == addr);
@@ -306,7 +395,7 @@ impl LanMouseListener {
                                     previous
                                 };
                                 listen_tx.send(ListenEvent::Accept { addr, fingerprint, conn: conn.clone() }).expect("channel closed");
-                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), readers_cancel.clone()));
+                                spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session));
                                 if let Some(previous) = previous { spawn_local(async move { close_incoming(&previous).await; }); }
                             },
                             Err(e) => {
@@ -386,7 +475,18 @@ impl LanMouseListener {
             request_port_change,
             port: running_port,
             authentication_notices,
+            authorization,
         })
+    }
+
+    pub(crate) fn authorization(&self) -> IncomingAuthorization {
+        self.authorization.clone()
+    }
+    pub(crate) fn revoked_signal(&self) -> Rc<tokio::sync::Notify> {
+        self.authorization.ready.clone()
+    }
+    pub(crate) fn take_revoked(&self) -> Vec<(SocketAddr, ArcConn)> {
+        self.authorization.take_revoked()
     }
 
     pub(crate) fn is_current(&self, addr: SocketAddr, conn: &ArcConn) -> bool {
@@ -606,6 +706,8 @@ async fn read_loop(
         }
     }
 
+    // Reject work already queued for a transport that has now ended.
+    cancellation.cancel();
     let removed = {
         let mut current = conns.borrow_mut();
         current
@@ -735,6 +837,7 @@ mod tests {
             request_port_change,
             port: Rc::new(Cell::new(2)),
             authentication_notices: Default::default(),
+            authorization: Default::default(),
         }
     }
 
@@ -1755,6 +1858,57 @@ mod tests {
         assert!(old.closed.load(Ordering::SeqCst));
         assert!(!replacement.closed.load(Ordering::SeqCst));
         assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revocation_detaches_only_untrusted_sessions_and_regrant_never_revives_old_token() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let other = "127.0.0.1:3".parse().unwrap();
+                let old: ArcConn = Arc::new(TestConn::new(None));
+                let peer: ArcConn = Arc::new(TestConn::new(None));
+                let auth = IncomingAuthorization {
+                    keys: Arc::new(RwLock::new(HashMap::from([
+                        ("old".into(), "a".into()),
+                        ("peer".into(), "b".into()),
+                    ]))),
+                    conns: Rc::new(RefCell::new(vec![
+                        (addr, old.clone()),
+                        (other, peer.clone()),
+                    ])),
+                    ..Default::default()
+                };
+                let parent = CancellationToken::new();
+                let old_token = auth.install(addr, "old".into(), &old, &parent);
+                let peer_token = auth.install(other, "peer".into(), &peer, &parent);
+                auth.keys.write().unwrap().remove("old");
+                assert_eq!(auth.revoke_untrusted(), vec![addr]);
+                assert!(old_token.is_cancelled());
+                assert!(!peer_token.is_cancelled());
+                assert!(is_current(&auth.conns.borrow(), other, &peer));
+                assert!(!is_current(&auth.conns.borrow(), addr, &old));
+                for _ in 0..1000 {
+                    assert!(auth.revoke_untrusted().is_empty());
+                }
+                assert_eq!(auth.pending.borrow().len(), 1);
+                auth.keys
+                    .write()
+                    .unwrap()
+                    .insert("old".into(), "regrant".into());
+                let replacement: ArcConn = Arc::new(TestConn::new(None));
+                auth.conns.borrow_mut().push((addr, replacement.clone()));
+                let fresh = auth.install(addr, "old".into(), &replacement, &parent);
+                assert!(old_token.is_cancelled());
+                assert!(!fresh.is_cancelled());
+                assert!(auth.token(addr, &old).is_none());
+                assert!(auth.token(addr, &replacement).is_some());
+                let queued = auth.take_revoked();
+                assert_eq!(queued.len(), 1);
+                assert!(is_current(&auth.conns.borrow(), addr, &replacement));
+                assert!(!parent.is_cancelled());
+            })
+            .await;
     }
 
     #[tokio::test]

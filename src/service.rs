@@ -61,6 +61,7 @@ pub struct Service {
     clipboard_ready: Arc<Notify>,
     clipboard_received: tokio::sync::watch::Receiver<Option<crate::connect::ReceivedEvent>>,
     clipboard_retry: bool,
+    clipboard_write_session: Option<tokio_util::sync::CancellationToken>,
     clipboard_busy_notice: Option<Instant>,
     incoming_clipboard:
         HashMap<SocketAddr, (String, std::sync::Weak<dyn webrtc_util::Conn + Send + Sync>)>,
@@ -73,6 +74,7 @@ pub struct Service {
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     authorization_warning: Option<String>,
+    incoming_authorization: crate::listen::IncomingAuthorization,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// lan mouse connection sender (for clipboard)
@@ -133,6 +135,7 @@ impl Service {
         let port = listener.port();
         let configured_port = config.port();
         let authentication_notices = listener.authentication_notices();
+        let incoming_authorization = listener.authorization();
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
         let conn_sender = conn.sender();
         let clipboard_ready = conn_sender.clipboard_ready_signal();
@@ -195,6 +198,7 @@ impl Service {
             clipboard_ready,
             clipboard_received,
             clipboard_retry: false,
+            clipboard_write_session: None,
             clipboard_busy_notice: None,
             incoming_clipboard: Default::default(),
             authentication_notices,
@@ -203,6 +207,7 @@ impl Service {
             resolver,
             authorized_keys,
             authorization_warning,
+            incoming_authorization,
             public_key_fingerprint,
             client_manager: client_manager.clone(),
             conn_sender,
@@ -491,7 +496,11 @@ impl Service {
                 addr,
                 pos,
                 fingerprint,
+                conn,
             } => {
+                if !self.emulation.clipboard_session_is_current(addr, &conn) {
+                    return;
+                }
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -529,7 +538,11 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ReleaseNotify { addr, conn } => {
+                if self.emulation.clipboard_session_is_current(addr, &conn) {
+                    self.capture.release();
+                }
+            }
             EmulationEvent::Connected {
                 addr,
                 fingerprint,
@@ -543,7 +556,10 @@ impl Service {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
                 self.replay_clipboard();
             }
-            EmulationEvent::PeerHello { addr, commit } => {
+            EmulationEvent::PeerHello { addr, commit, conn } => {
+                if !self.emulation.clipboard_session_is_current(addr, &conn) {
+                    return;
+                }
                 // Map the peer's source addr back to its client handle
                 // and stamp the commit. Skip if we don't have an
                 // outgoing client configured for this peer (incoming-
@@ -568,7 +584,11 @@ impl Service {
                     })
                     .map(|(origin, _)| origin.clone());
                 if let Some(origin) = origin {
-                    self.receive_clipboard(event, origin);
+                    self.receive_clipboard(
+                        event,
+                        origin,
+                        self.incoming_authorization.token(addr, &conn),
+                    );
                 }
             }
             EmulationEvent::ClipboardSendCompleted(completed) => {
@@ -680,11 +700,16 @@ impl Service {
             Some(origin),
         ) = (event, self.conn_sender.clipboard_peer(handle, &conn))
         {
-            self.receive_clipboard(event, origin);
+            self.receive_clipboard(event, origin, None);
         }
     }
 
-    fn receive_clipboard(&mut self, event: input_event::ClipboardEvent, origin: String) {
+    fn receive_clipboard(
+        &mut self,
+        event: input_event::ClipboardEvent,
+        origin: String,
+        session: Option<tokio_util::sync::CancellationToken>,
+    ) {
         if !self.clipboard_enabled {
             return;
         }
@@ -702,7 +727,8 @@ impl Service {
         self.emulation.clear_clipboard();
         self.clipboard_retry = false;
         let revision = self.clipboard_replay.begin_remote(origin);
-        writer.submit_with_revision(event, revision);
+        self.clipboard_write_session = session.clone();
+        writer.submit_with_revision(event, revision, session);
     }
 
     fn handle_clipboard_applied(
@@ -711,11 +737,18 @@ impl Service {
         result: Result<(), input_emulation::clipboard::ClipboardError>,
         revision: u64,
     ) {
+        let canceled = self
+            .clipboard_write_session
+            .as_ref()
+            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled);
         if !self.clipboard_enabled
             || !self
                 .clipboard_replay
-                .applied(revision, event.clone(), result.is_ok())
+                .applied(revision, event.clone(), result.is_ok() && !canceled)
         {
+            return;
+        }
+        if canceled {
             return;
         }
         match result {
@@ -972,6 +1005,11 @@ impl Service {
             log::warn!("{warning}");
         }
         *self.authorized_keys.write().expect("lock") = parsed.trusted;
+        for addr in self.incoming_authorization.revoke_untrusted() {
+            self.remove_incoming(addr);
+            self.incoming_clipboard.remove(&addr);
+            self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
+        }
     }
 
     fn notify_authorized_keys(&mut self) {
@@ -1686,7 +1724,32 @@ mod tests {
             assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([(reload_fp.clone(), "new-peer".into())]));
             assert!(!service.authorized_keys.read().unwrap().contains_key(&startup_fp));
             let accepted = handshake(service.port, reload_cert.clone()).await;
-            webrtc_util::Conn::close(&accepted).await.unwrap();
+            let (old_addr, old_server) = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = service.emulation.event().await;
+                    let current = match &event {
+                        EmulationEvent::Connected { addr, fingerprint, conn } if fingerprint == &reload_fp => Some((*addr, conn.clone())),
+                        _ => None,
+                    };
+                    service.handle_emulation_event(event).await;
+                    if let Some(current) = current { break current; }
+                }
+            }).await.unwrap();
+            let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = lan_mouse_proto::ProtoEvent::Enter(lan_mouse_proto::Position::Left, 0.5).into();
+            webrtc_util::Conn::send(&accepted, &bytes[..len]).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = service.emulation.event().await;
+                    let entered = matches!(&event, EmulationEvent::Entered { addr, .. } if *addr == old_addr);
+                    service.handle_emulation_event(event).await;
+                    if entered { break; }
+                }
+            }).await.unwrap();
+            assert!(service.incoming_conns.contains(&old_addr));
+            let old_token = service.incoming_authorization.token(old_addr, &old_server).unwrap();
+            let mut reply = [0u8; lan_mouse_proto::MAX_EVENT_SIZE];
+            let count = tokio::time::timeout(Duration::from_secs(2), webrtc_util::Conn::recv(&accepted, &mut reply)).await.unwrap().unwrap();
+            assert!(matches!(lan_mouse_proto::decode_event_frame(&reply[..count]).unwrap(), lan_mouse_proto::ProtoEvent::Ack(_)));
             assert!(!service.clipboard_enabled);
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::Settings { clipboard_enabled: false, invert_scroll: true, mouse_sensitivity } if *mouse_sensitivity == 1.75
@@ -1699,23 +1762,49 @@ mod tests {
             assert_eq!(persisted.mouse_sensitivity(), 2.25);
             assert!(!persisted.clipboard_enabled());
             assert_eq!(persisted.authorized_fingerprints(), HashMap::from([("new".into(), "invalid-key".into()), (reload_alias.clone(), "new-peer".into())]));
+            // Queue a network clipboard write but revoke before its worker runs.
+            service.emulation.send_clipboard(old_addr, input_event::ClipboardEvent::Text("must not share after revocation".into())).unwrap();
             service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(reload_fp.clone()))));
+            assert!(old_token.is_cancelled());
+            assert!(!service.emulation.clipboard_session_is_current(old_addr, &old_server));
+            assert!(!service.incoming_conns.contains(&old_addr));
+            assert!(!service.incoming_clipboard.contains_key(&old_addr));
+            service.pending_frontend_events.clear();
+            service.handle_emulation_event(EmulationEvent::Entered { addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
+            service.handle_emulation_event(EmulationEvent::Connected { addr: old_addr, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
+            service.handle_emulation_event(EmulationEvent::ClipboardReceived { addr: old_addr, conn: old_server.clone(), event: input_event::ClipboardEvent::Text("old receipt".into()) }).await;
+            service.handle_emulation_event(EmulationEvent::ReleaseNotify { addr: old_addr, conn: old_server.clone() }).await;
+            assert!(service.pending_frontend_events.is_empty());
+            assert!(!service.incoming_conns.contains(&old_addr));
             service.config.flush().await.unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(300), webrtc_util::Conn::recv(&accepted, &mut reply)).await;
+            if let Ok(Ok(count)) = result {
+                if count > 0 { assert!(!matches!(lan_mouse_proto::decode_event_frame(&reply[..count]).unwrap(), lan_mouse_proto::ProtoEvent::Input(input_event::Event::Clipboard(_)))); }
+            }
             service.reload_authorized_keys();
             assert!(service.authorized_keys.read().unwrap().is_empty());
             assert!(!service.config.authorized_fingerprints().contains_key(&reload_alias));
             assert!(service.config.authorized_fingerprints().contains_key("new"));
             let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
             socket.connect((std::net::Ipv4Addr::LOCALHOST, service.port)).await.unwrap();
+            let denied_cert = reload_cert.clone();
             let revoked = tokio::task::spawn_local(async move {
                 webrtc_dtls::conn::DTLSConn::new(socket, webrtc_dtls::config::Config {
-                    certificates: vec![reload_cert], insecure_skip_verify: true,
+                    certificates: vec![denied_cert], insecure_skip_verify: true,
                     extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require, ..Default::default()
                 }, true, None).await
             });
             let notice = tokio::time::timeout(Duration::from_secs(2), service.authentication_notices.next()).await.unwrap();
             assert_eq!(notice, reload_fp); // same certificate is now rejected, alias cannot restore trust.
             revoked.abort(); let _ = revoked.await;
+            service.handle_frontend_request(Some(Ok(FrontendRequest::AuthorizeKey("regranted peer".into(), reload_alias.clone()))));
+            assert!(old_token.is_cancelled());
+            let fresh = handshake(service.port, reload_cert).await;
+            assert!(!service.emulation.clipboard_session_is_current(old_addr, &old_server));
+            service.handle_emulation_event(EmulationEvent::Entered { addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp, conn: old_server }).await;
+            assert!(!service.incoming_conns.contains(&old_addr));
+            webrtc_util::Conn::close(&fresh).await.unwrap();
+            webrtc_util::Conn::close(&accepted).await.unwrap();
             service.clipboard_enabled = true;
             let clipboard = input_event::ClipboardEvent::Text("fixture clipboard".into());
             let missing_addr = "127.0.0.1:1".parse().unwrap();
@@ -1723,9 +1812,10 @@ mod tests {
             let completed = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     let event = service.emulation.event().await;
-                    if matches!(event, EmulationEvent::ClipboardSendCompleted(_)) {
+                    if matches!(&event, EmulationEvent::ClipboardSendCompleted(completed) if completed.addr == missing_addr) {
                         break event;
                     }
+                    service.handle_emulation_event(event).await;
                 }
             }).await.unwrap();
             assert!(matches!(&completed, EmulationEvent::ClipboardSendCompleted(completed)
