@@ -1409,3 +1409,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 上层一般捕获错误的按句柄 abort 路径仍需单独审查；R13、R60、真机千次往返、完整 p95/p99 和 8h RSS 尚未完成，不认定达到 90 分。协议编码不变。
 
 日志：capture-native-release-baseline.log、capture-native-release-library.log、capture-native-release-workspace.log、capture-native-release-clippy.log、capture-native-release-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、capture-native-release-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+
+## 第五十七轮：一般捕获错误取消了替代连接
+
+### R78 / P1
+
+- 基线核对 do_capture：保存 active handle 后等待 release_capture_with，再调用仅接受 handle 的 abort_capture。后者先 invalidate 当前配置，再解析当前连接并等待 close。因此释放等待期间建立的替代连接会被旧错误取消。受控传输基线保存旧快照、安装新配置/新连接、执行实际旧 abort API，确认新 token 取消、新连接关闭、旧连接未关闭；日志 capture-fatal-abort-baseline.log。这是错误处理阶段的替换模型，不是完整 native backend 故障注入。
+- [x] do_capture 在等待原生释放之前保存原连接及配置代次；成功释放后按该快照取消。释放自身失败时沿第 56 轮的原目标取消路径处理，不重复按当前句柄取消。
+- [x] abort_capture 改为内部同步调度 API，必须传入原配置代次及可用的连接快照。它复用 identity/revision 检查与后台断开，不等待 transport close。原设备、同设备替代连接、其他设备的回归继续通过。
+
+### 验证与证据边界
+
+- 新回归在实际 abort API 阶段模拟 native 等待期间连接替换，确认只关闭旧传输且保留新 token/address；另用永久 pending close 确认当前目标取消返回并清 active address。已有受控连接表竞争/配置代次测试保留。没有真实原生 release 延迟期间的端到端故障注入。
+- 全工作区 all-features 通过：root 140 / 2 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy 通过，提交前检查 fmt/diff。没有改变 wire encoding。
+- 0fd675a 的 Rust run 37212219833 检查时仍 in_progress，Nix 37212219805 queued；新 HEAD 需自己的 CI。
+- [ ] 下一轮检查 stream 意外 EOF：do_capture_session 的 capture.next()==None 直接返回 Ok，do_capture 仅在 Err 清 active/remap/取消连接。macOS stream 的接收端关闭可返回 None。尚需基线确认这种退出是否仍留下捕获状态，以及全服务 shutdown 是否已承担相应清理，不能直接称为已复现的物理粘键。
+- [ ] R13 全局连接/任务资源上限、R60 原生故障恢复、其他 backend 会话队列、真机千次往返、全服务 p95/p99 和 8h RSS 未完成，不认定达到 90 分。后台连接表等待不因本次改动获得全局上限。
+
+日志：capture-fatal-abort-baseline.log、capture-fatal-abort-library.log、capture-fatal-abort-workspace.log、capture-fatal-abort-clippy.log。

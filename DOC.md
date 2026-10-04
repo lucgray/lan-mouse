@@ -810,3 +810,12 @@ connection-table cleanup may remain pending, and these tasks do not establish a
 global resource bound. Controlled result-stage failure tests establish routing
 and cancellation behavior, not physical native or remote key release. Wire
 encoding and protocol version remain unchanged.
+
+
+Generic capture-session errors also snapshot transport identity and configuration
+revision before awaiting native release. Successful native release then aborts
+that saved session; failed native release already schedules the same cleanup.
+The internal abort API schedules closure without awaiting transport close, so a
+replacement created during native release is preserved. Controlled replacement
+and stalled-close tests verify this decision stage; full native fault/recovery
+and global pending-task bounds remain acceptance work.

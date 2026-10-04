@@ -358,16 +358,28 @@ impl CaptureTask {
 
         let r = self.do_capture_session(&mut capture).await;
         if let Err(error) = &r {
-            let active = self.active_client;
+            let active = self.active_client.and_then(|handle| {
+                self.conn
+                    .capture_revision(handle)
+                    .map(|revision| (handle, revision))
+            });
+            let cleanup_target = self
+                .active_client
+                .and_then(|handle| self.conn.prepare_cleanup(handle));
             // The event queue may contain stale presses. Do not send cleanup
             // input through a failing session or start a new connection.
-            if let Err(cleanup) = self.release_capture_with(&mut capture, false, None).await {
-                log::warn!("failed to release capture after backend error: {cleanup}");
+            match self.release_capture_with(&mut capture, false, None).await {
+                Err(cleanup) => {
+                    log::warn!("failed to release capture after backend error: {cleanup}")
+                }
+                Ok(()) => {
+                    if let Some((handle, revision)) = active {
+                        self.conn
+                            .abort_capture(handle, revision, cleanup_target.as_ref());
+                    }
+                }
             }
             self.remap.reset_session();
-            if let Some(handle) = active {
-                self.conn.abort_capture(handle).await;
-            }
             self.event_tx
                 .send(ICaptureEvent::CaptureFailed(error.to_string()))
                 .expect("channel closed");
@@ -785,6 +797,75 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_capture_abort_preserves_replacement_and_never_waits_for_close() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let conn = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = conn.sender();
+                let old = Arc::new(RefusedConnection::default());
+                sender
+                    .install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), old.clone())
+                    .await;
+                let revision = conn.capture_revision(handle).unwrap();
+                let cleanup = conn.prepare_cleanup(handle).unwrap();
+                // A replacement may arrive while native release is awaited.
+                clients.invalidate_target(handle);
+                let replacement = Arc::new(RefusedConnection::default());
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        replacement.clone(),
+                    )
+                    .await;
+                let fresh = clients.target_token(handle).unwrap();
+                conn.abort_capture(handle, revision, Some(&cleanup));
+                assert!(!fresh.is_cancelled());
+                assert!(!replacement.closed.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(clients.active_addr(handle).is_some());
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    while !old.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                // Current-session fatal abort also returns without waiting for close.
+                let stalled = Arc::new(RefusedConnection {
+                    stall_close: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        stalled.clone(),
+                    )
+                    .await;
+                let revision = conn.capture_revision(handle).unwrap();
+                let cleanup = conn.prepare_cleanup(handle).unwrap();
+                let token = clients.target_token(handle).unwrap();
+                tokio::time::timeout(Duration::from_millis(50), async {
+                    conn.abort_capture(handle, revision, Some(&cleanup));
+                })
+                .await
+                .unwrap();
+                assert!(token.is_cancelled());
+                assert!(clients.active_addr(handle).is_none());
+                sender.terminate().await;
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn native_release_error_aborts_pinned_peer_after_active_handle_is_taken() {

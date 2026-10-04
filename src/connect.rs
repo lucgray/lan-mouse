@@ -282,21 +282,17 @@ impl LanMouseConnection {
             .collect()
     }
 
-    /// End only the failed capture's transport and heartbeat. A fresh token
-    /// permits reconnect after capture is explicitly re-enabled.
-    pub(crate) async fn abort_capture(&self, handle: ClientHandle) {
-        self.sender.client_manager.invalidate_target(handle);
-        let connection = self.sender.conns.lock().await.get(&handle).cloned();
-        if let Some((addr, conn)) = connection {
-            disconnect(
-                &self.sender.client_manager,
-                handle,
-                addr,
-                &conn,
-                &self.sender.conns,
-                &self.sender.closed,
-            )
-            .await;
+    /// Abort the capture generation saved before awaiting native cleanup.
+    pub(crate) fn abort_capture(
+        &self,
+        handle: ClientHandle,
+        revision: u64,
+        cleanup: Option<&CleanupTarget>,
+    ) {
+        if let Some(cleanup) = cleanup {
+            self.abort_cleanup(cleanup);
+        } else {
+            self.abort_capture_at_revision(handle, revision);
         }
     }
 
@@ -1345,16 +1341,30 @@ pub(crate) mod tests {
             (handle, (addr, own.clone() as Connection)),
             (other, (addr, peer.clone() as Connection)),
         ]);
-        connection.abort_capture(handle).await;
+        connection.abort_capture(
+            handle,
+            connection.capture_revision(handle).unwrap(),
+            connection.prepare_cleanup(handle).as_ref(),
+        );
         assert!(old_token.is_cancelled());
         assert!(!clients.target_token(handle).unwrap().is_cancelled());
         assert!(!other_token.is_cancelled());
         assert!(clients.active_addr(handle).is_none());
-        assert!(own.closed.load(std::sync::atomic::Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !own.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(!peer.closed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(!connection.sender.conns.lock().await.contains_key(&handle));
         assert!(connection.sender.conns.lock().await.contains_key(&other));
-        connection.abort_capture(handle).await;
+        connection.abort_capture(
+            handle,
+            connection.capture_revision(handle).unwrap(),
+            connection.prepare_cleanup(handle).as_ref(),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
