@@ -35,6 +35,7 @@ enum Request {
     ReleaseTo(f64),
 }
 
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -60,6 +61,44 @@ struct ControlRequest {
 
 fn control_error(kind: std::io::ErrorKind, message: &'static str) -> CaptureError {
     std::io::Error::new(kind, message).into()
+}
+
+struct WorkerConfig {
+    event_tx: HookSender,
+    request_rx: mpsc::Receiver<ControlRequest>,
+    stopping: Arc<AtomicBool>,
+    lease: WorkerLease,
+}
+
+fn initialize_native(config: WorkerConfig) -> Result<X11State, X11InputCaptureCreationError> {
+    let display = unsafe { x11::xlib::XOpenDisplay(std::ptr::null()) };
+    if display.is_null() {
+        return Err(X11InputCaptureCreationError::OpenDisplayFailed);
+    }
+    let screen = unsafe { XDefaultScreen(display) };
+    let root = unsafe { XDefaultRootWindow(display) };
+    let screen_w = unsafe { XDisplayWidth(display, screen) };
+    let screen_h = unsafe { XDisplayHeight(display, screen) };
+    Ok(X11State {
+        display,
+        root,
+        screen_w,
+        screen_h,
+        clients: HashSet::new(),
+        active_client: None,
+        entry_point: (0, 0),
+        prev_pos: (0, 0),
+        event_tx: config.event_tx,
+        release_grabs: release_native_grabs,
+        warp_pointer: warp_native_pointer,
+        #[cfg(test)]
+        release_calls: 0,
+        #[cfg(test)]
+        warp_calls: 0,
+        request_rx: config.request_rx,
+        stopping: config.stopping,
+        _worker_lease: Some(config.lease),
+    })
 }
 
 // ── Internal thread state ─────────────────────────────────────────────────────
@@ -98,52 +137,68 @@ pub struct X11InputCapture {
 }
 
 impl X11InputCapture {
-    pub fn new() -> Result<Self, X11InputCaptureCreationError> {
-        let lease = WorkerLease::acquire(&WORKER_ACTIVE)?;
-        let display = unsafe { x11::xlib::XOpenDisplay(std::ptr::null()) };
-        if display.is_null() {
-            return Err(X11InputCaptureCreationError::OpenDisplayFailed);
-        }
+    pub async fn new() -> Result<Self, X11InputCaptureCreationError> {
+        Self::start_with(
+            WorkerLease::acquire(&WORKER_ACTIVE)?,
+            STARTUP_TIMEOUT,
+            initialize_native,
+            run_event_loop,
+        )
+        .await
+    }
 
-        let screen = unsafe { XDefaultScreen(display) };
-        let root = unsafe { XDefaultRootWindow(display) };
-        let screen_w = unsafe { XDisplayWidth(display, screen) };
-        let screen_h = unsafe { XDisplayHeight(display, screen) };
-
+    async fn start_with<F, R>(
+        lease: WorkerLease,
+        timeout: Duration,
+        initialize: F,
+        run: R,
+    ) -> Result<Self, X11InputCaptureCreationError>
+    where
+        F: FnOnce(WorkerConfig) -> Result<X11State, X11InputCaptureCreationError> + Send + 'static,
+        R: FnOnce(X11State) + Send + 'static,
+    {
         let (event_tx, event_rx) = x11_channel();
         let (request_tx, request_rx) = mpsc::channel(16);
         let stopping = Arc::new(AtomicBool::new(false));
-
-        let state = X11State {
-            display,
-            root,
-            screen_w,
-            screen_h,
-            clients: HashSet::new(),
-            active_client: None,
-            entry_point: (0, 0),
-            prev_pos: (0, 0),
+        let config = WorkerConfig {
             event_tx,
-            release_grabs: release_native_grabs,
-            warp_pointer: warp_native_pointer,
-            #[cfg(test)]
-            release_calls: 0,
-            #[cfg(test)]
-            warp_calls: 0,
             request_rx,
             stopping: stopping.clone(),
-            _worker_lease: Some(lease),
+            lease,
         };
-
-        let thread = thread::spawn(move || run_event_loop(state));
-
-        Ok(Self {
+        let (ready, initialized) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name("lan-mouse-x11".into())
+            .spawn(move || match initialize(config) {
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                }
+                Ok(state) => {
+                    if state.stopping.load(Ordering::Acquire) || ready.is_closed() {
+                        return;
+                    }
+                    if ready.send(Ok(())).is_ok() && !state.stopping.load(Ordering::Acquire) {
+                        run(state);
+                    }
+                }
+            })
+            .map_err(X11InputCaptureCreationError::ThreadSpawn)?;
+        // Keep ownership while awaiting readiness: cancellation drops this guard,
+        // requests stop, and leaves the native worker lease alive until cleanup.
+        let backend = Self {
             event_rx,
             request_tx,
             stopping,
             thread: Some(thread),
-        })
+        };
+        match tokio::time::timeout(timeout, initialized).await {
+            Ok(Ok(Ok(()))) => Ok(backend),
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => Err(X11InputCaptureCreationError::InitializationClosed),
+            Err(_) => Err(X11InputCaptureCreationError::InitializationTimedOut),
+        }
     }
+
     async fn control(&self, request: Request) -> Result<(), CaptureError> {
         self.control_with_timeout(request, CONTROL_TIMEOUT).await
     }
@@ -717,6 +772,150 @@ mod tests {
             Poll::Pending | Poll::Ready(None) => None,
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    fn initialize_mock(config: WorkerConfig) -> Result<X11State, X11InputCaptureCreationError> {
+        let (mut state, _) = button_fixture();
+        state.active_client = None;
+        state.event_tx = config.event_tx;
+        state.request_rx = config.request_rx;
+        state.stopping = config.stopping;
+        state._worker_lease = Some(config.lease);
+        Ok(state)
+    }
+
+    async fn wait_for_lease_release(active: &AtomicBool) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_initialization_runs_off_runtime_and_control_is_ready_on_success() {
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let caller = thread::current().id();
+        let (resume, blocked) = std::sync::mpsc::channel();
+        let (entered, starting) = oneshot::channel();
+        let start = X11InputCapture::start_with(
+            WorkerLease::acquire(&ACTIVE).unwrap(),
+            Duration::from_secs(1),
+            move |config| {
+                assert_ne!(thread::current().id(), caller);
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                initialize_mock(config)
+            },
+            |mut state| {
+                while !state.stopping.load(Ordering::Acquire) {
+                    if drain_requests(&mut state) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+            },
+        );
+        let (backend, ()) = tokio::join!(start, async {
+            starting.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            resume.send(()).unwrap();
+        });
+        let mut backend = backend.unwrap();
+        backend.create(Position::Left).await.unwrap();
+        backend.release().await.unwrap();
+        backend.terminate().await.unwrap();
+        assert!(!ACTIVE.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn initialization_timeout_retains_lease_and_never_runs_late_capture() {
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let (resume, blocked) = std::sync::mpsc::channel();
+        let result = X11InputCapture::start_with(
+            WorkerLease::acquire(&ACTIVE).unwrap(),
+            Duration::from_millis(20),
+            move |config| {
+                blocked.recv().unwrap();
+                initialize_mock(config)
+            },
+            move |_| {
+                observed.store(true, Ordering::Release);
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(X11InputCaptureCreationError::InitializationTimedOut)
+        ));
+        assert!(WorkerLease::acquire(&ACTIVE).is_err());
+        resume.send(()).unwrap();
+        wait_for_lease_release(&ACTIVE).await;
+        assert!(!ran.load(Ordering::Acquire));
+        assert!(WorkerLease::acquire(&ACTIVE).is_ok());
+    }
+
+    #[tokio::test]
+    async fn canceling_initialization_stops_before_late_activation() {
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let (resume, blocked) = std::sync::mpsc::channel();
+        let (entered, starting) = oneshot::channel();
+        let mut start = Box::pin(X11InputCapture::start_with(
+            WorkerLease::acquire(&ACTIVE).unwrap(),
+            Duration::from_secs(1),
+            move |config| {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+                assert!(config.stopping.load(Ordering::Acquire));
+                initialize_mock(config)
+            },
+            move |_| {
+                observed.store(true, Ordering::Release);
+            },
+        ));
+        assert!(futures::poll!(start.as_mut()).is_pending());
+        starting.await.unwrap();
+        drop(start);
+        assert!(WorkerLease::acquire(&ACTIVE).is_err());
+        resume.send(()).unwrap();
+        wait_for_lease_release(&ACTIVE).await;
+        assert!(!ran.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn initialization_failure_and_panic_report_errors_and_release_lease() {
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let failure = X11InputCapture::start_with(
+            WorkerLease::acquire(&ACTIVE).unwrap(),
+            Duration::from_secs(1),
+            |_| Err(X11InputCaptureCreationError::OpenDisplayFailed),
+            |_| panic!("must not run failed initialization"),
+        )
+        .await;
+        assert!(matches!(
+            failure,
+            Err(X11InputCaptureCreationError::OpenDisplayFailed)
+        ));
+        wait_for_lease_release(&ACTIVE).await;
+        let failure = X11InputCapture::start_with(
+            WorkerLease::acquire(&ACTIVE).unwrap(),
+            Duration::from_secs(1),
+            |_| panic!("simulated initialization panic"),
+            |_| panic!("must not run panicked initialization"),
+        )
+        .await;
+        assert!(matches!(
+            failure,
+            Err(X11InputCaptureCreationError::InitializationClosed)
+        ));
+        wait_for_lease_release(&ACTIVE).await;
+        assert!(WorkerLease::acquire(&ACTIVE).is_ok());
     }
 
     fn control_fixture() -> (X11State, X11InputCapture) {

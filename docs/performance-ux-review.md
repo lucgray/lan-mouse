@@ -1346,3 +1346,25 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R74 原生队列跨会话残留、R13 全服务资源上限、R60 原生故障退出、真机千次往返、完整 p95/p99 和 8h RSS 未闭环，尚不认定达到 90 分。
 
 日志：x11-control-baseline.log、x11-control-library.log、x11-control-workspace.log、x11-control-clippy.log、x11-control-{x11,none}-clippy.log、x11-control-retry.log。
+
+
+## 第五十四轮：X11 初始化移出异步调用线程
+
+### R75 / P1
+
+- 基线源码核对：同步 new() 中 XOpenDisplay、screen/root/尺寸查询全部先于 thread::spawn；异步 create_backend 直接调用 new()。因此 native opening 在 polling thread 执行。日志 x11-startup-baseline.log 为源码顺序证据，没有对原版注入真实卡住的 X server。
+- [x] X11 new() 改为 async，factory 对其 await。显示连接与查询全部由持有 worker lease 的同一专用线程初始化，然后通过 oneshot 回报结果；调用线程不执行这组 Xlib 初始化。
+- [x] 初始化统一最多异步等待 2 秒。backend owner 在等待期间已经存在，future 取消或 timeout 会触发 stop；native 初始化迟到返回时检查 stop/结果接收端，直接清理，不进入 capture loop。pending initializer 仍持有 lease，禁止第二个 X11 worker。
+- [x] Thread Builder 失败、初始化无结果/worker panic、初始化 timeout 有明确创建错误；OpenDisplayFailed 保留。线程自身负责成功 state 的最终 close 与 lease 释放，调用侧不尝试抢占 native I/O。
+
+### 验证和证据边界
+
+- 4 个实际 start_with 受控用例：延迟初始化确实在与 Tokio 不同的 OS thread，Tokio timer 可运行；完成后 create/release ACK 与 terminate 可用。另测 timeout 后 lease 保持且迟到不运行 capture；取消后 stop 可见且不激活；OpenDisplayFailed 与初始化 panic 报错并释放 lease。没有连接用户显示服务器。
+- 全工作区 all-features 通过：capture 55 / 1 忽略、emulation 40、root 136 / 2 忽略、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、capture X11-only / 无默认功能 Clippy、fmt/diff 通过。
+- 第 53 轮 726f1f9 Rust run 37209323655 / Nix 37209323656 检查时均 in_progress；本轮新 HEAD 需对应 CI。
+- 新线程隔离等待，不会使阻塞的 XOpenDisplay 可取消。若 opening/close 永久阻塞，后台停止状态与 worker lease 仍保留；没有把 timeout 说成 native 物理清理完成。初始化 panic 测试是捕获的 Rust worker 模型，不是系统 core dump。
+- [ ] R74 原生队列跨普通会话残留仍优先；R13 全服务资源上限、R60 原生故障/退出、真机千次往返、完整延迟和 8h RSS 尚未闭环。
+- [ ] Xlib 并发初始化前提另待核对：本仓库无显式 XInitThreads，capture/emulation 会并发调用 Xlib；[X.Org 规范](https://xorg.freedesktop.org/releases/current/doc/libX11/libX11/libX11.html) 要求线程初始化先完成，或所有调用受外部互斥保护。不能仅因源码未调用就认定本机故障：libX11 1.8 的默认构建添加自动线程初始化 constructor（[项目 README 源码](https://github.com/mirror/libX11/blob/master/README.md)），还需检查实际链接库/构建选项与 toolkit 初始化。此为未验证的兼容前提，不是已证实的运行时缺陷。
+- 尚不认定达到 90 分。
+
+日志：x11-startup-baseline.log、x11-startup-library.log、x11-startup-workspace.log、x11-startup-clippy.log、x11-startup-{x11,none}-clippy.log。

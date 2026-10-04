@@ -141,6 +141,12 @@ pub enum LayerShellCaptureCreationError {
 #[cfg(x11)]
 #[derive(Debug, Error)]
 pub enum X11InputCaptureCreationError {
+    #[error("X11 capture initialization timed out; native cleanup may still be pending")]
+    InitializationTimedOut,
+    #[error("X11 capture initialization thread closed without a result")]
+    InitializationClosed,
+    #[error("could not spawn X11 capture thread: {0}")]
+    ThreadSpawn(std::io::Error),
     #[error("previous X11 capture worker is still running or stopping")]
     WorkerStillRunning,
     #[error("XOpenDisplay failed — is DISPLAY set?")]

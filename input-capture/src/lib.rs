@@ -463,7 +463,7 @@ async fn create_backend(
         #[cfg(layer_shell)]
         Backend::LayerShell => Ok(Box::new(layer_shell::LayerShellInputCapture::new()?)),
         #[cfg(x11)]
-        Backend::X11 => Ok(Box::new(x11::X11InputCapture::new()?)),
+        Backend::X11 => Ok(Box::new(x11::X11InputCapture::new().await?)),
         #[cfg(windows)]
         Backend::Windows => Ok(Box::new(windows::WindowsInputCapture::new())),
         #[cfg(target_os = "macos")]

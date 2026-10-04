@@ -754,6 +754,22 @@ wire encoding/protocol version do not change.
 
 Native calls still cannot be interrupted by Tokio. Timeout reports incomplete
 shutdown, and Drop may leave the stopped worker pending; its lease prevents
-repeated X11 workers. Initial XOpenDisplay/screen queries still run synchronously
-in new(), and native success/error handling, physical cleanup and ordinary
-release/reentry event isolation remain acceptance work.
+repeated X11 workers. Native success/error handling, physical cleanup and ordinary release/reentry
+event isolation remain acceptance work. Initialization now uses the worker
+and asynchronous deadline described below.
+
+
+### X11 startup deadline
+
+X11InputCapture::new is asynchronous; the backend factory awaits it. Opening
+the display and querying its screen happen in the dedicated worker, with a
+2-second readiness deadline on the calling runtime. Canceling or timing out
+the wait requests stop; a late initializer cleans up rather than entering the
+capture loop. Its worker lease remains held until that cleanup returns.
+
+InitializationTimedOut, InitializationClosed and ThreadSpawn distinguish
+startup timeout, missing initialization result and OS-thread creation failure;
+OpenDisplayFailed remains the native open failure. A timeout cannot interrupt
+Xlib opening/closing or prove physical cleanup. Startup regressions use controlled
+initializers and real worker threads, not a stalled physical X server. Wire
+encoding/protocol version are unchanged.
