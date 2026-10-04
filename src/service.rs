@@ -72,6 +72,7 @@ pub struct Service {
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+    authorization_warning: Option<String>,
     /// (outgoing) client information
     client_manager: ClientManager,
     /// lan mouse connection sender (for clipboard)
@@ -119,7 +120,13 @@ impl Service {
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
-        let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        let parsed =
+            crate::authorization::AuthorizationConfig::new(config.authorized_fingerprints());
+        let authorization_warning = parsed.warning();
+        if let Some(warning) = &authorization_warning {
+            log::warn!("{warning}");
+        }
+        let authorized_keys = Arc::new(RwLock::new(parsed.trusted));
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
@@ -195,6 +202,7 @@ impl Service {
             frontend_listener,
             resolver,
             authorized_keys,
+            authorization_warning,
             public_key_fingerprint,
             client_manager: client_manager.clone(),
             conn_sender,
@@ -410,8 +418,8 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
-        let authorized_keys = self.authorized_keys.read().expect("lock").clone();
-        self.config.set_authorized_keys(authorized_keys);
+        // Authorization edits update the original table explicitly. Saving other
+        // settings must not rewrite aliases or silently discard malformed entries.
         self.config.queue_write_back();
     }
 
@@ -449,11 +457,7 @@ impl Service {
             self.config.invert_scroll_vertical(),
             self.config.invert_scroll_horizontal(),
         ));
-        let authorized_keys = self.config.authorized_fingerprints();
-        self.authorized_keys
-            .write()
-            .unwrap()
-            .clone_from(&authorized_keys);
+        self.reload_authorized_keys();
         self.apply_clipboard_enabled(self.config.clipboard_enabled());
         let configured_port = self.config.port();
         if configured_port != self.configured_port {
@@ -893,8 +897,7 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.notify_authorized_keys();
         self.notify_settings();
     }
 
@@ -961,6 +964,24 @@ impl Service {
         self.frontend_event_pending.notify_one();
     }
 
+    fn reload_authorized_keys(&mut self) {
+        let parsed =
+            crate::authorization::AuthorizationConfig::new(self.config.authorized_fingerprints());
+        self.authorization_warning = parsed.warning();
+        if let Some(warning) = &self.authorization_warning {
+            log::warn!("{warning}");
+        }
+        *self.authorized_keys.write().expect("lock") = parsed.trusted;
+    }
+
+    fn notify_authorized_keys(&mut self) {
+        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        if let Some(warning) = self.authorization_warning.clone() {
+            self.notify_frontend(FrontendEvent::Error(warning));
+        }
+    }
+
     fn add_authorized_key(&mut self, desc: String, fp: String) -> bool {
         let fp = match lan_mouse_ipc::normalize_fingerprint(&fp) {
             Ok(fp) => fp,
@@ -969,24 +990,29 @@ impl Service {
                 return false;
             }
         };
-        self.authorized_keys.write().expect("lock").insert(fp, desc);
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        let mut keys = self.config.authorized_fingerprints();
+        keys.retain(|key, _| lan_mouse_ipc::normalize_fingerprint(key).ok().as_ref() != Some(&fp));
+        keys.insert(fp, desc);
+        self.config.set_authorized_keys(keys);
+        self.reload_authorized_keys();
+        self.notify_authorized_keys();
         true
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        // Exact lookup preserves removal of malformed/noncanonical legacy keys;
-        // normalized fallback accepts pasted aliases of newly canonical keys.
-        let mut keys = self.authorized_keys.write().expect("lock");
-        if keys.remove(&fp).is_none() {
-            if let Ok(canonical) = lan_mouse_ipc::normalize_fingerprint(&fp) {
-                keys.remove(&canonical);
-            }
+        let mut keys = self.config.authorized_fingerprints();
+        if let Ok(canonical) = lan_mouse_ipc::normalize_fingerprint(&fp) {
+            // Removing a visible digest must remove every spelling, or a legacy
+            // alias could restore authorization on the next reload.
+            keys.retain(|key, _| {
+                lan_mouse_ipc::normalize_fingerprint(key).ok().as_ref() != Some(&canonical)
+            });
+        } else {
+            keys.remove(&fp);
         }
-        drop(keys);
-        let keys = self.authorized_keys.read().expect("lock").clone();
-        self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        self.config.set_authorized_keys(keys);
+        self.reload_authorized_keys();
+        self.notify_authorized_keys();
     }
 
     fn enumerate(&mut self) {
@@ -1539,17 +1565,44 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires isolated LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR / XDG_RUNTIME_DIR"]
     async fn external_reload_preserves_file_and_applies_authorization_and_clipboard() {
+        async fn handshake(
+            port: u16,
+            cert: webrtc_dtls::crypto::Certificate,
+        ) -> webrtc_dtls::conn::DTLSConn {
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket
+                .connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                webrtc_dtls::conn::DTLSConn::new(
+                    socket,
+                    webrtc_dtls::config::Config {
+                        certificates: vec![cert],
+                        insecure_skip_verify: true,
+                        extended_master_secret:
+                            webrtc_dtls::config::ExtendedMasterSecretType::Require,
+                        ..Default::default()
+                    },
+                    true,
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
         let runtime = std::env::var("LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR").unwrap();
         assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), runtime);
         assert!(std::path::Path::new(&runtime).starts_with(std::env::temp_dir()));
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let cert = directory.path().join("test.pem");
-        std::fs::write(
-            &path,
-            "port = 0\nenable_clipboard = false\n[authorized_fingerprints]\nold = 'old-peer'\n",
-        )
-        .unwrap();
+        let startup_cert = webrtc_dtls::crypto::Certificate::generate_self_signed(vec![]).unwrap();
+        let startup_fp = crypto::certificate_fingerprint(&startup_cert);
+        let startup_alias = startup_fp.replace(':', "").to_uppercase();
+        std::fs::write(&path, format!("port = 0\nenable_clipboard = false\n[authorized_fingerprints]\nold = 'old-peer'\n\"{startup_alias}\" = 'alias description'\n\"{startup_fp}\" = 'preferred description'\n")).unwrap();
         let config = Config::new_with_args([
             "lan-mouse",
             "--config",
@@ -1571,6 +1624,15 @@ mod tests {
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::PortChanged(port, None) if *port == initial_port
             )));
+            assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([(startup_fp.clone(), "preferred description".into())]));
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event, FrontendEvent::Error(message) if message.contains("1 malformed") && message.contains("1 alias"))));
+            let accepted = handshake(service.port, startup_cert).await;
+            webrtc_util::Conn::close(&accepted).await.unwrap();
+            let original_raw = service.config.authorized_fingerprints();
+            service.update_mouse_sensitivity(1.15);
+            service.config.flush().await.unwrap();
+            let persisted = Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+            assert_eq!(persisted.authorized_fingerprints(), original_raw); // no implicit authorization migration.
             // Invalid raw IPC requests cannot change trust or persist a bad key.
             service.pending_frontend_events.clear();
             let before = std::fs::read(&path).unwrap();
@@ -1592,9 +1654,14 @@ mod tests {
             service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(canonical.to_uppercase()))));
             assert!(!service.authorized_keys.read().unwrap().contains_key(&canonical));
             let legacy = canonical.to_uppercase();
-            service.authorized_keys.write().unwrap().insert(legacy.clone(), "legacy uppercase".into());
+            let mut raw = service.config.authorized_fingerprints();
+            raw.insert(legacy.clone(), "legacy uppercase".into());
+            service.config.set_authorized_keys(raw);
+            service.reload_authorized_keys();
+            assert!(service.authorized_keys.read().unwrap().contains_key(&canonical));
             service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(legacy.clone()))));
-            assert!(!service.authorized_keys.read().unwrap().contains_key(&legacy));
+            assert!(!service.authorized_keys.read().unwrap().contains_key(&canonical));
+            assert!(!service.config.authorized_fingerprints().contains_key(&legacy));
             service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey("old".into()))));
             assert!(!service.authorized_keys.read().unwrap().contains_key("old"));
             service.config.flush().await.unwrap();
@@ -1602,8 +1669,11 @@ mod tests {
             // Model an already enabled session without starting OS clipboard
             // resources: the external snapshot must disable it on reload.
             service.clipboard_enabled = true;
-            let external = "# external edit must survive reload\nport = 0\nenable_clipboard = false\n[authorized_fingerprints]\nnew = 'new-peer'\n[input_post_processing]\ninvert_scroll = true\nmouse_sensitivity = 1.75\n";
-            std::fs::write(&path, external).unwrap();
+            let reload_cert = webrtc_dtls::crypto::Certificate::generate_self_signed(vec![]).unwrap();
+            let reload_fp = crypto::certificate_fingerprint(&reload_cert);
+            let reload_alias = reload_fp.replace(':', "").to_uppercase();
+            let external = format!("# external edit must survive reload\nport = 0\nenable_clipboard = false\n[authorized_fingerprints]\nnew = 'invalid-key'\n\"{reload_alias}\" = 'new-peer'\n[input_post_processing]\ninvert_scroll = true\nmouse_sensitivity = 1.75\n");
+            std::fs::write(&path, &external).unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while !service.config.changed().await.unwrap() {}
             }).await.unwrap();
@@ -1613,7 +1683,10 @@ mod tests {
             assert_eq!(service.port, initial_port);
             assert_eq!(service.configured_port, 0);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
-            assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([("new".into(), "new-peer".into())]));
+            assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([(reload_fp.clone(), "new-peer".into())]));
+            assert!(!service.authorized_keys.read().unwrap().contains_key(&startup_fp));
+            let accepted = handshake(service.port, reload_cert.clone()).await;
+            webrtc_util::Conn::close(&accepted).await.unwrap();
             assert!(!service.clipboard_enabled);
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::Settings { clipboard_enabled: false, invert_scroll: true, mouse_sensitivity } if *mouse_sensitivity == 1.75
@@ -1625,7 +1698,24 @@ mod tests {
             ]).unwrap();
             assert_eq!(persisted.mouse_sensitivity(), 2.25);
             assert!(!persisted.clipboard_enabled());
-            assert_eq!(persisted.authorized_fingerprints(), HashMap::from([("new".into(), "new-peer".into())]));
+            assert_eq!(persisted.authorized_fingerprints(), HashMap::from([("new".into(), "invalid-key".into()), (reload_alias.clone(), "new-peer".into())]));
+            service.handle_frontend_request(Some(Ok(FrontendRequest::RemoveAuthorizedKey(reload_fp.clone()))));
+            service.config.flush().await.unwrap();
+            service.reload_authorized_keys();
+            assert!(service.authorized_keys.read().unwrap().is_empty());
+            assert!(!service.config.authorized_fingerprints().contains_key(&reload_alias));
+            assert!(service.config.authorized_fingerprints().contains_key("new"));
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket.connect((std::net::Ipv4Addr::LOCALHOST, service.port)).await.unwrap();
+            let revoked = tokio::task::spawn_local(async move {
+                webrtc_dtls::conn::DTLSConn::new(socket, webrtc_dtls::config::Config {
+                    certificates: vec![reload_cert], insecure_skip_verify: true,
+                    extended_master_secret: webrtc_dtls::config::ExtendedMasterSecretType::Require, ..Default::default()
+                }, true, None).await
+            });
+            let notice = tokio::time::timeout(Duration::from_secs(2), service.authentication_notices.next()).await.unwrap();
+            assert_eq!(notice, reload_fp); // same certificate is now rejected, alias cannot restore trust.
+            revoked.abort(); let _ = revoked.await;
             service.clipboard_enabled = true;
             let clipboard = input_event::ClipboardEvent::Text("fixture clipboard".into());
             let missing_addr = "127.0.0.1:1".parse().unwrap();

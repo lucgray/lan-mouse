@@ -455,9 +455,20 @@ fails; correcting the field clears the error. CLI argument parsing rejects bad
 input before connecting to the daemon. The service validates independently,
 reports invalid input through the existing Error event, and does not save a
 rejected authorization. Queue admission is still not a disk-write acknowledgement.
-Removal first matches the exact stored key and then a canonical alias, retaining
-the ability to delete legacy malformed or uppercase entries.
+Runtime trust also normalizes the configuration's authorization keys at startup
+and reload. Malformed keys are excluded from trust and the authorized-device list;
+a bounded summary warning reports their count. Aliases for one digest are folded
+together. If descriptions disagree, the exact canonical key wins; otherwise the
+original keys are ordered lexicographically to choose a description. Conflicting
+aliases produce a warning. Sync includes this warning for newly connected UIs.
 
-Configuration-file loading still uses its original raw authorization map; legacy
-noncanonical keys are not migrated by this change. This remaining path is tracked
-as R53 in the review checklist.
+Normalization does not write the file. Saving unrelated settings preserves the
+original authorization keys and descriptions, including invalid entries and
+aliases. Explicitly authorizing a digest replaces only that digest's aliases
+with one canonical key. Removing a valid digest removes all of its aliases, so
+reload cannot restore it; removing a malformed legacy key uses exact lookup.
+Unrelated entries remain intact. These rules preserve the raw authorization table,
+not file comments or formatting when a settings save serializes the configuration.
+
+Revocation currently rejects new handshakes. Enforcement against already accepted
+sessions remains tracked as R54 in the review checklist.
