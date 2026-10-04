@@ -28,6 +28,7 @@ enum Request {
     Create(Position),
     Destroy(Position),
     Release,
+    ReleaseTo(f64),
     Terminate,
 }
 
@@ -44,6 +45,7 @@ struct X11State {
     prev_pos: (i32, i32),
     event_tx: HookSender,
     release_grabs: fn(&mut X11State),
+    warp_pointer: fn(&mut X11State, (i32, i32)),
     #[cfg(test)]
     release_calls: usize,
     #[cfg(test)]
@@ -89,6 +91,7 @@ impl X11InputCapture {
             prev_pos: (0, 0),
             event_tx,
             release_grabs: release_native_grabs,
+            warp_pointer: warp_native_pointer,
             #[cfg(test)]
             release_calls: 0,
             #[cfg(test)]
@@ -147,7 +150,10 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
-    async fn release_to(&mut self, _t: f64) -> Result<(), CaptureError> {
+    async fn release_to(&mut self, t: f64) -> Result<(), CaptureError> {
+        self.request_tx.send(Request::ReleaseTo(t)).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "X11 capture thread closed")
+        })?;
         Ok(())
     }
 
@@ -223,6 +229,7 @@ fn drain_requests(state: &mut X11State) -> bool {
                 }
             }
             Ok(Request::Release) => do_release(state),
+            Ok(Request::ReleaseTo(t)) => do_release_to(state, t),
             Ok(Request::Terminate) => {
                 unsafe { XCloseDisplay(state.display) };
                 return true;
@@ -356,6 +363,18 @@ fn do_release(state: &mut X11State) {
     state.active_client = None;
 }
 
+fn do_release_to(state: &mut X11State, t: f64) {
+    let Some(pos) = state.active_client else {
+        return;
+    };
+    let target = return_point(pos, t, state.screen_w, state.screen_h);
+    // Warp while still grabbed, then ungrab. Seed the next idle crossing check
+    // from the returned coordinates rather than the old entry point.
+    (state.warp_pointer)(state, target);
+    state.prev_pos = target;
+    do_release(state);
+}
+
 fn send_event(state: &mut X11State, pos: Position, event: CaptureEvent) {
     if state.event_tx.send(pos, event).is_err() && state.active_client.is_some() {
         do_release(state);
@@ -443,6 +462,26 @@ fn normalized_cross_axis(coord: f64, min: f64, max: f64) -> f64 {
     ((coord - min) / (max - min)).clamp(0.0, 1.0)
 }
 
+fn return_point(pos: Position, t: f64, w: i32, h: i32) -> (i32, i32) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let x = (f64::from(w - 1) * t).round() as i32;
+    let y = (f64::from(h - 1) * t).round() as i32;
+    let x_inset = 16.min((w - 1) / 2);
+    let y_inset = 16.min((h - 1) / 2);
+    match pos {
+        Position::Left => (x_inset, y),
+        Position::Right => (w - 1 - x_inset, y),
+        Position::Top => (x, y_inset),
+        Position::Bottom => (x, h - 1 - y_inset),
+    }
+}
+
 pub(crate) fn crossed_boundary(
     prev: (i32, i32),
     curr: (i32, i32),
@@ -520,6 +559,7 @@ mod tests {
                 prev_pos: (0, 0),
                 event_tx,
                 release_grabs: |state| state.release_calls += 1,
+                warp_pointer: |state, _| state.warp_calls += 1,
                 release_calls: 0,
                 warp_calls: 0,
                 request_rx,
@@ -544,6 +584,77 @@ mod tests {
             Poll::Ready(Some(Ok(event))) => Some(event),
             Poll::Pending | Poll::Ready(None) => None,
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn release_to_request_releases_at_matching_inset_without_immediate_recapture() {
+        for (pos, target) in [
+            (Position::Left, (16, 74)),
+            (Position::Right, (83, 74)),
+            (Position::Top, (74, 16)),
+            (Position::Bottom, (74, 83)),
+        ] {
+            let (mut state, events) = button_fixture();
+            state.active_client = Some(pos);
+            let (request_tx, request_rx) = mpsc::sync_channel(16);
+            state.request_rx = request_rx;
+            let mut backend = X11InputCapture {
+                event_rx: events,
+                request_tx,
+                thread: None,
+            };
+            backend.release_to(0.75).await.unwrap();
+            assert!(!drain_requests(&mut state));
+            assert_eq!(state.active_client, None);
+            assert_eq!(state.release_calls, 1);
+            assert_eq!(state.warp_calls, 1);
+            assert_eq!(state.prev_pos, target);
+            assert_eq!(crossed_boundary(state.prev_pos, target, 100, 100), None);
+            backend.release_to(0.25).await.unwrap();
+            assert!(!drain_requests(&mut state));
+            assert_eq!(state.release_calls, 1);
+            assert_eq!(state.warp_calls, 1);
+            assert_eq!(state.prev_pos, target);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_to_reports_closed_thread_instead_of_false_success() {
+        let (_, events) = button_fixture();
+        let (request_tx, request_rx) = mpsc::sync_channel(16);
+        drop(request_rx);
+        let mut backend = X11InputCapture {
+            event_rx: events,
+            request_tx,
+            thread: None,
+        };
+        assert!(
+            matches!(backend.release_to(0.75).await, Err(CaptureError::Io(error))
+            if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[test]
+    fn return_point_handles_endpoints_invalid_values_and_tiny_screens() {
+        assert_eq!(return_point(Position::Left, 0.0, 100, 100), (16, 0));
+        assert_eq!(return_point(Position::Right, 1.0, 100, 100), (83, 99));
+        assert_eq!(return_point(Position::Top, -1.0, 100, 100), (0, 16));
+        assert_eq!(return_point(Position::Bottom, 2.0, 100, 100), (99, 83));
+        for t in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(return_point(Position::Left, t, 100, 100), (16, 50));
+        }
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            for (w, h) in [(1, 1), (2, 2), (0, -1), (i32::MAX, i32::MAX)] {
+                let target = return_point(pos, 0.75, w, h);
+                assert!((0..w.max(1)).contains(&target.0));
+                assert!((0..h.max(1)).contains(&target.1));
+            }
         }
     }
 

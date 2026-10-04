@@ -1301,3 +1301,25 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] X11 同步控制通道/线程退出/native 阻塞、R13 全服务资源上限、R60 原生退出、真机千次往返、完整 p95/p99 与 8h RSS 未完成，尚不认定达到 90 分。
 
 日志：x11-partial-grab-baseline.log、x11-partial-grab-library.log、x11-partial-grab-workspace.log、x11-partial-grab-clippy.log。
+
+
+## 第五十二轮：X11 带返程位置的释放请求
+
+### R72 / P1
+
+- 实际 X11InputCapture::release_to(0.75) 基线返回 Ok；执行真实 drain_requests 后 active_client 仍为 Left，release/warp callback 均零次。证据确认 backend 没有提交任何返程请求，不仅是位置近似。日志 x11-return-release-baseline.log；未打开显示服务器。
+- [x] 新增内部 Request::ReleaseTo(t)，release_to 投递后由原 X11 线程处理；接收线程关闭时返回 BrokenPipe，避免假成功。没有改 wire/IPC 编码。
+- [x] 当前 active edge 决定返程目标：保持 t 的 cross-axis 位置，并在捕获边缘内侧最多 16 像素处返回；狭小屏幕限制 inset。先 warp，再请求 ungrab；更新 prev_pos，下一次 idle 检查不会把返回位置本身当成新穿越。无 active 时不重复 warp/ungrab。
+- [x] t 越界截到 0..1，非有限值用中点；尺寸退化至少按 1 像素计算，避免负范围/算术溢出。保留普通 release 的原有语义。
+
+### 回归及限制
+
+- 实际 backend API → 内部请求 → drain_requests → 状态/回调测试覆盖四条边，在 100×100 / t=.75 分别返回 (16,74)/(83,74)/(74,16)/(74,83)，各释放一次，重复返程不操作；crossed_boundary(returned,returned) 不产生穿越。另测关闭 receiver 的错误、端点/越界/NaN/Inf、1/2 像素、非正尺寸及 i32 最大尺寸。
+- 全工作区 all-features 通过：capture 44 / 1 忽略、emulation 40、root 136 / 2 忽略、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。
+- API 成功证明请求已提交，不是 native 完成确认；回调证明处理逻辑，不是物理 XWarpPointer/XUngrab 成功。实际历史故障使用哪个 backend 仍需日志核对，不把这个 X11 缺陷直接称为已证实的用户历史根因。
+- 第 51 轮 848d23d 检查时 Rust in_progress、Nix queued；本轮 HEAD 需要自己的 CI。
+- [ ] R73 / P1：现有 X11 request channel 的 SyncSender::send 和 Drop 中的 send/join 都同步阻塞，release_to 当前也遵循这个请求通道。若 native 线程卡住或容量 16 满，可能阻塞 Tokio/UI；下一轮必须改为可取消/有界等待的异步控制和退出，并明确 native 卡住时的处理限制。
+- [ ] R74：X11 release/return 后尚未排空原生事件队列，下一次 grab 可能读到上一会话遗留的 motion/key；需实际队列/会话基线，尤其新 warp 的合成事件。
+- [ ] R13 资源总上限、R60 原生退出、真机千次往返、完整 p95/p99 与 8h RSS 未完成，尚不认定达到 90 分。
+
+日志：x11-return-release-baseline.log、x11-return-release-library.log、x11-return-release-workspace.log、x11-return-release-clippy.log。

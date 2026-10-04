@@ -718,3 +718,19 @@ bounded queue, the overload path requests release and disables capture.
 
 State-machine tests use native-operation callbacks; actual Xlib release success,
 blocking calls and physical keyboard/pointer recovery remain target-OS gates.
+
+
+### X11 cursor return
+
+X11 release_to(t) submits an internal return request. The capture thread moves
+the pointer to the matching cross-axis position on the edge it left, inset by
+up to 16 pixels, then requests pointer/keyboard ungrab. It seeds the next idle
+edge check with that returned position. An inactive capture ignores repeated
+return requests. Nonfinite t uses the midpoint; out-of-range t is clamped and
+small/degenerate screen sizes bound the inset.
+
+A closed request receiver returns BrokenPipe. Success means request submission,
+not native completion acknowledgement. The existing synchronous control channel,
+thread join, native blocking/error handling and old native-event queue still
+need separate recovery work. Tests cover request processing and callback/state
+behavior, not physical pointer return or actual Xlib success.
