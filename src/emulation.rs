@@ -207,7 +207,7 @@ impl Emulation {
         self.port_requests.send_replace(Some(port));
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn last_port_request(&self) -> Option<u16> {
         *self.port_requests.borrow()
     }

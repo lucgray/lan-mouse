@@ -353,3 +353,24 @@ other settings with an unchanged configured port preserves the running port and
 an existing temporary GUI port choice; it does not request another ephemeral
 binding. An explicit GUI request for `0` chooses a new port. Bind failures retain
 the running port and can be retried by explicitly requesting the port again.
+
+
+## Clipboard monitor queue ordering
+
+Local samples carry their monitor/write revision inside the bounded queue. The
+public receive API still returns the same capture event, but discards queued
+samples from older revisions, while disabled, or while a remote write is active.
+A producer blocked by the full queue keeps the sample's original revision when
+space becomes available. Disabling and re-enabling invalidates prior samples and
+clears the local cache so the next fresh sample can establish the new scope.
+
+Successful remote writes update the suppression cache and preserve unchanged raw
+image reuse. Failed or abandoned writes preserve the last known content but mark
+the completed revision for a fresh local observation; an older sample cannot clear
+that refresh. Image reuse is reset when a fresh observation is needed. Publication
+releases enabled/content/time/reader locks before waiting for queue capacity.
+
+This handles queued samples across writes that have started and monitor toggles.
+The interval between accepting a remote request and starting its serial OS write,
+plus connection readiness/latest-value replay, still requires service-level ordering
+work. These changes do not retract a sample already delivered to its consumer.

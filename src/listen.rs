@@ -748,6 +748,8 @@ mod tests {
             let certificate = Certificate::generate_self_signed(vec![]).unwrap();
             let cfg = Config { certificates: vec![certificate.clone()], ..Default::default() };
             let listeners = bind_dtls(0, &cfg).await.unwrap();
+            #[cfg(any(windows, target_os = "macos"))]
+            assert_eq!(listeners.len(), 2, "v6-only CI must exercise both real families");
             let first = listeners[0].addr().await.unwrap().port();
             assert_ne!(first, 0);
             for listener in &listeners { assert_eq!(listener.addr().await.unwrap().port(), first); }
