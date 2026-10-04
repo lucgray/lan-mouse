@@ -252,6 +252,13 @@ struct CaptureTask {
     pending_modifiers: Option<KeyboardEvent>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseMode {
+    NotifyPeer,
+    Silent,
+    AbortPeer,
+}
+
 impl CaptureTask {
     fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
         self.captures.push((handle, pos, capture_type));
@@ -367,26 +374,13 @@ impl CaptureTask {
         r: Result<(), InputCaptureError>,
     ) -> Result<(), InputCaptureError> {
         if r.is_err() {
-            let active = self.active_client.and_then(|handle| {
-                self.conn
-                    .capture_revision(handle)
-                    .map(|revision| (handle, revision))
-            });
-            let cleanup_target = self
-                .active_client
-                .and_then(|handle| self.conn.prepare_cleanup(handle));
-            // The event queue may contain stale presses. Do not send cleanup
-            // input through a failing session or start a new connection.
-            match self.release_capture_with(capture, false, None).await {
-                Err(cleanup) => {
-                    log::warn!("failed to release capture after backend error: {cleanup}")
-                }
-                Ok(()) => {
-                    if let Some((handle, revision)) = active {
-                        self.conn
-                            .abort_capture(handle, revision, cleanup_target.as_ref());
-                    }
-                }
+            // Cancel the failed transport before waiting for native release.
+            // This mode snapshots the original generation and never sends stale input.
+            if let Err(cleanup) = self
+                .release_capture_with(capture, ReleaseMode::AbortPeer, None)
+                .await
+            {
+                log::warn!("failed to release capture after backend error: {cleanup}");
             }
             self.remap.reset_session();
         }
@@ -638,7 +632,8 @@ impl CaptureTask {
         if let Err(error) = result {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {error}"));
-            self.release_capture_with(capture, false, None).await?;
+            self.release_capture_with(capture, ReleaseMode::Silent, None)
+                .await?;
             return Ok(false);
         }
         Ok(true)
@@ -653,7 +648,8 @@ impl CaptureTask {
             log::info!("releasing capture: client {handle} transport disconnected");
             self.remap.reset_session();
             self.state = State::WaitingForAck;
-            self.release_capture_with(capture, false, None).await?;
+            self.release_capture_with(capture, ReleaseMode::Silent, None)
+                .await?;
         }
         Ok(())
     }
@@ -663,7 +659,8 @@ impl CaptureTask {
         capture: &mut InputCapture,
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
-        self.release_capture_with(capture, true, warp_to).await
+        self.release_capture_with(capture, ReleaseMode::NotifyPeer, warp_to)
+            .await
     }
 
     /// releases the capture, optionally warping the cursor to a
@@ -674,7 +671,7 @@ impl CaptureTask {
     async fn release_capture_with(
         &mut self,
         capture: &mut InputCapture,
-        notify_peer: bool,
+        mode: ReleaseMode,
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
         self.pending_modifiers = None;
@@ -702,15 +699,23 @@ impl CaptureTask {
                 .send(ICaptureEvent::ClientLeft(handle))
                 .expect("channel closed");
         }
-        // Restore the local pointer before any network cleanup. Key-ups, modifier
-        // reset and Leave share one deadline and stay pinned to the old transport.
-        let release = match warp_to {
-            Some(t) => capture.release_to(t).await,
-            None => capture.release().await,
+        // Normal release restores the pointer before peer cleanup. Fatal capture
+        // errors cancel the original transport first; neither path reconnects it.
+        let release = async {
+            match warp_to {
+                Some(t) => capture.release_to(t).await,
+                None => capture.release().await,
+            }
         };
-        self.complete_native_release(abort, cleanup.as_ref(), release)
-            .await?;
-        if let Some(cleanup) = cleanup.filter(|_| notify_peer) {
+        release_native_capture(
+            &self.conn,
+            abort,
+            cleanup.as_ref(),
+            mode == ReleaseMode::AbortPeer,
+            release,
+        )
+        .await?;
+        if let Some(cleanup) = cleanup.filter(|_| mode == ReleaseMode::NotifyPeer) {
             events.push(ProtoEvent::Input(Event::Keyboard(
                 KeyboardEvent::Modifiers {
                     depressed: 0,
@@ -729,22 +734,35 @@ impl CaptureTask {
         }
         Ok(())
     }
-    async fn complete_native_release(
-        &self,
-        active: Option<(CaptureHandle, u64)>,
-        cleanup: Option<&CleanupTarget>,
-        result: Result<(), CaptureError>,
-    ) -> Result<(), CaptureError> {
-        if let Err(error) = result {
-            if let Some(cleanup) = cleanup {
-                self.conn.abort_cleanup(cleanup);
-            } else if let Some((handle, revision)) = active {
-                self.conn.abort_capture_at_revision(handle, revision);
-            }
-            return Err(error);
+}
+
+async fn release_native_capture<F>(
+    conn: &LanMouseConnection,
+    active: Option<(CaptureHandle, u64)>,
+    cleanup: Option<&CleanupTarget>,
+    abort_before_release: bool,
+    release: F,
+) -> Result<(), CaptureError>
+where
+    F: std::future::Future<Output = Result<(), CaptureError>>,
+{
+    let abort = || {
+        if let Some((handle, revision)) = active {
+            conn.abort_capture(handle, revision, cleanup);
+        } else if let Some(cleanup) = cleanup {
+            conn.abort_cleanup(cleanup);
         }
-        Ok(())
+    };
+    if abort_before_release {
+        abort();
     }
+    let result = release.await;
+    // The original generation was already canceled on the fatal path. A late
+    // release error must not re-resolve the handle or close a replacement.
+    if result.is_err() && !abort_before_release {
+        abort();
+    }
+    result
 }
 
 async fn await_capture_termination<F>(
@@ -863,6 +881,95 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_release_cancels_original_before_wait_and_preserves_late_replacement() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for native_error in [false, true] {
+                    let clients = ClientManager::default();
+                    let handle = clients.add_client();
+                    clients.activate_client(handle);
+                    let other = clients.add_client();
+                    clients.activate_client(other);
+                    let token = clients.target_token(handle).unwrap();
+                    let other_token = clients.target_token(other).unwrap();
+                    let conn = LanMouseConnection::new(
+                        Certificate::generate_self_signed(vec![]).unwrap(),
+                        clients.clone(),
+                    );
+                    let sender = conn.sender();
+                    let old = Arc::new(RefusedConnection::default());
+                    let healthy = Arc::new(RefusedConnection::default());
+                    sender
+                        .install_test_connection(
+                            handle,
+                            "127.0.0.1:2".parse().unwrap(),
+                            old.clone(),
+                        )
+                        .await;
+                    sender
+                        .install_test_connection(
+                            other,
+                            "127.0.0.1:3".parse().unwrap(),
+                            healthy.clone(),
+                        )
+                        .await;
+                    let revision = conn.capture_revision(handle).unwrap();
+                    let cleanup = conn.prepare_cleanup(handle).unwrap();
+                    let (done, receiver) = tokio::sync::oneshot::channel();
+                    let started = Cell::new(false);
+                    let release = release_native_capture(
+                        &conn,
+                        Some((handle, revision)),
+                        Some(&cleanup),
+                        true,
+                        async {
+                            assert!(token.is_cancelled()); // cancellation precedes native future's first poll.
+                            assert!(clients.active_addr(handle).is_none());
+                            started.set(true);
+                            receiver.await.unwrap();
+                            if native_error {
+                                Err(CaptureError::Io(std::io::Error::other(
+                                    "native release failed",
+                                )))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    );
+                    tokio::pin!(release);
+                    tokio::select! {
+                        _ = &mut release => panic!("native release must still be pending"),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                    }
+                    assert!(started.get());
+                    assert!(token.is_cancelled());
+                    assert!(old.closed.load(std::sync::atomic::Ordering::SeqCst));
+                    assert!(!other_token.is_cancelled());
+                    assert!(!healthy.closed.load(std::sync::atomic::Ordering::SeqCst));
+                    let replacement = Arc::new(RefusedConnection::default());
+                    sender
+                        .install_test_connection(
+                            handle,
+                            "127.0.0.1:2".parse().unwrap(),
+                            replacement.clone(),
+                        )
+                        .await;
+                    let fresh = clients.target_token(handle).unwrap();
+                    done.send(()).unwrap();
+                    assert_eq!(release.await.is_err(), native_error);
+                    assert!(!fresh.is_cancelled());
+                    assert!(clients.active_addr(handle).is_some());
+                    assert!(!replacement.closed.load(std::sync::atomic::Ordering::SeqCst));
+                    assert!(old.sent.lock().unwrap().is_empty());
+                    sender.terminate().await;
+                }
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn pending_capture_cleanup_reports_progress_and_retains_owner_until_completion() {
@@ -1190,8 +1297,8 @@ mod tests {
             let active = task.active_client.take();
             let abort = active.and_then(|h| task.conn.capture_revision(h).map(|revision| (h, revision)));
             let cleanup = active.and_then(|h| task.conn.prepare_cleanup(h));
-            let result = tokio::time::timeout(Duration::from_millis(50), task.complete_native_release(abort, cleanup.as_ref(),
-                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "native release failed").into()))).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_millis(50), release_native_capture(&task.conn, abort, cleanup.as_ref(), false, std::future::ready(
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "native release failed").into())))).await.unwrap();
             assert!(matches!(result, Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
             assert!(task.active_client.is_none());
             assert!(old_token.is_cancelled());

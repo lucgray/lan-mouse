@@ -8,6 +8,12 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R77 | 已实现并通过释放错误决策回归 | active handle 已取走仍按原连接快照/配置代次取消；native 错误不发送旧 cleanup input，物理后端释放未验收 |
+| R78 | 已实现并通过替代连接回归 | 一般 capture error 使用原 snapshot，不按迟到当前句柄误断新连接；故障释放等待的取消顺序由 R82 补充 |
+| R79 | 已实现并通过 EOF 最终处理回归 | 意外 EOF 进入失败清理，清 active/modifiers/remap；shutdown EOF 不误报，真实 native receiver 关闭未验收 |
+| R80 | 已实现并通过通知/错误上下文回归 | 创建/运行/退出返回错误统一 CaptureFailed，双失败保留两原因；实际 GUI toast 待验 |
+| R81 | 异步 terminate 进度已实现 | 250ms 后报 pending、保留原 future/owner；隔离 Service 转发通过；同步阻塞和服务 shutdown 的反馈未闭环 |
+| R82 | 故障取消顺序已实现并通过受控等待回归 | AbortPeer 在 native release 首次 poll 前请求取消旧 snapshot；健康/迟到替代连接保留；锁竞争及物理释放边界见第 61 轮 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -53,7 +59,7 @@
 | R57 | 已实现并通过慢后端/实际 tracked-input 回归 | 入队起本地 50ms 期限覆盖排队/create/delivery；到期取消会话、一次错误反馈、即时 bounded 清理；旧输入不重播，活动操作可取消；同步原生与完整端到端时延仍待验 |
 | R58 | 已实现并通过身份/真实 DTLS Enter 回归 | Enter 复用握手验证时存下的指纹，核对 Weak/实际 Arc 与 token；不在 dispatcher 重读 DTLS 状态或 rehash，也无错误 downcast expect |
 | R59 | 已实现并通过代理故障/实际 tracked-input 回归 | lease 携带连接独立 opaque 身份，native handle 弱引用记录所属会话；替换先重试旧 cleanup，失败只拒绝新 reader 并保留旧 backend/ledger，其他 peer 可提交；成功后分配新 handle，同会话重试仍复用 |
-| R60 | 待修复 / 条件性源码路径及底层测试证据 | 普通致命 backend 错误/最终退出会 terminate 后 drop InputEmulation；terminate 返回 unit 且失败时仍有 tracked input，旧 ledger 在实例丢弃时失去重试能力；R59 替换拒绝现已避免这条 fatal/drop 路径 |
+| R60 | 部分修复，原生故障恢复仍待验收 | 当前 emulation 有 terminate_bounded 完成状态及 CleanupState owner，后续轮次保留失败清理状态；原始 unit/drop 描述只代表早期基线。同步 native 阻塞、最终物理释放和全服务退出恢复仍未证明 |
 | R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；普通 Input/Enter 帧现有全局 256 / 每会话 64 贯穿额度，超额等待受 50ms freshness 剩余时间约束，过期关闭并清理；协议控制/剪贴板接收/生命周期及其他事件链仍未全部有界，旧输入年龄见 R57，完整风暴资源及界面验收仍待验 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
 | R14 | 已实现并通过故障注入 | 临时文件原子替换；写入失败保留旧文件；失败后恢复监听，并支持 rename 型外部更新；符号链接和权限测试通过；保存失败在界面显示提示 |
@@ -1489,3 +1495,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务连接/任务上限、其他 backend 会话隔离、真机千次往返、完整 p95/p99 与 8h RSS 仍未验收，不认定达到 90 分。
 
 日志：capture-pending-notice-baseline.log、capture-pending-notice-library.log、capture-pending-notice-workspace.log、capture-pending-notice-clippy.log、capture-pending-notice-service.log。
+
+
+## 第六十一轮：捕获故障先取消原目标，再等待原生释放
+
+### R82 / P1
+
+- 基线将实际 native release 等待/结果处理提取为 release_native_capture，oneshot 控制释放 future。按原 fatal 顺序，50ms pending 期间目标 token、active address 和旧传输均有效；释放返回后才执行 abort。日志 capture-fatal-release-baseline.log。这是生产阶段控制，不是实际 native release hang 或网络输入持续发送的实测。
+- [x] 私有 ReleaseMode 区分 NotifyPeer、Silent、AbortPeer。仅已确认 fatal capture error 的最终处理选择 AbortPeer；它先保存原 transport/revision、清本机会话状态并发 ClientLeft，再请求原目标取消，随后 poll native release。正常鼠标返回仍先 native release，再向旧快照发有界 cleanup。发送错误/断线释放保持 Silent。
+- [x] 取消动作使用已有 Arc identity/revision fence，不等待 close；fatal 释放迟到报错时不再重复取消或重新查找当前连接，因此释放期间的替代连接保持可用。保留同一 native release future，未引入丢弃/超时完成或后台重建。
+
+### 验证与剩余边界
+
+- 新回归在 native future 的第一次 poll 内确认原 token 已取消、active address 已移除；50ms pending 时旧受控 transport 已关闭、健康设备未受影响。等待期间安装新连接，随后让 native 成功/失败，两种结果都保留新 token/连接；无 stale cleanup input。已有 native 释放错误、快照替代、正常释放与迟到输入回归继续通过。
+- 全工作区 all-features 通过：root 146 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。未修改公共 API 或 wire encoding。eda5dbf Rust 37213897318 / Nix 37213897335 检查时 in_progress，新 HEAD 需对应 CI。
+- 连接表可用时取消在 native 首次 poll 前生效；表锁竞争时既有 abort 路径等待锁并复核身份/代次，所以不能保证这种场景立即完成。同步 native 阻塞 executor 也可能阻止已经调度的 transport close 运行；本轮未证明远端物理按键释放或本机 cursor 恢复。
+- [ ] 原生 release 本身挂起仍没有这一阶段的 pending 反馈，terminate 的 250ms 通知要等 release 返回才开始。下一轮应在不重复通知/不取消 owner 的前提下覆盖 release 等待；这是反馈范围缺口，不把已排入连接关闭说成所有清理已完成。
+- [ ] R13 全服务连接/任务资源上限、R60 原生阻塞/故障恢复、真机千次往返、完整延迟和 8h RSS 未完成，不认定达到 90 分。
+
+日志：capture-fatal-release-baseline.log、capture-fatal-release-library.log、capture-fatal-release-workspace.log、capture-fatal-release-clippy.log。

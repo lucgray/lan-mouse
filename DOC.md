@@ -875,3 +875,22 @@ events while awaiting termination. Native release waits before termination are
 not covered here. The isolated Service fixture verifies status/message forwarding
 with Dummy backends, not GTK rendering or physical backend recovery. Wire encoding
 and public APIs are unchanged.
+
+
+### Fatal capture release ordering
+
+On a confirmed fatal capture-session error, the private AbortPeer release mode
+requests cancellation of the saved transport/configuration generation before
+polling native release. It clears local session state and sends ClientLeft, but
+sends no stale cleanup input to the peer. A late native release error does not
+repeat cancellation or resolve the handle to a replacement connection.
+
+Normal release still restores the pointer before sending the bounded cleanup
+batch. Send failure/disconnect paths keep their existing silent release behavior.
+The same native release future is awaited; this ordering does not make native
+release cancelable or prove physical key/pointer recovery. With a contended
+connection table, cancellation waits for its lock and repeats identity checks.
+A synchronous native call may prevent scheduled transport close from running.
+Release-phase pending feedback remains separate from the termination timer.
+Controlled native futures/transports verify this order; public APIs and wire
+encoding are unchanged.
