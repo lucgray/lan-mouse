@@ -1368,3 +1368,25 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 尚不认定达到 90 分。
 
 日志：x11-startup-baseline.log、x11-startup-library.log、x11-startup-workspace.log、x11-startup-clippy.log、x11-startup-{x11,none}-clippy.log。
+
+
+## 第五十五轮：释放与再捕获之间的三层事件缓存
+
+### R74 / P1
+
+- 基线实际 dispatcher/handoff：Ctrl 按下入队后 do_release，旧按下仍可从 HookReceiver 读取。另用保留的模拟 native backlog 在新 Right grab 后调用实际 handle_event，旧 Ctrl 被转发到 Right。该 native backlog 是模型，不是对真实 X server 队列注入；日志 x11-session-queue-baseline.log。
+- 公共 wrapper 基线：release 后仍返回 cached Ctrl press，但 pressed_keys 已清空、缓存投递路径不重新登记该键；存在转发按下却不在 cleanup ledger 的路径。日志 capture-fanout-release-baseline.log。最初误以为缓存投递会重新登记，实际 poll_next 检查纠正：pending 分支直接返回，基线按此真实行为验证。
+- [x] X11 do_release 清空已进入异步 handoff 的旧事件；保留 failed/closed 标志，不把 discard 当作队列故障恢复。原饱和错误优先级回归仍通过。
+- [x] 每次新抓取前在 worker 执行 XSync(display, True)，先处理旧 ungrab/return 请求并丢弃旧原生事件，再开始 pointer/keyboard acquisition。这个时点不丢掉新 grab 后的输入；已 active 不重复 grab。同步后复核 stopping / queue availability，取消时不继续获取。
+- [x] 公共 release/release_to 在等待 backend 之前清除 fanout 缓存；成功后才清 pressed_keys，失败或等待取消时保留已有 tracking 供清理。此处公共缓存修复适用于全部 backend，X11 native/handoff 清理限于 X11。
+
+### 回归与限制
+
+- 新抓取准备 callback 在 pointer callback 之前清空模型 native backlog；新的 Ctrl 仍发到 Right。另测 prepare 中 stop 不执行任何 grab；公共 release / release_to 的成功/失败四种组合均清旧缓存，失败保留已跟踪 Ctrl，后续 poll 不重放旧按下。
+- 全工作区 all-features 通过：capture 58 / 1 忽略、emulation 40、root 136 / 2 忽略、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、capture X11-only / 无默认功能 Clippy、fmt/diff 通过。
+- [X.Org XSync 文档](https://xorg.freedesktop.org/archive/X11R7.5/doc/man/man3/XSync.3.html) 规定 True 丢弃当前队列，且同步等待此前请求被处理。新增同步仅在会话开始，仍增加一次服务器等待；没有对实际 X server 的 p95/p99、协议错误 handler 或永久阻塞做验收。之前的 stop/deadline/lease 防护继续保留，不把 callback 模型当成物理清队列成功。
+- 第 54 轮 fc63aed Rust 37209967412 / Nix 37209967403 检查时均 queued；本轮 HEAD 需自己的 CI。
+- [ ] R77 / P1：root release_capture_with 在 native release 前 take active_client、take_pressed_keys、reset remap。若 native release 返回 Err，? 提前退出，已准备的 cleanup events 未发送；上层 do_capture 捕获错误时 active_client 已 None，可能漏掉目标 abort_capture。下一轮必须用释放失败注入核对旧连接是否取消，不能依靠正常 cleanup 回归。
+- [ ] 其他 backend 的 native/handoff 普通会话隔离需继续核对；R13 全服务资源上限、Xlib 并发初始化前提、R60 原生故障/退出、真机千次往返、完整延迟与 8h RSS 未完成，尚不认定达到 90 分。
+
+日志：x11-session-queue-baseline.log、capture-fanout-release-baseline.log、x11-session-queue-library.log、x11-session-queue-workspace.log、x11-session-queue-clippy.log、x11-session-queue-{x11,none}-clippy.log。

@@ -733,7 +733,8 @@ A closed request receiver returns BrokenPipe. Success now waits for the capture
 thread to process the request and for its synchronous calls to return. This is
 not acknowledgement of X server effects or verification of Xlib success. Tests
 cover request processing and callback/state behavior, not physical pointer return.
-Old native events across ordinary release/reentry remain a separate recovery gap.
+X11 now fences its native queue before a new grab; the implementation and
+remaining physical validation requirements are described below.
 
 
 ### X11 control and shutdown bounds
@@ -773,3 +774,23 @@ OpenDisplayFailed remains the native open failure. A timeout cannot interrupt
 Xlib opening/closing or prove physical cleanup. Startup regressions use controlled
 initializers and real worker threads, not a stalled physical X server. Wire
 encoding/protocol version are unchanged.
+
+
+### Release/reentry input isolation
+
+Public InputCapture release/release_to discard already expanded fanout before
+awaiting the backend. They clear tracked keys only on successful release; errors
+or cancellation retain that ledger for cleanup. X11 release also discards pending
+handoff input without clearing an overload latch.
+
+Before each new X11 grab, the worker calls XSync(display, True) to process prior
+requests and discard their events, then acquires pointer/keyboard. It skips
+preparation when already active and checks stop again before acquisition. Fresh
+input after that boundary remains deliverable. This follows the
+[X.Org XSync contract](https://xorg.freedesktop.org/archive/X11R7.5/doc/man/man3/XSync.3.html).
+
+The boundary adds a native server wait per capture start, not per motion event.
+Its real latency and X server failure behavior remain unverified. Callback tests
+exercise state/ordering and a modeled native backlog; they do not establish
+physical native queue cleanup. Other backends' ordinary native/handoff session
+isolation remains separate work. Wire encoding and protocol version do not change.

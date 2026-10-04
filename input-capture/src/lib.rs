@@ -240,8 +240,12 @@ impl InputCapture {
 
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
-        self.pressed_keys.clear();
-        self.capture.release().await
+        self.pending.clear();
+        let result = self.capture.release().await;
+        if result.is_ok() {
+            self.pressed_keys.clear();
+        }
+        result
     }
 
     /// release mouse, first warping the cursor to the normalized
@@ -249,8 +253,12 @@ impl InputCapture {
     /// currently captured at — so a peer that detected its own local
     /// crossing back can hand the cursor back at the matching spot.
     pub async fn release_to(&mut self, t: f64) -> Result<(), CaptureError> {
-        self.pressed_keys.clear();
-        self.capture.release_to(t).await
+        self.pending.clear();
+        let result = self.capture.release_to(t).await;
+        if result.is_ok() {
+            self.pressed_keys.clear();
+        }
+        result
     }
 
     /// Drain and return every key the capture has forwarded as
@@ -528,6 +536,7 @@ mod tests {
     struct QueuedCapture {
         events: VecDeque<(Position, CaptureEvent, bool)>,
         last_event_requires_enter_only: bool,
+        fail_release: bool,
     }
 
     impl Stream for QueuedCapture {
@@ -567,15 +576,61 @@ mod tests {
         }
 
         async fn release(&mut self) -> Result<(), CaptureError> {
+            if self.fail_release {
+                return Err(std::io::Error::other("simulated release failure").into());
+            }
             Ok(())
         }
 
         async fn release_to(&mut self, _t: f64) -> Result<(), CaptureError> {
-            Ok(())
+            self.release().await
         }
 
         async fn terminate(&mut self) -> Result<(), CaptureError> {
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn release_discards_cached_fanout_and_retains_tracking_on_failure() {
+        use input_event::{Event, KeyboardEvent, scancode::Linux};
+        for fail_release in [false, true] {
+            for with_position in [false, true] {
+                let backend = QueuedCapture {
+                    events: Default::default(),
+                    last_event_requires_enter_only: false,
+                    fail_release,
+                };
+                let mut capture = InputCapture {
+                    capture: Box::new(backend),
+                    enter_only_handles: Default::default(),
+                    enter_only_positions: Default::default(),
+                    id_map: Default::default(),
+                    position_map: Default::default(),
+                    pressed_keys: HashSet::from([Linux::KeyLeftCtrl]),
+                    pending: VecDeque::from([(
+                        7,
+                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                            time: 0,
+                            key: 29,
+                            state: 1,
+                        })),
+                    )]),
+                };
+                let result = if with_position {
+                    capture.release_to(0.75).await
+                } else {
+                    capture.release().await
+                };
+                assert_eq!(result.is_err(), fail_release);
+                assert!(capture.pending.is_empty());
+                assert_eq!(capture.keys_pressed(&[Linux::KeyLeftCtrl]), fail_release);
+                assert!(
+                    Pin::new(&mut capture)
+                        .poll_next(&mut Context::from_waker(noop_waker_ref()))
+                        .is_pending()
+                );
+            }
         }
     }
 
@@ -605,6 +660,7 @@ mod tests {
                 (Position::Left, CaptureEvent::Begin(0.5), false),
             ]),
             last_event_requires_enter_only: false,
+            fail_release: false,
         };
         let mut capture = InputCapture {
             capture: Box::new(backend),

@@ -65,6 +65,12 @@ impl HookSender {
         !self.0.failed.load(Ordering::Acquire) && !self.0.closed.load(Ordering::Acquire)
     }
 
+    #[cfg(x11)]
+    pub(crate) fn discard_pending(&self) {
+        self.0.events.lock().unwrap().clear();
+        // An overload latch survives release: discarding input is not recovery.
+    }
+
     /// Never waits for consumer capacity. The mutex protects only a bounded
     /// push/pop or tail merge, with no I/O, callback, or await under the lock.
     pub(crate) fn send(&self, pos: Position, event: CaptureEvent) -> Result<(), ()> {

@@ -16,10 +16,10 @@ use futures_core::Stream;
 use x11::xlib::{
     ButtonMotionMask, ButtonPress, ButtonPressMask, ButtonRelease, ButtonReleaseMask, CurrentTime,
     Display, False, GrabModeAsync, GrabSuccess, KeyPress, KeyRelease, MotionNotify,
-    PointerMotionMask, Window, XButtonEvent, XCloseDisplay, XDefaultRootWindow, XDefaultScreen,
-    XDisplayHeight, XDisplayWidth, XEvent, XFlush, XGrabKeyboard, XGrabPointer, XKeyEvent,
-    XMotionEvent, XNextEvent, XPending, XQueryPointer, XUngrabKeyboard, XUngrabPointer,
-    XWarpPointer,
+    PointerMotionMask, True, Window, XButtonEvent, XCloseDisplay, XDefaultRootWindow,
+    XDefaultScreen, XDisplayHeight, XDisplayWidth, XEvent, XFlush, XGrabKeyboard, XGrabPointer,
+    XKeyEvent, XMotionEvent, XNextEvent, XPending, XQueryPointer, XSync, XUngrabKeyboard,
+    XUngrabPointer, XWarpPointer,
 };
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
@@ -95,6 +95,8 @@ fn initialize_native(config: WorkerConfig) -> Result<X11State, X11InputCaptureCr
         release_calls: 0,
         #[cfg(test)]
         warp_calls: 0,
+        #[cfg(test)]
+        pending_native: Default::default(),
         request_rx: config.request_rx,
         stopping: config.stopping,
         _worker_lease: Some(config.lease),
@@ -119,6 +121,8 @@ struct X11State {
     release_calls: usize,
     #[cfg(test)]
     warp_calls: usize,
+    #[cfg(test)]
+    pending_native: std::collections::VecDeque<XEvent>,
     request_rx: mpsc::Receiver<ControlRequest>,
     stopping: Arc<AtomicBool>,
     _worker_lease: Option<WorkerLease>,
@@ -435,16 +439,26 @@ fn query_pointer(state: &X11State) -> (i32, i32) {
 }
 
 struct GrabOps {
+    prepare: fn(&mut X11State),
     pointer: fn(&mut X11State) -> i32,
     keyboard: fn(&mut X11State) -> i32,
     warp: fn(&mut X11State, (i32, i32)),
 }
 
 const NATIVE_GRAB_OPS: GrabOps = GrabOps {
+    prepare: discard_native_events,
     pointer: grab_native_pointer,
     keyboard: grab_native_keyboard,
     warp: warp_native_pointer,
 };
+
+fn discard_native_events(state: &mut X11State) {
+    // Process prior ungrab/return requests and discard their buffered events
+    // before acquiring a new capture, not after new input can be captured.
+    unsafe {
+        XSync(state.display, True);
+    }
+}
 
 fn grab_native_pointer(state: &mut X11State) -> i32 {
     let grab_mask =
@@ -489,6 +503,13 @@ fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
 }
 
 fn do_grab_with(state: &mut X11State, pos: Position, entry: (i32, i32), ops: &GrabOps) {
+    if state.active_client.is_some()
+        || state.stopping.load(Ordering::Acquire)
+        || !state.event_tx.available()
+    {
+        return;
+    }
+    (ops.prepare)(state);
     if state.stopping.load(Ordering::Acquire) || !state.event_tx.available() {
         return;
     }
@@ -543,6 +564,7 @@ fn release_native_grabs(state: &mut X11State) {
 fn do_release(state: &mut X11State) {
     (state.release_grabs)(state);
     log::debug!("x11: released pointer (was {:?})", state.active_client);
+    state.event_tx.discard_pending();
     state.active_client = None;
 }
 
@@ -747,6 +769,7 @@ mod tests {
                 warp_pointer: |state, _| state.warp_calls += 1,
                 release_calls: 0,
                 warp_calls: 0,
+                pending_native: Default::default(),
                 request_rx,
                 stopping: Arc::new(AtomicBool::new(false)),
                 _worker_lease: None,
@@ -772,6 +795,59 @@ mod tests {
             Poll::Pending | Poll::Ready(None) => None,
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn release_discards_handoff_and_new_grab_fences_old_native_events() {
+        let (mut state, mut events) = button_fixture();
+        let key = || XEvent {
+            key: XKeyEvent {
+                type_: KeyPress,
+                keycode: 37,
+                ..unsafe { std::mem::zeroed() }
+            },
+        };
+        handle_event(&mut state, key());
+        state.pending_native.push_back(key());
+        do_release(&mut state);
+        assert!(ready_event(&mut events).is_none());
+        let ops = GrabOps {
+            prepare: |state| state.pending_native.clear(),
+            pointer: |state| {
+                assert!(state.pending_native.is_empty());
+                GrabSuccess
+            },
+            keyboard: |_| GrabSuccess,
+            warp: |_, _| {},
+        };
+        do_grab_with(&mut state, Position::Right, (99, 25), &ops);
+        assert!(state.pending_native.is_empty());
+        assert!(matches!(
+            ready_event(&mut events),
+            Some((Position::Right, CaptureEvent::Begin(_)))
+        ));
+        // Fresh input after the fence remains deliverable to the new session.
+        handle_event(&mut state, key());
+        assert!(matches!(
+            ready_event(&mut events),
+            Some((Position::Right, CaptureEvent::Input(Event::Keyboard(_))))
+        ));
+    }
+
+    #[test]
+    fn stopping_during_native_fence_never_attempts_a_new_grab() {
+        let (mut state, mut events) = button_fixture();
+        state.active_client = None;
+        let ops = GrabOps {
+            prepare: |state| state.stopping.store(true, Ordering::Release),
+            pointer: |_| panic!("must not grab after stopped fence"),
+            keyboard: |_| panic!("must not grab after stopped fence"),
+            warp: |_, _| panic!("must not warp after stopped fence"),
+        };
+        do_grab_with(&mut state, Position::Right, (99, 25), &ops);
+        assert_eq!(state.active_client, None);
+        assert_eq!(state.release_calls, 0);
+        assert!(ready_event(&mut events).is_none());
     }
 
     fn initialize_mock(config: WorkerConfig) -> Result<X11State, X11InputCaptureCreationError> {
@@ -1053,6 +1129,7 @@ mod tests {
         let (mut state, mut events) = button_fixture();
         state.active_client = None;
         let ops = GrabOps {
+            prepare: |_| {},
             pointer: |state| {
                 state.stopping.store(true, Ordering::Release);
                 GrabSuccess
@@ -1175,6 +1252,7 @@ mod tests {
             state.active_client = None;
             state.entry_point = (10, 20);
             let ops = GrabOps {
+                prepare: |_| {},
                 pointer: |_| GrabSuccess,
                 keyboard,
                 warp: |state, _| state.warp_calls += 1,
@@ -1206,6 +1284,7 @@ mod tests {
         let (mut state, mut events) = button_fixture();
         state.active_client = None;
         let ops = GrabOps {
+            prepare: |_| {},
             pointer: |_| x11::xlib::AlreadyGrabbed,
             keyboard: |_| panic!("must not attempt keyboard after pointer refusal"),
             warp: |_, _| panic!("must not warp after pointer refusal"),
@@ -1227,6 +1306,7 @@ mod tests {
                 .unwrap();
         }
         let ops = GrabOps {
+            prepare: |_| {},
             pointer: |_| GrabSuccess,
             keyboard: |_| GrabSuccess,
             warp: |state, _| state.warp_calls += 1,
