@@ -20,6 +20,8 @@
 | R52 | 已实现并通过生产捕获会话回归 | 空 release_bind 不再被 all(empty) 误当按下；夹具确实发送 Enter，不进入错误的释放清理路径 |
 | R47 | 新授权入口已实现并通过 GTK / CLI / Service / DTLS 回归 | 共享 SHA-256 解析，大小写/64 连续 hex 规范化到 95 字符；坏输入保留草稿并提示、不写授权/配置；原文件加载路径见 R53 |
 | R53 | 已实现并通过模型/真实 Service-DTLS 回归 | 启动/重载以校验后标准指纹建立信任；坏项排除并汇总提示；别名描述选择确定；普通保存保留原表，明确添加整理该摘要，撤销清全部别名 |
+| R55 | 已实现并通过代理异步阻塞回归 | create/consume/warp 每次 500ms 期限，超时走有界终止并禁用/报告原因；部分 create 保留映射；同步原生调用不能被 Tokio 期限抢占 |
+| R56 | 已实现并通过重建退出回归 | create_clients 区分完成与已消费 Terminate；后者清理后直接返回，不再进入等不到退出消息的输入循环 |
 | R54 | 已实现并通过会话/队列/真实 Service-DTLS 回归 | 撤销同步移除入站连接、取消会话 token；空闲 reader 唤醒清理，旧输入/warp/通知/剪贴板过滤，返回边缘销毁；重新授权只允许新握手；已开始原生调用及真机释放仍待验 |
 | R37 | 已实现并通过真实分发及原生 CI | 4 活跃、128 全局待发、每 peer 32 待发；入队起一秒期限；FIFO 不合并，失败只移除当前 Arc 并通知释放；902f544 原生 Rust 矩阵已通过，完整真机时延仍待验 |
 | R40 | 已实现并通过监控队列回归 | 本地队列携带监控/写入代次，消费时过滤旧事件/禁用/远端写入；切换重新采样；失败保持缓存并标记新代次刷新，旧采样不能清除；阻塞发送前释放锁 |
@@ -46,7 +48,7 @@
 | R12 | 已实现 | 格式化移入 trace 宏；分配/CPU 基准待测 |
 | R15 | 已实现 | info 日志仅输出 kind 与字节数；诊断日志实测待验 |
 | R16、R17 | 已实现并通过回归 | 三字节 duplex 短写保序；停止读取的 writer 不阻塞正常 writer，超时断开 |
-| R23 | 已实现 | destroy_bounded 成功才删除代理映射；代理层超时调度测试待补 |
+| R23 | 已实现并通过代理请求循环故障注入 | 首次 Remove 超时保留地址/handle，再次 Input 复用同一 handle，第二次 Remove 清理；底层真实 tracked-input 释放测试已覆盖，原生故障重试待验 |
 | R07 | 已实现并通过真实 DTLS / Service 回归 | 单份最多 64 KiB 最新有效值；就绪补发、忙队列重试、双路同身份去重、来源排除、远端完成顺序和禁用清空；真实系统剪贴板/跨平台验收仍待验 |
 | R13 | 部分实现 | 控制消息发送失败/缺连接有日志，控制及入站剪贴板发送等待前释放连接表借用；入站剪贴板发送结果已回传服务，短发送按失败处理；入站发送已独立、有界并可取消，结果只保留元数据；出站有界网络任务已实现；控制回复已改独立有界任务，短发送/超时清理当前会话；剪贴板来源/会话去重及重连补发已实现；一般输入/控制事件通道仍无界，完整风暴资源及界面验收仍待验 |
 | R01 | 独立 PR 已合并并同步 | https://github.com/lucgray/lan-mouse/pull/5；本分支已同步 PR #4/#5，额外增加了只允许 Input/Ping 恢复的保护及状态回归，避免晚到 Leave/Hello/Ack 重注册；部署及真机通过仍待验证 |
@@ -64,7 +66,7 @@
 
 ## 结论与 90 分标准
 
-目前不能认定达到 90 分：存在丢失按键释放、返回路径不恢复、图片单向失效等核心问题。下面是审查清单，不是已完成修复清单。没有实际 CPU、延迟、跨平台长时间测试，因此不编造当前综合分。
+目前不能认定达到 90 分：原始审查发现的按键释放、返回路径和图片单向问题已按表内范围修复，但一般队列拥塞、原生后端阻塞、真机往返及长期资源验收仍未闭环。下方原始清单保留当时问题证据；源码实现和完整验收分开记录。没有完整实测依据，不编造当前综合分。
 
 建议采用以下验收评分；未验证项不计“通过”。90 分还必须满足所有 P1 问题关闭，不能用界面优化抵消失控风险。
 
@@ -954,3 +956,30 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - 上一 HEAD 8011d3b Rust run 37191759059 已成功；新提交还需自己的跨平台 CI。一般事件队列无界（R13）、原生代理阻塞/超时调度（R23）、实际鼠标往返、完整 p95/p99 与八小时 RSS 均未闭环，整体 90 分仍未确认。
 
 日志：session-revocation-workspace.log、session-revocation-clippy.log、session-revocation-service.log、session-revocation-clipboard-service.log。
+
+## 第三十九轮：输入代理阻塞与重建时退出
+
+### R55 / P1：普通后端操作使清理消息无法执行
+
+- 源码证据：EmulationTask 的 Input/Warp 分支直接 await handle_for/create、consume、warp；Remove/Terminate 同属该串行循环，无法在等待未结束时执行。底层 destroy_bounded 的期限无法约束尚未进入清理的普通操作。
+- [x] 创建 handle、输入 delivery、warp 单次异步等待均有 500ms 期限，超时以 TimedOut 输入错误结束会话，走现有 bounded terminate；EmulationDisabled 之外向前端提供失败原因。未知是否已执行的事件不自动重播。
+- [x] handle 地址映射先登记后创建，部分成功/取消仍可被清理；已有底层 tracked-input 对未知按下/释放的保留不改变。用户桌面权限初始化不套用这条 500ms 期限。
+- [x] 抽取 worker 内部 ProxyBackend 接口，生产仍用 InputEmulation；三个故障注入分别让 create/consume/warp 永久 Pending，实际请求循环均在期限内返回具体 TimedOut，保留同一个部分 handle，后续 Terminate 未被吞掉。
+- [ ] 同步原生 API 卡住整个 runtime 线程不受 Tokio timeout 抢占；此轮仅关闭异步等待路径，不能宣称所有 OS 调用已有硬上限。各平台实测和阻塞隔离仍是 90 分门槛。
+
+### R23 代理层验证补齐
+
+- [x] 首次 Remove 的模拟 bounded destroy 超时返回 false；随后 Input 不创建新 handle，复用旧 handle；第二次 Remove 成功清理按住状态和代理表，Terminate 仍能完成。此测试覆盖生产请求循环的重试调度，不等同于 Windows 原生挂起实测。
+
+### R56 / P1：重建 handle 时消费退出消息后继续等消息
+
+- 源码证据：create_clients 的 wait_for_termination 分支原返回 Ok(())，调用者随后进入 do_emulation_session；退出消息已消费，后续不再收到该消息时可永久等待。
+- [x] create_clients 返回“完成/已退出”两个成功结果，已退出时清理 backend 并直接返回。永远 Pending 的 create 搭配排队 Terminate 回归验证不会以初始化成功返回、不会遗留未消费退出消息。
+
+### 本轮验证
+
+- Linux 工作区 all-features 通过：主包 122 / 2 默认忽略，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略；严格 all-targets Clippy、格式与 diff 检查通过。
+- 隔离真实 Service-DTLS 授权/活跃撤销回归、双向剪贴板重播/来源/禁用/重连回归均另行通过。
+- 上一提交 230eca4 已推送 PR #6，其 Rust CI 正在运行，新 HEAD 将触发自己的检查。仍有 R13 无界一般事件链、同步原生阻塞和完整真机延迟/八小时资源要求，目标保持未完成。
+
+日志：proxy-operation-workspace.log、proxy-operation-clippy.log、proxy-operation-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、proxy-operation-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

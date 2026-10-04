@@ -530,6 +530,11 @@ impl Service {
                 Err(e) => self
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
+            EmulationEvent::BackendFailed(error) => {
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Input emulation failed: {error}"
+                )));
+            }
             EmulationEvent::EmulationDisabled => {
                 self.emulation_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));

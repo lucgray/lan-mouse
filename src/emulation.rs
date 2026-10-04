@@ -66,6 +66,8 @@ pub(crate) enum EmulationEvent {
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
     EmulationDisabled,
+    /// backend operation failed; surfaced separately from the disabled status
+    BackendFailed(String),
     /// emulation was enabled
     EmulationEnabled,
     /// capture should be released
@@ -540,6 +542,7 @@ impl EmulationProxy {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            operation_timeout: Duration::from_millis(500),
             input_config,
         };
         let task = spawn_local(emulation_task.run());
@@ -617,6 +620,56 @@ impl EmulationProxy {
     }
 }
 
+// Generic only at the internal worker boundary, allowing backend stalls to be
+// exercised through the same request loop without a native display server.
+trait ProxyBackend {
+    async fn create(&mut self, handle: EmulationHandle);
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), input_emulation::EmulationError>;
+    async fn warp(&mut self, handle: EmulationHandle, pos: input_emulation::Position, t: f64);
+    async fn destroy_bounded(&mut self, handle: EmulationHandle) -> bool;
+    fn update_config(&mut self, config: InputConfig);
+}
+
+impl ProxyBackend for InputEmulation {
+    async fn create(&mut self, handle: EmulationHandle) {
+        InputEmulation::create(self, handle).await;
+    }
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), input_emulation::EmulationError> {
+        InputEmulation::consume(self, event, handle).await
+    }
+    async fn warp(&mut self, handle: EmulationHandle, pos: input_emulation::Position, t: f64) {
+        InputEmulation::warp(self, handle, pos, t).await;
+    }
+    async fn destroy_bounded(&mut self, handle: EmulationHandle) -> bool {
+        InputEmulation::destroy_bounded(self, handle).await
+    }
+    fn update_config(&mut self, config: InputConfig) {
+        InputEmulation::update_config(self, config);
+    }
+}
+
+async fn backend_operation<T>(
+    timeout: Duration,
+    operation: &'static str,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, InputEmulationError> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        input_emulation::EmulationError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("input emulation {operation} exceeded its deadline"),
+        ))
+        .into()
+    })
+}
+
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
     options: EmulationOptions,
@@ -625,6 +678,7 @@ struct EmulationTask {
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
     next_id: EmulationHandle,
+    operation_timeout: Duration,
     input_config: InputConfig,
 }
 
@@ -633,6 +687,9 @@ impl EmulationTask {
         loop {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
+                self.event_tx
+                    .send(EmulationEvent::BackendFailed(e.to_string()))
+                    .expect("channel closed");
             }
             if self.exit_requested.get() {
                 break;
@@ -669,9 +726,16 @@ impl EmulationTask {
         );
 
         // create active handles
-        if let Err(e) = self.create_clients(&mut emulation).await {
-            emulation.terminate().await;
-            return Err(e);
+        match self.create_clients(&mut emulation).await {
+            Ok(true) => {}
+            Ok(false) => {
+                emulation.terminate().await;
+                return Ok(());
+            }
+            Err(e) => {
+                emulation.terminate().await;
+                return Err(e);
+            }
         }
 
         let res = self.do_emulation_session(&mut emulation).await;
@@ -682,35 +746,35 @@ impl EmulationTask {
 
     async fn create_clients(
         &mut self,
-        emulation: &mut InputEmulation,
-    ) -> Result<(), InputEmulationError> {
+        emulation: &mut impl ProxyBackend,
+    ) -> Result<bool, InputEmulationError> {
         for handle in self.handles.values() {
             tokio::select! {
-                _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                result = backend_operation(self.operation_timeout, "create", emulation.create(*handle)) => { result?; },
+                _ = wait_for_termination(&mut self.request_rx) => return Ok(false),
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn do_emulation_session(
         &mut self,
-        emulation: &mut InputEmulation,
+        emulation: &mut impl ProxyBackend,
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr, session) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
-                        let handle = self.handle_for(emulation, addr).await;
+                        let handle = self.handle_for(emulation, addr).await?;
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
-                        emulation.consume(event, handle).await?;
+                        backend_operation(self.operation_timeout, "consume", emulation.consume(event, handle)).await??;
                     },
                     ProxyRequest::Warp(addr, pos, t, session) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
-                        let handle = self.handle_for(emulation, addr).await;
+                        let handle = self.handle_for(emulation, addr).await?;
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
-                        emulation.warp(handle, pos, t).await;
+                        backend_operation(self.operation_timeout, "warp", emulation.warp(handle, pos, t)).await?;
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(&handle) = self.handles.get(&addr) {
@@ -733,17 +797,19 @@ impl EmulationTask {
     /// the emulation handle for `addr`, creating one on first use
     async fn handle_for(
         &mut self,
-        emulation: &mut InputEmulation,
+        emulation: &mut impl ProxyBackend,
         addr: SocketAddr,
-    ) -> EmulationHandle {
+    ) -> Result<EmulationHandle, InputEmulationError> {
         if let Some(&handle) = self.handles.get(&addr) {
-            return handle;
+            return Ok(handle);
         }
         let handle = self.next_id;
         self.next_id += 1;
-        emulation.create(handle).await;
+        // Retain the mapping if create partially succeeds before timing out.
+        // Session termination must still be able to release/destroy this handle.
         self.handles.insert(addr, handle);
-        handle
+        backend_operation(self.operation_timeout, "create", emulation.create(handle)).await?;
+        Ok(handle)
     }
 }
 
@@ -803,6 +869,177 @@ impl<T> Drop for DropGuard<T> {
 mod resume_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct StallingBackend {
+        stall: Option<&'static str>,
+        creates: Vec<EmulationHandle>,
+        consumed: Vec<EmulationHandle>,
+        removes: usize,
+        held: bool,
+    }
+
+    impl ProxyBackend for StallingBackend {
+        async fn create(&mut self, handle: EmulationHandle) {
+            self.creates.push(handle);
+            if self.stall == Some("create") {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn consume(
+            &mut self,
+            _: Event,
+            handle: EmulationHandle,
+        ) -> Result<(), input_emulation::EmulationError> {
+            self.consumed.push(handle);
+            self.held = true;
+            if self.stall == Some("consume") {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn warp(&mut self, _: EmulationHandle, _: input_emulation::Position, _: f64) {
+            if self.stall == Some("warp") {
+                std::future::pending::<()>().await;
+            }
+        }
+        async fn destroy_bounded(&mut self, _: EmulationHandle) -> bool {
+            self.removes += 1;
+            if self.stall == Some("remove") && self.removes == 1 {
+                return tokio::time::timeout(
+                    Duration::from_millis(10),
+                    std::future::pending::<bool>(),
+                )
+                .await
+                .unwrap_or(false);
+            }
+            self.held = false;
+            true
+        }
+        fn update_config(&mut self, _: InputConfig) {}
+    }
+
+    fn worker() -> (EmulationTask, Sender<ProxyRequest>) {
+        let (tx, request_rx) = channel();
+        let (event_tx, _) = channel();
+        (
+            EmulationTask {
+                backend: Some(input_emulation::Backend::Dummy),
+                options: Default::default(),
+                exit_requested: Default::default(),
+                request_rx,
+                event_tx,
+                handles: Default::default(),
+                next_id: 0,
+                operation_timeout: Duration::from_millis(20),
+                input_config: Default::default(),
+            },
+            tx,
+        )
+    }
+
+    fn press() -> Event {
+        Event::Keyboard(input_event::KeyboardEvent::Key {
+            time: 0,
+            key: 29,
+            state: 1,
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_backend_stalls_return_error_and_preserve_partial_handle_for_cleanup() {
+        for operation in ["create", "consume", "warp"] {
+            let (mut task, tx) = worker();
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let mut backend = StallingBackend {
+                stall: Some(operation),
+                ..Default::default()
+            };
+            if operation == "warp" {
+                tx.send(ProxyRequest::Warp(
+                    addr,
+                    input_emulation::Position::Left,
+                    0.5,
+                    None,
+                ))
+                .unwrap();
+            } else {
+                tx.send(ProxyRequest::Input(press(), addr, None)).unwrap();
+            }
+            tx.send(ProxyRequest::Terminate).unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_millis(200),
+                task.do_emulation_session(&mut backend),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(
+                matches!(error, InputEmulationError::Emulate(input_emulation::EmulationError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut)
+            );
+            assert!(error.to_string().contains(operation));
+            assert_eq!(task.handles.get(&addr), Some(&0));
+            assert_eq!(backend.creates, vec![0]);
+            // Failure leaves shutdown queued for the outer worker; no late input
+            // or automatic replay occurs after an uncertain native delivery.
+            assert!(matches!(
+                task.request_rx.recv().await.unwrap(),
+                ProxyRequest::Terminate
+            ));
+            assert!(backend.destroy_bounded(0).await);
+            assert!(!backend.held);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminate_during_handle_creation_never_resumes_input_loop() {
+        let (mut task, tx) = worker();
+        task.handles.insert("127.0.0.1:2".parse().unwrap(), 0);
+        let mut backend = StallingBackend {
+            stall: Some("create"),
+            ..Default::default()
+        };
+        tx.send(ProxyRequest::Terminate).unwrap();
+        let initialized = tokio::time::timeout(
+            Duration::from_millis(200),
+            task.create_clients(&mut backend),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !initialized,
+            "caller must exit rather than await an already consumed Terminate"
+        );
+        assert!(futures::FutureExt::now_or_never(task.request_rx.recv()).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_failed_remove_retains_address_and_retry_releases_same_handle() {
+        let (mut task, tx) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut backend = StallingBackend {
+            stall: Some("remove"),
+            ..Default::default()
+        };
+        tx.send(ProxyRequest::Input(press(), addr, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr)).unwrap();
+        tx.send(ProxyRequest::Input(press(), addr, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr)).unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            task.do_emulation_session(&mut backend),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(backend.creates, vec![0]);
+        assert_eq!(backend.consumed, vec![0, 0]);
+        assert_eq!(backend.removes, 2);
+        assert!(task.handles.is_empty());
+        assert!(!backend.held);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn revoked_proxy_input_and_warp_are_filtered_and_removal_releases_pressed_keys() {
         let addr = "127.0.0.1:2".parse().unwrap();
@@ -817,6 +1054,7 @@ mod resume_tests {
             event_tx,
             handles: Default::default(),
             next_id: 0,
+            operation_timeout: Duration::from_millis(20),
             input_config: Default::default(),
         };
         let mut emulation = InputEmulation::new(
@@ -831,7 +1069,7 @@ mod resume_tests {
             key: input_event::scancode::Linux::KeyLeftCtrl as u32,
             state: 1,
         });
-        let handle = task.handle_for(&mut emulation, addr).await;
+        let handle = task.handle_for(&mut emulation, addr).await.unwrap();
         emulation.consume(key.clone(), handle).await.unwrap();
         assert!(emulation.has_pressed_keys(handle));
         let token = CancellationToken::new();

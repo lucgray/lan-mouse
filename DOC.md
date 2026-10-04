@@ -485,3 +485,21 @@ clipboard calls cannot be undone; a successful clipboard write still updates
 feedback suppression, but a revoked write cannot report success or become the
 latest replay snapshot. Existing local clipboard contents are not erased.
 Native backend stalls and complete-service latency remain acceptance work.
+
+
+### Input backend operation deadlines
+
+The emulation worker allows 500 ms for each asynchronous per-handle creation,
+input delivery and cursor warp. A deadline returns an input error, runs the
+existing bounded backend cleanup and disables emulation until explicitly enabled
+again. The frontend receives the failure reason as well as the disabled status.
+An uncertain input delivery is not automatically retried. Partial handle creation
+retains its address mapping so cleanup can reach the handle. Failed destruction
+also retains that mapping for a subsequent Remove to retry the same handle.
+
+Backend initialization that asks the user for desktop permission keeps its
+existing termination path; it has no 500 ms approval deadline. Terminating during
+handle reconstruction now exits after cleanup rather than entering the input
+loop after its Terminate message was already consumed. These deadlines cover
+futures that yield to the runtime. They cannot interrupt synchronous native calls
+that block the runtime thread; native latency remains an acceptance requirement.
