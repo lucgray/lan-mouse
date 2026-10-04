@@ -495,22 +495,28 @@ impl Service {
                 }
             }
             EmulationEvent::ClipboardReceived(event) => self.receive_clipboard(event),
-            EmulationEvent::ClipboardSendCompleted {
-                addr,
-                event,
-                result,
-            } => match result {
-                Ok(()) if self.clipboard_enabled => self.notify_clipboard_shared(&event, false),
-                Ok(()) => {}
-                Err(error) => {
-                    log::warn!("clipboard send to {addr} failed: {error}");
-                    if self.clipboard_enabled {
+            EmulationEvent::ClipboardSendCompleted(completed) => {
+                if !self.clipboard_enabled
+                    || completed.generation != self.emulation.clipboard_generation()
+                {
+                    return;
+                }
+                match completed.result {
+                    Ok(()) => self.notify_frontend(FrontendEvent::ClipboardShared {
+                        received: false,
+                        kind: completed.kind,
+                        bytes: completed.bytes,
+                    }),
+                    Err(crate::listen::ClipboardSendError::Canceled) => {}
+                    Err(error) => {
+                        log::warn!("clipboard send to {} failed: {error}", completed.addr);
                         self.notify_frontend(FrontendEvent::Error(format!(
-                            "Failed to send clipboard to {addr}: {error}"
+                            "Failed to send clipboard to {}: {error}",
+                            completed.addr
                         )));
                     }
                 }
-            },
+            }
         }
     }
 
@@ -619,7 +625,9 @@ impl Service {
 
             for addr in incoming_addrs {
                 log::info!("Sending clipboard to incoming connection {}", addr);
-                self.emulation.send_clipboard(addr, clipboard_event.clone());
+                if let Err(error) = self.emulation.send_clipboard(addr, clipboard_event.clone()) {
+                    self.notify_frontend(FrontendEvent::Error(error.into()));
+                }
             }
 
             // only hint when the content actually went somewhere
@@ -952,6 +960,7 @@ impl Service {
                 monitor.enable();
             }
         } else {
+            self.emulation.clear_clipboard();
             if let Some(monitor) = &self.clipboard_monitor {
                 monitor.disable();
             }
@@ -1068,18 +1077,17 @@ mod tests {
             service.clipboard_enabled = true;
             let clipboard = input_event::ClipboardEvent::Text("fixture clipboard".into());
             let missing_addr = "127.0.0.1:1".parse().unwrap();
-            service.emulation.send_clipboard(missing_addr, clipboard.clone());
+            service.emulation.send_clipboard(missing_addr, clipboard.clone()).unwrap();
             let completed = tokio::time::timeout(Duration::from_secs(3), async {
                 loop {
                     let event = service.emulation.event().await;
-                    if matches!(event, EmulationEvent::ClipboardSendCompleted { .. }) {
+                    if matches!(event, EmulationEvent::ClipboardSendCompleted(_)) {
                         break event;
                     }
                 }
             }).await.unwrap();
-            assert!(matches!(&completed, EmulationEvent::ClipboardSendCompleted {
-                addr, result: Err(crate::listen::ClipboardSendError::NotConnected), ..
-            } if *addr == missing_addr));
+            assert!(matches!(&completed, EmulationEvent::ClipboardSendCompleted(completed)
+                if completed.addr == missing_addr && matches!(completed.result, Err(crate::listen::ClipboardSendError::NotConnected))));
             service.handle_emulation_event(completed).await;
             assert!(!service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::ClipboardShared { .. }
@@ -1087,17 +1095,31 @@ mod tests {
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::Error(message) if message.contains("Failed to send clipboard")
             )));
-            service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted {
-                addr: missing_addr, event: clipboard.clone(), result: Ok(()),
-            }).await;
+            service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted(crate::clipboard_network::ClipboardCompletion {
+                addr: missing_addr, kind: clipboard.kind(), bytes: clipboard.content_len(),
+                generation: service.emulation.clipboard_generation(), result: Ok(()),
+            })).await;
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::ClipboardShared { .. }
             )));
             service.pending_frontend_events.clear();
-            service.clipboard_enabled = false;
-            service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted {
-                addr: missing_addr, event: clipboard, result: Ok(()),
-            }).await;
+            service.apply_clipboard_enabled(false);
+            service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted(crate::clipboard_network::ClipboardCompletion {
+                addr: missing_addr, kind: clipboard.kind(), bytes: clipboard.content_len(),
+                generation: service.emulation.clipboard_generation(), result: Ok(()),
+            })).await;
+            assert!(service.pending_frontend_events.is_empty());
+            let old_generation = service.emulation.clipboard_generation();
+            for _ in 0..32 {
+                service.emulation.send_clipboard(missing_addr, clipboard.clone()).unwrap();
+            }
+            assert!(service.emulation.send_clipboard(missing_addr, clipboard.clone()).is_err());
+            service.emulation.clear_clipboard();
+            service.clipboard_enabled = true;
+            service.handle_emulation_event(EmulationEvent::ClipboardSendCompleted(crate::clipboard_network::ClipboardCompletion {
+                addr: missing_addr, kind: clipboard.kind(), bytes: clipboard.content_len(),
+                generation: old_generation, result: Ok(()),
+            })).await;
             assert!(service.pending_frontend_events.is_empty());
             service.capture.terminate().await;
             service.emulation.terminate().await;

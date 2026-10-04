@@ -273,11 +273,25 @@ enabled. A complete send produces the shared hint; completions after sharing is
 disabled do not produce a stale success hint. Outgoing clipboard sends also
 reject incomplete sends and disconnect only that target. Success means that the
 local transport accepted the full encoded packet; this protocol has no remote
-system-clipboard write acknowledgement. Network sends currently still run in
-the service/emulation dispatch paths; moving them to bounded cancellable workers,
-reconnect replay and notification deduplication remain review work.
+system-clipboard write acknowledgement. Incoming-session sends now use a separate 32-request ingress queue, four
+independent send tasks and at most 32 latest-value pending peer slots. One send
+per peer runs at a time, each with a two-second deadline. Pending values for the
+same peer coalesce. Admission failure reports a retry hint. Requests retain the
+connection captured at submission; replacement/disconnection cancels only stale
+sessions. Disabling sharing cancels the generation, and completions from an old
+generation are ignored even after re-enabling. Completion events retain only
+payload kind/size, not its contents. Shutdown drops and aborts active tasks without
+closing input connections just to cancel a clipboard send. Outgoing-session
+network waits still run in the service dispatch path; reconnect replay and
+notification deduplication also remain review work.
 
 
 On Windows, watcher path matching treats ordinary and verbatim drive/UNC
 prefixes as equivalent (`C:\...` / `\\?\C:\...` and UNC / verbatim UNC). It does
 not fold file-name case or treat different drives/shares as the same file.
+
+
+Generic watcher modification events (`Modify(Any)`, emitted by the Windows notify
+backend) trigger a config read just like specific data/rename events. The injected
+error-recovery fixture uses the registered canonical path, avoiding platform temp
+path aliases; the separate actual notify test continues to check native delivery.

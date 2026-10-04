@@ -1,4 +1,6 @@
+use crate::clipboard_network::{ClipboardCompletion, ClipboardJobs, ClipboardRequest};
 use crate::config::local_commit;
+use crate::listen::ArcConn;
 use crate::listen::{ClipboardSendError, LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{
@@ -14,16 +16,28 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
+use std::{
+    cell::RefCell,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use tokio::{
     select,
     task::{JoinHandle, spawn_local},
 };
+use tokio_util::sync::CancellationToken;
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
+    clipboard_tx: tokio::sync::mpsc::Sender<ClipboardRequest>,
+    clipboard_conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
+    clipboard_generation: AtomicU64,
+    clipboard_cancel: Mutex<CancellationToken>,
 }
 
 pub(crate) enum EmulationEvent {
@@ -73,11 +87,7 @@ pub(crate) enum EmulationEvent {
     /// clipboard data received from remote
     ClipboardReceived(input_event::ClipboardEvent),
     /// Completion of a network send, not acknowledgement of a remote OS write.
-    ClipboardSendCompleted {
-        addr: SocketAddr,
-        event: input_event::ClipboardEvent,
-        result: Result<(), ClipboardSendError>,
-    },
+    ClipboardSendCompleted(ClipboardCompletion),
 }
 
 enum EmulationRequest {
@@ -89,7 +99,6 @@ enum EmulationRequest {
     Terminate,
     UpdateScrollingInversion(bool),
     UpdateMouseSensitivity(f64),
-    SendClipboard(SocketAddr, input_event::ClipboardEvent),
 }
 
 impl Emulation {
@@ -106,17 +115,24 @@ impl Emulation {
         let emulation_proxy = EmulationProxy::new(backend, options, input_config);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let (clipboard_tx, clipboard_rx) = tokio::sync::mpsc::channel(32);
+        let clipboard_conns = listener.clipboard_connections();
         let emulation_task = ListenTask {
             listener,
             emulation_proxy,
             request_rx,
             event_tx,
+            clipboard_rx,
         };
         let task = spawn_local(emulation_task.run());
         Self {
             task,
             request_tx,
             event_rx,
+            clipboard_tx,
+            clipboard_conns,
+            clipboard_generation: AtomicU64::new(0),
+            clipboard_cancel: Mutex::new(CancellationToken::new()),
         }
     }
 
@@ -126,10 +142,45 @@ impl Emulation {
             .expect("channel closed");
     }
 
-    pub(crate) fn send_clipboard(&self, addr: SocketAddr, clipboard: input_event::ClipboardEvent) {
-        self.request_tx
-            .send(EmulationRequest::SendClipboard(addr, clipboard))
-            .expect("channel closed");
+    pub(crate) fn send_clipboard(
+        &self,
+        addr: SocketAddr,
+        event: input_event::ClipboardEvent,
+    ) -> Result<(), &'static str> {
+        if event.content_len() > lan_mouse_proto::MAX_CLIPBOARD_SIZE {
+            return Err("Clipboard is too large to send");
+        }
+        let conn = self
+            .clipboard_conns
+            .borrow()
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, conn)| conn.clone());
+        let request = ClipboardRequest {
+            addr,
+            conn,
+            event,
+            generation: self.clipboard_generation(),
+            cancellation: self
+                .clipboard_cancel
+                .lock()
+                .expect("clipboard token")
+                .child_token(),
+        };
+        self.clipboard_tx
+            .try_send(request)
+            .map_err(|_| "Clipboard send is busy or stopped; copy again")
+    }
+
+    pub(crate) fn clipboard_generation(&self) -> u64 {
+        self.clipboard_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn clear_clipboard(&self) {
+        self.clipboard_generation.fetch_add(1, Ordering::AcqRel);
+        let mut token = self.clipboard_cancel.lock().expect("clipboard token");
+        token.cancel();
+        *token = CancellationToken::new();
     }
 
     pub(crate) fn reenable(&self) {
@@ -162,6 +213,7 @@ impl Emulation {
 
     /// wait for termination
     pub(crate) async fn terminate(&mut self) {
+        self.clear_clipboard();
         log::debug!("terminating emulation");
         self.request_tx
             .send(EmulationRequest::Terminate)
@@ -172,11 +224,22 @@ impl Emulation {
     }
 }
 
+impl Drop for Emulation {
+    fn drop(&mut self) {
+        // Also cancel independent sends if the owner exits without terminate.
+        self.clipboard_cancel
+            .get_mut()
+            .expect("clipboard token")
+            .cancel();
+    }
+}
+
 struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    clipboard_rx: tokio::sync::mpsc::Receiver<ClipboardRequest>,
 }
 
 impl ListenTask {
@@ -191,8 +254,24 @@ impl ListenTask {
         // addrs whose emulation session timed out while entered
         let mut dormant: HashSet<SocketAddr> = HashSet::new();
         let mut accepted_clients = HashSet::new();
+        let mut clipboard_jobs = ClipboardJobs::default();
         loop {
             select! {
+                Some(request) = self.clipboard_rx.recv() => {
+                    if request.cancellation.is_cancelled() { continue; }
+                    if let Err(request) = clipboard_jobs.submit(request) {
+                        self.event_tx.send(EmulationEvent::ClipboardSendCompleted(ClipboardCompletion {
+                            addr: request.addr, generation: request.generation,
+                            kind: request.event.kind(), bytes: request.event.content_len(),
+                            result: Err(ClipboardSendError::Transport(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock, "clipboard send is busy; copy again"
+                            ).into())),
+                        })).expect("channel closed");
+                    }
+                },
+                completed = clipboard_jobs.completed() => {
+                    self.event_tx.send(EmulationEvent::ClipboardSendCompleted(completed)).expect("channel closed");
+                },
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr, conn }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
@@ -268,6 +347,7 @@ impl ListenTask {
                     }
                     Some(ListenEvent::Accept { addr, fingerprint, conn }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
+                        clipboard_jobs.cancel_stale(addr, Some(&conn));
                         let remembered = forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
                         if !accepted_clients.insert(addr) || remembered {
                             self.emulation_proxy.remove(addr);
@@ -276,6 +356,8 @@ impl ListenTask {
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Disconnected { addr }) => {
+                        let current = self.listener.clipboard_connection(addr);
+                        clipboard_jobs.cancel_stale(addr, current.as_ref());
                         // A new connection may already have replaced this one
                         // while its disconnect notification was queued.
                         if self.listener.has_connection(addr) { continue; }
@@ -308,14 +390,6 @@ impl ListenTask {
                         self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
                         self.emulation_proxy.update_config();
                     }
-                    // send clipboard to a specific address
-                    EmulationRequest::SendClipboard(addr, clipboard_event) => {
-                        let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event.clone()));
-                        let result = self.listener.reply_clipboard(addr, proto_event).await;
-                        self.event_tx.send(EmulationEvent::ClipboardSendCompleted {
-                            addr, event: clipboard_event, result,
-                        }).expect("channel closed");
-                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -342,6 +416,7 @@ impl ListenTask {
                 }
             }
         }
+        drop(clipboard_jobs);
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }

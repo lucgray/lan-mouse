@@ -35,6 +35,10 @@ pub enum ListenerCreationError {
 pub(crate) enum ClipboardSendError {
     #[error("clipboard peer is no longer connected")]
     NotConnected,
+    #[error("clipboard send canceled")]
+    Canceled,
+    #[error("clipboard send timed out")]
+    Timeout,
     #[error(transparent)]
     Encode(#[from] lan_mouse_proto::ProtocolError),
     #[error(transparent)]
@@ -43,7 +47,7 @@ pub(crate) enum ClipboardSendError {
     Incomplete { sent: usize, expected: usize },
 }
 
-type ArcConn = Arc<dyn Conn + Send + Sync>;
+pub(crate) type ArcConn = Arc<dyn Conn + Send + Sync>;
 
 /// Create a DTLS listener per address family.
 ///
@@ -303,18 +307,16 @@ impl LanMouseListener {
         }
     }
 
-    pub(crate) async fn reply_clipboard(
-        &self,
-        addr: SocketAddr,
-        event: ProtoEvent,
-    ) -> Result<(), ClipboardSendError> {
-        let conn = self
-            .conns
+    pub(crate) fn clipboard_connection(&self, addr: SocketAddr) -> Option<ArcConn> {
+        self.conns
             .borrow()
             .iter()
             .find(|(a, _)| *a == addr)
-            .map(|(_, conn)| conn.clone());
-        send_clipboard_reply(conn, event).await
+            .map(|(_, conn)| conn.clone())
+    }
+
+    pub(crate) fn clipboard_connections(&self) -> Rc<RefCell<Vec<(SocketAddr, ArcConn)>>> {
+        self.conns.clone()
     }
 
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
@@ -336,7 +338,7 @@ impl LanMouseListener {
     }
 }
 
-async fn send_clipboard_reply(
+pub(crate) async fn send_clipboard_reply(
     conn: Option<ArcConn>,
     event: ProtoEvent,
 ) -> Result<(), ClipboardSendError> {
@@ -466,6 +468,9 @@ mod tests {
         closed: AtomicBool,
         send_result: Mutex<Option<webrtc_util::Result<usize>>>,
         sent: Mutex<Vec<Vec<u8>>>,
+        send_gate: Option<Arc<tokio::sync::Semaphore>>,
+        sending: AtomicBool,
+        send_entered: tokio::sync::Notify,
     }
     impl TestConn {
         fn new(packet: Option<Vec<u8>>) -> Self {
@@ -474,6 +479,9 @@ mod tests {
                 closed: AtomicBool::new(false),
                 send_result: Mutex::new(None),
                 sent: Mutex::new(Vec::new()),
+                send_gate: None,
+                sending: AtomicBool::new(false),
+                send_entered: tokio::sync::Notify::new(),
             }
         }
     }
@@ -494,7 +502,19 @@ mod tests {
             unreachable!()
         }
         async fn send(&self, bytes: &[u8]) -> webrtc_util::Result<usize> {
+            struct SendGuard<'a>(&'a AtomicBool);
+            impl Drop for SendGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            self.sending.store(true, Ordering::SeqCst);
+            let _guard = SendGuard(&self.sending);
+            self.send_entered.notify_one();
             self.sent.lock().unwrap().push(bytes.to_vec());
+            if let Some(gate) = &self.send_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             self.send_result
                 .lock()
                 .unwrap()
@@ -561,6 +581,169 @@ mod tests {
             ))
         ));
         assert_eq!(conn.sent.lock().unwrap().len(), before);
+    }
+
+    fn clipboard_job_request(
+        addr: SocketAddr,
+        conn: Option<ArcConn>,
+        text: String,
+    ) -> crate::clipboard_network::ClipboardRequest {
+        crate::clipboard_network::ClipboardRequest {
+            addr,
+            conn,
+            event: input_event::ClipboardEvent::Text(text),
+            generation: 0,
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_jobs_bound_active_pending_and_keep_latest_per_peer() {
+        let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+        for port in 1..=36 {
+            jobs.submit(clipboard_job_request(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                None,
+                "test".into(),
+            ))
+            .unwrap_or_else(|_| panic!("unexpected admission failure"));
+        }
+        assert_eq!(jobs.sizes(), (4, 32));
+        assert!(
+            jobs.submit(clipboard_job_request(
+                "127.0.0.1:37".parse().unwrap(),
+                None,
+                "new peer".into()
+            ))
+            .is_err()
+        );
+        jobs.submit(clipboard_job_request(
+            "127.0.0.1:36".parse().unwrap(),
+            None,
+            "latest".into(),
+        ))
+        .unwrap_or_else(|_| panic!("existing pending peer must coalesce"));
+        assert_eq!(jobs.sizes(), (4, 32));
+    }
+
+    #[tokio::test]
+    async fn clipboard_jobs_slow_send_allows_timer_and_coalesces_a_thousand_edits() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let conn = Arc::new(TestConn {
+            send_gate: Some(gate.clone()),
+            ..TestConn::new(None)
+        });
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+        jobs.submit(clipboard_job_request(
+            addr,
+            Some(conn.clone()),
+            "first".into(),
+        ))
+        .unwrap_or_else(|_| panic!());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), jobs.completed())
+                .await
+                .is_err()
+        );
+        assert_eq!(conn.sent.lock().unwrap().len(), 1);
+        for index in 1..=1000 {
+            jobs.submit(clipboard_job_request(
+                addr,
+                Some(conn.clone()),
+                format!("latest-{index}"),
+            ))
+            .unwrap_or_else(|_| panic!());
+        }
+        assert_eq!(jobs.sizes(), (1, 1));
+        gate.add_permits(2);
+        jobs.completed().await.result.unwrap();
+        jobs.completed().await.result.unwrap();
+        assert_eq!(jobs.sizes(), (0, 0));
+        let sent = conn.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(
+            sent.last().unwrap(),
+            &lan_mouse_proto::encode_clipboard_event(&ProtoEvent::Input(
+                input_event::Event::Clipboard(input_event::ClipboardEvent::Text(
+                    "latest-1000".into()
+                ))
+            ))
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn clipboard_jobs_timeout_does_not_hold_up_another_peer_or_close_input_connection() {
+        let conn = Arc::new(TestConn {
+            send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..TestConn::new(None)
+        });
+        let healthy = Arc::new(TestConn::new(None));
+        let slow_addr = "127.0.0.1:2".parse().unwrap();
+        let healthy_addr = "127.0.0.1:3".parse().unwrap();
+        let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+        jobs.submit(clipboard_job_request(
+            slow_addr,
+            Some(conn.clone()),
+            "slow".into(),
+        ))
+        .unwrap_or_else(|_| panic!());
+        jobs.submit(clipboard_job_request(
+            healthy_addr,
+            Some(healthy),
+            "healthy".into(),
+        ))
+        .unwrap_or_else(|_| panic!());
+        let first = tokio::time::timeout(Duration::from_millis(500), jobs.completed())
+            .await
+            .unwrap();
+        assert_eq!(first.addr, healthy_addr);
+        first.result.unwrap();
+        conn.send_entered.notified().await;
+        // No polling of the manager during this wait: a separate dispatch
+        // await must not prevent the background send's deadline from firing.
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert!(!conn.sending.load(Ordering::SeqCst));
+        let slow = tokio::time::timeout(Duration::from_secs(3), jobs.completed())
+            .await
+            .unwrap();
+        assert!(matches!(slow.result, Err(ClipboardSendError::Timeout)));
+        assert!(!conn.closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn clipboard_jobs_cancel_only_old_session_and_preserve_new_pending_connection() {
+        let old = Arc::new(TestConn {
+            send_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+            ..TestConn::new(None)
+        });
+        let new = Arc::new(TestConn::new(None));
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+        jobs.submit(clipboard_job_request(addr, Some(old.clone()), "old".into()))
+            .unwrap_or_else(|_| panic!());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), jobs.completed())
+                .await
+                .is_err()
+        );
+        let new_conn: ArcConn = new.clone();
+        jobs.submit(clipboard_job_request(
+            addr,
+            Some(new_conn.clone()),
+            "new".into(),
+        ))
+        .unwrap_or_else(|_| panic!());
+        jobs.cancel_stale(addr, Some(&new_conn));
+        assert!(matches!(
+            jobs.completed().await.result,
+            Err(ClipboardSendError::Canceled)
+        ));
+        jobs.completed().await.result.unwrap();
+        assert_eq!(old.sent.lock().unwrap().len(), 1);
+        assert_eq!(new.sent.lock().unwrap().len(), 1);
+        assert!(!old.closed.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -623,6 +623,7 @@ impl Config {
             }) && matches!(
                 event.kind,
                 EventKind::Create(_)
+                    | EventKind::Modify(ModifyKind::Any)
                     | EventKind::Modify(ModifyKind::Data(_))
                     | EventKind::Modify(ModifyKind::Name(_))
                     | EventKind::Remove(_)
@@ -1267,10 +1268,8 @@ mod tests {
         assert!(config.changed().await.is_err());
         assert!(!config.clipboard_enabled());
         fs::write(&path, "enable_clipboard = true").unwrap();
-        tx.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Data(
-            notify::event::DataChange::Content,
-        )))
-        .add_path(path)))
+        tx.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(config.config_path().to_owned())))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), config.changed())
