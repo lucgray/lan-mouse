@@ -336,3 +336,20 @@ Shutdown stops the emulation backend and releases its inputs before waiting for
 listener cleanup. Listening sockets are closed explicitly; accepted connections
 close concurrently. Binding/cleanup tasks are aborted when their owner is dropped.
 These network deadlines are not a deadline for every OS backend shutdown operation.
+
+
+## Ephemeral listening ports
+
+A configured listening port of `0` asks the OS to choose an available port. The
+first successfully bound address family selects it, and subsequent families use
+that same port. Startup and port-change notifications report the actual nonzero
+port so it can be entered on the peer. All installed listeners are checked for a
+consistent nonzero port; invalid results are closed without replacing the running
+listeners. Startup binding/address validation shares the two-second deadline used
+for later changes.
+
+The configuration keeps `0`, so a fresh process can choose a fresh port. Reloading
+other settings with an unchanged configured port preserves the running port and
+an existing temporary GUI port choice; it does not request another ephemeral
+binding. An explicit GUI request for `0` chooses a new port. Bind failures retain
+the running port and can be retried by explicitly requesting the port again.

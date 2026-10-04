@@ -70,6 +70,8 @@ pub struct Service {
     conn_sender: LanMouseConnectionSender,
     /// current port
     port: u16,
+    /// last configured port; zero is a request, not the running socket port
+    configured_port: u16,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
     /// notify for pending frontend events
@@ -113,6 +115,8 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        let port = listener.port();
+        let configured_port = config.port();
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
         let conn_sender = conn.sender();
 
@@ -159,7 +163,6 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
-        let port = config.port();
         let service = Self {
             config,
             hooks: HookRunner::new(),
@@ -178,6 +181,7 @@ impl Service {
             conn_sender,
             frontend_event_pending: Default::default(),
             port,
+            configured_port,
             pending_frontend_events: Default::default(),
             capture_status: Default::default(),
             emulation_status: Default::default(),
@@ -425,7 +429,11 @@ impl Service {
             .unwrap()
             .clone_from(&authorized_keys);
         self.apply_clipboard_enabled(self.config.clipboard_enabled());
-        self.change_port(self.config.port());
+        let configured_port = self.config.port();
+        if configured_port != self.configured_port {
+            self.configured_port = configured_port;
+            self.change_port(configured_port);
+        }
         self.sync_frontend();
     }
 
@@ -1056,6 +1064,13 @@ mod tests {
         .unwrap();
         tokio::task::LocalSet::new().run_until(async move {
             let mut service = Service::new(config).await.unwrap();
+            let initial_port = service.port;
+            assert_ne!(initial_port, 0);
+            assert_eq!(service.config.port(), 0);
+            service.sync_frontend();
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                FrontendEvent::PortChanged(port, None) if *port == initial_port
+            )));
             // Model an already enabled session without starting OS clipboard
             // resources: the external snapshot must disable it on reload.
             service.clipboard_enabled = true;
@@ -1065,6 +1080,10 @@ mod tests {
                 while !service.config.changed().await.unwrap() {}
             }).await.unwrap();
             service.handle_config_change();
+            // Reloading unrelated settings must not request a new ephemeral port.
+            assert_eq!(service.emulation.last_port_request(), None);
+            assert_eq!(service.port, initial_port);
+            assert_eq!(service.configured_port, 0);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
             assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([("new".into(), "new-peer".into())]));
             assert!(!service.clipboard_enabled);
@@ -1134,6 +1153,20 @@ mod tests {
                 generation: old_generation, outgoing: None, conn: None, result: Ok(()),
             })).await;
             assert!(service.pending_frontend_events.is_empty());
+            service.change_port(0);
+            let changed = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let event = service.emulation.event().await;
+                    if matches!(event, EmulationEvent::PortChanged(_)) { break event; }
+                }
+            }).await.unwrap();
+            service.handle_emulation_event(changed).await;
+            assert_ne!(service.port, 0);
+            assert_ne!(service.port, initial_port);
+            assert_eq!(service.config.port(), 0);
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                FrontendEvent::PortChanged(port, None) if *port == service.port
+            )));
             service.capture.terminate().await;
             service.emulation.terminate().await;
             service.conn_sender.terminate().await;

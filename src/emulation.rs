@@ -207,6 +207,11 @@ impl Emulation {
         self.port_requests.send_replace(Some(port));
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_port_request(&self) -> Option<u16> {
+        *self.port_requests.borrow()
+    }
+
     pub(crate) fn request_scrolling_inversion(&self, invert_scroll: bool) {
         self.request_tx
             .send(EmulationRequest::UpdateScrollingInversion(invert_scroll))
