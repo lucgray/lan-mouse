@@ -106,6 +106,10 @@ async fn accept_any(
 }
 
 pub(crate) enum ListenEvent {
+    InputRejected {
+        addr: SocketAddr,
+        reason: String,
+    },
     InputOverloaded {
         addr: SocketAddr,
     },
@@ -698,6 +702,16 @@ async fn read_loop(
                 continue;
             }
         };
+
+        if let ProtoEvent::Input(input) = &event {
+            if let Err(error) = input.validate_transition() {
+                let _ = dtls_tx.send(ListenEvent::InputRejected {
+                    addr,
+                    reason: error.to_string(),
+                });
+                break;
+            }
+        }
 
         let budget = if matches!(
             &event,
@@ -1963,6 +1977,85 @@ mod tests {
         assert_eq!(disconnected, 1);
         assert_eq!(overloaded, 1);
         assert_eq!(budget.available(), (256, 64));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_transition_closes_only_its_reader_before_queue_admission() {
+        use input_event::{Event, KeyboardEvent, PointerEvent};
+        for input in [
+            Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: u32::MAX,
+                state: 1,
+            }),
+            Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: 29,
+                state: 2,
+            }),
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: u32::MAX,
+                state: 1,
+            }),
+            Event::Pointer(PointerEvent::Button {
+                time: 0,
+                button: 272,
+                state: u32::MAX,
+            }),
+        ] {
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let healthy_addr = "127.0.0.1:3".parse().unwrap();
+            let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) =
+                ProtoEvent::Input(input).into();
+            let conn = Arc::new(TestConn {
+                repeat_packet: true,
+                ..TestConn::new(Some(bytes[..len].to_vec()))
+            });
+            let healthy = Arc::new(TestConn::new(None));
+            let conns = Rc::new(RefCell::new(vec![
+                (addr, conn.clone() as ArcConn),
+                (healthy_addr, healthy.clone() as ArcConn),
+            ]));
+            let (tx, mut rx) = channel();
+            let budget = crate::input_budget::InputBudget::default();
+            let token = CancellationToken::new();
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                read_loop(
+                    conns.clone(),
+                    addr,
+                    conn.clone(),
+                    tx,
+                    token.clone(),
+                    budget.clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(token.is_cancelled());
+            assert!(conn.closed.load(Ordering::SeqCst));
+            assert!(!healthy.closed.load(Ordering::SeqCst));
+            assert_eq!(conns.borrow().len(), 1);
+            assert!(is_current(
+                &conns.borrow(),
+                healthy_addr,
+                &(healthy as ArcConn)
+            ));
+            assert_eq!(budget.available(), (256, 64));
+            assert!(
+                matches!(rx.recv().await, Some(ListenEvent::InputRejected { addr: actual, reason })
+                if actual == addr && !reason.is_empty())
+            );
+            assert!(
+                matches!(rx.recv().await, Some(ListenEvent::Disconnected { addr: actual }) if actual == addr)
+            );
+            assert!(
+                rx.recv().await.is_none(),
+                "invalid input was admitted or reported repeatedly"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

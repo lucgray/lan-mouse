@@ -1105,3 +1105,30 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 永久 native failure、同步阻塞、强制退出/task panic 后物理状态与持久 ledger 无法由本次保证；R60 原生验收仍待完成。R13 其他无界事件/连接资源、真机千次切换、完整 p95/p99 与八小时 RSS 继续未闭环，不认定 90 分。
 
 日志：retained-cleanup-library.log、retained-cleanup-workspace.log、retained-cleanup-clippy.log、retained-cleanup-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、retained-cleanup-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。
+
+
+## 第四十四轮：输入队列之外的 pressed ledger 边界
+
+### R63 / P1：任意 u32 编号持续扩大单 handle 状态
+
+- 源码证据：track_key / track_button 在 backend consume 前以任意 u32 为 HashMap key 登记 pressed；没有编号和状态校验。即使所有请求顺序完成，队列容量限制也不约束已完成但没有 release 的不同编号数量。
+- 基线使用现有 MockEmulation 顺序提交 10,000 个越界 key-down 与 10,000 个越界 button-down，全部获得 backend Ok；结果 keys=10,000、buttons=10,000、completed backend events=20,000。没有排队积压。这是可确认的 wrapper/状态模型复现，不是实际 native 后端已接收全部这些事件或 RSS 测量。
+- 额外源码路径：evdev 将编号 as u16、button state as i32；X11 key + 8 对接近 u32::MAX 的输入可溢出。校验需要在状态登记及 native 投递之前，而不是只给 HashMap 添加可静默丢 release 的容量限制。
+- [x] input-event 新增 MAX_EVDEV_CODE=0x2ff 和 Event.validate_transition；与本机 Linux input-event-codes.h 的 KEY_MAX 一致。完整 0..=0x2ff 保留，包括当前 enum 没列出的保留编号；state 仅接受协议定义的 press=1 / release=0。每个 handle 的 keys/buttons 各至多 768 个不同编号。
+- [x] DTLS reader 在 queue admission 前校验。失败通过内部 InputRejected 回报原因，随后正常取消原 token、移除精确 Arc、发送 Disconnected 并 bounded close；不把错误 peer 交给代理作为全局 backend 故障，也不关闭其他已接受连接。
+- [x] InputEmulation.consume 直接调用也先校验，返回 InvalidInput，不改变原有按住状态，不轮询 native backend。原合法按住键/按钮仍能通过 cleanup 释放；无需修改 wire/IPC schema/version。
+
+### 回归与结果
+
+- 两个新增 library 用例：20,000 个不同越界按下及非法状态/越界 release 全部被拒，原 Ctrl 与鼠标键各一个记录保留，backend 只收到两个合法按下；最终 cleanup 成功。另一个用例确认每类完整 768 码域都能登记并释放，0x300 被拒，不因当前枚举缺项误杀保留编号。
+- reader 用例对 keyboard/button 越界编号与非法状态各进行实际 decode/read_loop 验证：重复无效帧只产生一次拒绝与一次断线，不入 Msg 队列、不占 256/64 input budget；原 reader token canceled、连接 closed，健康另一个 Arc 留在接受表且未关闭。
+- Linux all-features 工作区通过：主包 135 / 2 默认忽略，input-emulation 25，GTK 14 / 4 默认忽略，CLI 3，IPC 4，input-capture 33 / 1 默认忽略。严格 all-targets Clippy、格式和 diff 检查通过；两个隔离真实 Service-DTLS 授权/活跃撤销、双向剪贴板重播/来源/禁用/重连回归通过。
+- 上一 HEAD b8c9d91 Rust 37198145748 与 Nix 37198145625 检查时仍在运行，不能引用旧 green 为本轮 native 验证。本轮新提交仍需自己的 CI。
+
+### 下一轮源码线索和未完成门槛
+
+- [ ] R64 / P2：X11 emulate_mouse_button 的未知 evdev button fallback 为 X button 1；合法额外按钮也可能变成左键点击。范围校验不会拒绝所有 native 不支持的合法按钮。需要转换测试和一致的 unsupported 策略，尚未做 X11 真机验收。
+- [ ] R65 / P1：Motion 的 f64 可解码 NaN/Infinity，post_process_event 与 evdev quantize_motion 无 finite 检查；保存 dx-round(dx) 的 remainder 可能变成 NaN 并污染后续合法 motion。需先故障注入验证、再处理输入/缩放与累计状态边界，尚未称为已修复。
+- [ ] R13 连接/handle 数量与其他事件队列仍有无界路径；本轮单 handle ledger 限制不能代替全服务资源上限。R60 永久原生故障、强制退出，真机千次往返、完整 p95/p99 与八小时 RSS 均未闭环，不能确认达到 90 分。
+
+日志：input-validation-baseline.log、input-validation-library.log、input-validation-workspace.log、input-validation-clippy.log、input-validation-external_reload_preserves_file_and_applies_authorization_and_clipboard.log、input-validation-real_dtls_clipboard_replay_both_routes_origin_order_disable_and_reconnect.log。

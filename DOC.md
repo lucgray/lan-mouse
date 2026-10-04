@@ -586,3 +586,23 @@ be undone by abort. The deadlines cover yielding operations; synchronous native
 calls, ignored native close errors, forced process exit and task panics cannot
 provide a guaranteed physical release or a durable cleanup ledger. Native
 Windows/macOS/Linux fault recovery remains a separate acceptance requirement.
+
+
+### Bounded key and button transitions
+
+`input_event::Event::validate_transition()` checks that keyboard/button codes
+belong to the bounded Linux EV_KEY namespace (`0..=0x2ff`, inclusive KEY_MAX)
+and states are release (0) or press (1). Reserved in-range codes remain accepted;
+this is a range bound, not a requirement to appear in the current key enum.
+Motion, modifiers and clipboard payloads are outside this method's scope.
+
+Incoming DTLS readers validate transitions before queue admission. An invalid
+transition closes only that reader, cancels its queued input and follows normal
+disconnect cleanup; the frontend receives an explanation through the existing
+Error event. Other accepted connections remain available. Direct InputEmulation
+consumers get `EmulationError::InvalidInput` before tracking or native delivery.
+This prevents unbounded per-handle ledgers from distinct arbitrary u32 codes,
+and prevents invalid codes/states from reaching native casts or keycode offsets.
+Each handle's key and button ledgers can each hold at most 768 distinct codes.
+The number of accepted connections/handles and other event queues still need
+separate resource limits. Wire encoding and the protocol version are unchanged.

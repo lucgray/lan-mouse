@@ -539,6 +539,11 @@ impl Service {
                 Err(e) => self
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
+            EmulationEvent::InputRejected { addr, reason } => {
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "Invalid incoming input from {addr}: {reason}. Its connection was closed."
+                )));
+            }
             EmulationEvent::InputCleanupFailed { addr } => {
                 self.notify_frontend(FrontendEvent::Error(format!("Previous input session at {addr} could not finish cleanup. New input was rejected; retry after the backend recovers.")));
             }

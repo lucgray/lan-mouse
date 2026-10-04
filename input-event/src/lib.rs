@@ -6,6 +6,10 @@ pub mod scancode;
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 
+/// Largest code in the Linux EV_KEY namespace shared by keyboard and buttons.
+/// Keep reserved in-range codes available rather than requiring enum membership.
+pub const MAX_EVDEV_CODE: u32 = 0x2ff;
+
 // FIXME
 pub const BTN_LEFT: u32 = 0x110;
 pub const BTN_RIGHT: u32 = 0x111;
@@ -189,6 +193,34 @@ impl Display for ClipboardEvent {
                 write!(f, "clipboard(image: {} bytes)", png.len())
             }
         }
+    }
+}
+
+impl Event {
+    /// Validate the bounded EV_KEY code domain and press/release wire states.
+    /// This does not validate motion, modifier or clipboard payloads.
+    pub fn validate_transition(&self) -> Result<(), error::InvalidInputEvent> {
+        use error::InvalidInputEvent;
+        match self {
+            Self::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
+                if *key > MAX_EVDEV_CODE {
+                    return Err(InvalidInputEvent::CodeOutOfRange(*key));
+                }
+                if *state > 1 {
+                    return Err(InvalidInputEvent::KeyState(*state));
+                }
+            }
+            Self::Pointer(PointerEvent::Button { button, state, .. }) => {
+                if *button > MAX_EVDEV_CODE {
+                    return Err(InvalidInputEvent::CodeOutOfRange(*button));
+                }
+                if *state > 1 {
+                    return Err(InvalidInputEvent::ButtonState(*state));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 

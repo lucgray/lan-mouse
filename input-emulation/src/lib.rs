@@ -281,6 +281,7 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        event.validate_transition()?;
         let event = post_process_event(event, self.input_config);
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
@@ -747,6 +748,75 @@ mod tests {
         );
         assert!(!emulation.has_pressed_keys(0));
         assert!(!emulation.has_pressed_keys(1));
+    }
+
+    #[tokio::test]
+    async fn invalid_transitions_cannot_grow_or_change_tracked_input() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+        emulation.consume(key_event(29, 1), 0).await.unwrap();
+        emulation.consume(button_event(272, 1), 0).await.unwrap();
+        for code in 0x10000..0x10000 + 10000 {
+            for event in [key_event(code, 1), button_event(code, 1)] {
+                assert!(matches!(
+                    emulation.consume(event, 0).await,
+                    Err(EmulationError::InvalidInput(_))
+                ));
+            }
+        }
+        for event in [
+            key_event(29, 2),
+            key_event(29, u8::MAX),
+            key_event(u32::MAX, 0),
+            button_event(272, 2),
+            button_event(272, u32::MAX),
+            button_event(u32::MAX, 0),
+        ] {
+            assert!(matches!(
+                emulation.consume(event, 0).await,
+                Err(EmulationError::InvalidInput(_))
+            ));
+        }
+        assert_eq!(emulation.handles[&0].keys.len(), 1);
+        assert_eq!(emulation.handles[&0].buttons.len(), 1);
+        assert_eq!(control.lock().unwrap().consumed.len(), 2);
+        assert_eq!(emulation.handles[&0].keys[&29], TrackedTransition::Pressed);
+        assert_eq!(
+            emulation.handles[&0].buttons[&272],
+            TrackedTransition::Pressed
+        );
+        assert!(emulation.terminate_bounded().await);
+        assert!(emulation.handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_evdev_code_domain_remains_available_and_finite() {
+        let (_, control) = MockEmulation::new();
+        let mut emulation = emulation_with(&control);
+        emulation.create(0).await;
+        for code in 0..=input_event::MAX_EVDEV_CODE {
+            emulation.consume(key_event(code, 1), 0).await.unwrap();
+            emulation.consume(button_event(code, 1), 0).await.unwrap();
+        }
+        let codes = (input_event::MAX_EVDEV_CODE + 1) as usize;
+        assert_eq!(emulation.handles[&0].keys.len(), codes);
+        assert_eq!(emulation.handles[&0].buttons.len(), codes);
+        assert_eq!(control.lock().unwrap().consumed.len(), 2 * codes);
+        assert!(
+            emulation
+                .consume(key_event(input_event::MAX_EVDEV_CODE + 1, 1), 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            emulation
+                .consume(button_event(input_event::MAX_EVDEV_CODE + 1, 1), 0)
+                .await
+                .is_err()
+        );
+        assert!(emulation.terminate_bounded().await);
+        assert!(emulation.handles.is_empty());
     }
 
     #[tokio::test]

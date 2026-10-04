@@ -45,6 +45,10 @@ pub(crate) struct Emulation {
 }
 
 pub(crate) enum EmulationEvent {
+    InputRejected {
+        addr: SocketAddr,
+        reason: String,
+    },
     Connected {
         addr: SocketAddr,
         fingerprint: String,
@@ -351,6 +355,7 @@ impl ListenTask {
                     self.event_tx.send(EmulationEvent::ClipboardSendCompleted(completed)).expect("channel closed");
                 },
                 e = self.listener.next() => {match e {
+                    Some(ListenEvent::InputRejected { addr, reason }) => { self.event_tx.send(EmulationEvent::InputRejected { addr, reason }).expect("channel closed"); },
                     Some(ListenEvent::InputOverloaded { addr }) => { self.event_tx.send(EmulationEvent::InputOverloaded { addr }).expect("channel closed"); },
                     Some(ListenEvent::Msg { event, addr, conn, budget }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
