@@ -208,5 +208,27 @@ request without saving the previous runtime snapshot over that file. Clipboard
 sharing can therefore also be disabled through the file while the service runs.
 Watcher/read errors are reported to the frontend; the current configuration
 remains in use and subsequent valid edits can still reload. This does not add
-live switching of backend, certificate or key-repeat options. GUI saves and
-configuration reads still perform synchronous disk I/O.
+live switching of backend, certificate or key-repeat options. The service queues GUI saves on a serial blocking worker instead of waiting for
+serialization, writes, fsync or rename in the input loop. One in-flight save and
+one latest pending snapshot are retained; intermediate pending snapshots are
+coalesced. Save completion is separate from external reload and cannot revert
+newer runtime settings. Errors are reported asynchronously to the frontend.
+`Config::changed` returns `Ok(true)` for an applied external edit and
+`Ok(false)` for a successful background save; its in-flight task survives
+cancellation of the awaiting future. `queue_write_back` accepts a snapshot and
+`flush` waits for all accepted snapshots or reports a failure. The blocking
+`write_back` utility remains available, rejecting calls while a background save
+runs. Configuration reads still perform synchronous disk I/O.
+
+Before saving, file bytes must match the last loaded/saved baseline. A second
+check after syncing the temporary file catches edits during save preparation;
+on conflict the original external file is kept and queued snapshots are dropped
+until reload or a new explicit edit. This is best-effort conflict detection,
+not an atomic compare-and-swap with third-party editors: an edit between the
+final check and rename can still race. Comments from external edits remain on
+reload; a later accepted GUI save still serializes the entire configuration.
+The watcher callback is nonblocking; overflow retains a rescan flag and the
+latest error. Normal shutdown releases input first, then allows up to two
+seconds for config flush. On timeout the pending latest snapshot may not have
+been persisted; the log explicitly reports unconfirmed disk completion. An
+already running filesystem call cannot be forcibly cancelled.

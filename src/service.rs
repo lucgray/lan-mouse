@@ -25,6 +25,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{signal, sync::Notify};
@@ -214,11 +215,12 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 result = self.config.changed() => match result {
-                    Ok(()) => self.handle_config_change(),
+                    Ok(true) => self.handle_config_change(),
+                    Ok(false) => {},
                     Err(error) => {
-                        log::warn!("could not reload configuration: {error}");
+                        log::warn!("could not save or reload configuration: {error}");
                         self.notify_frontend(FrontendEvent::Error(format!(
-                            "Failed to reload settings: {error}"
+                            "Failed to save or reload settings: {error}"
                         )));
                     }
                 },
@@ -263,6 +265,13 @@ impl Service {
         self.hooks.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        match tokio::time::timeout(Duration::from_secs(2), self.config.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("configuration shutdown save failed: {error}"),
+            Err(_) => log::warn!(
+                "configuration shutdown save exceeded two seconds; disk completion is unconfirmed"
+            ),
+        }
 
         Ok(())
     }
@@ -363,12 +372,7 @@ impl Service {
         self.config.set_clients(clients);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
-        if let Err(e) = self.config.write_back() {
-            log::warn!("failed to write config: {e}");
-            self.notify_frontend(FrontendEvent::Error(format!(
-                "Failed to update settings: {e}"
-            )));
-        }
+        self.config.queue_write_back();
     }
 
     fn handle_config_change(&mut self) {
@@ -1029,6 +1033,14 @@ mod tests {
             assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
                 FrontendEvent::Settings { clipboard_enabled: false, invert_scroll: true, mouse_sensitivity } if *mouse_sensitivity == 1.75
             )));
+            service.update_mouse_sensitivity(2.25);
+            service.config.flush().await.unwrap();
+            let persisted = Config::new_with_args([
+                "lan-mouse", "--config", path.to_str().unwrap(),
+            ]).unwrap();
+            assert_eq!(persisted.mouse_sensitivity(), 2.25);
+            assert!(!persisted.clipboard_enabled());
+            assert_eq!(persisted.authorized_fingerprints(), HashMap::from([("new".into(), "new-peer".into())]));
             service.capture.terminate().await;
             service.emulation.terminate().await;
             service.conn_sender.terminate().await;
