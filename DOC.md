@@ -729,8 +729,31 @@ edge check with that returned position. An inactive capture ignores repeated
 return requests. Nonfinite t uses the midpoint; out-of-range t is clamped and
 small/degenerate screen sizes bound the inset.
 
-A closed request receiver returns BrokenPipe. Success means request submission,
-not native completion acknowledgement. The existing synchronous control channel,
-thread join, native blocking/error handling and old native-event queue still
-need separate recovery work. Tests cover request processing and callback/state
-behavior, not physical pointer return or actual Xlib success.
+A closed request receiver returns BrokenPipe. Success now waits for the capture
+thread to process the request and for its synchronous calls to return. This is
+not acknowledgement of X server effects or verification of Xlib success. Tests
+cover request processing and callback/state behavior, not physical pointer return.
+Old native events across ordinary release/reentry remain a separate recovery gap.
+
+
+### X11 control and shutdown bounds
+
+The control channel holds at most 16 requests. Creation of client edges,
+destruction, release and cursor return wait asynchronously for admission and
+thread processing within a combined 500ms deadline. Canceled requests are skipped
+before processing; a timeout stops the backend rather than replaying late work.
+Stopped capture refuses new controls and suppresses stale stream/fanout input.
+
+Termination uses an independent stop flag, waits asynchronously up to 500ms,
+and retains an unfinished thread handle for retry. Drop never waits for an
+unfinished native worker. The worker owns final ungrab/display close and a
+process-wide X11 worker lease; another X11 backend returns WorkerStillRunning
+until that worker's cleanup finishes. Grab stages check stop before proceeding
+and roll back late acquisition. The public creation error variant is additive;
+wire encoding/protocol version do not change.
+
+Native calls still cannot be interrupted by Tokio. Timeout reports incomplete
+shutdown, and Drop may leave the stopped worker pending; its lease prevents
+repeated X11 workers. Initial XOpenDisplay/screen queries still run synchronously
+in new(), and native success/error handling, physical cleanup and ordinary
+release/reentry event isolation remain acceptance work.

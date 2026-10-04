@@ -1323,3 +1323,26 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 资源总上限、R60 原生退出、真机千次往返、完整 p95/p99 与 8h RSS 未完成，尚不认定达到 90 分。
 
 日志：x11-return-release-baseline.log、x11-return-release-library.log、x11-return-release-workspace.log、x11-return-release-clippy.log。
+
+
+## 第五十三轮：X11 异步控制、处理确认和有界停止
+
+### R73 / P1
+
+- 实际 create() 基线填满原 sync_channel(16)，在独立 current-thread Tokio runtime 执行后 30ms 内无法完成，关闭 receiver 后才返回。证明同步 send 占住运行时；日志 x11-control-baseline.log，无 native display。
+- [x] 改为容量仍为 16 的 Tokio mpsc 控制通道。create/destroy/release/release_to 在统一 500ms 内等待入队和 native 线程的处理确认；取消等待不会执行未开始处理的请求，已关闭接收端返回 BrokenPipe。每轮最多处理 16 条控制，避免连续 producer 挤占事件循环。
+- [x] 控制超时锁存 stopping，停止后不接受新的控制、旧/新输入也不再从公共 stream 输出；现有 fanout failure priority 识别 stopping 并清理缓存。这个错误不是“已经完成原生释放”。
+- [x] terminate 使用独立 atomic stop，不等待控制队列容量；异步等待线程退出最多 500ms，超时保留 handle 供重试，只有 is_finished 后才 join。Drop 只发送 stop 并尝试回收已结束线程，不执行阻塞 send 或等待仍运行的线程。
+- [x] X11State 负责最终 ungrab/close，进程内 worker lease 在这个清理完成后释放；旧 worker 仍运行/停止时，新 X11 constructor 返回 WorkerStillRunning，避免超时后不断创建重复原生线程。移除没有额外初始化作用的阻塞 ready 握手。
+- [x] Grab 的各阶段返回后检查 stopping，迟到的 pointer/keyboard 获取会回退，不 warp/发布 Begin；stop 后 send_event 也禁止投递。
+
+### 验证和证据边界
+
+- 7 个新增用例覆盖满队列异步 timeout、处理确认、取消请求不重播、入队后未处理的 timeout、卡住线程退出超时/Drop 不 join/lease 阻止替代/后来释放、退出 timeout 后重试/幂等/panic error、grab 中 stop 回退、stop 后不输出旧/新输入。其原生操作用 callback / 可恢复阻塞线程模型。
+- 全工作区 all-features 通过：capture 51 / 1 忽略、emulation 40、root 136 / 2 忽略、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11；严格 all-targets Clippy、capture X11-only / 无默认功能 Clippy、fmt/diff 通过。随后加强退出超时后的重试用例并单独通过，生产源码未变化。
+- 4f7943e Rust run 37208562237 completed/success；Nix 37208562269 检查时 in_progress。本轮新 HEAD 需要自己的跨平台 CI。
+- 处理确认代表 thread 已处理请求且同步调用返回，不能证明 X server 已执行或 Xlib 成功。同步 native 调用不能被 Tokio 取消；若卡住，API 超时与 Drop 不等待，清理可能仍未完成，lease 保留并阻止另一个 X11 worker。实际 native 超时后的物理释放/退出尚未验收，不能把后台 pending cleanup 称为清理完成。
+- [ ] R75 / P1：new() 中 XOpenDisplay、screen 查询仍运行于调用线程并同步执行，可能阻塞 backend 创建；下一轮应将初始化放入持有 lease 的 worker，使用有界 async 等待，并保留超时后停止/禁止迟到激活的约束。
+- [ ] R74 原生队列跨会话残留、R13 全服务资源上限、R60 原生故障退出、真机千次往返、完整 p95/p99 和 8h RSS 未闭环，尚不认定达到 90 分。
+
+日志：x11-control-baseline.log、x11-control-library.log、x11-control-workspace.log、x11-control-clippy.log、x11-control-{x11,none}-clippy.log、x11-control-retry.log。

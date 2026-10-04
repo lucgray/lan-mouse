@@ -1,9 +1,13 @@
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::hook_queue::{HookReceiver, HookSender, x11_channel};
 use async_trait::async_trait;
@@ -29,7 +33,33 @@ enum Request {
     Destroy(Position),
     Release,
     ReleaseTo(f64),
-    Terminate,
+}
+
+const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
+static WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct WorkerLease(&'static AtomicBool);
+impl WorkerLease {
+    fn acquire(active: &'static AtomicBool) -> Result<Self, X11InputCaptureCreationError> {
+        active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| X11InputCaptureCreationError::WorkerStillRunning)?;
+        Ok(Self(active))
+    }
+}
+impl Drop for WorkerLease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct ControlRequest {
+    request: Request,
+    done: oneshot::Sender<()>,
+}
+
+fn control_error(kind: std::io::ErrorKind, message: &'static str) -> CaptureError {
+    std::io::Error::new(kind, message).into()
 }
 
 // ── Internal thread state ─────────────────────────────────────────────────────
@@ -50,7 +80,9 @@ struct X11State {
     release_calls: usize,
     #[cfg(test)]
     warp_calls: usize,
-    request_rx: mpsc::Receiver<Request>,
+    request_rx: mpsc::Receiver<ControlRequest>,
+    stopping: Arc<AtomicBool>,
+    _worker_lease: Option<WorkerLease>,
 }
 
 // Safety: display is only accessed from the dedicated X11 thread.
@@ -60,12 +92,14 @@ unsafe impl Send for X11State {}
 
 pub struct X11InputCapture {
     event_rx: HookReceiver,
-    request_tx: mpsc::SyncSender<Request>,
+    request_tx: mpsc::Sender<ControlRequest>,
+    stopping: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl X11InputCapture {
     pub fn new() -> Result<Self, X11InputCaptureCreationError> {
+        let lease = WorkerLease::acquire(&WORKER_ACTIVE)?;
         let display = unsafe { x11::xlib::XOpenDisplay(std::ptr::null()) };
         if display.is_null() {
             return Err(X11InputCaptureCreationError::OpenDisplayFailed);
@@ -77,8 +111,8 @@ impl X11InputCapture {
         let screen_h = unsafe { XDisplayHeight(display, screen) };
 
         let (event_tx, event_rx) = x11_channel();
-        let (request_tx, request_rx) = mpsc::sync_channel(16);
-        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let stopping = Arc::new(AtomicBool::new(false));
 
         let state = X11State {
             display,
@@ -97,28 +131,112 @@ impl X11InputCapture {
             #[cfg(test)]
             warp_calls: 0,
             request_rx,
+            stopping: stopping.clone(),
+            _worker_lease: Some(lease),
         };
 
-        let thread = thread::spawn(move || {
-            ready_tx.send(()).expect("ready channel closed");
-            run_event_loop(state);
-        });
-
-        ready_rx.recv().expect("ready channel closed");
+        let thread = thread::spawn(move || run_event_loop(state));
 
         Ok(Self {
             event_rx,
             request_tx,
+            stopping,
             thread: Some(thread),
         })
+    }
+    async fn control(&self, request: Request) -> Result<(), CaptureError> {
+        self.control_with_timeout(request, CONTROL_TIMEOUT).await
+    }
+
+    async fn control_with_timeout(
+        &self,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<(), CaptureError> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(control_error(
+                std::io::ErrorKind::BrokenPipe,
+                "X11 capture is stopping",
+            ));
+        }
+        let result = tokio::time::timeout(timeout, async {
+            let (done, completion) = oneshot::channel();
+            self.request_tx
+                .send(ControlRequest { request, done })
+                .await
+                .map_err(|_| {
+                    control_error(std::io::ErrorKind::BrokenPipe, "X11 capture thread closed")
+                })?;
+            completion.await.map_err(|_| {
+                control_error(
+                    std::io::ErrorKind::BrokenPipe,
+                    "X11 capture request was not completed",
+                )
+            })
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                self.stopping.store(true, Ordering::Release);
+                Err(control_error(
+                    std::io::ErrorKind::TimedOut,
+                    "X11 capture control timed out; stopping capture",
+                ))
+            }
+        }
+    }
+
+    async fn terminate_with_timeout(&mut self, timeout: Duration) -> Result<(), CaptureError> {
+        self.stopping.store(true, Ordering::Release);
+        tokio::time::timeout(timeout, async {
+            while self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished())
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if let Some(thread) = self.thread.take() {
+                thread.join().map_err(|_| {
+                    control_error(std::io::ErrorKind::Other, "X11 capture thread panicked")
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            control_error(
+                std::io::ErrorKind::TimedOut,
+                "X11 capture thread has not stopped",
+            )
+        })?
     }
 }
 
 impl Drop for X11InputCapture {
     fn drop(&mut self) {
-        let _ = self.request_tx.send(Request::Terminate);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        self.stopping.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                // The native worker keeps its lease until cleanup actually completes.
+                log::warn!("X11 capture worker still stopping; native cleanup is pending");
+            }
+        }
+    }
+}
+
+impl Drop for X11State {
+    fn drop(&mut self) {
+        if !self.display.is_null() {
+            if self.active_client.is_some() {
+                do_release(self);
+            }
+            unsafe {
+                XCloseDisplay(self.display);
+            }
         }
     }
 }
@@ -128,17 +246,15 @@ impl Drop for X11InputCapture {
 #[async_trait]
 impl Capture for X11InputCapture {
     fn pending_failure(&self) -> bool {
-        self.event_rx.failed()
+        self.stopping.load(Ordering::Acquire) || self.event_rx.failed()
     }
 
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let _ = self.request_tx.send(Request::Create(pos));
-        Ok(())
+        self.control(Request::Create(pos)).await
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let _ = self.request_tx.send(Request::Destroy(pos));
-        Ok(())
+        self.control(Request::Destroy(pos)).await
     }
 
     async fn set_enter_only(&mut self, _pos: Position, _enabled: bool) -> Result<(), CaptureError> {
@@ -146,20 +262,15 @@ impl Capture for X11InputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        let _ = self.request_tx.send(Request::Release);
-        Ok(())
+        self.control(Request::Release).await
     }
 
     async fn release_to(&mut self, t: f64) -> Result<(), CaptureError> {
-        self.request_tx.send(Request::ReleaseTo(t)).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "X11 capture thread closed")
-        })?;
-        Ok(())
+        self.control(Request::ReleaseTo(t)).await
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
-        let _ = self.request_tx.send(Request::Terminate);
-        Ok(())
+        self.terminate_with_timeout(CONTROL_TIMEOUT).await
     }
 }
 
@@ -167,6 +278,9 @@ impl Stream for X11InputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Poll::Ready(None);
+        }
         self.event_rx.poll_recv(cx)
     }
 }
@@ -175,13 +289,7 @@ impl Stream for X11InputCapture {
 
 fn run_event_loop(mut state: X11State) {
     loop {
-        if !state.event_tx.available() {
-            if state.active_client.is_some() {
-                do_release(&mut state);
-            }
-            unsafe {
-                XCloseDisplay(state.display);
-            }
+        if state.stopping.load(Ordering::Acquire) || !state.event_tx.available() {
             return;
         }
         if drain_requests(&mut state) {
@@ -217,26 +325,34 @@ fn run_event_loop(mut state: X11State) {
 
 /// Drains pending requests. Returns `true` if the thread should terminate.
 fn drain_requests(state: &mut X11State) -> bool {
-    loop {
-        match state.request_rx.try_recv() {
-            Ok(Request::Create(pos)) => {
+    for _ in 0..16 {
+        if state.stopping.load(Ordering::Acquire) {
+            return true;
+        }
+        let control = match state.request_rx.try_recv() {
+            Ok(control) => control,
+            Err(mpsc::error::TryRecvError::Empty) => return false,
+            Err(mpsc::error::TryRecvError::Disconnected) => return true,
+        };
+        if control.done.is_closed() {
+            continue;
+        }
+        match control.request {
+            Request::Create(pos) => {
                 state.clients.insert(pos);
             }
-            Ok(Request::Destroy(pos)) => {
+            Request::Destroy(pos) => {
                 state.clients.remove(&pos);
                 if state.active_client == Some(pos) {
                     do_release(state);
                 }
             }
-            Ok(Request::Release) => do_release(state),
-            Ok(Request::ReleaseTo(t)) => do_release_to(state, t),
-            Ok(Request::Terminate) => {
-                unsafe { XCloseDisplay(state.display) };
-                return true;
-            }
-            Err(_) => return false,
+            Request::Release => do_release(state),
+            Request::ReleaseTo(t) => do_release_to(state, t),
         }
+        let _ = control.done.send(());
     }
+    false
 }
 
 fn query_pointer(state: &X11State) -> (i32, i32) {
@@ -318,12 +434,16 @@ fn do_grab(state: &mut X11State, pos: Position, entry: (i32, i32)) {
 }
 
 fn do_grab_with(state: &mut X11State, pos: Position, entry: (i32, i32), ops: &GrabOps) {
-    if !state.event_tx.available() {
+    if state.stopping.load(Ordering::Acquire) || !state.event_tx.available() {
         return;
     }
     let result = (ops.pointer)(state);
     if result != GrabSuccess {
         log::warn!("x11: XGrabPointer failed with code {result}");
+        return;
+    }
+    if state.stopping.load(Ordering::Acquire) {
+        do_release(state);
         return;
     }
     let result = (ops.keyboard)(state);
@@ -332,7 +452,15 @@ fn do_grab_with(state: &mut X11State, pos: Position, entry: (i32, i32), ops: &Gr
         do_release(state);
         return;
     }
+    if state.stopping.load(Ordering::Acquire) {
+        do_release(state);
+        return;
+    }
     (ops.warp)(state, entry);
+    if state.stopping.load(Ordering::Acquire) {
+        do_release(state);
+        return;
+    }
     state.entry_point = entry;
     state.active_client = Some(pos);
     let t = match pos {
@@ -376,7 +504,9 @@ fn do_release_to(state: &mut X11State, t: f64) {
 }
 
 fn send_event(state: &mut X11State, pos: Position, event: CaptureEvent) {
-    if state.event_tx.send(pos, event).is_err() && state.active_client.is_some() {
+    if (state.stopping.load(Ordering::Acquire) || state.event_tx.send(pos, event).is_err())
+        && state.active_client.is_some()
+    {
         do_release(state);
     }
 }
@@ -546,7 +676,7 @@ mod tests {
 
     fn button_fixture() -> (X11State, HookReceiver) {
         let (event_tx, event_rx) = x11_channel();
-        let (_request_tx, request_rx) = mpsc::channel();
+        let (_request_tx, request_rx) = mpsc::channel(16);
         (
             X11State {
                 display: std::ptr::null_mut(),
@@ -563,6 +693,8 @@ mod tests {
                 release_calls: 0,
                 warp_calls: 0,
                 request_rx,
+                stopping: Arc::new(AtomicBool::new(false)),
+                _worker_lease: None,
             },
             event_rx,
         )
@@ -587,6 +719,172 @@ mod tests {
         }
     }
 
+    fn control_fixture() -> (X11State, X11InputCapture) {
+        let (mut state, events) = button_fixture();
+        let (request_tx, request_rx) = mpsc::channel(16);
+        state.request_rx = request_rx;
+        let backend = X11InputCapture {
+            event_rx: events,
+            request_tx,
+            stopping: state.stopping.clone(),
+            thread: None,
+        };
+        (state, backend)
+    }
+
+    #[tokio::test]
+    async fn full_control_queue_yields_and_times_out_without_synchronous_blocking() {
+        let (state, backend) = control_fixture();
+        let mut completions = Vec::new();
+        for _ in 0..16 {
+            let (done, completion) = oneshot::channel();
+            completions.push(completion);
+            backend
+                .request_tx
+                .try_send(ControlRequest {
+                    request: Request::Create(Position::Left),
+                    done,
+                })
+                .unwrap();
+        }
+        let (result, ()) = tokio::join!(
+            backend.control_with_timeout(Request::Release, Duration::from_millis(20)),
+            async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        );
+        assert!(
+            matches!(result, Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(state.stopping.load(Ordering::Acquire));
+        assert_eq!(backend.request_tx.capacity(), 0);
+        assert!(matches!(backend.control(Request::Release).await,
+            Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe));
+        drop(backend); // full queue does not prevent Drop.
+    }
+
+    #[tokio::test]
+    async fn control_waits_for_ack_and_canceled_return_is_not_replayed() {
+        let (mut state, backend) = control_fixture();
+        let mut request = Box::pin(backend.control(Request::ReleaseTo(0.75)));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        assert_eq!(state.active_client, Some(Position::Left));
+        drop(request);
+        assert!(!drain_requests(&mut state));
+        assert_eq!(state.warp_calls, 0);
+        assert_eq!(state.release_calls, 0);
+        let mut release = Box::pin(backend.control(Request::Release));
+        assert!(futures::poll!(release.as_mut()).is_pending());
+        assert_eq!(state.release_calls, 0);
+        assert!(!drain_requests(&mut state));
+        release.await.unwrap();
+        assert_eq!(state.release_calls, 1);
+        assert_eq!(state.active_client, None);
+    }
+
+    #[tokio::test]
+    async fn admitted_control_timeout_stops_before_late_native_work() {
+        let (mut state, backend) = control_fixture();
+        assert!(
+            matches!(backend.control_with_timeout(Request::ReleaseTo(0.75), Duration::from_millis(10)).await,
+            Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(drain_requests(&mut state));
+        assert_eq!(state.warp_calls, 0);
+        assert_eq!(state.release_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn stalled_shutdown_is_bounded_drop_does_not_join_and_lease_prevents_replacement() {
+        static ACTIVE: AtomicBool = AtomicBool::new(false);
+        let lease = WorkerLease::acquire(&ACTIVE).unwrap();
+        let (_, mut backend) = control_fixture();
+        let (resume, blocked) = std::sync::mpsc::channel();
+        let (done, completed) = oneshot::channel();
+        backend.thread = Some(thread::spawn(move || {
+            let _lease = lease;
+            blocked.recv().unwrap(); // models an uninterruptible native operation.
+            drop(_lease);
+            let _ = done.send(());
+        }));
+        assert!(
+            matches!(backend.terminate_with_timeout(Duration::from_millis(20)).await,
+            Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(backend.stopping.load(Ordering::Acquire));
+        assert!(backend.thread.is_some());
+        assert!(WorkerLease::acquire(&ACTIVE).is_err());
+        drop(backend); // must not wait for the simulated native operation.
+        assert!(WorkerLease::acquire(&ACTIVE).is_err());
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), completed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(WorkerLease::acquire(&ACTIVE).is_ok());
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_can_be_retried_and_panicked_worker_reports_error() {
+        let (_, mut backend) = control_fixture();
+        let stopping = backend.stopping.clone();
+        let (resume, blocked) = std::sync::mpsc::channel();
+        backend.thread = Some(thread::spawn(move || {
+            blocked.recv().unwrap();
+            assert!(stopping.load(Ordering::Acquire));
+        }));
+        assert!(
+            matches!(backend.terminate_with_timeout(Duration::from_millis(10)).await,
+            Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        assert!(backend.thread.is_some());
+        resume.send(()).unwrap();
+        backend.terminate().await.unwrap();
+        assert!(backend.thread.is_none());
+        backend.terminate().await.unwrap();
+        let (_, mut backend) = control_fixture();
+        backend.thread = Some(thread::spawn(|| panic!("simulated native worker panic")));
+        assert!(matches!(backend.terminate().await,
+            Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::Other));
+        assert!(backend.thread.is_none());
+    }
+
+    #[test]
+    fn stopping_during_grab_rolls_back_without_warp_or_begin() {
+        let (mut state, mut events) = button_fixture();
+        state.active_client = None;
+        let ops = GrabOps {
+            pointer: |state| {
+                state.stopping.store(true, Ordering::Release);
+                GrabSuccess
+            },
+            keyboard: |_| panic!("must not acquire keyboard after stop"),
+            warp: |_, _| panic!("must not warp after stop"),
+        };
+        do_grab_with(&mut state, Position::Left, (0, 25), &ops);
+        assert_eq!(state.active_client, None);
+        assert_eq!(state.release_calls, 1);
+        assert!(ready_event(&mut events).is_none());
+    }
+
+    #[test]
+    fn stopped_capture_never_delivers_old_or_new_input() {
+        let (mut state, mut backend) = control_fixture();
+        state
+            .event_tx
+            .send(Position::Left, CaptureEvent::Begin(0.5))
+            .unwrap();
+        state.stopping.store(true, Ordering::Release);
+        send_event(&mut state, Position::Left, CaptureEvent::Begin(0.75));
+        assert_eq!(state.release_calls, 1);
+        let waker = futures::task::noop_waker();
+        assert!(matches!(
+            Pin::new(&mut backend).poll_next(&mut Context::from_waker(&waker)),
+            Poll::Ready(None)
+        ));
+        assert!(backend.pending_failure());
+    }
+
     #[tokio::test]
     async fn release_to_request_releases_at_matching_inset_without_immediate_recapture() {
         for (pos, target) in [
@@ -597,22 +895,29 @@ mod tests {
         ] {
             let (mut state, events) = button_fixture();
             state.active_client = Some(pos);
-            let (request_tx, request_rx) = mpsc::sync_channel(16);
+            let (request_tx, request_rx) = mpsc::channel(16);
             state.request_rx = request_rx;
             let mut backend = X11InputCapture {
                 event_rx: events,
                 request_tx,
+                stopping: state.stopping.clone(),
                 thread: None,
             };
-            backend.release_to(0.75).await.unwrap();
-            assert!(!drain_requests(&mut state));
+            let (result, ()) = tokio::join!(backend.release_to(0.75), async {
+                tokio::task::yield_now().await;
+                assert!(!drain_requests(&mut state));
+            });
+            result.unwrap();
             assert_eq!(state.active_client, None);
             assert_eq!(state.release_calls, 1);
             assert_eq!(state.warp_calls, 1);
             assert_eq!(state.prev_pos, target);
             assert_eq!(crossed_boundary(state.prev_pos, target, 100, 100), None);
-            backend.release_to(0.25).await.unwrap();
-            assert!(!drain_requests(&mut state));
+            let (result, ()) = tokio::join!(backend.release_to(0.25), async {
+                tokio::task::yield_now().await;
+                assert!(!drain_requests(&mut state));
+            });
+            result.unwrap();
             assert_eq!(state.release_calls, 1);
             assert_eq!(state.warp_calls, 1);
             assert_eq!(state.prev_pos, target);
@@ -622,11 +927,12 @@ mod tests {
     #[tokio::test]
     async fn release_to_reports_closed_thread_instead_of_false_success() {
         let (_, events) = button_fixture();
-        let (request_tx, request_rx) = mpsc::sync_channel(16);
+        let (request_tx, request_rx) = mpsc::channel(16);
         drop(request_rx);
         let mut backend = X11InputCapture {
             event_rx: events,
             request_tx,
+            stopping: Arc::new(AtomicBool::new(false)),
             thread: None,
         };
         assert!(
@@ -776,10 +1082,11 @@ mod tests {
         }
         handle_event(&mut state, button_event(ButtonRelease, 1));
         assert_eq!(state.release_calls, 1);
-        let (request_tx, _request_rx) = mpsc::sync_channel(16);
+        let (request_tx, _request_rx) = mpsc::channel(16);
         let backend = X11InputCapture {
             event_rx: events,
             request_tx,
+            stopping: Arc::new(AtomicBool::new(false)),
             thread: None,
         };
         let mut capture = crate::InputCapture {

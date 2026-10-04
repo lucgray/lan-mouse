@@ -141,6 +141,8 @@ pub enum LayerShellCaptureCreationError {
 #[cfg(x11)]
 #[derive(Debug, Error)]
 pub enum X11InputCaptureCreationError {
+    #[error("previous X11 capture worker is still running or stopping")]
+    WorkerStillRunning,
     #[error("XOpenDisplay failed — is DISPLAY set?")]
     OpenDisplayFailed,
 }
