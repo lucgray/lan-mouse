@@ -213,7 +213,15 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event).await,
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
-                _ = self.config.changed() => self.handle_config_change(),
+                result = self.config.changed() => match result {
+                    Ok(()) => self.handle_config_change(),
+                    Err(error) => {
+                        log::warn!("could not reload configuration: {error}");
+                        self.notify_frontend(FrontendEvent::Error(format!(
+                            "Failed to reload settings: {error}"
+                        )));
+                    }
+                },
                 event = async {
                     match &mut self.clipboard_monitor {
                         Some(monitor) => monitor.recv().await,
@@ -383,8 +391,12 @@ impl Service {
         self.capture.set_jail_bind(jail_bind);
         let enter_binds = self.config.enter_binds();
         self.capture.set_enter_binds(enter_binds);
-        self.update_scrolling_inversion(self.config.invert_scroll());
-        self.update_mouse_sensitivity(self.config.mouse_sensitivity());
+        // Applying an external snapshot must not invoke GUI setters that save
+        // runtime state back over the newly read configuration.
+        self.emulation
+            .request_scrolling_inversion(self.config.invert_scroll());
+        self.emulation
+            .request_mouse_sensitivity_change(self.config.mouse_sensitivity());
         self.capture.set_remap(KeyRemap::new(
             self.config.remap_keys(),
             self.config.remap_chords(),
@@ -398,6 +410,8 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+        self.apply_clipboard_enabled(self.config.clipboard_enabled());
+        self.change_port(self.config.port());
         self.sync_frontend();
     }
 
@@ -870,6 +884,17 @@ impl Service {
             self.notify_settings();
             return;
         }
+        self.apply_clipboard_enabled(enabled);
+        self.config.set_clipboard_enabled(enabled);
+        self.save_config();
+        self.notify_settings();
+    }
+
+    /// Update runtime state without writing an externally loaded snapshot back.
+    fn apply_clipboard_enabled(&mut self, enabled: bool) {
+        if self.clipboard_enabled == enabled {
+            return;
+        }
         log::info!(
             "clipboard sharing {}",
             if enabled { "enabled" } else { "disabled" }
@@ -908,9 +933,6 @@ impl Service {
                 writer.clear_pending();
             }
         }
-        self.config.set_clipboard_enabled(enabled);
-        self.save_config();
-        self.notify_settings();
     }
 
     fn update_scrolling_inversion(&mut self, invert_scroll: bool) {
@@ -957,5 +979,61 @@ impl Service {
                 self.notify_frontend(FrontendEvent::Error(notice));
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // This constructs the real service. Explicit isolation is required so the
+    // fixture never binds to the user's frontend socket or uses input hardware.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires isolated LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR / XDG_RUNTIME_DIR"]
+    async fn external_reload_preserves_file_and_applies_authorization_and_clipboard() {
+        let runtime = std::env::var("LAN_MOUSE_SERVICE_TEST_RUNTIME_DIR").unwrap();
+        assert_eq!(std::env::var("XDG_RUNTIME_DIR").unwrap(), runtime);
+        assert!(std::path::Path::new(&runtime).starts_with(std::env::temp_dir()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let cert = directory.path().join("test.pem");
+        std::fs::write(
+            &path,
+            "port = 0\nenable_clipboard = false\n[authorized_fingerprints]\nold = 'old-peer'\n",
+        )
+        .unwrap();
+        let config = Config::new_with_args([
+            "lan-mouse",
+            "--config",
+            path.to_str().unwrap(),
+            "--cert-path",
+            cert.to_str().unwrap(),
+            "--capture-backend",
+            "dummy",
+            "--emulation-backend",
+            "dummy",
+        ])
+        .unwrap();
+        tokio::task::LocalSet::new().run_until(async move {
+            let mut service = Service::new(config).await.unwrap();
+            // Model an already enabled session without starting OS clipboard
+            // resources: the external snapshot must disable it on reload.
+            service.clipboard_enabled = true;
+            let external = "# external edit must survive reload\nport = 0\nenable_clipboard = false\n[authorized_fingerprints]\nnew = 'new-peer'\n[input_post_processing]\ninvert_scroll = true\nmouse_sensitivity = 1.75\n";
+            std::fs::write(&path, external).unwrap();
+            assert!(service.config.read_from_disk().unwrap());
+            service.handle_config_change();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
+            assert_eq!(*service.authorized_keys.read().unwrap(), HashMap::from([("new".into(), "new-peer".into())]));
+            assert!(!service.clipboard_enabled);
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event,
+                FrontendEvent::Settings { clipboard_enabled: false, invert_scroll: true, mouse_sensitivity } if *mouse_sensitivity == 1.75
+            )));
+            service.capture.terminate().await;
+            service.emulation.terminate().await;
+            service.conn_sender.terminate().await;
+            service.hooks.terminate().await;
+            service.resolver.terminate().await;
+        }).await;
     }
 }

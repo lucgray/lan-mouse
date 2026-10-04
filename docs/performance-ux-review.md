@@ -8,6 +8,9 @@
 
 | 清单项 | 状态 | 证据 / 剩余验证 |
 |---|---|---|
+| R26 | 已实现并通过磁盘往返回归 | 删除最后一台设备保存空列表，重载后不会复活；保留授权和其他设置 |
+| R27 | 已实现并通过隔离真实服务回归 | 外部加载不调用写盘 setter，保留文件和新授权，应用剪贴板开关；端口请求及输入设置走运行状态更新；完整真机动态重载待验 |
+| R28 | 已实现并通过错误后恢复回归 | watcher 错误传播而非 panic，服务提示失败并保留旧状态；后续有效编辑仍能读取 |
 | R24 | 已实现并通过 Windows 原生 CI | 通知 ready 前以 PeekMessage 创建线程队列；原生测试在首个投递前禁止其他建队列 API，af0ff03 的 Windows 测试已通过 |
 | R02 | 已实现并通过队列/连接状态回归 | 256 条保序有界队列，积压时合并相邻 motion；超载立即恢复本机透传，清空旧队列并禁用捕获，取消目标连接/心跳并提示；Windows CI 编译、队列与启动原生回归通过；hook 拥塞及双机人工验收待实测 |
 | R03 | 已实现并通过回归 | transport 发送拒绝时输入/剪贴板均返回 Err 并清理 active_addr |
@@ -456,3 +459,28 @@ GTK 测试命令：`cargo test -p lan-mouse-gtk --all-features --offline actual_
 日志：work/diagnostics/gtk-reconnect-workspace.log、gtk-reconnect-clippy.log、gtk-reconnect-window.log、gtk-reconnect-real-ipc.log。
 
 上一轮 af0ff03 的 Rust Linux/Windows/macOS Intel/ARM 全矩阵已通过，Windows 原生消息队列测试及六个 hook_queue 回归确实执行；日志保存在 work/diagnostics/windows-ci-af0ff03.log。该证据不能替代本轮提交的新 CI。后台配置持久化、剪贴板重连/反馈和完整性能/真机门槛仍未完成，当前不认定 90 分。
+
+
+## 第十九轮：配置重载覆盖授权、空列表与监视器错误
+
+### R26 / P2：删除最后一台设备没有保存
+
+- [x] `Config::set_clients` 不再对空列表提前返回；旧逻辑会在下次启动恢复被删除设备。
+- [x] 临时文件往返回归从一台启动激活设备开始，删除后保存，再构造 Config 读取；设备为空，授权和剪贴板设置保留。
+
+### R27 / P1：外部配置重载反而保存旧授权
+
+- [x] 原 `handle_config_change` 先调用滚动/灵敏度 GUI setter，里面的 save_config 会用旧 runtime 授权覆盖新配置；随后才读授权。移除重载路径的写盘调用，直接提交运行设置，再同步前端。
+- [x] 提取不写盘的剪贴板状态更新，外部开关也能生效；重载提交监听端口更新。GUI 修改仍通过原有持久化入口。
+- [x] 隔离实际 Service 回归使用独立 /tmp IPC 目录、随机 DTLS 端口、dummy 输入后端和临时证书；外部文件新增授权并撤销旧授权，带注释及新输入设置，加载后文件逐字节不变、授权采用新名单、前端 Settings 使用新值。
+- [x] 剪贴板关闭回归模拟已开启的 runtime 标志，没有启动系统剪贴板资源；不将此测试称为实际 OS 剪贴板或网络认证撤销验收。
+- [ ] 真机运行中的已认证会话撤销行为、端口绑定冲突反馈以及 OS 剪贴板开关仍需单独验收；现有连接的即时断开不属于这条授权快照测试的证明范围。
+
+### R28 / P2：文件监视错误导致 panic
+
+- [x] 文件事件错误使用 Result 传播；服务只在成功加载时重建状态，失败显示错误而非重新应用旧快照。
+- [x] 注入 watcher 错误后再次注入有效编辑，确认旧状态保留且后续加载成功。
+
+Linux 工作区测试通过（root 65 个通过、隔离服务测试默认忽略并已单独运行通过），严格 Clippy、格式和 diff 检查通过。
+
+日志：work/diagnostics/config-reload-service.log、config-reload-workspace.log、config-reload-clippy.log。上一轮 33a7372 的 Rust 全矩阵已通过（run 37162865341）；本轮需要新的 CI。R20 的异步、有序配置持久化及外部编辑冲突保护仍未实现，评分与真机性能门槛继续保留，不认定 90 分。

@@ -198,3 +198,15 @@ The Wayland window identifier is reapplied to the new service. Closing the app
 allows accepted requests to drain for at most two seconds before the IPC worker
 stops. This is a socket-send flush, not confirmation of configuration disk sync. The normal program entry point manages daemon startup;
 the GTK UI no longer spawns an additional unmanaged daemon while waiting for IPC.
+
+## Configuration reload
+
+Deleting the final configured client persists an empty list. Reloading an
+externally edited configuration applies clients, authorized fingerprints,
+input mapping, scrolling, sensitivity, clipboard sharing and the listen-port
+request without saving the previous runtime snapshot over that file. Clipboard
+sharing can therefore also be disabled through the file while the service runs.
+Watcher/read errors are reported to the frontend; the current configuration
+remains in use and subsequent valid edits can still reload. This does not add
+live switching of backend, certificate or key-repeat options. GUI saves and
+configuration reads still perform synchronous disk I/O.

@@ -511,7 +511,7 @@ impl Config {
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
             let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let event = event?;
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
@@ -682,14 +682,7 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clients =
-            Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        self.toml_mut().clients = Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
     }
 
     /// set authorized keys
@@ -909,6 +902,65 @@ mod tests {
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(3), config.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(config.clipboard_enabled());
+    }
+
+    #[test]
+    fn deleting_last_client_persists_empty_list_and_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            enable_clipboard = false
+            [authorized_fingerprints]
+            trusted = "peer"
+            [[clients]]
+            hostname = "old-peer"
+            activate_on_startup = true
+        "#,
+        )
+        .unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(config.clients().len(), 1);
+        config.set_clients(Vec::new());
+        config.write_back().unwrap();
+        let reloaded =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        assert!(reloaded.clients().is_empty());
+        assert!(!reloaded.clipboard_enabled());
+        assert_eq!(
+            reloaded.authorized_fingerprints().get("trusted"),
+            Some(&"peer".into())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_error_is_reported_and_next_valid_edit_can_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        config.watch_rx = rx;
+        tx.send(Err(notify::Error::generic("injected watcher error")))
+            .await
+            .unwrap();
+        assert!(config.changed().await.is_err());
+        assert!(!config.clipboard_enabled());
+        fs::write(&path, "enable_clipboard = true").unwrap();
+        tx.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(path)))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), config.changed())
             .await
             .unwrap()
             .unwrap();
