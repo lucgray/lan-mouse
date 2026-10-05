@@ -326,7 +326,7 @@ impl ListenTask {
         let mut control_jobs = crate::control_network::ControlJobs::default();
         let revoked = self.listener.revoked_signal();
         loop {
-            for (addr, _) in self.listener.take_revoked() {
+            for (addr, _, admission) in self.listener.take_revoked() {
                 let current = self.listener.clipboard_connection(addr);
                 clipboard_jobs.cancel_stale(addr, current.as_ref());
                 control_jobs.cancel_stale(addr, current.as_ref());
@@ -335,12 +335,10 @@ impl ListenTask {
                 }
                 accepted_clients.remove(&addr);
                 forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
-                self.emulation_proxy.remove(addr);
+                self.emulation_proxy
+                    .remove_with_admission(addr, None, admission.clone());
                 self.event_tx
-                    .send(EmulationEvent::ConnectionClosed {
-                        addr,
-                        admission: None,
-                    })
+                    .send(EmulationEvent::ConnectionClosed { addr, admission })
                     .expect("channel closed");
             }
             select! {

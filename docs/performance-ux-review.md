@@ -1854,3 +1854,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 一份代次owner多次clone不限制同一live代次无限派生消息，timeout/恢复等重复工作仍需独立预算或合并策略。全进程资源、原生恢复、千次切换、完整p95/p99与8h RSS未证明，不认定90分。
 
 日志：disconnect-generation-budget-baseline.log、disconnect-generation-budget-fixed.log、disconnect-generation-budget-workspace.log、disconnect-generation-budget-clippy.log。
+
+
+## 第七十九轮：主动断线和授权撤销保留代次额度
+
+### R96 后续 / P1
+
+- 基线直接调用生产 admission 和 finish_control_reply：控制发送超时先移除连接，reader/close owners 释放后计数为0，但 Disconnected 尚未消费；期望1的断言失败。日志 forced-disconnect-budget-baseline.log。此处证明队列预算缺陷，并不直接证明用户现场鼠标卡顿的全部原因。
+- [x] IncomingAuthorization 弱引用登记连接身份和原 ReaderReservation；精确匹配 conn 才能共享名额。登记不会延长已结束代次寿命，后续登记清理失效条目。
+- [x] 控制回复失败把原代次 owner 同时传给 Disconnected 和异步关闭任务。授权撤销 pending 和关闭任务也保留原 owner，dispatcher 继续转交 ConnectionClosed 和代理 cleanup；地址已有替代连接时沿用跳过旧清理的保护。
+
+### 验证和边界
+
+- 基线回归修复后通过；新增弱登记/替代连接身份隔离/失效条目回收测试。撤销测试覆盖重复调用100次不新增通知、pending dequeue/drop 后挂起 close 仍占名额、close 完成后归零。
+- 工作区 all-features：root 176通过/3忽略，其余组件全部通过；严格 Clippy、fmt、diff 检查通过。额外执行临时目录 Dummy Service 授权撤销回归1条通过。未部署已安装程序。
+- [ ] R96仍部分完成：InputRejected/InputOverloaded 等错误报告和同一活代次反复派生的生命周期工作需要单独预算或合并。共享代次额度不等于总消息数量或全进程 RSS 已受限。
+- [ ] 真实双机千次切换、原生故障恢复、完整输入延迟 p95/p99 和8小时 RSS 尚缺验收证据，不认定90分。
+
+日志：forced-disconnect-budget-baseline.log、forced-disconnect-budget-fixed.log、forced-disconnect-budget-workspace.log、forced-disconnect-budget-clippy.log、forced-disconnect-budget-isolated-service.log。

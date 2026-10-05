@@ -1079,6 +1079,10 @@ Natural reader shutdown now transfers that reservation through Disconnected,
 ConnectionClosed Service notices and proxy removal. An obsolete disconnect
 discarded while a replacement is live releases only its old owner. This also
 keeps a generation reserved after its stale Accept notice is rejected.
-Control-reply failures, authorization-revocation notifications, error reports
-and repeated lifecycle work without ownership still need separate queue bounds.
+Control-reply failure and authorization revocation now retain the exact
+generation through queued notifications and asynchronous close. Revocation
+forwards that owner to ConnectionClosed and proxy cleanup. The lookup registry
+uses weak references and connection identity checks, so it neither leaks slots
+nor lends a replacement connection's reservation to an old completion. Error
+reports and repeated lifecycle work still need separate queue bounds.
 It does not establish a total notification count or whole-service RSS bound.

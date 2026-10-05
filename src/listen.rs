@@ -243,6 +243,7 @@ fn admit_reader(
     // Reserve before replacing authorization/state or publishing Accept.
     let lease = budget.try_reserve()?;
     let session = authorization.install(addr, fingerprint.clone(), conn, parent);
+    authorization.track_reader(addr, conn, &lease);
     let mut current = authorization.conns.borrow_mut();
     if let Some(index) = current.iter().position(|(old, _)| *old == addr) {
         current.remove(index);
@@ -263,16 +264,47 @@ fn admit_reader(
 type SessionIdentities =
     HashMap<SocketAddr, (String, Weak<dyn Conn + Send + Sync>, CancellationToken)>;
 
+type ReaderAdmissions = HashMap<
+    SocketAddr,
+    (
+        Weak<dyn Conn + Send + Sync>,
+        std::rc::Weak<ReaderReservation>,
+    ),
+>;
+type RevokedPeer = (ArcConn, Option<ReaderLease>);
+
 #[derive(Clone, Default)]
 pub(crate) struct IncomingAuthorization {
     keys: Arc<RwLock<HashMap<String, String>>>,
     conns: Rc<RefCell<Vec<(SocketAddr, ArcConn)>>>,
     identities: Rc<RefCell<SessionIdentities>>,
-    pending: Rc<RefCell<HashMap<SocketAddr, ArcConn>>>,
+    admissions: Rc<RefCell<ReaderAdmissions>>,
+    pending: Rc<RefCell<HashMap<SocketAddr, RevokedPeer>>>,
     ready: Rc<tokio::sync::Notify>,
 }
 
 impl IncomingAuthorization {
+    fn track_reader(&self, addr: SocketAddr, conn: &ArcConn, lease: &ReaderLease) {
+        let mut admissions = self.admissions.borrow_mut();
+        // Weak entries must not keep ended generations reserved.
+        admissions.retain(|_, (conn, slot)| conn.strong_count() != 0 && slot.strong_count() != 0);
+        admissions.insert(
+            addr,
+            (Arc::downgrade(conn), Rc::downgrade(&lease._reservation)),
+        );
+    }
+
+    fn reader_admission(&self, addr: SocketAddr, conn: &ArcConn) -> Option<ReaderLease> {
+        self.admissions
+            .borrow()
+            .get(&addr)
+            .filter(|(old, _)| old.ptr_eq(&Arc::downgrade(conn)))
+            .and_then(|(_, slot)| slot.upgrade())
+            .map(|reservation| ReaderLease {
+                _reservation: reservation,
+            })
+    }
+
     fn install(
         &self,
         addr: SocketAddr,
@@ -328,8 +360,12 @@ impl IncomingAuthorization {
         drop(keys);
         let result = removed.iter().map(|(addr, _)| *addr).collect();
         for (addr, conn) in removed {
-            self.pending.borrow_mut().insert(addr, conn.clone());
+            let admission = self.reader_admission(addr, &conn);
+            self.pending
+                .borrow_mut()
+                .insert(addr, (conn.clone(), admission.clone()));
             spawn_local(async move {
+                let _admission = admission;
                 close_incoming(&conn).await;
             });
         }
@@ -338,9 +374,10 @@ impl IncomingAuthorization {
         }
         result
     }
-    fn take_revoked(&self) -> Vec<(SocketAddr, ArcConn)> {
+    fn take_revoked(&self) -> Vec<(SocketAddr, ArcConn, Option<ReaderLease>)> {
         std::mem::take(&mut *self.pending.borrow_mut())
             .into_iter()
+            .map(|(addr, (conn, admission))| (addr, conn, admission))
             .collect()
     }
 }
@@ -628,7 +665,7 @@ impl LanMouseListener {
     pub(crate) fn revoked_signal(&self) -> Rc<tokio::sync::Notify> {
         self.authorization.ready.clone()
     }
-    pub(crate) fn take_revoked(&self) -> Vec<(SocketAddr, ArcConn)> {
+    pub(crate) fn take_revoked(&self) -> Vec<(SocketAddr, ArcConn, Option<ReaderLease>)> {
         self.authorization.take_revoked()
     }
 
@@ -720,6 +757,9 @@ impl LanMouseListener {
             completed.addr,
             completed.result.unwrap_err()
         );
+        let admission = self
+            .authorization
+            .reader_admission(completed.addr, &completed.conn);
         // Remove before notifying so queued input from this failed session is
         // ignored. Releasing its emulation state does not wait for socket close.
         self.conns
@@ -727,9 +767,10 @@ impl LanMouseListener {
             .retain(|(addr, conn)| *addr != completed.addr || !Arc::ptr_eq(conn, &completed.conn));
         let _ = self.listen_tx.send(ListenEvent::Disconnected {
             addr: completed.addr,
-            admission: None,
+            admission: admission.clone(),
         });
         spawn_local(async move {
+            let _admission = admission;
             close_incoming(&completed.conn).await;
         });
     }
@@ -2819,6 +2860,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_failure_disconnect_keeps_reader_generation_reserved() {
+        tokio::task::LocalSet::new().run_until(async {
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let conn: ArcConn = Arc::new(TestConn::new(None));
+            let mut listener = control_listener(Vec::new());
+            listener.authorization.conns = listener.conns.clone();
+            let budget = ReaderBudget::default();
+            let (lease, _) = admit_reader(&budget, &listener.authorization, addr, "peer".into(), &conn, &CancellationToken::new(), &listener.listen_tx).unwrap();
+            assert!(matches!(listener.next().await, Some(ListenEvent::Accept { .. })));
+            listener.finish_control_reply(crate::control_network::ControlCompletion { addr, conn,
+                result: Err(crate::control_network::ControlSendError::Timeout) });
+            drop(lease);
+            tokio::task::yield_now().await;
+            assert_eq!(budget.0.get(), 1, "failed-control disconnect must retain the generation after reader/close owners finish");
+            let event = listener.next().await.unwrap();
+            assert!(matches!(event, ListenEvent::Disconnected { .. }));
+            drop(event);
+            assert_eq!(budget.0.get(), 0);
+            listener.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test]
     async fn control_failures_remove_only_current_session_and_notify_release() {
         use crate::control_network::{ControlCompletion, ControlJobs, ControlSendError};
         tokio::task::LocalSet::new().run_until(async {
@@ -3548,6 +3612,80 @@ mod tests {
         .unwrap();
         assert!(conns.borrow().is_empty());
         assert_eq!(budget.available(), (1, 1));
+    }
+
+    #[test]
+    fn reader_registry_is_weak_and_fences_replacement_connections() {
+        let auth = IncomingAuthorization::default();
+        let budget = ReaderBudget::default();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let old: ArcConn = Arc::new(TestConn::new(None));
+        let replacement: ArcConn = Arc::new(TestConn::new(None));
+        let old_lease = budget.try_reserve().unwrap();
+        auth.track_reader(addr, &old, &old_lease);
+        assert!(auth.reader_admission(addr, &replacement).is_none());
+        drop(old_lease);
+        assert_eq!(budget.0.get(), 0);
+        assert!(auth.reader_admission(addr, &old).is_none());
+        let fresh = budget.try_reserve().unwrap();
+        auth.track_reader(addr, &replacement, &fresh);
+        assert!(auth.reader_admission(addr, &old).is_none());
+        let shared = auth.reader_admission(addr, &replacement).unwrap();
+        drop(fresh);
+        assert_eq!(budget.0.get(), 1);
+        drop(shared);
+        assert_eq!(budget.0.get(), 0);
+        let other = "127.0.0.1:3".parse().unwrap();
+        let lease = budget.try_reserve().unwrap();
+        auth.track_reader(other, &old, &lease);
+        assert_eq!(auth.admissions.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revoked_generation_retains_pending_and_close_owners() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let conn: ArcConn = Arc::new(TestConn {
+                    close_gate: Some(gate.clone()),
+                    ..TestConn::new(None)
+                });
+                let auth = IncomingAuthorization::default();
+                let budget = ReaderBudget::default();
+                let (tx, mut rx) = channel();
+                let (lease, token) = admit_reader(
+                    &budget,
+                    &auth,
+                    addr,
+                    "revoked".into(),
+                    &conn,
+                    &CancellationToken::new(),
+                    &tx,
+                )
+                .unwrap();
+                drop(rx.recv().await.unwrap());
+                assert_eq!(auth.revoke_untrusted(), vec![addr]);
+                assert!(token.is_cancelled());
+                drop(lease);
+                for _ in 0..100 {
+                    assert!(auth.revoke_untrusted().is_empty());
+                }
+                let queued = auth.take_revoked();
+                assert_eq!(queued.len(), 1);
+                assert_eq!(budget.0.get(), 1);
+                drop(queued);
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    budget.0.get(),
+                    1,
+                    "pending close must retain the generation"
+                );
+                gate.add_permits(1);
+                tokio::task::yield_now().await;
+                assert_eq!(budget.0.get(), 0);
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
