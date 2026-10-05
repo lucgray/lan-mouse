@@ -851,6 +851,12 @@ mod tests {
         inner: ArcConn,
         fail_sends: AtomicBool,
         fail_close: bool,
+        active_sends: AtomicUsize,
+        hold_sends: AtomicBool,
+        hold_closes: AtomicBool,
+        send_gate: tokio::sync::Semaphore,
+        close_gate: tokio::sync::Semaphore,
+        close_finished: tokio::sync::Notify,
         closes: AtomicUsize,
     }
 
@@ -866,6 +872,17 @@ mod tests {
             self.inner.recv_from(buf).await
         }
         async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+            struct SendGuard<'a>(&'a AtomicUsize);
+            impl Drop for SendGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            self.active_sends.fetch_add(1, Ordering::SeqCst);
+            let _sending = SendGuard(&self.active_sends);
+            if self.hold_sends.load(Ordering::SeqCst) {
+                self.send_gate.acquire().await.unwrap().forget();
+            }
             if self.fail_sends.load(Ordering::SeqCst) {
                 return Err(Error::Other("injected close-notify send failure".into()));
             }
@@ -882,7 +899,11 @@ mod tests {
         }
         async fn close(&self) -> webrtc_util::Result<()> {
             self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.hold_closes.load(Ordering::SeqCst) {
+                self.close_gate.acquire().await.unwrap().forget();
+            }
             self.inner.close().await?;
+            self.close_finished.notify_one();
             if self.fail_close {
                 return Err(Error::Other("injected transport close failure".into()));
             }
@@ -893,40 +914,58 @@ mod tests {
         }
     }
 
+    async fn dtls_close_fixture(
+        fail_close: bool,
+    ) -> (
+        Box<dyn Listener>,
+        Arc<tokio::net::UdpSocket>,
+        DTLSConn,
+        DTLSConn,
+        Arc<FailingCloseNotifyConn>,
+    ) {
+        let parent = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+            .await
+            .unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket.connect(parent.addr().await.unwrap()).await.unwrap();
+        let cfg = Config {
+            certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let server_cfg = cfg.clone();
+        let handshake = async {
+            tokio::join!(DTLSConn::new(socket.clone(), cfg, true, None), async {
+                let (raw, _) = parent.accept().await.unwrap();
+                let transport = Arc::new(FailingCloseNotifyConn {
+                    inner: raw,
+                    fail_sends: AtomicBool::new(false),
+                    fail_close,
+                    active_sends: AtomicUsize::new(0),
+                    hold_sends: AtomicBool::new(false),
+                    hold_closes: AtomicBool::new(false),
+                    send_gate: tokio::sync::Semaphore::new(0),
+                    close_gate: tokio::sync::Semaphore::new(0),
+                    close_finished: tokio::sync::Notify::new(),
+                    closes: AtomicUsize::new(0),
+                });
+                let server = DTLSConn::new(transport.clone(), server_cfg, false, None)
+                    .await
+                    .unwrap();
+                (server, transport)
+            })
+        };
+        let (client, (server, transport)) = tokio::time::timeout(Duration::from_secs(3), handshake)
+            .await
+            .unwrap();
+        let client = client.unwrap();
+        (Box::new(parent), socket, client, server, transport)
+    }
+
     #[tokio::test]
     async fn dtls_failed_close_notify_still_closes_underlying_session_once() {
         for (fail_send, fail_close) in [(true, false), (false, true), (true, true)] {
-            let parent = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
-                .await
-                .unwrap();
-            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            socket.connect(parent.addr().await.unwrap()).await.unwrap();
-            let cfg = Config {
-                certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
-                insecure_skip_verify: true,
-                ..Default::default()
-            };
-            let server_cfg = cfg.clone();
-            let handshake = async {
-                tokio::join!(DTLSConn::new(socket.clone(), cfg, true, None), async {
-                    let (raw, _) = parent.accept().await.unwrap();
-                    let transport = Arc::new(FailingCloseNotifyConn {
-                        inner: raw,
-                        fail_sends: AtomicBool::new(false),
-                        fail_close,
-                        closes: AtomicUsize::new(0),
-                    });
-                    let server = DTLSConn::new(transport.clone(), server_cfg, false, None)
-                        .await
-                        .unwrap();
-                    (server, transport)
-                })
-            };
-            let (client, (server, transport)) =
-                tokio::time::timeout(Duration::from_secs(3), handshake)
-                    .await
-                    .unwrap();
-            let client = client.unwrap();
+            let (parent, socket, client, server, transport) = dtls_close_fixture(fail_close).await;
             transport.fail_sends.store(fail_send, Ordering::SeqCst);
             let error = server.close().await.unwrap_err().to_string();
             if fail_send {
@@ -965,6 +1004,69 @@ mod tests {
             client.close().await.unwrap();
             parent.close().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn canceled_dtls_close_waiters_preserve_one_cleanup_owner() {
+        for hold_send in [true, false] {
+            let (parent, _, client, server, transport) = dtls_close_fixture(false).await;
+            transport.hold_sends.store(hold_send, Ordering::SeqCst);
+            transport.hold_closes.store(!hold_send, Ordering::SeqCst);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), server.close())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), server.close())
+                    .await
+                    .is_err(),
+                "another close cannot report completion while cleanup is pending"
+            );
+            // All callers and the DTLS object may disappear; its cleanup owner
+            // must retain and finish the same transport close attempt.
+            drop(server);
+            transport.send_gate.add_permits(1);
+            transport.close_gate.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(1), transport.close_finished.notified())
+                .await
+                .unwrap();
+            assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+            client.close().await.unwrap();
+            parent.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dtls_close_deadline_stops_pending_writer_before_transport_cleanup() {
+        let (parent, _, client, server, transport) = dtls_close_fixture(false).await;
+        transport.hold_sends.store(true, Ordering::SeqCst);
+        let sending = server.send(b"inflight");
+        tokio::pin!(sending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut sending)
+                .await
+                .is_err()
+        );
+        let error = tokio::time::timeout(Duration::from_secs(1), server.close())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error, webrtc_dtls::Error::ErrDeadlineExceeded);
+        assert_eq!(transport.active_sends.load(Ordering::SeqCst), 0);
+        assert!(
+            sending.await.is_err(),
+            "aborted write must not report success"
+        );
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+        let received =
+            tokio::time::timeout(Duration::from_millis(100), server.recv(&mut [0u8; 32]))
+                .await
+                .unwrap();
+        assert!(received.is_err() || received == Ok(0));
+        server.close().await.unwrap();
+        client.close().await.unwrap();
+        parent.close().await.unwrap();
     }
 
     use std::sync::Mutex;

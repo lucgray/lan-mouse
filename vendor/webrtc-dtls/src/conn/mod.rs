@@ -104,7 +104,10 @@ pub struct DTLSConn {
     pub(crate) handle_queue_tx: mpsc::Sender<mpsc::Sender<()>>,
     pub(crate) handshake_done_tx: Option<mpsc::Sender<()>>,
 
-    reader_close_tx: Mutex<Option<mpsc::Sender<()>>>,
+    reader_close_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    packet_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    close_task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
 }
 
 type UtilResult<T> = std::result::Result<T, util::Error>;
@@ -317,13 +320,16 @@ impl DTLSConn {
             packet_tx,
             handle_queue_tx,
             handshake_done_tx: Some(handshake_done_tx),
-            reader_close_tx: Mutex::new(Some(reader_close_tx)),
+            reader_close_tx: Arc::new(Mutex::new(Some(reader_close_tx))),
+            packet_task: Arc::new(Mutex::new(None)),
+            reader_task: Arc::new(Mutex::new(None)),
+            close_task: Mutex::new(None),
         };
 
         let cipher_suite1 = Arc::clone(&c.state.cipher_suite);
         let sequence_number = Arc::clone(&c.state.local_sequence_number);
 
-        tokio::spawn(async move {
+        let packet_task = tokio::spawn(async move {
             loop {
                 let rx = packet_rx.recv().await;
                 if let Some(r) = rx {
@@ -350,11 +356,13 @@ impl DTLSConn {
             }
         });
 
+        c.packet_task.lock().await.replace(packet_task);
+
         let local_epoch = Arc::clone(&c.state.local_epoch);
         let remote_epoch = Arc::clone(&c.state.remote_epoch);
         let cipher_suite2 = Arc::clone(&c.state.cipher_suite);
 
-        tokio::spawn(async move {
+        let reader_task = tokio::spawn(async move {
             let mut buf = vec![0u8; INBOUND_BUFFER_SIZE];
             let mut ctx = ConnReaderContext {
                 is_client,
@@ -409,6 +417,8 @@ impl DTLSConn {
                 }
             }
         });
+
+        c.reader_task.lock().await.replace(reader_task);
 
         // Do handshake
         c.handshake(initial_fsm_state).await?;
@@ -495,31 +505,56 @@ impl DTLSConn {
 
     // Close closes the connection.
     pub async fn close(&self) -> Result<()> {
-        if self
-            .closed
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            // Send close-notify once, retaining any error through local cleanup.
-            let notification = self
-                .notify(AlertLevel::Warning, AlertDescription::CloseNotify)
-                .await;
-
-            {
-                let mut reader_close_tx = self.reader_close_tx.lock().await;
-                reader_close_tx.take();
-            }
-            // A failed close notification must not skip local transport cleanup.
-            let transport = self.conn.close().await.map_err(Error::from);
-            return match (notification, transport) {
-                (Ok(()), result) | (result, Ok(())) => result,
-                (Err(notification), Err(transport)) => Err(Error::Other(format!(
-                    "close notification: {notification}; transport close: {transport}"
-                ))),
-            };
+        // A caller can time out or disappear without canceling cleanup. Keep
+        // one owned task, and make concurrent/repeated callers wait for it.
+        let mut task = self.close_task.lock().await;
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            let packet = Self::alert_packet(
+                self.get_local_epoch(),
+                self.is_handshake_completed_successfully(),
+                AlertLevel::Warning,
+                AlertDescription::CloseNotify,
+            );
+            let packet_tx = self.packet_tx.clone();
+            let reader_close_tx = self.reader_close_tx.clone();
+            let packet_task = self.packet_task.clone();
+            let reader_task = self.reader_task.clone();
+            let conn = self.conn.clone();
+            *task = Some(tokio::spawn(async move {
+                // A best-effort notification cannot hold local cleanup forever.
+                let notification = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    Self::send_packets(&packet_tx, vec![packet]),
+                )
+                .await
+                .unwrap_or(Err(Error::ErrDeadlineExceeded));
+                reader_close_tx.lock().await.take();
+                // Stop an outgoing send that outlived its notification waiter.
+                if let Some(writer) = packet_task.lock().await.take() {
+                    writer.abort();
+                    let _ = writer.await;
+                }
+                if let Some(reader) = reader_task.lock().await.take() {
+                    let _ = reader.await;
+                }
+                let transport = conn.close().await.map_err(Error::from);
+                match (notification, transport) {
+                    (Ok(()), result) | (result, Ok(())) => result,
+                    (Err(notification), Err(transport)) => Err(Error::Other(format!(
+                        "close notification: {notification}; transport close: {transport}"
+                    ))),
+                }
+            }));
         }
-
-        Ok(())
+        if let Some(owner) = task.as_mut() {
+            let result = owner
+                .await
+                .map_err(|error| Error::Other(format!("close task: {error}")));
+            task.take();
+            result?
+        } else {
+            Ok(())
+        }
     }
 
     /// connection_state returns basic DTLS details about the connection.
@@ -533,31 +568,50 @@ impl DTLSConn {
         self.state.srtp_protection_profile
     }
 
-    pub(crate) async fn notify(&self, level: AlertLevel, desc: AlertDescription) -> Result<()> {
-        self.write_packets(vec![Packet {
+    fn alert_packet(
+        epoch: u16,
+        encrypt: bool,
+        level: AlertLevel,
+        desc: AlertDescription,
+    ) -> Packet {
+        Packet {
             record: RecordLayer::new(
                 PROTOCOL_VERSION1_2,
-                self.get_local_epoch(),
+                epoch,
                 Content::Alert(Alert {
                     alert_level: level,
                     alert_description: desc,
                 }),
             ),
-            should_encrypt: self.is_handshake_completed_successfully(),
+            should_encrypt: encrypt,
             reset_local_sequence_number: false,
-        }])
+        }
+    }
+
+    pub(crate) async fn notify(&self, level: AlertLevel, desc: AlertDescription) -> Result<()> {
+        self.write_packets(vec![Self::alert_packet(
+            self.get_local_epoch(),
+            self.is_handshake_completed_successfully(),
+            level,
+            desc,
+        )])
         .await
     }
 
     pub(crate) async fn write_packets(&self, pkts: Vec<Packet>) -> Result<()> {
+        Self::send_packets(&self.packet_tx, pkts).await
+    }
+
+    async fn send_packets(
+        packet_tx: &Arc<mpsc::Sender<PacketSendRequest>>,
+        pkts: Vec<Packet>,
+    ) -> Result<()> {
         let (tx, mut rx) = mpsc::channel(1);
-
-        self.packet_tx.send((pkts, Some(tx))).await?;
-
+        packet_tx.send((pkts, Some(tx))).await?;
         if let Some(result) = rx.recv().await {
             result
         } else {
-            Ok(())
+            Err(Error::ErrConnClosed)
         }
     }
 

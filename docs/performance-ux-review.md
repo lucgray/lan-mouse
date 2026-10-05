@@ -19,6 +19,7 @@
 | R85 | 已实现并通过真实 UDP 回归 | vendored webrtc-util 0.11.0 关闭时移除精确会话、唤醒读取、拒绝关闭后发送；同地址重连及重复关闭隔离；未完成握手和底层缓冲总量仍待处理 |
 | R86 | 已实现并通过缓冲阶段回归 | 单原始 UDP 会话 256 包/256KiB（含两字节帧头），满则沿既有 UDP 路径丢包；FIFO/读取后额度恢复/其他缓冲隔离；全服务总量及实机高频输入仍待验 |
 | R87 | 已实现并通过真实 DTLS 故障回归 | close-notify 失败仍停止内部 reader 并关闭底层 UDP；单/双错误保留，旧会话不阻碍同地址新接入；pending/取消与底层真实关闭失败仍待处理 |
+| R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1615,3 +1616,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 本机鼠标故障是否经过此路径仍缺实机证据。全服务资源、原生恢复、千次双机往返、完整时延和 8h RSS 待验；不认定 90 分。第 65 轮 CI 检查时仍排队，前一 HEAD 的 run 因新提交被取消，不当作失败复现。未部署已安装服务。
 
 日志：dtls-close-notify-baseline.log、dtls-close-notify-fixed.log、dtls-close-notify-workspace.log、dtls-close-notify-clippy.log、dtls-close-notify-original-tests.log。
+
+
+## 第六十七轮：关闭等待取消不丢弃清理 owner
+
+### R88 / P1
+
+- 基线用真实 loopback DTLS 会话挂起关闭通知，50ms 取消首次 close 等待后，第二次 close 在实际清理未完成时立即 Ok。日志 dtls-close-owner-baseline.log。挂起来源为实际 transport send 的 Semaphore 注入，不是实机 socket 故障。
+- [x] 每个 DTLSConn 保存一个 close JoinHandle；首次 close 在锁内标记并启动拥有 transport/channel/worker 句柄的任务，等待方取消只释放锁，不 abort 任务。其他 close 等待同一任务；首个完成的等待者取得结果，任务已完成后的重复调用仍 Ok。对象 Drop 丢弃 JoinHandle 只 detach，任务保留资源至整个链结束。
+- [x] close-notify 为 250ms best-effort，过期返回 ErrDeadlineExceeded 后仍执行清理；停止并 join outgoing writer，停止并 join reader，然后 await 同一底层 close future。拒绝用等待方的超时销毁 raw close owner。已有通知/传输双错误报告保留。
+- [x] 发送确认通道断开从原 Ok 改为 ErrConnClosed，避免关闭时 writer 被取消后尚未完成的发送虚报成功。alert packet / send_packets 提取为共用 helper，未修改 wire 格式；依赖原测试 constructor 更新私有字段。
+
+### 验证与限制
+
+- 新真实 DTLS 回归分别挂起通知和底层 close：取消两个等待者均不提前报告完成；释放整个 DTLS 对象后，放行原阶段，仍只调用一次底层 close 并完成。另一回归让普通发送永久 pending，close 通知达到期限，writer future 的 Drop 计数确认结束，原发送返回错误、底层关闭一次、reader EOF。此前错误/同地址替代回归继续通过。
+- 全工作区 all-features：root 154 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。依赖原有 test_routine_leak_on_close 通过；不是全部原 DTLS 测试或真实硬件验收。
+- [ ] 原生同步阻塞仍不能由异步 deadline 抢占。底层 close 永久 pending 会保留一个任务与 transport；新增 owner 不由应用 reader lease 计数，全服务任务/会话总上限仍待实现。真正 raw close Err 的重新尝试没有实现；不将“等待方不能取消”当成“所有底层故障都恢复”。
+- [ ] DTLS constructor handshake 失败/取消的 raw session 所有权仍未修复，accept_any/timer 取消路径继续检查。worker panic/error 的诊断与资源恢复也需进一步核对。
+- [ ] 物理鼠标恢复、双机千次往返、端到端 p95/p99、8h RSS 与 90 分门槛仍未满足。第 66 轮 CI 检查时 Rust queued/Nix in_progress。未修改已安装服务。
+
+日志：dtls-close-owner-baseline.log、dtls-close-owner-fixed.log、dtls-close-owner-workspace.log、dtls-close-owner-clippy.log、dtls-close-owner-original-tests.log。

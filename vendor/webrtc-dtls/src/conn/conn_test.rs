@@ -436,7 +436,10 @@ async fn test_export_keying_material() -> Result<()> {
         handle_queue_tx,
         handshake_done_tx: None,
 
-        reader_close_tx: Mutex::new(None),
+        reader_close_tx: Arc::new(Mutex::new(None)),
+        packet_task: Arc::new(Mutex::new(None)),
+        reader_task: Arc::new(Mutex::new(None)),
+        close_task: Mutex::new(None),
     };
 
     c.set_local_epoch(0);

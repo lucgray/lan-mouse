@@ -970,6 +970,20 @@ The locked DTLS dependency is vendored at webrtc-dtls 0.12.0 (see PATCHES.md).
 Once close-notify returns, its error no longer skips reader shutdown and
 underlying transport close. Single errors retain their original type; a double
 failure reports both causes. Repeated close retains the original once-only
-semantics. Pending/canceled close futures and genuinely failed transport close
-are not made recoverable by this change; global handshake/session bounds and
+semantics. Close-wait cancellation is handled by the owned cleanup described below;
+genuinely failed transport-close retry remains open. Global handshake/session bounds and
 physical input recovery remain unverified. Public/wire signatures are unchanged.
+
+
+### Canceling a DTLS close wait
+
+DTLS close now retains one owned cleanup task per connection. Canceling a
+caller wait (or dropping the DTLS object) does not cancel notification/worker/
+transport cleanup. Concurrent calls wait for the same pending task. The first
+completed waiter receives its result; later completed close calls return Ok.
+A close notification has a 250ms best-effort deadline, followed by writer/reader
+shutdown and the original raw transport close attempt. An interrupted outgoing
+send cannot report successful completion merely because its result channel closed.
+A raw close that never completes retains its cleanup owner: global task/resource
+bounds, genuinely failed-close retry and constructor-handshake cancellation are
+still unverified. Synchronous stalls are not preempted by the async timer.
