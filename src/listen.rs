@@ -1044,12 +1044,69 @@ mod tests {
                         assert_eq!(listener.conns.borrow().len(), MAX_INCOMING_READERS);
                     }
                 }
-                listener.terminate().await;
                 for client in clients {
                     client.close().await.unwrap();
                 }
+                listener.terminate().await;
             })
             .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_udp_parent_close_releases_session_and_preserves_same_address_replacement() {
+        let listener = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+            .await
+            .unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.connect(listener.addr().await.unwrap()).await.unwrap();
+        peer.send(b"first").await.unwrap();
+        let (old, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let weak = Arc::downgrade(&old);
+        let mut buffer = [0u8; 32];
+        assert_eq!(old.recv(&mut buffer).await.unwrap(), 5);
+        {
+            let read = old.recv(&mut buffer);
+            tokio::pin!(read);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut read)
+                    .await
+                    .is_err()
+            );
+            old.close().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut read)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        assert!(old.send(b"stale").await.is_err());
+        assert!(
+            old.send_to(b"stale", peer.local_addr().unwrap())
+                .await
+                .is_err()
+        );
+        peer.send(b"after-close").await.unwrap();
+        let (replacement, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        old.close().await.unwrap();
+        assert_eq!(replacement.recv(&mut [0u8; 32]).await.unwrap(), 11);
+        peer.send(b"new-session").await.unwrap();
+        assert_eq!(replacement.recv(&mut [0u8; 32]).await.unwrap(), 11);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(old);
+        assert!(weak.upgrade().is_none());
+        replacement.close().await.unwrap();
+        listener.close().await.unwrap();
     }
 
     struct TestConn {

@@ -16,6 +16,7 @@
 | R82 | 故障取消顺序已实现并通过受控等待回归 | AbortPeer 在 native release 首次 poll 前请求取消旧 snapshot；健康/迟到替代连接保留；锁竞争及物理释放边界见第 61 轮 |
 | R83 | fatal release 反馈/错误上下文已实现 | 整条 fatal 清理链只发一次进度；释放/退出连续等待保持 owner，最终保留三个阶段原因；生产 helper 模型验证，物理故障未验收 |
 | R84 | 应用入站 reader 上限已实现 | 每 Listener 32 个，覆盖排队任务/接收/close；满额保留旧会话，33 个真实 DTLS 回归通过；握手内部、事件队列与其他 cleanup 仍未全局有界 |
+| R85 | 已实现并通过真实 UDP 回归 | vendored webrtc-util 0.11.0 关闭时移除精确会话、唤醒读取、拒绝关闭后发送；同地址重连及重复关闭隔离；未完成握手和底层缓冲总量仍待处理 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1556,3 +1557,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务资源、R60 原生恢复、真机千次往返、完整 p95/p99 和 8h RSS 未验收，不认定达到 90 分。协议格式/公共 API 不变；32 个是新应用生命周期上限，超过上限需等现有 reader 完成再连接。
 
 日志：incoming-reader-budget-baseline.log、incoming-reader-budget-library.log、incoming-reader-budget-dtls.log、incoming-reader-budget-workspace.log、incoming-reader-budget-clippy.log。
+
+
+## 第六十四轮：修复底层 UDP 会话关闭无效
+
+### R85 / P1（R13 的一部分）
+
+- 基线直接运行锁定的 webrtc-util 0.11.0 原始 UDP listener：close 返回成功、调用方释放 Arc 后 Weak 仍存活；旧会话继续接收 after-close，同地址不产生新 accept。源码确认 close 仅 Ok(())，listener 表持有强引用且从不删除；Buffer::new(0,0) 无总量限制。日志 udp-parent-retention-baseline.log。
+- [x] 将该确切版本源码与 MIT/Apache-2.0 许可保留于 vendor/webrtc-util，使用 Cargo patch；生产修改仅 conn_udp_listener.rs。close 按对象身份移除当前表项、关闭 Buffer/唤醒读取；send/send_to 拒绝已关闭会话。使用 Weak 回指表，避免循环引用；重复旧 close 不删除同地址替代会话，不关闭共享 socket。
+- [x] 先建立表项再发布 accept，避免消费者立即 close 后才被重新插入；accept 队列满则撤回未发布表项。PATCHES.md 记录原版本、checksum、改动及维护边界。
+- [x] 上一 HEAD afdef25 的 Nix macOS run 37215923027 在测试清理中失败：先 terminate listener 后 client.close 得到 ConnectionRefused。夹具改为先关客户端再停 listener，保留错误断言；生产 shutdown 本轮未改。该修正仍须新 macOS CI 验证。
+
+### 验证与边界
+
+- 真实 UDP 回归验证 pending recv 被 close 唤醒、关闭后发送被拒绝、同一源地址可重新 accept/收包、旧 close 不影响替代会话、旧 Arc 最终可释放。原 UDP 依赖 4 条测试通过；全工作区 all-features 通过：root 151 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。
+- [ ] 这是实际底层传输缺陷的复现，并非已证明本次双机鼠标故障唯一原因。未完成/取消的 DTLS handshake、尚未调用到底层 close 的会话、底层缓冲/表的全局上限仍未解决；已排队数据可以继续 drain，不能宣称所有数据立即丢弃。并发已开始的发送也不能由关闭抢占。
+- [ ] R13 全服务资源、R60 原生恢复、真机千次往返、完整 p95/p99 与 8h RSS 仍未验收，不认定达到 90 分。无 wire/public API 变化，未部署已安装程序。
+
+日志：udp-parent-retention-baseline.log、udp-parent-retention-fixed.log、udp-parent-retention-workspace.log、udp-parent-retention-clippy.log、udp-parent-retention-dependency-tests.log、udp-parent-retention-prior-nix-failure.log。

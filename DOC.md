@@ -937,3 +937,16 @@ reader retirement also remains under review; no idle timeout is added here.
 Regressions include application admission/close ownership and 33 real local DTLS
 connections with excess rejection and existing-peer Ping delivery. Wire encoding
 and public APIs are unchanged.
+
+
+### UDP session close and same-address reconnect
+
+The locked webrtc-util 0.11.0 is vendored with a local close patch (see
+vendor/webrtc-util/PATCHES.md). Closing an accepted UDP session removes only
+that session from the listener table, wakes pending reads, and rejects later
+sends. A reconnect from the same source address can create a fresh session;
+repeating close on the old session cannot remove the replacement. The shared
+listening socket remains available to other peers. Registration precedes
+accept publication, with rollback when the pending accept queue is full.
+Already buffered packets may drain after close. Canceled/incomplete DTLS
+handshakes and global underlying buffer/session limits remain separate work.

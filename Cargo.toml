@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/webrtc-util"]
 members = [
     "input-capture",
     "input-emulation",
@@ -130,3 +131,6 @@ info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 
 [dev-dependencies]
 async-trait = "0.1.80"
+
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }
