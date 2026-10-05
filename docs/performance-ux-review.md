@@ -21,6 +21,7 @@
 | R87 | 已实现并通过真实 DTLS 故障回归 | close-notify 失败仍停止内部 reader 并关闭底层 UDP；单/双错误保留，旧会话不阻碍同地址新接入；pending/取消与底层真实关闭失败仍待处理 |
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
+| R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1657,3 +1658,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 第 67 轮检查时 CI queued；新 HEAD 需对应原生 CI。千次双机往返、完整延迟、原生恢复与 8h RSS 未验收，不认定 90 分。未修改已安装程序。
 
 日志：dtls-handshake-cleanup-baseline.log、dtls-handshake-cleanup-fixed.log、dtls-handshake-cleanup-workspace.log、dtls-handshake-cleanup-clippy.log、dtls-handshake-cleanup-original-tests.log。
+
+
+## 第六十九轮：保留其他监听器正在进行的接入
+
+### R90 / P2
+
+- 基线调用实际 accept_any/select_all，两个 Listener 接入 future 均已 poll；第一项完成时，第二项的 Drop guard 计数从 0 变 1，证明剩余 future 被丢弃。日志 accept-lifetime-baseline.log。它是生产选择器加受控 Listener 的生命周期模型，不是原版本两台真机握手失败实测。源码另确认全局两秒 sleep 和端口控制事件也会 drop 外层 accept_any。
+- [x] 私有 AcceptPool 每个绑定监听器保留一项 LocalBoxFuture，存于 FuturesUnordered；取得结果只重新创建对应项。外层 next 等待取消不清空池，其他监听器的合法握手继续使用同一 future；没有增加每 accept 的后台 task 或无界结果队列。
+- [x] 原两秒停滞 workaround 移至单个监听器的 accept 尝试；过期只重新创建该项、无空闲警告刷屏。移除全局 sleep 分支，不再由任意其他事件重置整个组。端口成功替换和退出先清空旧池，再取回 Box listener 并执行已有并行有界 close；废弃的未应用 bind 仍沿原 close 路径。
+
+### 验证与剩余边界
+
+- 三条回归：受控两个 Listener 的完成/两次外层等待取消均保留第二项，关闭时释放 Rc 所有权；超过实际两秒后只重启该监听器并释放旧项；两个真实 loopback UDP/DTLS 监听器，第一握手由 transport Semaphore 延迟，第二完成后第一没有被关闭，放行后第一完成并传输 still-connected。后者是组件真实加密握手与故障注入，不是两种地址族/完整 UI/真机体验实测。
+- 最终工作区 all-features：root 158 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 Clippy/fmt/diff 通过；已有 IPv4/IPv6 接入、端口切换/保留旧端口/关闭、授权和 reader 额度回归一起执行。
+- [ ] 两秒是整个单次 accept（含等待首包）的 deadline，尚未改为从实际握手开始计时。接近期限才到的首包仍可能只有很短握手时间；慢网络/高负载合法握手可能重试。本轮解决其他 listener/控制事件造成的额外取消，不宣称所有合法握手永不被中断。
+- [ ] 池中 future 数等于绑定 listener 数（正常至多 IPv4/IPv6 两项）；DTLS worker/raw table/cleanup task 的全局额度、accept 结果处理阶段的延迟和原生调用仍是其他范围。永久 raw close、worker panic诊断、完整输入延迟与 RSS 门槛未完成。
+- [ ] 上一 e611d8e Rust run 37249061528 completed/success，Nix 37249061607 检查时 in_progress。新 HEAD 需原生 CI；千次真机往返、原生恢复和 8h RSS 未验收，不认定 90 分。公共 API/wire 不变，未部署已安装程序。
+
+日志：accept-lifetime-baseline.log、accept-lifetime-fixed.log、accept-lifetime-dtls.log、accept-lifetime-workspace.log、accept-lifetime-clippy.log。

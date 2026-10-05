@@ -999,3 +999,15 @@ handle so dropping the polled future on another thread still schedules cleanup
 on the original live runtime. Runtime shutdown, never-polled futures, global
 cleanup/session limits and genuinely failed raw close remain separate concerns.
 Standalone vendored DTLS tests link the sibling UDP patch and run in Rust CI.
+
+
+### Independent pending accepts
+
+Pending accepts are retained per bound listener. Completion of another listener
+or cancellation of a control-loop wait does not discard an in-flight handshake.
+Only the completed listener is rearmed. The existing two-second stalled-accept
+retry is now per attempt/listener; it still includes time waiting for the first
+packet and does not guarantee all slow handshakes complete. Port replacement
+and shutdown cancel the old accept pool before closing those listeners.
+The pool retains one future per bound listener with no additional result queue;
+underlying DTLS/session/cleanup global resource limits remain separate work.

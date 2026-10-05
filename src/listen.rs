@@ -96,6 +96,69 @@ async fn bind_dtls(
     }
 }
 
+type AcceptResult = Result<(ArcConn, SocketAddr), webrtc_util::Error>;
+type AcceptAttempt = futures::future::LocalBoxFuture<'static, (usize, Option<AcceptResult>)>;
+
+struct AcceptPool {
+    listeners: Vec<Rc<Box<dyn Listener>>>,
+    pending: futures::stream::FuturesUnordered<AcceptAttempt>,
+}
+
+impl AcceptPool {
+    fn new(listeners: Vec<Box<dyn Listener>>) -> Self {
+        let mut pool = Self {
+            listeners: listeners.into_iter().map(Rc::new).collect(),
+            pending: futures::stream::FuturesUnordered::new(),
+        };
+        for index in 0..pool.listeners.len() {
+            pool.rearm(index);
+        }
+        pool
+    }
+
+    fn rearm(&mut self, index: usize) {
+        let listener = self.listeners[index].clone();
+        self.pending.push(
+            async move {
+                // Retain the existing stalled-accept workaround per listener;
+                // another family's completion/control event must not cancel it.
+                let result = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .ok();
+                (index, result)
+            }
+            .boxed_local(),
+        );
+    }
+
+    async fn next(&mut self) -> AcceptResult {
+        loop {
+            let (index, result) = self
+                .pending
+                .next()
+                .await
+                .expect("bound listener set is nonempty");
+            self.rearm(index);
+            if let Some(result) = result {
+                return result;
+            }
+        }
+    }
+
+    fn into_listeners(mut self) -> Vec<Box<dyn Listener>> {
+        // Cancel old-port accepts before releasing/closing their listeners.
+        self.pending.clear();
+        self.listeners
+            .into_iter()
+            .map(|listener| {
+                Rc::try_unwrap(listener)
+                    .unwrap_or_else(|_| panic!("accept futures retained listener ownership"))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
 /// Wait for an incoming connection on any of the bound listeners.
 async fn accept_any(
     listeners: &[Box<dyn Listener>],
@@ -421,7 +484,7 @@ impl LanMouseListener {
         )
         .await
         .map_err(|_| ListenerCreationError::BindTimeout)??;
-        let mut listeners = bound.listeners;
+        let mut listeners = AcceptPool::new(bound.listeners);
         let running_port = Rc::new(Cell::new(bound.port));
         let task_port = running_port.clone();
 
@@ -445,11 +508,8 @@ impl LanMouseListener {
                 let mut binding: Option<OwnedListenerTask<BindingResult>> = None;
                 let mut cleanup = None;
                 loop {
-                    let sleep = tokio::time::sleep(Duration::from_secs(2));
                     tokio::select! {
-                        /* workaround for https://github.com/webrtc-rs/webrtc/issues/614 */
-                        _ = sleep => continue,
-                        c = accept_any(&listeners) => match c {
+                        c = listeners.next() => match c {
                             Ok((conn, addr)) => {
                                 let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
@@ -514,9 +574,9 @@ impl LanMouseListener {
                                         cleanup = Some(OwnedListenerTask(spawn_local(close_listeners(new_listeners))));
                                         continue;
                                     }
-                                    let previous = std::mem::replace(&mut listeners, new_listeners);
+                                    let previous = std::mem::replace(&mut listeners, AcceptPool::new(new_listeners));
                                     current_port.set(new_bound.port);
-                                    cleanup = Some(OwnedListenerTask(spawn_local(close_listeners(previous))));
+                                    cleanup = Some(OwnedListenerTask(spawn_local(close_listeners(previous.into_listeners()))));
                                     let _ = listen_tx.send(ListenEvent::PortChanged(Ok(new_bound.port)));
                                 }
                                 Ok((port, Err(error))) => {
@@ -533,7 +593,7 @@ impl LanMouseListener {
                 }
                 drop(binding);
                 drop(cleanup);
-                close_listeners(listeners).await;
+                close_listeners(listeners.into_listeners()).await;
             })
         };
 
@@ -1736,6 +1796,221 @@ mod tests {
                     .unwrap();
             })
             .await;
+    }
+
+    struct TrackingAcceptListener {
+        addr: SocketAddr,
+        ready: Arc<tokio::sync::Semaphore>,
+        starts: Arc<AtomicUsize>,
+        canceled: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Listener for TrackingAcceptListener {
+        async fn accept(&self) -> webrtc_util::Result<(ArcConn, SocketAddr)> {
+            struct Attempt {
+                canceled: Arc<AtomicUsize>,
+                completed: bool,
+            }
+            impl Drop for Attempt {
+                fn drop(&mut self) {
+                    if !self.completed {
+                        self.canceled.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let mut attempt = Attempt {
+                canceled: self.canceled.clone(),
+                completed: false,
+            };
+            self.ready.acquire().await.unwrap().forget();
+            attempt.completed = true;
+            Ok((Arc::new(TestConn::new(None)), self.addr))
+        }
+        async fn addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_pool_preserves_other_listener_across_completion_and_waiter_cancellation() {
+        let ready = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow_ready = Arc::new(tokio::sync::Semaphore::new(0));
+        let fast_canceled = Arc::new(AtomicUsize::new(0));
+        let slow_canceled = Arc::new(AtomicUsize::new(0));
+        let slow_started = Arc::new(AtomicUsize::new(0));
+        let listeners: Vec<Box<dyn Listener>> = vec![
+            Box::new(TrackingAcceptListener {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                ready: ready.clone(),
+                starts: Arc::new(AtomicUsize::new(0)),
+                canceled: fast_canceled.clone(),
+            }),
+            Box::new(TrackingAcceptListener {
+                addr: "127.0.0.1:2".parse().unwrap(),
+                ready: slow_ready.clone(),
+                starts: slow_started.clone(),
+                canceled: slow_canceled.clone(),
+            }),
+        ];
+        let mut pool = AcceptPool::new(listeners);
+        {
+            let selecting = pool.next();
+            tokio::pin!(selecting);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut selecting)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(slow_started.load(Ordering::SeqCst), 1);
+            ready.add_permits(1);
+            assert_eq!(selecting.await.unwrap().1.port(), 1);
+        }
+        assert_eq!(slow_canceled.load(Ordering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pool.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(slow_started.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_canceled.load(Ordering::SeqCst), 0);
+        slow_ready.add_permits(1);
+        assert_eq!(pool.next().await.unwrap().1.port(), 2);
+        let listeners = pool.into_listeners();
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(fast_canceled.load(Ordering::SeqCst), 1);
+        close_listeners(listeners).await;
+    }
+
+    #[tokio::test]
+    async fn accept_pool_retries_expired_attempt_and_releases_listener_ownership() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let canceled = Arc::new(AtomicUsize::new(0));
+        let mut pool = AcceptPool::new(vec![Box::new(TrackingAcceptListener {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            ready: Arc::new(tokio::sync::Semaphore::new(0)),
+            starts: starts.clone(),
+            canceled: canceled.clone(),
+        })]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pool.next())
+                .await
+                .is_err()
+        );
+        // Keep the attempt alive while its own two-second timer expires;
+        // polling it again must rearm just this listener, not report an error.
+        tokio::time::sleep(Duration::from_millis(2020)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), pool.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(canceled.load(Ordering::SeqCst), 1);
+        let listeners = pool.into_listeners();
+        assert_eq!(canceled.load(Ordering::SeqCst), 2);
+        close_listeners(listeners).await;
+    }
+
+    struct GatedHandshakeListener {
+        parent: Arc<dyn Listener + Send + Sync>,
+        cfg: Config,
+        started: Arc<tokio::sync::Notify>,
+        transport: Arc<Mutex<Option<Arc<FailingCloseNotifyConn>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Listener for GatedHandshakeListener {
+        async fn accept(&self) -> webrtc_util::Result<(ArcConn, SocketAddr)> {
+            let (raw, addr) = self.parent.accept().await?;
+            let transport = Arc::new(FailingCloseNotifyConn::new(raw, false));
+            transport.hold_sends.store(true, Ordering::SeqCst);
+            *self.transport.lock().unwrap() = Some(transport.clone());
+            self.started.notify_one();
+            let conn = DTLSConn::new(transport, self.cfg.clone(), false, None)
+                .await
+                .map_err(Error::from_std)?;
+            Ok((Arc::new(conn), addr))
+        }
+        async fn addr(&self) -> webrtc_util::Result<SocketAddr> {
+            self.parent.addr().await
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            self.parent.close().await
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dtls_accept_pool_preserves_delayed_handshake_when_other_listener_completes() {
+        let cfg = Config {
+            certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let slow_parent = Arc::new(
+            webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+                .await
+                .unwrap(),
+        );
+        let slow_addr = slow_parent.addr().await.unwrap();
+        let fast = listen("127.0.0.1:0", cfg.clone()).await.unwrap();
+        let fast_addr = fast.addr().await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let captured = Arc::new(Mutex::new(None));
+        let mut pool = AcceptPool::new(vec![
+            Box::new(GatedHandshakeListener {
+                parent: slow_parent,
+                cfg: cfg.clone(),
+                started: started.clone(),
+                transport: captured.clone(),
+            }),
+            Box::new(fast),
+        ]);
+        let slow_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        slow_socket.connect(slow_addr).await.unwrap();
+        let slow_client = tokio::spawn(DTLSConn::new(slow_socket, cfg.clone(), true, None));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = started.notified() => {},
+                _ = pool.next() => panic!("gated handshake completed prematurely"),
+            }
+        })
+        .await
+        .unwrap();
+        let transport = captured.lock().unwrap().clone().unwrap();
+        let fast_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        fast_socket.connect(fast_addr).await.unwrap();
+        let fast_client = tokio::spawn(DTLSConn::new(fast_socket, cfg, true, None));
+        let (fast_server, _) = tokio::time::timeout(Duration::from_secs(1), pool.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let fast_client = fast_client.await.unwrap().unwrap();
+        assert_eq!(transport.closes.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.active_sends.load(Ordering::SeqCst), 1);
+        transport.hold_sends.store(false, Ordering::SeqCst);
+        transport.send_gate.add_permits(1);
+        let (slow_server, _) = tokio::time::timeout(Duration::from_secs(1), pool.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let slow_client = slow_client.await.unwrap().unwrap();
+        slow_client.send(b"still-connected").await.unwrap();
+        let mut received = [0u8; 32];
+        let length = tokio::time::timeout(Duration::from_secs(1), slow_server.recv(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..length], b"still-connected");
+        fast_client.close().await.unwrap();
+        slow_client.close().await.unwrap();
+        fast_server.close().await.unwrap();
+        slow_server.close().await.unwrap();
+        close_listeners(pool.into_listeners()).await;
     }
 
     struct SlowListener(Arc<AtomicBool>);
