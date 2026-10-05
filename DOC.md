@@ -1054,7 +1054,8 @@ independent. Dropping/draining queued messages restores admission capacity.
 The same lease now follows ClipboardReceived and PeerHello into the Service
 queue and remains held until handling or rejection ends. Ping-triggered Entered
 notifications share that ownership. Forwarding does not free a permit, and
-dropping the queue frees retained permits. Leave-derived proxy Remove requests,
+dropping the queue frees retained permits. Leave-derived proxy Remove requests
+now carry the same control lease through queueing and asynchronous cleanup;
 ordinary Enter-derived Service notifications and connection-churn notifications
 still require further queue bounds. High-rate real-device fairness and
 whole-service RSS are not established.

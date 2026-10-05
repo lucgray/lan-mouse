@@ -633,6 +633,11 @@ impl LanMouseListener {
         self.authentication_notices.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_sender(&self) -> Sender<ListenEvent> {
+        self.listen_tx.clone()
+    }
+
     pub(crate) fn port(&self) -> u16 {
         self.port.get()
     }
@@ -915,6 +920,12 @@ async fn close_incoming(conn: &ArcConn) {
     {
         log::warn!("incoming connection cleanup exceeded one second");
     }
+}
+
+#[cfg(test)]
+pub(crate) fn control_test_listener(addr: SocketAddr) -> (LanMouseListener, ArcConn) {
+    let conn: ArcConn = Arc::new(tests::TestConn::new(None));
+    (tests::control_listener(vec![(addr, conn.clone())]), conn)
 }
 
 #[cfg(test)]
@@ -1489,7 +1500,7 @@ mod tests {
         listener.close().await.unwrap();
     }
 
-    struct TestConn {
+    pub(super) struct TestConn {
         packet: Mutex<Option<Vec<u8>>>,
         repeat_packet: bool,
         remaining_reads: Option<AtomicUsize>,
@@ -1502,7 +1513,7 @@ mod tests {
         send_entered: tokio::sync::Notify,
     }
     impl TestConn {
-        fn new(packet: Option<Vec<u8>>) -> Self {
+        pub(super) fn new(packet: Option<Vec<u8>>) -> Self {
             Self {
                 packet: Mutex::new(packet),
                 repeat_packet: false,
@@ -1590,7 +1601,7 @@ mod tests {
         }
     }
 
-    fn control_listener(conns: Vec<(SocketAddr, ArcConn)>) -> LanMouseListener {
+    pub(super) fn control_listener(conns: Vec<(SocketAddr, ArcConn)>) -> LanMouseListener {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, _) = tokio::sync::watch::channel(None);
         let cancellation = CancellationToken::new();

@@ -22,8 +22,8 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
-| R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生及churn仍待有界 |
-| R95 | 已发现待复现 | Leave派生ProxyRequest::Remove未带额度，普通Enter的Service通知不随InputLease持有；慢后端/Service可转移积压 |
+| R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理已补齐；Enter派生及churn仍待有界 |
+| R95 | 部分实现：Leave清理额度 | Leave派生Remove持有ControlLease到清理结束；普通Enter的Service通知不随InputLease持有，仍待复现/修复 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
 | R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
@@ -1777,3 +1777,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 全服务资源、原生恢复、千次双机切换、完整p95/p99与8h RSS仍未证明；不认定90分，未部署本机程序。
 
 日志：forwarded-control-budget-baseline.log、forwarded-control-budget-fixed.log、forwarded-control-budget-workspace.log、forwarded-control-budget-clippy.log。
+
+
+## 第七十五轮：Leave 派生清理请求持有控制额度
+
+### R95 后续 / P1
+
+- 实际ListenTask dispatcher基线：32条带ControlLease的Leave转入暂停的代理队列，额度变回128/32，期望96/0失败。队列中的Remove未被消费。日志leave-proxy-budget-baseline.log；受控fake worker与Conn，没有物理native/RSS测量。
+- [x] ProtoEvent::Leave把原Arc<ControlLease>转入ProxyRequest::Remove；代理运行/失败后清理路径在await destroy_bounded期间持有该owner，request处理或丢弃后归还。旧生命周期remove(addr)仍以None调用兼容helper，无wire/public API变化。
+- [x] 测试共享既有受控listener fixture，新增访问均cfg(test)；暂停代理回归验证队列持有96/0、取出但不drop仍持有、drop一项后97/1、排空后128/32及dispatcher正常退出。
+
+### 验证与剩余范围
+
+- 生产EmulationTask+受控异步backend：Remove进入destroy_bounded，挂起10ms期间额度保持127/31；放行后处理Terminate，额度128/32恢复，handle表清除、fixture held状态释放。不是实际OS按键释放验收。
+- 工作区all-features root 167 / 3忽略，其他组件计数与第74轮一致；严格Clippy/fmt/diff通过。沿用前两轮clipboard/Hello跨Service、入站控制/键鼠额度隔离及真实网络回归。第74轮d2a9dc5 Rust/Nix CI检查时均in_progress，未称已通过。
+- [ ] 普通Enter派生ReleaseNotify/Entered仍未和已转入proxy的InputLease共享额度；普通Input恢复Entered通知同样需检查。R95部分完成，下一轮必须验证这些分支在Service暂停时是否突破原输入上限。
+- [ ] 非Leave生命周期Remove、连接churn/授权撤销、backend失败通知等来源没有因此自动限额；失败cleanup保留的handle metadata不等于无限期保留该请求额度。全进程资源边界仍需闭合。
+- [ ] 千次双机切换、原生故障恢复、完整p95/p99与8h RSS未证明，不认定90分，未部署本机程序。
+
+日志：leave-proxy-budget-baseline.log、leave-proxy-budget-fixed.log、leave-proxy-budget-cleanup.log、leave-proxy-budget-workspace.log、leave-proxy-budget-clippy.log。
