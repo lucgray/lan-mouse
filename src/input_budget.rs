@@ -13,7 +13,7 @@ const CONTROL_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
 
 const MAX_INPUT_AGE: Duration = Duration::from_millis(50);
 
-/// Bounds decoded control/clipboard frames while queued in the listener.
+/// Bounds decoded control/clipboard frames through listener and Service queues.
 /// It carries no input freshness deadline; control messages are never silently
 /// discarded as stale keyboard/motion input.
 pub(crate) struct ControlLease {

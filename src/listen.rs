@@ -179,7 +179,7 @@ pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
         budget: Option<crate::input_budget::InputLease>,
-        control: Option<crate::input_budget::ControlLease>,
+        control: Option<Arc<crate::input_budget::ControlLease>>,
         addr: SocketAddr,
         conn: ArcConn,
     },
@@ -867,7 +867,7 @@ async fn read_loop(
                 }
                 break;
             };
-            Some(lease)
+            Some(Arc::new(lease))
         } else {
             None
         };
@@ -3225,6 +3225,89 @@ mod tests {
                 "invalid input was admitted or reported repeatedly"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn forwarded_clipboard_and_hello_hold_control_capacity_until_service_consumes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for clipboard in [true, false] {
+                    let addr = "127.0.0.1:2".parse().unwrap();
+                    let conn: ArcConn = Arc::new(TestConn::new(None));
+                    let listener = control_listener(vec![(addr, conn.clone())]);
+                    let incoming = listener.listen_tx.clone();
+                    let mut emulation = crate::emulation::Emulation::new(
+                        Some(input_emulation::Backend::Dummy),
+                        Default::default(),
+                        listener,
+                        (false, 1.0),
+                    );
+                    let budget = crate::input_budget::InputBudget::default();
+                    let token = CancellationToken::new();
+                    for _ in 0..32 {
+                        let lease = budget.acquire_control(&token).await.unwrap();
+                        let event = if clipboard {
+                            ProtoEvent::Input(input_event::Event::Clipboard(
+                                input_event::ClipboardEvent::Text("queued service data".into()),
+                            ))
+                        } else {
+                            ProtoEvent::Hello {
+                                commit: *b"testpeer",
+                            }
+                        };
+                        incoming
+                            .send(ListenEvent::Msg {
+                                addr,
+                                conn: conn.clone(),
+                                event,
+                                budget: None,
+                                control: Some(Arc::new(lease)),
+                            })
+                            .unwrap_or_else(|_| panic!());
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::task::yield_now().await;
+                    assert_eq!(
+                        budget.control_available(),
+                        (96, 0),
+                        "forwarding must not free capacity while Service is paused"
+                    );
+                    assert!(budget.acquire_control(&token).await.is_none());
+                    let other = budget.for_peer().acquire_control(&token).await.unwrap();
+                    drop(other);
+                    let event = tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            let event = emulation.event().await;
+                            if matches!(
+                                event,
+                                crate::emulation::EmulationEvent::ClipboardReceived { .. }
+                                    | crate::emulation::EmulationEvent::PeerHello { .. }
+                            ) {
+                                break event;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        budget.control_available(),
+                        (96, 0),
+                        "dequeue retains ownership until handling ends"
+                    );
+                    drop(event);
+                    assert_eq!(budget.control_available(), (97, 1));
+                    let replacement = budget.acquire_control(&token).await.unwrap();
+                    drop(replacement);
+                    emulation.terminate().await;
+                    drop(emulation);
+                    assert_eq!(
+                        budget.control_available(),
+                        (128, 32),
+                        "discarding the Service queue returns all permits"
+                    );
+                }
+            })
+            .await;
     }
 
     #[tokio::test]

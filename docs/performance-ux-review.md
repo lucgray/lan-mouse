@@ -22,7 +22,8 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
-| R94 | 部分实现：入站控制队列额度 | 每peer32/global128控制或剪贴板帧，250ms超额关闭原会话，不占键鼠额度；Service转发与生命周期队列仍待有界 |
+| R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生及churn仍待有界 |
+| R95 | 已发现待复现 | Leave派生ProxyRequest::Remove未带额度，普通Enter的Service通知不随InputLease持有；慢后端/Service可转移积压 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
 | R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
@@ -1757,3 +1758,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 大clipboard128×64KiB最多约8MiB为该listener队列payload上界估算，另有正在decode的reader帧、raw/DTLS、后续Service队列与allocator；不是RSS实测。真实高频输入、原生恢复、1000双机切换、p95/p99与8h RSS未验收，不认定90分，未部署本机。
 
 日志：inbound-control-budget-baseline.log、inbound-control-budget-fixed.log、inbound-control-budget-workspace.log、inbound-control-budget-clippy.log。
+
+
+## 第七十四轮：控制额度跨 Service 转发
+
+### R94 后续 / P1
+
+- 实际Emulation dispatcher基线：给32条clipboard各附ControlLease，暂停读取Service事件队列。dispatcher转发后可用额度变回128/32，断言期望96/0失败；旧队列中的32份payload仍存活。日志forwarded-control-budget-baseline.log。该基线使用生产dispatcher/Dummy backend/受控Conn，未测物理延迟。
+- [x] ListenEvent持有Arc<ControlLease>；ClipboardReceived/PeerHello转移同一owner到Service，Service match分支保留至处理/丢弃结束。Ping触发恢复时的Entered派生消息克隆共享owner，不另申请额外permit，最后引用释放才还额度。Wire和公开API不变。
+- [x] 原Enter和普通Input继续使用InputLease，不误将键鼠freshness策略应用到clipboard/Hello；现有旧conn拒绝路径释放事件及额度，队列丢弃也归还额度。
+
+### 验证与后续边界
+
+- 实际dispatcher矩阵验证clipboard和Hello：暂停Service消费后保持96/0；再次申请同peer超时，其他peer仍可申请；dequeue但继续持有event时仍是96/0，drop后97/1，新申请恢复；终止并丢弃队列后128/32。补丁后通过，日志forwarded-control-budget-fixed.log。
+- 工作区all-features root 165 / 3忽略，其他组件计数与第73轮一致；严格Clippy/fmt/diff通过。保留第73轮原控制矩阵和共享global/peer回归。第73轮5f2e7fe CI检查时Rust queued、Nix in_progress，第72轮被新提交取消，不当作通过。
+- [ ] R95 / P1：Leave在dispatcher中调用emulation_proxy.remove，ProxyRequest::Remove通过另一个无界队列且没有转移ControlLease；慢native cleanup仍可能累计Remove。普通Enter派生ReleaseNotify/Entered也不保留已经交给proxy的InputLease，Service慢时可积压小消息。需下一轮生产链路基线和所有权边界修复。
+- [ ] 连接churn、生命周期事件、backend反馈及Service→frontend等其他消息总量仍需逐一审查；本轮只闭合指定control派生链路。Ping恢复owner路径已审代码，当前真实dispatcher矩阵覆盖clipboard/Hello，不扩展为所有并发交错穷尽验证。
+- [ ] 全服务资源、原生恢复、千次双机切换、完整p95/p99与8h RSS仍未证明；不认定90分，未部署本机程序。
+
+日志：forwarded-control-budget-baseline.log、forwarded-control-budget-fixed.log、forwarded-control-budget-workspace.log、forwarded-control-budget-clippy.log。

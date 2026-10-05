@@ -1051,7 +1051,10 @@ while the listener queue or its dispatcher owns the message. Control frames do
 not receive the 50ms input freshness deadline, and input queue permits remain
 independent. Dropping/draining queued messages restores admission capacity.
 
-This bounds the listener stage only. ClipboardReceived/PeerHello/lifecycle
-messages forwarded into the Service queue currently do not carry this lease;
-that downstream queue and connection-churn notifications remain separate work.
-High-rate real-device fairness and whole-service RSS are not established.
+The same lease now follows ClipboardReceived and PeerHello into the Service
+queue and remains held until handling or rejection ends. Ping-triggered Entered
+notifications share that ownership. Forwarding does not free a permit, and
+dropping the queue frees retained permits. Leave-derived proxy Remove requests,
+ordinary Enter-derived Service notifications and connection-churn notifications
+still require further queue bounds. High-rate real-device fairness and
+whole-service RSS are not established.

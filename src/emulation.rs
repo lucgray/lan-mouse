@@ -63,6 +63,7 @@ pub(crate) enum EmulationEvent {
         /// certificate fingerprint of the connection
         fingerprint: String,
         conn: ArcConn,
+        control: Option<std::sync::Arc<crate::input_budget::ControlLease>>,
     },
     /// connection closed
     Disconnected {
@@ -102,12 +103,14 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         commit: [u8; 8],
         conn: ArcConn,
+        control: Option<std::sync::Arc<crate::input_budget::ControlLease>>,
     },
     /// clipboard data received from remote
     ClipboardReceived {
         event: input_event::ClipboardEvent,
         addr: SocketAddr,
         conn: ArcConn,
+        control: Option<std::sync::Arc<crate::input_budget::ControlLease>>,
     },
     /// Completion of a network send, not acknowledgement of a remote OS write.
     ClipboardSendCompleted(ClipboardCompletion),
@@ -372,6 +375,7 @@ impl ListenTask {
                                 pos: to_ipc_pos(pos),
                                 fingerprint,
                                 conn: conn.clone(),
+                                control: _control.clone(),
                             }).expect("channel closed");
                         }
                         match event {
@@ -385,7 +389,7 @@ impl ListenTask {
                                     self.listener.reply(&mut control_jobs, addr, ProtoEvent::Ack(0));
                                     if !self.listener.is_current(addr, &conn) { continue; }
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t, self.listener.authorization().token(addr, &conn), budget);
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint, conn: conn.clone()}).expect("channel closed");
+                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint, conn: conn.clone(), control: _control.clone()}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(..) => {
@@ -401,7 +405,7 @@ impl ListenTask {
                                 match input_event {
                                     input_event::Event::Clipboard(clipboard_event) => {
                                         self.event_tx
-                                            .send(EmulationEvent::ClipboardReceived { event: clipboard_event, addr, conn })
+                                            .send(EmulationEvent::ClipboardReceived { event: clipboard_event, addr, conn, control: _control })
                                             .expect("channel closed");
                                     }
                                     _ => {
@@ -423,7 +427,7 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(&mut control_jobs, addr, ProtoEvent::Hello { commit: local_commit() });
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit, conn: conn.clone() }).expect("channel closed");
+                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit, conn: conn.clone(), control: _control }).expect("channel closed");
                             }
                             _ => {}
                         }
