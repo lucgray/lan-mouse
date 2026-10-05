@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R96 | 部分实现：接入代次额度跨队列 | ReaderLease共享reservation，Accept/Connected/接入替换cleanup与reader共用32名额；断线/撤销及重复lifecycle仍待有界 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
@@ -1816,3 +1817,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 千次双机切换、原生故障恢复、完整p95/p99与8h RSS仍缺少证据，不认定90分，未部署本机程序。
 
 日志：enter-service-budget-baseline.log、enter-service-budget-fixed.log、enter-service-budget-workspace.log、enter-service-budget-clippy.log、enter-service-budget-isolated-service.log。
+
+
+## 第七十七轮：接入通知保留 reader 代次额度
+
+### R96 / P1
+
+- 源码：ReaderLease只跟随reader task到close结束，Accept虽然持有conn但不持有该名额。消费者暂停时，短会话可不断回收32名额、留下无限接入通知。基线直接调用生产admit_reader，64个同地址不同conn代次、每次模拟reader结束，全部获准；预期32断言失败。日志accept-generation-budget-baseline.log；非真实网络洪泛。
+- [x] ReaderLease通过Rc<ReaderReservation>共享原名额，只有最后owner drop扣减计数；admit_reader发布Accept时携带clone，Connected转移到Service，替换时派生ProxyRequest::Remove也共享该owner直到await cleanup结束。活reader与待处理通知共用32额度，不另申请第二份。
+- [x] 旧reader容量测试保留超额不得替换/发布的断言，增加“reader owners已丢弃但替换Accept未消费时仍占1，消费后为0”；既有行为上界变化已经明确验证。
+
+### 验证与尚未闭合范围
+
+- 接入阶段：最多32代次获准，取出Accept仍保留32，drop一项变31、排空变0。实际Emulation dispatcher暂停Service：Connected持有名额，dequeue仍持有，drop后归零。
+- 原生产EmulationTask挂起cleanup回归增加接入代次owner：异步destroy等待时控制permit和reader名额均保留，放行后均恢复。隔离Service旧身份撤销fixture新增迟到Connected携带代次owner，拒绝后归还。
+- 工作区all-features root 171 / 3忽略，其他组件计数与第76轮一致；严格Clippy/fmt/diff通过。隔离Service旧身份撤销回归1条通过。第76轮798d2fb Rust CI run 37254366466 completed/success，Nix 37254366404检查时in_progress；新HEAD仍需CI。所有新fixture访问均cfg(test)，未部署本机程序。
+- [ ] R96部分完成：Disconnected/ConnectionClosed、授权撤销pending、没有接入owner的非Leave代理Remove尚未完整携带名额/独立消息预算。尤其被过滤的过时Accept可释放owner，而迟到断线仍可能产生其他无额度消息；下一轮必须验证该路径，不能把本轮32代次上限扩展成全部生命周期通知上限。
+- [ ] 同一活代次可以产生多项派生工作，clone共享名额不等于独立限制每项消息数量。重复timeout/恢复、backend反馈等需另行检查。原生释放、千次双机切换、完整p95/p99和8h RSS仍未证明，不认定90分。
+
+日志：accept-generation-budget-baseline.log、accept-generation-budget-fixed.log、accept-generation-budget-workspace.log、accept-generation-budget-clippy.log、accept-generation-budget-isolated-service.log。

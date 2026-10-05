@@ -190,6 +190,7 @@ pub(crate) enum ListenEvent {
         addr: SocketAddr,
         fingerprint: String,
         conn: ArcConn,
+        admission: Option<ReaderLease>,
     },
     PortChanged(Result<u16, ListenerCreationError>),
 }
@@ -199,7 +200,12 @@ const MAX_INCOMING_READERS: usize = 32;
 #[derive(Default)]
 struct ReaderBudget(Rc<Cell<usize>>);
 
-struct ReaderLease(Rc<Cell<usize>>);
+#[derive(Clone)]
+pub(crate) struct ReaderLease {
+    _reservation: Rc<ReaderReservation>,
+}
+
+struct ReaderReservation(Rc<Cell<usize>>);
 
 impl ReaderBudget {
     fn try_reserve(&self) -> Option<ReaderLease> {
@@ -207,11 +213,13 @@ impl ReaderBudget {
             return None;
         }
         self.0.set(self.0.get() + 1);
-        Some(ReaderLease(self.0.clone()))
+        Some(ReaderLease {
+            _reservation: Rc::new(ReaderReservation(self.0.clone())),
+        })
     }
 }
 
-impl Drop for ReaderLease {
+impl Drop for ReaderReservation {
     fn drop(&mut self) {
         self.0.set(self.0.get() - 1);
     }
@@ -245,6 +253,7 @@ fn admit_reader(
             addr,
             fingerprint,
             conn: conn.clone(),
+            admission: Some(lease.clone()),
         })
         .expect("channel closed");
     Some((lease, session))
@@ -938,6 +947,12 @@ pub(crate) fn authorized_control_test_listener(addr: SocketAddr) -> (LanMouseLis
 }
 
 #[cfg(test)]
+pub(crate) fn reader_slot_for_test() -> (ReaderLease, Rc<Cell<usize>>) {
+    let budget = ReaderBudget::default();
+    (budget.try_reserve().unwrap(), budget.0.clone())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use lan_mouse_proto::MAX_EVENT_SIZE;
@@ -1321,6 +1336,49 @@ mod tests {
         assert_eq!(budget.0.get(), MAX_INCOMING_READERS);
         drop(lease);
         drop(leases);
+        assert_eq!(
+            budget.0.get(),
+            1,
+            "replacement Accept still owns its generation"
+        );
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ListenEvent::Accept { .. }
+        ));
+        assert_eq!(budget.0.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_accept_generations_keep_reader_capacity_after_readers_finish() {
+        let budget = ReaderBudget::default();
+        let auth = IncomingAuthorization::default();
+        let (tx, mut rx) = channel();
+        let parent = CancellationToken::new();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let mut admitted = 0;
+        for _ in 0..64 {
+            let conn: ArcConn = Arc::new(TestConn::new(None));
+            let Some((lease, _)) =
+                admit_reader(&budget, &auth, addr, "peer".into(), &conn, &parent, &tx)
+            else {
+                break;
+            };
+            admitted += 1;
+            // A completed reader releases its owner while its Accept remains queued.
+            drop(lease);
+        }
+        assert_eq!(
+            admitted, MAX_INCOMING_READERS,
+            "finished readers must not recycle slots while their Accept notices remain queued"
+        );
+        assert_eq!(budget.0.get(), MAX_INCOMING_READERS);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(budget.0.get(), MAX_INCOMING_READERS);
+        drop(event);
+        assert_eq!(budget.0.get(), MAX_INCOMING_READERS - 1);
+        for _ in 1..MAX_INCOMING_READERS {
+            drop(rx.recv().await.unwrap());
+        }
         assert_eq!(budget.0.get(), 0);
     }
 

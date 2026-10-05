@@ -1063,3 +1063,19 @@ input deadline/cancellation and creates an Arc only for these derived notices.
 Ordinary input retains directly owned permits. Connection-churn and other
 lifecycle notifications still require further bounds. High-rate real-device
 fairness and whole-service RSS are not established.
+
+
+### Incoming reader generations retained by admission notices
+
+The 32 incoming-reader slots now count a generation until its final reader,
+Accept notice, Connected Service notice and admission-derived replacement
+cleanup owner is released. ReaderLease shares one reservation; cloning owners
+does not reserve additional slots. Completed readers cannot recycle slots while
+these notices remain queued. Replacement cleanup retains the new admission's
+reservation through proxy cleanup, and stale Accept/Connected rejection releases
+its owner. The limit is shared across address families and port replacement.
+
+This bounds retained admitted generations in those paths. Disconnected and
+ConnectionClosed notices, authorization-revocation notifications, and repeated
+lifecycle work without admission ownership remain separate queue-bound work.
+It does not establish a total notification count or whole-service RSS bound.

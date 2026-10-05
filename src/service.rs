@@ -578,6 +578,7 @@ impl Service {
                 addr,
                 fingerprint,
                 conn,
+                admission: _admission,
             } => {
                 if !self.emulation.clipboard_session_is_current(addr, &conn) {
                     return;
@@ -1841,7 +1842,7 @@ mod tests {
                 loop {
                     let event = service.emulation.event().await;
                     let current = match &event {
-                        EmulationEvent::Connected { addr, fingerprint, conn } if fingerprint == &reload_fp => Some((*addr, conn.clone())),
+                        EmulationEvent::Connected { addr, fingerprint, conn, .. } if fingerprint == &reload_fp => Some((*addr, conn.clone())),
                         _ => None,
                     };
                     service.handle_emulation_event(event).await;
@@ -1889,7 +1890,9 @@ mod tests {
             drop(stale_lease);
             service.handle_emulation_event(EmulationEvent::Entered { input: Some(stale_admission.clone()), control: None, addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
             assert_eq!(stale_budget.available(), (0, 0));
-            service.handle_emulation_event(EmulationEvent::Connected { addr: old_addr, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
+            let (stale_generation, generation_slots) = crate::listen::reader_slot_for_test();
+            service.handle_emulation_event(EmulationEvent::Connected { admission: Some(stale_generation), addr: old_addr, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
+            assert_eq!(generation_slots.get(), 0, "rejecting stale Connected must release generation ownership");
             service.handle_emulation_event(EmulationEvent::ClipboardReceived { control: None, addr: old_addr, conn: old_server.clone(), event: input_event::ClipboardEvent::Text("old receipt".into()) }).await;
             service.handle_emulation_event(EmulationEvent::ReleaseNotify { input: Some(stale_admission), addr: old_addr, conn: old_server.clone() }).await;
             assert_eq!(stale_budget.available(), (1, 1), "rejecting both stale notices must return admission");
