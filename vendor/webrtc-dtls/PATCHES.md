@@ -3,7 +3,7 @@
 Base: crates.io webrtc-dtls 0.12.0, checksum
 `5ccbe4d9049390ab52695c3646c1395c877e16c15fb05d3bda8eee0c7351711c`.
 The original MIT/Apache-2.0 licenses and source files are retained.
-Production changes are confined to src/conn/mod.rs:
+Production changes are in src/conn/mod.rs and src/listener.rs:
 
 - One owned close task survives cancellation/drop of its callers and object.
 - Concurrent/repeated pending closes wait for that task. The first completed
@@ -30,3 +30,9 @@ bounded by this patch and the application reader budget does not account for it.
 
 Standalone Cargo.toml links ../webrtc-util through a local patch so original
 DTLS library tests exercise the same UDP close behavior as the application.
+
+The additive listen_with_handshake_timeout factory bounds DTLS construction
+only after parent.accept returns. Existing listen/new remain untimed. Lan Mouse
+selects two seconds; the accept pool no longer times idle waiting. Original
+ConnectContextMaker documentation was replaced because no such Config field
+exists in this Rust version. No existing function signature or wire changes.

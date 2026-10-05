@@ -3,6 +3,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::net::ToSocketAddrs;
@@ -18,6 +19,24 @@ use crate::record_layer::unpack_datagram;
 
 /// Listen creates a DTLS listener
 pub async fn listen<A: 'static + ToSocketAddrs>(laddr: A, config: Config) -> Result<impl Listener> {
+    listen_internal(laddr, config, None).await
+}
+
+/// Bound only the handshake after an underlying UDP session arrives.
+/// Waiting for the first packet does not consume this duration.
+pub async fn listen_with_handshake_timeout<A: 'static + ToSocketAddrs>(
+    laddr: A,
+    config: Config,
+    timeout: Duration,
+) -> Result<impl Listener> {
+    listen_internal(laddr, config, Some(timeout)).await
+}
+
+async fn listen_internal<A: 'static + ToSocketAddrs>(
+    laddr: A,
+    config: Config,
+    handshake_timeout: Option<Duration>,
+) -> Result<DTLSListener> {
     validate_config(false, &config)?;
 
     let mut lc = ListenConfig {
@@ -47,13 +66,18 @@ pub async fn listen<A: 'static + ToSocketAddrs>(laddr: A, config: Config) -> Res
     };
 
     let parent = Arc::new(lc.listen(laddr).await?);
-    Ok(DTLSListener { parent, config })
+    Ok(DTLSListener {
+        parent,
+        config,
+        handshake_timeout,
+    })
 }
 
 /// DTLSListener represents a DTLS listener
 pub struct DTLSListener {
     parent: Arc<dyn Listener + Send + Sync>,
     config: Config,
+    handshake_timeout: Option<Duration>,
 }
 
 impl DTLSListener {
@@ -61,7 +85,11 @@ impl DTLSListener {
     pub fn new(parent: Arc<dyn Listener + Send + Sync>, config: Config) -> Result<Self> {
         validate_config(false, &config)?;
 
-        Ok(DTLSListener { parent, config })
+        Ok(DTLSListener {
+            parent,
+            config,
+            handshake_timeout: None,
+        })
     }
 }
 
@@ -71,13 +99,19 @@ type UtilResult<T> = std::result::Result<T, util::Error>;
 impl Listener for DTLSListener {
     /// Accept waits for and returns the next connection to the listener.
     /// You have to either close or read on all connection that are created.
-    /// Connection handshake will timeout using ConnectContextMaker in the Config.
-    /// If you want to specify the timeout duration, set ConnectContextMaker.
+    /// The optional local handshake timeout starts after parent acceptance.
+    /// The original listen/new entry points retain their untimed behavior.
     async fn accept(&self) -> UtilResult<(Arc<dyn Conn + Send + Sync>, SocketAddr)> {
         let (conn, raddr) = self.parent.accept().await?;
-        let dtls_conn = DTLSConn::new(conn, self.config.clone(), false, None)
-            .await
-            .map_err(util::Error::from_std)?;
+        let handshake = DTLSConn::new(conn, self.config.clone(), false, None);
+        let result = if let Some(timeout) = self.handshake_timeout {
+            tokio::time::timeout(timeout, handshake)
+                .await
+                .unwrap_or(Err(crate::error::Error::ErrDeadlineExceeded))
+        } else {
+            handshake.await
+        };
+        let dtls_conn = result.map_err(util::Error::from_std)?;
         Ok((Arc::new(dtls_conn), raddr))
     }
 

@@ -25,6 +25,8 @@ jobs:
         run: rustfmt --check --edition 2021 vendor/webrtc-util/src/conn/conn_udp_listener.rs
       - name: Check patched DTLS module formatting
         run: rustfmt --check --edition 2021 --config skip_children=true,style_edition=2021 vendor/webrtc-dtls/src/conn/mod.rs
+      - name: Check patched DTLS listener formatting
+        run: rustfmt --check --edition 2021 --config style_edition=2021 vendor/webrtc-dtls/src/listener.rs
 
   ci:
     name: ${{ matrix.job }} ${{ matrix.os }}

@@ -1005,9 +1005,18 @@ Standalone vendored DTLS tests link the sibling UDP patch and run in Rust CI.
 
 Pending accepts are retained per bound listener. Completion of another listener
 or cancellation of a control-loop wait does not discard an in-flight handshake.
-Only the completed listener is rearmed. The existing two-second stalled-accept
-retry is now per attempt/listener; it still includes time waiting for the first
-packet and does not guarantee all slow handshakes complete. Port replacement
+Only the completed listener is rearmed. The two-second handshake deadline now starts after underlying UDP acceptance;
+idle waiting does not consume it. It does not guarantee all slow handshakes complete. Port replacement
 and shutdown cancel the old accept pool before closing those listeners.
 The pool retains one future per bound listener with no additional result queue;
 underlying DTLS/session/cleanup global resource limits remain separate work.
+
+
+### Handshake deadline start
+
+Lan Mouse uses the vendored listen_with_handshake_timeout entry point with a
+two-second duration. It bounds DTLS construction after raw UDP accept returns,
+with ErrDeadlineExceeded on expiry and the constructor guard scheduling cleanup.
+The original dependency listen/new signatures and untimed behavior remain.
+Raw backlog waiting is outside this duration; slow/lossy real networks still
+need validation. Wire encoding is unchanged.

@@ -13,11 +13,13 @@ use std::{
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
+#[cfg(test)]
+use webrtc_dtls::listener::listen;
+use webrtc_dtls::listener::listen_with_handshake_timeout;
 use webrtc_dtls::{
     config::{ClientAuthType::RequireAnyClientCert, Config, ExtendedMasterSecretType},
     conn::DTLSConn,
     crypto::Certificate,
-    listener::listen,
 };
 use webrtc_util::{Conn, Error, conn::Listener};
 
@@ -74,7 +76,13 @@ async fn bind_dtls(
         IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     ] {
-        match listen(SocketAddr::new(ip, selected_port), cfg.clone()).await {
+        match listen_with_handshake_timeout(
+            SocketAddr::new(ip, selected_port),
+            cfg.clone(),
+            Duration::from_secs(2),
+        )
+        .await
+        {
             Ok(l) => {
                 // Port zero asks the OS once; the other family must bind the
                 // same actual port, including on v6-only platforms.
@@ -97,7 +105,7 @@ async fn bind_dtls(
 }
 
 type AcceptResult = Result<(ArcConn, SocketAddr), webrtc_util::Error>;
-type AcceptAttempt = futures::future::LocalBoxFuture<'static, (usize, Option<AcceptResult>)>;
+type AcceptAttempt = futures::future::LocalBoxFuture<'static, (usize, AcceptResult)>;
 
 struct AcceptPool {
     listeners: Vec<Rc<Box<dyn Listener>>>,
@@ -120,11 +128,7 @@ impl AcceptPool {
         let listener = self.listeners[index].clone();
         self.pending.push(
             async move {
-                // Retain the existing stalled-accept workaround per listener;
-                // another family's completion/control event must not cancel it.
-                let result = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-                    .await
-                    .ok();
+                let result = listener.accept().await;
                 (index, result)
             }
             .boxed_local(),
@@ -132,17 +136,13 @@ impl AcceptPool {
     }
 
     async fn next(&mut self) -> AcceptResult {
-        loop {
-            let (index, result) = self
-                .pending
-                .next()
-                .await
-                .expect("bound listener set is nonempty");
-            self.rearm(index);
-            if let Some(result) = result {
-                return result;
-            }
-        }
+        let (index, result) = self
+            .pending
+            .next()
+            .await
+            .expect("bound listener set is nonempty");
+        self.rearm(index);
+        result
     }
 
     fn into_listeners(mut self) -> Vec<Box<dyn Listener>> {
@@ -912,6 +912,7 @@ mod tests {
         fail_sends: AtomicBool,
         fail_close: bool,
         active_sends: AtomicUsize,
+        send_attempts: AtomicUsize,
         hold_sends: AtomicBool,
         hold_closes: AtomicBool,
         send_gate: tokio::sync::Semaphore,
@@ -927,6 +928,7 @@ mod tests {
                 fail_close,
                 fail_sends: AtomicBool::new(false),
                 active_sends: AtomicUsize::new(0),
+                send_attempts: AtomicUsize::new(0),
                 hold_sends: AtomicBool::new(false),
                 hold_closes: AtomicBool::new(false),
                 send_gate: tokio::sync::Semaphore::new(0),
@@ -955,6 +957,7 @@ mod tests {
                     self.0.fetch_sub(1, Ordering::SeqCst);
                 }
             }
+            self.send_attempts.fetch_add(1, Ordering::SeqCst);
             self.active_sends.fetch_add(1, Ordering::SeqCst);
             let _sending = SendGuard(&self.active_sends);
             if self.hold_sends.load(Ordering::SeqCst) {
@@ -1887,7 +1890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_pool_retries_expired_attempt_and_releases_listener_ownership() {
+    async fn accept_pool_keeps_idle_wait_and_releases_listener_ownership() {
         let starts = Arc::new(AtomicUsize::new(0));
         let canceled = Arc::new(AtomicUsize::new(0));
         let mut pool = AcceptPool::new(vec![Box::new(TrackingAcceptListener {
@@ -1901,18 +1904,18 @@ mod tests {
                 .await
                 .is_err()
         );
-        // Keep the attempt alive while its own two-second timer expires;
-        // polling it again must rearm just this listener, not report an error.
+        // An idle accept is not a stalled handshake. It must remain the
+        // same attempt past the former whole-accept timeout.
         tokio::time::sleep(Duration::from_millis(2020)).await;
         assert!(
             tokio::time::timeout(Duration::from_millis(20), pool.next())
                 .await
                 .is_err()
         );
-        assert_eq!(starts.load(Ordering::SeqCst), 2);
-        assert_eq!(canceled.load(Ordering::SeqCst), 1);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(canceled.load(Ordering::SeqCst), 0);
         let listeners = pool.into_listeners();
-        assert_eq!(canceled.load(Ordering::SeqCst), 2);
+        assert_eq!(canceled.load(Ordering::SeqCst), 1);
         close_listeners(listeners).await;
     }
 
@@ -2010,6 +2013,120 @@ mod tests {
         slow_client.close().await.unwrap();
         fast_server.close().await.unwrap();
         slow_server.close().await.unwrap();
+        close_listeners(pool.into_listeners()).await;
+    }
+
+    #[tokio::test]
+    async fn idle_listener_grants_full_handshake_deadline_after_first_packet() {
+        let cfg = Config {
+            certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let listener =
+            listen_with_handshake_timeout("127.0.0.1:0", cfg.clone(), Duration::from_secs(2))
+                .await
+                .unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket
+            .connect(listener.addr().await.unwrap())
+            .await
+            .unwrap();
+        let transport = Arc::new(FailingCloseNotifyConn::new(socket, false));
+        transport.hold_sends.store(true, Ordering::SeqCst);
+        let client = tokio::spawn(DTLSConn::new(transport.clone(), cfg, true, None));
+        let mut pool = AcceptPool::new(vec![Box::new(listener)]);
+        let (server, _) = {
+            let selecting = pool.next();
+            tokio::pin!(selecting);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut selecting)
+                    .await
+                    .is_err()
+            );
+            tokio::time::sleep(Duration::from_millis(1800)).await;
+            transport.send_gate.add_permits(1);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut selecting)
+                    .await
+                    .is_err()
+            );
+            assert!(transport.send_attempts.load(Ordering::SeqCst) >= 2);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            transport.hold_sends.store(false, Ordering::SeqCst);
+            transport.send_gate.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(1), &mut selecting)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let client = client.await.unwrap().unwrap();
+        client.send(b"idle-then-connect").await.unwrap();
+        let mut buffer = [0u8; 32];
+        let length = tokio::time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..length], b"idle-then-connect");
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+        close_listeners(pool.into_listeners()).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_rearms_listener_for_another_peer() {
+        let cfg = Config {
+            certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let listener =
+            listen_with_handshake_timeout("127.0.0.1:0", cfg.clone(), Duration::from_millis(500))
+                .await
+                .unwrap();
+        let addr = listener.addr().await.unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket.connect(addr).await.unwrap();
+        let blocked = Arc::new(FailingCloseNotifyConn::new(socket, false));
+        blocked.hold_sends.store(true, Ordering::SeqCst);
+        blocked.send_gate.add_permits(1);
+        let client = tokio::spawn(DTLSConn::new(blocked.clone(), cfg.clone(), true, None));
+        let mut pool = AcceptPool::new(vec![Box::new(listener)]);
+        let error = tokio::time::timeout(Duration::from_secs(2), pool.next())
+            .await
+            .unwrap()
+            .err()
+            .unwrap();
+        let Error::Std(error) = error else {
+            panic!("expected DTLS deadline error");
+        };
+        assert_eq!(
+            error.0.downcast_ref::<webrtc_dtls::Error>(),
+            Some(&webrtc_dtls::Error::ErrDeadlineExceeded)
+        );
+        client.abort();
+        let _ = client.await;
+        tokio::time::timeout(Duration::from_secs(1), blocked.close_finished.notified())
+            .await
+            .unwrap();
+        assert_eq!(blocked.active_sends.load(Ordering::SeqCst), 0);
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket.connect(addr).await.unwrap();
+        let healthy = tokio::spawn(DTLSConn::new(socket, cfg, true, None));
+        let (server, _) = tokio::time::timeout(Duration::from_secs(2), pool.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let healthy = healthy.await.unwrap().unwrap();
+        healthy.send(b"recovered").await.unwrap();
+        let mut buffer = [0u8; 32];
+        let length = tokio::time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..length], b"recovered");
+        healthy.close().await.unwrap();
+        server.close().await.unwrap();
         close_listeners(pool.into_listeners()).await;
     }
 

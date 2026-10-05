@@ -22,6 +22,7 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
+| R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1677,3 +1678,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 上一 e611d8e Rust run 37249061528 completed/success，Nix 37249061607 检查时 in_progress。新 HEAD 需原生 CI；千次真机往返、原生恢复和 8h RSS 未验收，不认定 90 分。公共 API/wire 不变，未部署已安装程序。
 
 日志：accept-lifetime-baseline.log、accept-lifetime-fixed.log、accept-lifetime-dtls.log、accept-lifetime-workspace.log、accept-lifetime-clippy.log。
+
+
+## 第七十轮：从收到连接后开始握手期限
+
+### R91 / P2
+
+- 核对原始 [webrtc issue #614](https://github.com/webrtc-rs/webrtc/issues/614)：问题指向 parent.accept 返回后的 DTLSConn::new 没有超时、失败握手挡住后续接入。锁定依赖源码仍在该位置 await new，没有实际 ConnectContextMaker 配置字段；不把等待首包视为失败握手。
+- 基线实际 UDP/DTLS：监听 future 已开始后空闲 1.8 秒，客户端只放行第一 flight，第二 flight 再等待 500ms。旧的整个 accept 两秒期限下，放行后的一秒内没有完成接入，测试失败。相同故障控制在补丁后完成并传输数据。日志 handshake-deadline-baseline/fixed.log；不是物理慢网络或唯一鼠标故障原因证明。
+- [x] vendored DTLS 新增兼容的 listen_with_handshake_timeout 入口：parent.accept 后才包住 DTLSConn::new 的 timeout。原 listen/new 保持无额外期限行为；根程序绑定使用新增入口、指定两秒。移除 AcceptPool 整个 accept 的计时，保留 pending future 和仅完成项重建；空闲监听不再每两秒取消重建。
+- [x] 超时返回现有 ErrDeadlineExceeded，构造 guard 处理被取消的 raw/worker 清理。保留真实失败握手的退出能力；原错误文档关于不存在的 ConnectContextMaker 已改为实际入口说明。现有公开函数签名未改，新增依赖工厂函数，不改变 wire 编码。
+
+### 验证和边界
+
+- 空闲后的真实受控延迟握手完成并传输 idle-then-connect；另一真实握手用 500ms 测试期限卡住 client flight，收到可识别 DTLS 期限错误，取消失败客户端后，同一监听器能接入健康 peer 并传输 recovered。原 idle 模型回归现验证超过两秒仍是同一 accept，端口退出时仍释放所有权。
+- 工作区 all-features：root 160 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11；严格 Clippy/fmt/diff 通过，原 DTLS library 61 条全部通过。CI 增加修改后的 listener.rs 格式检查，真实新期限回归在根测试中执行。
+- [ ] 起点为 raw accept 返回，不是网卡收包的绝对时间；accept backlog 中的排队延迟未计入此期限。两秒仍可能不足以完成所有合法丢包/慢网握手，不能把受控正常恢复扩展为全部网络体验已验收。
+- [ ] 停滞握手在本监听器仍会占用单 accept 至期限；同监听器并发接入、底层会话/清理 task 全局额度、worker panic 与永久 raw close 的恢复仍未完成。原生释放、千次双机往返、完整时延和 8h RSS 未验收，不认定 90 分。未部署本机程序。
+
+日志：handshake-deadline-baseline.log、handshake-deadline-fixed.log、handshake-deadline-workspace.log、handshake-deadline-clippy.log、handshake-deadline-original-tests.log。
