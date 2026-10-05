@@ -524,7 +524,10 @@ impl Service {
                     self.update_incoming(addr, pos, fingerprint);
                 }
             }
-            EmulationEvent::ConnectionClosed { addr } => {
+            EmulationEvent::ConnectionClosed {
+                addr,
+                admission: _admission,
+            } => {
                 self.remove_incoming(addr);
                 self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }

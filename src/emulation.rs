@@ -74,6 +74,7 @@ pub(crate) enum EmulationEvent {
     /// actual DTLS connection ended or was replaced
     ConnectionClosed {
         addr: SocketAddr,
+        admission: Option<crate::listen::ReaderLease>,
     },
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
@@ -336,7 +337,10 @@ impl ListenTask {
                 forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
                 self.emulation_proxy.remove(addr);
                 self.event_tx
-                    .send(EmulationEvent::ConnectionClosed { addr })
+                    .send(EmulationEvent::ConnectionClosed {
+                        addr,
+                        admission: None,
+                    })
                     .expect("channel closed");
             }
             select! {
@@ -444,11 +448,11 @@ impl ListenTask {
                         let remembered = forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
                         if !accepted_clients.insert(addr) || remembered {
                             self.emulation_proxy.remove_with_admission(addr, None, admission.clone());
-                            self.event_tx.send(EmulationEvent::ConnectionClosed { addr }).expect("channel closed");
+                            self.event_tx.send(EmulationEvent::ConnectionClosed { addr, admission: admission.clone() }).expect("channel closed");
                         }
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint, conn, admission }).expect("channel closed");
                     }
-                    Some(ListenEvent::Disconnected { addr }) => {
+                    Some(ListenEvent::Disconnected { addr, admission }) => {
                         let current = self.listener.clipboard_connection(addr);
                         clipboard_jobs.cancel_stale(addr, current.as_ref());
                         control_jobs.cancel_stale(addr, current.as_ref());
@@ -457,8 +461,8 @@ impl ListenTask {
                         if self.listener.has_connection(addr) { continue; }
                         accepted_clients.remove(&addr);
                         forget_peer(addr, &mut entered_clients, &mut dormant, &mut last_response);
-                        self.emulation_proxy.remove(addr);
-                        self.event_tx.send(EmulationEvent::ConnectionClosed { addr }).expect("channel closed");
+                        self.emulation_proxy.remove_with_admission(addr, None, admission.clone());
+                        self.event_tx.send(EmulationEvent::ConnectionClosed { addr, admission }).expect("channel closed");
                     }
                     Some(ListenEvent::PortChanged(result)) => {
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
@@ -1314,6 +1318,38 @@ mod resume_tests {
                 emulation.terminate().await;
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_generation_is_retained_by_service_or_discarded_for_current_peer() {
+        tokio::task::LocalSet::new().run_until(async {
+            for replacement_live in [false, true] {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, conn) = crate::listen::control_test_listener(addr);
+                let incoming = listener.test_sender();
+                if !replacement_live { listener.clipboard_connections().borrow_mut().clear(); }
+                let mut emulation = Emulation::new(Some(input_emulation::Backend::Dummy), Default::default(), listener, (false, 1.0));
+                let (admission, slots) = crate::listen::reader_slot_for_test();
+                incoming.send(ListenEvent::Disconnected { addr, admission: Some(admission) }).unwrap_or_else(|_| panic!());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if replacement_live {
+                    assert_eq!(slots.get(), 0, "obsolete disconnect must release only its owner");
+                    assert!(emulation.clipboard_session_is_current(addr, &conn));
+                    assert!(tokio::time::timeout(Duration::from_millis(20), async {
+                        loop { if matches!(emulation.event().await, EmulationEvent::ConnectionClosed { .. }) { break; } }
+                    }).await.is_err());
+                } else {
+                    assert_eq!(slots.get(), 1, "pending ConnectionClosed must retain the generation after proxy processing");
+                    let event = tokio::time::timeout(Duration::from_secs(1), async {
+                        loop { let event = emulation.event().await; if matches!(event, EmulationEvent::ConnectionClosed { .. }) { break event; } }
+                    }).await.unwrap();
+                    assert_eq!(slots.get(), 1);
+                    drop(event);
+                    assert_eq!(slots.get(), 0);
+                }
+                emulation.terminate().await;
+            }
+        }).await;
     }
 
     #[tokio::test]

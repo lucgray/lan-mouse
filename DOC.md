@@ -1075,7 +1075,10 @@ these notices remain queued. Replacement cleanup retains the new admission's
 reservation through proxy cleanup, and stale Accept/Connected rejection releases
 its owner. The limit is shared across address families and port replacement.
 
-This bounds retained admitted generations in those paths. Disconnected and
-ConnectionClosed notices, authorization-revocation notifications, and repeated
-lifecycle work without admission ownership remain separate queue-bound work.
+Natural reader shutdown now transfers that reservation through Disconnected,
+ConnectionClosed Service notices and proxy removal. An obsolete disconnect
+discarded while a replacement is live releases only its old owner. This also
+keeps a generation reserved after its stale Accept notice is rejected.
+Control-reply failures, authorization-revocation notifications, error reports
+and repeated lifecycle work without ownership still need separate queue bounds.
 It does not establish a total notification count or whole-service RSS bound.

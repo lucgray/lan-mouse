@@ -185,6 +185,7 @@ pub(crate) enum ListenEvent {
     },
     Disconnected {
         addr: SocketAddr,
+        admission: Option<ReaderLease>,
     },
     Accept {
         addr: SocketAddr,
@@ -537,7 +538,8 @@ impl LanMouseListener {
                                 log::info!("dtls client connected, ip: {addr}");
                                 // Replaced readers are canceled by install and own their close.
                                 // Keep their lease through close instead of spawning duplicate cleanup.
-                                spawn_local(hold_reader_slot(lease, read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session, input_budget.for_peer())));
+                                let reader_admission = Some(lease.clone());
+                                spawn_local(hold_reader_slot(lease, read_loop(conns_clone.clone(), addr, conn, listen_tx.clone(), session, input_budget.for_peer(), reader_admission)));
                             },
                             Err(e) => {
                                 if let Error::Std(ref e) = e {
@@ -725,6 +727,7 @@ impl LanMouseListener {
             .retain(|(addr, conn)| *addr != completed.addr || !Arc::ptr_eq(conn, &completed.conn));
         let _ = self.listen_tx.send(ListenEvent::Disconnected {
             addr: completed.addr,
+            admission: None,
         });
         spawn_local(async move {
             close_incoming(&completed.conn).await;
@@ -795,6 +798,7 @@ async fn read_loop(
     dtls_tx: Sender<ListenEvent>,
     cancellation: CancellationToken,
     input_budget: crate::input_budget::InputBudget,
+    admission: Option<ReaderLease>,
 ) -> Result<(), Error> {
     use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_event_frame};
 
@@ -910,7 +914,7 @@ async fn read_loop(
             .is_some()
     };
     if removed {
-        let _ = dtls_tx.send(ListenEvent::Disconnected { addr });
+        let _ = dtls_tx.send(ListenEvent::Disconnected { addr, admission });
     }
     close_incoming(&conn).await;
     Ok(())
@@ -1382,6 +1386,47 @@ mod tests {
         assert_eq!(budget.0.get(), 0);
     }
 
+    #[tokio::test]
+    async fn natural_disconnect_keeps_generation_after_stale_accept_is_discarded() {
+        let budget = ReaderBudget::default();
+        let auth = IncomingAuthorization::default();
+        let (tx, mut rx) = channel();
+        let parent = CancellationToken::new();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let conn: ArcConn = Arc::new(TestConn::new(None));
+        let (lease, session) =
+            admit_reader(&budget, &auth, addr, "peer".into(), &conn, &parent, &tx).unwrap();
+        let reader_admission = Some(lease.clone());
+        hold_reader_slot(
+            lease,
+            read_loop(
+                auth.conns.clone(),
+                addr,
+                conn,
+                tx,
+                session,
+                crate::input_budget::InputBudget::default(),
+                reader_admission,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            ListenEvent::Accept { .. }
+        ));
+        assert_eq!(
+            budget.0.get(),
+            1,
+            "discarding stale Accept must not free queued disconnect ownership"
+        );
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, ListenEvent::Disconnected { .. }));
+        assert_eq!(budget.0.get(), 1);
+        drop(event);
+        assert_eq!(budget.0.get(), 0);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn incoming_reader_slot_covers_actual_close_and_releases_on_task_cancellation() {
         tokio::task::LocalSet::new()
@@ -1408,6 +1453,7 @@ mod tests {
                             tx,
                             CancellationToken::new(),
                             crate::input_budget::InputBudget::default(),
+                            None,
                         ),
                     ));
                     assert!(budget.try_reserve().is_none()); // counts scheduled tasks before their first poll.
@@ -2793,7 +2839,7 @@ mod tests {
                 listener.finish_control_reply(completed);
                 assert!(!listener.has_connection(addr));
                 assert!(listener.is_current(other, &healthy));
-                assert!(matches!(listener.next().await, Some(ListenEvent::Disconnected { addr: a }) if a == addr));
+                assert!(matches!(listener.next().await, Some(ListenEvent::Disconnected { addr: a, .. }) if a == addr));
                 tokio::task::yield_now().await;
                 assert!(failed.closed.load(Ordering::SeqCst));
                 // A stale error cannot remove a newer connection at the address.
@@ -2825,7 +2871,7 @@ mod tests {
             listener.reply(&mut jobs, addr, ProtoEvent::Leave(0, 0.5));
             assert!(!listener.has_connection(addr));
             assert!(listener.has_connection(other));
-            assert!(matches!(listener.next().await, Some(ListenEvent::Disconnected { addr: a }) if a == addr));
+            assert!(matches!(listener.next().await, Some(ListenEvent::Disconnected { addr: a, .. }) if a == addr));
             tokio::task::yield_now().await;
             assert!(slow.closed.load(Ordering::SeqCst));
             assert!(!rejected.closed.load(Ordering::SeqCst));
@@ -3126,6 +3172,7 @@ mod tests {
             tx,
             CancellationToken::new(),
             crate::input_budget::InputBudget::default(),
+            None,
         )
         .await
         .unwrap();
@@ -3163,6 +3210,7 @@ mod tests {
                 tx,
                 token.clone(),
                 budget.clone(),
+                None,
             ),
         )
         .await
@@ -3187,7 +3235,7 @@ mod tests {
                 } => {
                     count += 1;
                 }
-                ListenEvent::Disconnected { addr: actual } => {
+                ListenEvent::Disconnected { addr: actual, .. } => {
                     assert_eq!(actual, addr);
                     disconnected += 1;
                 }
@@ -3276,6 +3324,7 @@ mod tests {
                     tx,
                     token.clone(),
                     budget.clone(),
+                    None,
                 ),
             )
             .await
@@ -3296,7 +3345,7 @@ mod tests {
                 if actual == addr && !reason.is_empty())
             );
             assert!(
-                matches!(rx.recv().await, Some(ListenEvent::Disconnected { addr: actual }) if actual == addr)
+                matches!(rx.recv().await, Some(ListenEvent::Disconnected { addr: actual, .. }) if actual == addr)
             );
             assert!(
                 rx.recv().await.is_none(),
@@ -3428,6 +3477,7 @@ mod tests {
                 tx,
                 CancellationToken::new(),
                 budget.clone(),
+                None,
             )
             .await
             .unwrap();
@@ -3472,7 +3522,15 @@ mod tests {
         let budget = crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_secs(60));
         let token = CancellationToken::new();
         let cancel = token.clone();
-        let read = read_loop(conns.clone(), addr, conn.clone(), tx, token, budget.clone());
+        let read = read_loop(
+            conns.clone(),
+            addr,
+            conn.clone(),
+            tx,
+            token,
+            budget.clone(),
+            None,
+        );
         let control = async {
             let first = rx.recv().await.unwrap(); // holds the only lease
             cancel.cancel();
@@ -3561,11 +3619,12 @@ mod tests {
             tx.clone(),
             CancellationToken::new(),
             crate::input_budget::InputBudget::default(),
+            None,
         )
         .await
         .unwrap();
         assert!(
-            matches!(rx.recv().await, Some(ListenEvent::Disconnected { addr: actual }) if actual == addr)
+            matches!(rx.recv().await, Some(ListenEvent::Disconnected { addr: actual, .. }) if actual == addr)
         );
         read_loop(
             conns.clone(),
@@ -3574,6 +3633,7 @@ mod tests {
             tx,
             CancellationToken::new(),
             crate::input_budget::InputBudget::default(),
+            None,
         )
         .await
         .unwrap();
