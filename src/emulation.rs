@@ -63,6 +63,7 @@ pub(crate) enum EmulationEvent {
         /// certificate fingerprint of the connection
         fingerprint: String,
         conn: ArcConn,
+        input: Option<crate::input_budget::InputAdmission>,
         control: Option<std::sync::Arc<crate::input_budget::ControlLease>>,
     },
     /// connection closed
@@ -91,6 +92,7 @@ pub(crate) enum EmulationEvent {
     ReleaseNotify {
         addr: SocketAddr,
         conn: ArcConn,
+        input: Option<crate::input_budget::InputAdmission>,
     },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
@@ -360,7 +362,7 @@ impl ListenTask {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::InputRejected { addr, reason }) => { self.event_tx.send(EmulationEvent::InputRejected { addr, reason }).expect("channel closed"); },
                     Some(ListenEvent::InputOverloaded { addr }) => { self.event_tx.send(EmulationEvent::InputOverloaded { addr }).expect("channel closed"); },
-                    Some(ListenEvent::Msg { event, addr, conn, budget, control: _control }) => {
+                    Some(ListenEvent::Msg { event, addr, conn, mut budget, control: _control }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
@@ -376,6 +378,7 @@ impl ListenTask {
                                 fingerprint,
                                 conn: conn.clone(),
                                 control: _control.clone(),
+                                input: budget.as_mut().map(crate::input_budget::InputLease::share_admission),
                             }).expect("channel closed");
                         }
                         match event {
@@ -385,11 +388,12 @@ impl ListenTask {
                                     log::info!("releasing capture: {addr} entered this device");
                                     dormant.remove(&addr);
                                     entered_clients.insert(addr, (pos, fingerprint.clone()));
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify { addr, conn: conn.clone() }).expect("channel closed");
+                                    let admission = budget.as_mut().map(crate::input_budget::InputLease::share_admission);
+                                    self.event_tx.send(EmulationEvent::ReleaseNotify { addr, conn: conn.clone(), input: admission.clone() }).expect("channel closed");
                                     self.listener.reply(&mut control_jobs, addr, ProtoEvent::Ack(0));
                                     if !self.listener.is_current(addr, &conn) { continue; }
                                     self.emulation_proxy.warp(addr, to_emulation_pos(pos), t, self.listener.authorization().token(addr, &conn), budget);
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint, conn: conn.clone(), control: _control.clone()}).expect("channel closed");
+                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint, conn: conn.clone(), control: _control.clone(), input: admission}).expect("channel closed");
                                 }
                             }
                             ProtoEvent::Leave(..) => {
@@ -1190,6 +1194,69 @@ mod resume_tests {
             tx,
             event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn enter_notifications_retain_input_admission_after_proxy_delivery() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, conn) = crate::listen::authorized_control_test_listener(addr);
+                let incoming = listener.test_sender();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                let budget =
+                    crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_millis(50));
+                let token = CancellationToken::new();
+                let lease = budget.acquire(&token).await.unwrap();
+                incoming
+                    .send(ListenEvent::Msg {
+                        addr,
+                        conn,
+                        event: ProtoEvent::Enter(Position::Left, 0.5),
+                        budget: Some(lease),
+                        control: None,
+                    })
+                    .unwrap_or_else(|_| panic!());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert_eq!(
+                    budget.available(),
+                    (0, 0),
+                    "proxy completion must not release admission for pending Service notices"
+                );
+                let mut notices = Vec::new();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while notices.len() < 2 {
+                        let event = emulation.event().await;
+                        if matches!(
+                            event,
+                            EmulationEvent::ReleaseNotify { .. } | EmulationEvent::Entered { .. }
+                        ) {
+                            notices.push(event);
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(budget.available(), (0, 0));
+                drop(notices.pop());
+                assert_eq!(
+                    budget.available(),
+                    (0, 0),
+                    "the other derived notice must retain the same reservation"
+                );
+                assert!(budget.acquire(&token).await.is_none());
+                drop(notices);
+                assert_eq!(budget.available(), (1, 1));
+                let recovered = budget.acquire(&token).await.unwrap();
+                drop(recovered);
+                emulation.terminate().await;
+            })
+            .await;
     }
 
     #[tokio::test]

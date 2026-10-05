@@ -929,6 +929,15 @@ pub(crate) fn control_test_listener(addr: SocketAddr) -> (LanMouseListener, ArcC
 }
 
 #[cfg(test)]
+pub(crate) fn authorized_control_test_listener(addr: SocketAddr) -> (LanMouseListener, ArcConn) {
+    let (listener, conn) = control_test_listener(addr);
+    listener
+        .authorization
+        .install(addr, "test-peer".into(), &conn, &CancellationToken::new());
+    (listener, conn)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use lan_mouse_proto::MAX_EVENT_SIZE;

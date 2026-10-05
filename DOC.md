@@ -1056,6 +1056,10 @@ queue and remains held until handling or rejection ends. Ping-triggered Entered
 notifications share that ownership. Forwarding does not free a permit, and
 dropping the queue frees retained permits. Leave-derived proxy Remove requests
 now carry the same control lease through queueing and asynchronous cleanup;
-ordinary Enter-derived Service notifications and connection-churn notifications
-still require further queue bounds. High-rate real-device fairness and
-whole-service RSS are not established.
+Enter-derived ReleaseNotify/Entered notices and input-triggered Entered
+recovery notices now share the original input reservation with the proxy.
+Only the final owner releases its permits; sharing preserves the original
+input deadline/cancellation and creates an Arc only for these derived notices.
+Ordinary input retains directly owned permits. Connection-churn and other
+lifecycle notifications still require further bounds. High-rate real-device
+fairness and whole-service RSS are not established.

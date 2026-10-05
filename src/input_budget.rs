@@ -21,17 +21,43 @@ pub(crate) struct ControlLease {
     _peer: OwnedSemaphorePermit,
 }
 
-/// Admission follows the frame through both listener and proxy queues, and is
-/// released only after delivery (or rejection), not merely after forwarding.
-pub(crate) struct InputLease {
-    deadline: Instant,
-    cancellation: CancellationToken,
-    identity: Arc<()>,
+struct InputReservation {
     _global: OwnedSemaphorePermit,
     _peer: OwnedSemaphorePermit,
 }
 
+/// Additional owner for Service notices derived from an input frame.
+#[derive(Clone)]
+pub(crate) struct InputAdmission {
+    _reservation: Arc<InputReservation>,
+}
+
+/// Admission follows the frame through listener, proxy and derived Service
+/// notices. It is released after the final delivery/rejection owner drops.
+pub(crate) struct InputLease {
+    deadline: Instant,
+    cancellation: CancellationToken,
+    identity: Arc<()>,
+    owned: Option<InputReservation>,
+    shared: Option<InputAdmission>,
+}
+
 impl InputLease {
+    // Promote only frames that derive additional queued notices. Ordinary
+    // input keeps its directly owned permits without another Arc allocation.
+    pub(crate) fn share_admission(&mut self) -> InputAdmission {
+        let owned = &mut self.owned;
+        self.shared
+            .get_or_insert_with(|| InputAdmission {
+                _reservation: Arc::new(
+                    owned
+                        .take()
+                        .expect("input reservation has one owner before sharing"),
+                ),
+            })
+            .clone()
+    }
+
     pub(crate) fn identity(&self) -> std::sync::Weak<()> {
         Arc::downgrade(&self.identity)
     }
@@ -108,7 +134,7 @@ impl InputBudget {
             result = tokio::time::timeout_at(admission_deadline, async {
                 let peer = self.peer.clone().acquire_owned().await.ok()?;
                 let global = self.global.clone().acquire_owned().await.ok()?;
-                Some(InputLease { deadline, cancellation: cancellation.clone(), identity: self.identity.clone(), _global: global, _peer: peer })
+                Some(InputLease { deadline, cancellation: cancellation.clone(), identity: self.identity.clone(), owned: Some(InputReservation { _global: global, _peer: peer }), shared: None })
             }) => result.ok().flatten(),
         }
     }
@@ -144,6 +170,30 @@ impl InputBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn derived_input_notices_share_one_reservation_without_renewing_deadline() {
+        let budget = InputBudget::with_limits(1, 1, Duration::from_millis(50));
+        let token = CancellationToken::new();
+        let mut lease = budget.acquire(&token).await.unwrap();
+        let deadline = lease.deadline();
+        let first = lease.share_admission();
+        let second = lease.share_admission();
+        assert_eq!(lease.deadline(), deadline);
+        assert_eq!(budget.available(), (0, 0));
+        drop(first);
+        assert_eq!(budget.available(), (0, 0));
+        token.cancel();
+        assert!(lease.cancellation().is_cancelled());
+        drop(lease);
+        assert_eq!(
+            budget.available(),
+            (0, 0),
+            "cancellation cannot free still-queued notice capacity"
+        );
+        drop(second);
+        assert_eq!(budget.available(), (1, 1));
+    }
 
     #[tokio::test]
     async fn control_capacity_is_global_with_peer_isolation_and_cancellation() {

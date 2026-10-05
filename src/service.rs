@@ -507,6 +507,7 @@ impl Service {
                 fingerprint,
                 conn,
                 control: _control,
+                input: _input,
             } => {
                 if !self.emulation.clipboard_session_is_current(addr, &conn) {
                     return;
@@ -564,7 +565,11 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::ReleaseNotify { addr, conn } => {
+            EmulationEvent::ReleaseNotify {
+                addr,
+                conn,
+                input: _input,
+            } => {
                 if self.emulation.clipboard_session_is_current(addr, &conn) {
                     self.capture.release();
                 }
@@ -1878,10 +1883,16 @@ mod tests {
             assert!(!service.incoming_conns.contains(&old_addr));
             assert!(!service.incoming_clipboard.contains_key(&old_addr));
             service.pending_frontend_events.clear();
-            service.handle_emulation_event(EmulationEvent::Entered { control: None, addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
+            let stale_budget = crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_millis(50));
+            let mut stale_lease = stale_budget.acquire(&tokio_util::sync::CancellationToken::new()).await.unwrap();
+            let stale_admission = stale_lease.share_admission();
+            drop(stale_lease);
+            service.handle_emulation_event(EmulationEvent::Entered { input: Some(stale_admission.clone()), control: None, addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
+            assert_eq!(stale_budget.available(), (0, 0));
             service.handle_emulation_event(EmulationEvent::Connected { addr: old_addr, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
             service.handle_emulation_event(EmulationEvent::ClipboardReceived { control: None, addr: old_addr, conn: old_server.clone(), event: input_event::ClipboardEvent::Text("old receipt".into()) }).await;
-            service.handle_emulation_event(EmulationEvent::ReleaseNotify { addr: old_addr, conn: old_server.clone() }).await;
+            service.handle_emulation_event(EmulationEvent::ReleaseNotify { input: Some(stale_admission), addr: old_addr, conn: old_server.clone() }).await;
+            assert_eq!(stale_budget.available(), (1, 1), "rejecting both stale notices must return admission");
             assert!(service.pending_frontend_events.is_empty());
             assert!(!service.incoming_conns.contains(&old_addr));
             service.config.flush().await.unwrap();
@@ -1909,7 +1920,7 @@ mod tests {
             assert!(old_token.is_cancelled());
             let fresh = handshake(service.port, reload_cert).await;
             assert!(!service.emulation.clipboard_session_is_current(old_addr, &old_server));
-            service.handle_emulation_event(EmulationEvent::Entered { control: None, addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp, conn: old_server }).await;
+            service.handle_emulation_event(EmulationEvent::Entered { input: None, control: None, addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp, conn: old_server }).await;
             assert!(!service.incoming_conns.contains(&old_addr));
             webrtc_util::Conn::close(&fresh).await.unwrap();
             webrtc_util::Conn::close(&accepted).await.unwrap();

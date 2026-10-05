@@ -22,8 +22,8 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
-| R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理已补齐；Enter派生及churn仍待有界 |
-| R95 | 部分实现：Leave清理额度 | Leave派生Remove持有ControlLease到清理结束；普通Enter的Service通知不随InputLease持有，仍待复现/修复 |
+| R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
 | R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
@@ -1796,3 +1796,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 千次双机切换、原生故障恢复、完整p95/p99与8h RSS未证明，不认定90分，未部署本机程序。
 
 日志：leave-proxy-budget-baseline.log、leave-proxy-budget-fixed.log、leave-proxy-budget-cleanup.log、leave-proxy-budget-workspace.log、leave-proxy-budget-clippy.log。
+
+
+## 第七十六轮：Enter 派生通知共享输入额度
+
+### R95 后续 / P1
+
+- 实际Emulation dispatcher/Dummy代理基线：1个输入额度下发送Enter，10ms后代理已不持有该lease，额度恢复1/1，但ReleaseNotify和Entered仍留在暂停的Service队列。期望0/0失败；日志enter-service-budget-baseline.log。受控Conn及认证身份fixture，不是物理输入测量。
+- [x] InputLease将permit直接保存在InputReservation中；仅share_admission首次调用时把原reservation提升为Arc所有权。重复分享同一份额度，不重新申请permit、不更新deadline/token/identity；普通键鼠帧未生成派生通知时不增加该Arc分配。
+- [x] Enter派生ReleaseNotify/Entered共用InputAdmission，原proxy仍持有InputLease；普通Input触发恢复的Entered也取得同一份admission。Service分支处理/拒绝结束释放自己的owner，最后一个owner释放global/peer permit。旧capture释放、会话取消及proxy输入freshness规则保持。
+
+### 验证与剩余范围
+
+- 实际dispatcher：代理交付后Service队列仍占0/0；取出两notice后仍占用，丢弃一条不恢复，仍不能申请新输入；最后notice丢弃恢复1/1并可重新申请，最终正常退出。
+- reservation测试：两次share仅占同一份permit；deadline保持不变，token取消仍传播，drop原InputLease后排队notice继续占额，最后owner drop归还。隔离Service认证撤销fixture新增旧Entered/ReleaseNotify携带共享owner，实际处理拒绝后回收原额度。
+- 工作区all-features root 169 / 3忽略，其他组件计数与第75轮一致；严格Clippy/fmt/diff通过。额外执行隔离Service旧身份撤销回归1条通过。隔离fixture仅使用临时XDG_RUNTIME_DIR、临时config与Dummy后端，不改变已安装服务或桌面配置。第75轮b1ff9fa Rust/Nix CI检查时均in_progress，未称已通过。
+- [ ] 输入触发恢复通知的owner路径已审源代码，当前新增dispatcher矩阵直接验证Enter两条派生通知；不是所有恢复时序/线程交错穷尽测试。共享admission只保留permit，不把Service通知当作可以更新输入deadline的新帧。
+- [ ] 连接churn/授权撤销、非Leave代理Remove、backend状态反馈等生命周期源头总量未全局限制；pending原生cleanupmetadata仍是其他范围。接下来应审这些源头，不能把指定派生链路闭合当作全进程内存已证明。
+- [ ] 千次双机切换、原生故障恢复、完整p95/p99与8h RSS仍缺少证据，不认定90分，未部署本机程序。
+
+日志：enter-service-budget-baseline.log、enter-service-budget-fixed.log、enter-service-budget-workspace.log、enter-service-budget-clippy.log、enter-service-budget-isolated-service.log。
