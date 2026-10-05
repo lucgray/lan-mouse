@@ -845,6 +845,128 @@ async fn close_incoming(conn: &ArcConn) {
 mod tests {
     use super::*;
     use lan_mouse_proto::MAX_EVENT_SIZE;
+    use std::sync::atomic::AtomicUsize;
+
+    struct FailingCloseNotifyConn {
+        inner: ArcConn,
+        fail_sends: AtomicBool,
+        fail_close: bool,
+        closes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Conn for FailingCloseNotifyConn {
+        async fn connect(&self, addr: SocketAddr) -> webrtc_util::Result<()> {
+            self.inner.connect(addr).await
+        }
+        async fn recv(&self, buf: &mut [u8]) -> webrtc_util::Result<usize> {
+            self.inner.recv(buf).await
+        }
+        async fn recv_from(&self, buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+            self.inner.recv_from(buf).await
+        }
+        async fn send(&self, buf: &[u8]) -> webrtc_util::Result<usize> {
+            if self.fail_sends.load(Ordering::SeqCst) {
+                return Err(Error::Other("injected close-notify send failure".into()));
+            }
+            self.inner.send(buf).await
+        }
+        async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> webrtc_util::Result<usize> {
+            self.inner.send_to(buf, addr).await
+        }
+        fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            self.inner.remote_addr()
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.inner.close().await?;
+            if self.fail_close {
+                return Err(Error::Other("injected transport close failure".into()));
+            }
+            Ok(())
+        }
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn dtls_failed_close_notify_still_closes_underlying_session_once() {
+        for (fail_send, fail_close) in [(true, false), (false, true), (true, true)] {
+            let parent = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+                .await
+                .unwrap();
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket.connect(parent.addr().await.unwrap()).await.unwrap();
+            let cfg = Config {
+                certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+                insecure_skip_verify: true,
+                ..Default::default()
+            };
+            let server_cfg = cfg.clone();
+            let handshake = async {
+                tokio::join!(DTLSConn::new(socket.clone(), cfg, true, None), async {
+                    let (raw, _) = parent.accept().await.unwrap();
+                    let transport = Arc::new(FailingCloseNotifyConn {
+                        inner: raw,
+                        fail_sends: AtomicBool::new(false),
+                        fail_close,
+                        closes: AtomicUsize::new(0),
+                    });
+                    let server = DTLSConn::new(transport.clone(), server_cfg, false, None)
+                        .await
+                        .unwrap();
+                    (server, transport)
+                })
+            };
+            let (client, (server, transport)) =
+                tokio::time::timeout(Duration::from_secs(3), handshake)
+                    .await
+                    .unwrap();
+            let client = client.unwrap();
+            transport.fail_sends.store(fail_send, Ordering::SeqCst);
+            let error = server.close().await.unwrap_err().to_string();
+            if fail_send {
+                assert!(error.contains("close-notify send failure"));
+            }
+            if fail_close {
+                assert!(error.contains("transport close failure"));
+            }
+            assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+            server.close().await.unwrap();
+            assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+            let result =
+                tokio::time::timeout(Duration::from_millis(100), server.recv(&mut [0u8; 32]))
+                    .await
+                    .unwrap();
+            assert!(result.is_err() || result == Ok(0));
+            socket.send(b"fresh-session").await.unwrap();
+            let (fresh, _) = tokio::time::timeout(Duration::from_secs(1), parent.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            // The DTLS peer can emit a final alert/retransmission before our
+            // marker; do not assume it is the replacement's first datagram.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut packet = [0u8; 8192];
+                loop {
+                    let length = fresh.recv(&mut packet).await.unwrap();
+                    if &packet[..length] == b"fresh-session" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            fresh.close().await.unwrap();
+            client.close().await.unwrap();
+            parent.close().await.unwrap();
+        }
+    }
+
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 

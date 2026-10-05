@@ -18,6 +18,7 @@
 | R84 | 应用入站 reader 上限已实现 | 每 Listener 32 个，覆盖排队任务/接收/close；满额保留旧会话，33 个真实 DTLS 回归通过；握手内部、事件队列与其他 cleanup 仍未全局有界 |
 | R85 | 已实现并通过真实 UDP 回归 | vendored webrtc-util 0.11.0 关闭时移除精确会话、唤醒读取、拒绝关闭后发送；同地址重连及重复关闭隔离；未完成握手和底层缓冲总量仍待处理 |
 | R86 | 已实现并通过缓冲阶段回归 | 单原始 UDP 会话 256 包/256KiB（含两字节帧头），满则沿既有 UDP 路径丢包；FIFO/读取后额度恢复/其他缓冲隔离；全服务总量及实机高频输入仍待验 |
+| R87 | 已实现并通过真实 DTLS 故障回归 | close-notify 失败仍停止内部 reader 并关闭底层 UDP；单/双错误保留，旧会话不阻碍同地址新接入；pending/取消与底层真实关闭失败仍待处理 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1595,3 +1596,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 原生恢复、真机千次往返、p95/p99、8h RSS 及 90 分门槛未完成。未修改已安装服务。
 
 日志：udp-buffer-budget-baseline.log、udp-buffer-budget-dependency-tests.log、udp-buffer-budget-workspace.log、udp-buffer-budget-clippy.log。
+
+
+## 第六十六轮：关闭通知失败不再跳过传输清理
+
+### R87 / P1
+
+- 锁定的 webrtc-dtls 0.12.0 close 先 CAS closed=true，然后 notify.await?；通知失败会在移除 reader_close_tx 和 conn.close 之前返回。重复 close 看到 closed 标记只返回 Ok，底层表项无法由重复 close 回收。
+- 基线完成真实 loopback UDP/DTLS 握手，包装实际 raw UDP 会话，只在握手后故障注入 send 返回 Err；server.close 返回 Err，但底层 close 调用次数为 0。日志 dtls-close-notify-baseline.log。夹具初版有重复 import/trait 类型编译错误，修正后得到该运行证据；不把编译失败称作缺陷复现。
+- [x] vendor/webrtc-dtls 保留确切版本、MIT/Apache-2.0 许可和源码，Cargo patch 只变更 close 生产处理（同模块一处 warn 排版同步 rustfmt）。先保存通知结果，再无论成功失败移除内部 reader 通道并 await 底层 close；单错误保留原型，两错误以现有 Other 文本同时报告。重复 close 仍保持一次调用语义。无 public/wire 编码更改。
+- [x] 回归覆盖通知错误、底层关闭错误、双错误：底层 close 仅调用一次、错误原因保留、DTLS reader 结束、同一源地址新 raw 会话能收到后续标记。关闭阶段可能有合法尾包，夹具读取完整数据报直至标记；曾因错误假设首包就是标记遇到 ErrBufferShort，已修正夹具而非抑制传输错误。
+
+### 验证与边界
+
+- 全工作区 all-features：root 152 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过；依赖原有 test_routine_leak_on_close 一条回归通过。新增真实故障矩阵随 root 测试由现有跨平台 CI 执行；vendored DTLS 补丁模块另加格式检查。
+- 底层错误夹具在实际 raw close 完成后返回注入错误，用来验证错误合并，不是证明实际 native/socket close 失败仍能恢复。原版本 checksum/改动边界记录于 PATCHES.md。
+- [ ] notify 长期 pending 或 close future 被外层一秒期限取消仍可能跳过清理；closed 已置位时，后续调用不会重试。底层 close 自身真实失败的恢复、并发 close 的等待语义、构造/握手取消仍未解决。必须继续检查整个关闭 owner，不能将本轮返回 Err 的修复扩展成所有取消安全。
+- [ ] 本机鼠标故障是否经过此路径仍缺实机证据。全服务资源、原生恢复、千次双机往返、完整时延和 8h RSS 待验；不认定 90 分。第 65 轮 CI 检查时仍排队，前一 HEAD 的 run 因新提交被取消，不当作失败复现。未部署已安装服务。
+
+日志：dtls-close-notify-baseline.log、dtls-close-notify-fixed.log、dtls-close-notify-workspace.log、dtls-close-notify-clippy.log、dtls-close-notify-original-tests.log。

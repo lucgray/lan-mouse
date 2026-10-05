@@ -962,3 +962,14 @@ FIFO. This reduces the original Buffer's 4MiB per-session allocation ceiling;
 it does not bound total sessions/handshakes or establish full-service RSS.
 Overflow is lossy and high-rate hardware input/clipboard sharing needs manual
 validation. Public signatures and DTLS wire encoding are unchanged.
+
+
+### DTLS close notification errors
+
+The locked DTLS dependency is vendored at webrtc-dtls 0.12.0 (see PATCHES.md).
+Once close-notify returns, its error no longer skips reader shutdown and
+underlying transport close. Single errors retain their original type; a double
+failure reports both causes. Repeated close retains the original once-only
+semantics. Pending/canceled close futures and genuinely failed transport close
+are not made recoverable by this change; global handshake/session bounds and
+physical input recovery remain unverified. Public/wire signatures are unchanged.

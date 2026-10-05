@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["vendor/webrtc-util"]
+exclude = ["vendor/webrtc-util", "vendor/webrtc-dtls"]
 members = [
     "input-capture",
     "input-emulation",
@@ -134,3 +134,4 @@ async-trait = "0.1.80"
 
 [patch.crates-io]
 webrtc-util = { path = "vendor/webrtc-util" }
+webrtc-dtls = { path = "vendor/webrtc-dtls" }
