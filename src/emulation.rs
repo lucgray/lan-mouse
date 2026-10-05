@@ -69,7 +69,11 @@ pub(crate) enum EmulationEvent {
         control: Option<std::sync::Arc<crate::input_budget::ControlLease>>,
     },
     /// connection closed
-    Disconnected { addr: SocketAddr },
+    Disconnected {
+        addr: SocketAddr,
+        conn: ArcConn,
+        timeout: Rc<TimeoutLease>,
+    },
     /// actual DTLS connection ended or was replaced
     ConnectionClosed {
         addr: SocketAddr,
@@ -305,6 +309,79 @@ impl Drop for Emulation {
     }
 }
 
+const MAX_PENDING_TIMEOUTS: usize = 128;
+const MAX_PENDING_TIMEOUTS_PER_PEER: usize = 4;
+
+type TimeoutPeers = HashMap<
+    SocketAddr,
+    (
+        std::sync::Weak<dyn webrtc_util::Conn + Send + Sync>,
+        Rc<Cell<usize>>,
+    ),
+>;
+
+#[derive(Default)]
+struct TimeoutBudget {
+    global: Rc<Cell<usize>>,
+    peers: RefCell<TimeoutPeers>,
+}
+
+/// Shared by the watchdog notice and its proxy cleanup until both finish.
+pub(crate) struct TimeoutLease {
+    global: Rc<Cell<usize>>,
+    peer: Rc<Cell<usize>>,
+    _admission: Option<crate::listen::ReaderLease>,
+}
+
+impl Drop for TimeoutLease {
+    fn drop(&mut self) {
+        self.global.set(self.global.get() - 1);
+        self.peer.set(self.peer.get() - 1);
+    }
+}
+
+impl TimeoutBudget {
+    fn reserve(
+        &self,
+        addr: SocketAddr,
+        conn: &ArcConn,
+        admission: Option<crate::listen::ReaderLease>,
+    ) -> Option<Rc<TimeoutLease>> {
+        let mut peers = self.peers.borrow_mut();
+        peers.retain(|_, (conn, _)| conn.strong_count() != 0);
+        let weak = std::sync::Arc::downgrade(conn);
+        let (_, peer) = peers
+            .entry(addr)
+            .and_modify(|(old, count)| {
+                if !old.ptr_eq(&weak) {
+                    *old = weak.clone();
+                    *count = Rc::new(Cell::new(0));
+                }
+            })
+            .or_insert_with(|| (weak, Rc::new(Cell::new(0))));
+        if self.global.get() == MAX_PENDING_TIMEOUTS || peer.get() == MAX_PENDING_TIMEOUTS_PER_PEER
+        {
+            return None;
+        }
+        self.global.set(self.global.get() + 1);
+        peer.set(peer.get() + 1);
+        Some(Rc::new(TimeoutLease {
+            global: self.global.clone(),
+            peer: peer.clone(),
+            _admission: admission,
+        }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn timeout_lease_for_test(conn: &ArcConn) -> (Rc<TimeoutLease>, Rc<Cell<usize>>) {
+    let budget = TimeoutBudget::default();
+    let lease = budget
+        .reserve("127.0.0.1:2".parse().unwrap(), conn, None)
+        .unwrap();
+    (lease, budget.global.clone())
+}
+
 struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
@@ -314,8 +391,42 @@ struct ListenTask {
 }
 
 impl ListenTask {
+    fn expire_peer(&self, addr: SocketAddr, budget: &TimeoutBudget) {
+        let Some(conn) = self.listener.clipboard_connection(addr) else {
+            return;
+        };
+        let authorization = self.listener.authorization();
+        let Some(token) = authorization.token(addr, &conn) else {
+            return;
+        };
+        let admission = authorization.reader_admission(addr, &conn);
+        let Some(timeout) = budget.reserve(addr, &conn, admission.clone()) else {
+            // Do not block the dispatcher or let a silent peer grow queues.
+            // Cancellation wakes its reader and preserves normal disconnect cleanup.
+            token.cancel();
+            self.event_tx
+                .send(EmulationEvent::InputOverloaded {
+                    addr,
+                    admission,
+                    input: None,
+                })
+                .expect("channel closed");
+            return;
+        };
+        self.emulation_proxy
+            .remove_for_timeout(addr, timeout.clone());
+        self.event_tx
+            .send(EmulationEvent::Disconnected {
+                addr,
+                conn,
+                timeout,
+            })
+            .expect("channel closed");
+    }
+
     async fn run(mut self) -> CleanupState<InputEmulation> {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let timeout_budget = TimeoutBudget::default();
         let mut last_response = HashMap::new();
         // peers that entered this device: addr -> (edge, fingerprint).
         // kept across temporary silence so a resuming sender does not
@@ -491,13 +602,12 @@ impl ListenTask {
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
-                            self.emulation_proxy.remove(addr);
+                            self.expire_peer(addr, &timeout_budget);
                             // remember a timed-out entered peer so its return
                             // edge can be rebuilt if it starts sending again
                             if entered_clients.contains_key(&addr) {
                                 dormant.insert(addr);
                             }
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
                         } else {
                             true
@@ -571,6 +681,7 @@ enum ProxyRequest {
         SocketAddr,
         Option<std::sync::Arc<crate::input_budget::ControlLease>>,
         Option<crate::listen::ReaderLease>,
+        Option<Rc<TimeoutLease>>,
     ),
     Terminate,
     Reenable,
@@ -655,8 +766,10 @@ impl EmulationProxy {
         }
     }
 
-    fn remove(&self, addr: SocketAddr) {
-        self.remove_with_control(addr, None);
+    fn remove_for_timeout(&self, addr: SocketAddr, timeout: Rc<TimeoutLease>) {
+        self.request_tx
+            .send(ProxyRequest::Remove(addr, None, None, Some(timeout)))
+            .expect("channel closed");
     }
 
     fn remove_with_control(
@@ -674,7 +787,7 @@ impl EmulationProxy {
         admission: Option<crate::listen::ReaderLease>,
     ) {
         self.request_tx
-            .send(ProxyRequest::Remove(addr, control, admission))
+            .send(ProxyRequest::Remove(addr, control, admission, None))
             .expect("channel closed");
     }
 
@@ -865,7 +978,7 @@ impl EmulationTask {
                         return self.cleanup;
                     }
                     ProxyRequest::Input(..) | ProxyRequest::Warp(..) => {}
-                    ProxyRequest::Remove(addr, _control, _admission) => {
+                    ProxyRequest::Remove(addr, _control, _admission, _timeout) => {
                         if let (CleanupState::Pending(backend), Some(&handle)) =
                             (&mut self.cleanup, self.handles.get(&addr))
                         {
@@ -959,7 +1072,7 @@ impl EmulationTask {
                         }).await;
                         self.finish_input_delivery(outcome, addr, budget.as_mut(), emulation).await?;
                     },
-                    ProxyRequest::Remove(addr, _control, _admission) => {
+                    ProxyRequest::Remove(addr, _control, _admission, _timeout) => {
                         if let Some(&handle) = self.handles.get(&addr) {
                             if emulation.destroy_bounded(handle).await {
                                 self.handles.remove(&addr);
@@ -1282,6 +1395,106 @@ mod resume_tests {
     }
 
     #[tokio::test]
+    async fn watchdog_budget_preserves_global_peer_and_generation_ownership() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (mut listener, conn) = crate::listen::control_test_listener(addr);
+                let (mut replacement_listener, replacement) =
+                    crate::listen::control_test_listener(addr);
+                let budget = TimeoutBudget::default();
+                let (generation, slots) = crate::listen::reader_slot_for_test();
+                let lease = budget.reserve(addr, &conn, Some(generation)).unwrap();
+                let other_owner = lease.clone();
+                drop(lease);
+                assert_eq!(budget.global.get(), 1);
+                assert_eq!(slots.get(), 1);
+                drop(other_owner);
+                assert_eq!(budget.global.get(), 0);
+                assert_eq!(slots.get(), 0);
+                let mut leases = Vec::new();
+                for peer in 0..32 {
+                    let addr = SocketAddr::from(([127, 0, 0, 1], 1000 + peer));
+                    for _ in 0..4 {
+                        leases.push(budget.reserve(addr, &conn, None).unwrap());
+                    }
+                    assert!(budget.reserve(addr, &conn, None).is_none());
+                }
+                assert_eq!(budget.global.get(), 128);
+                let fresh_addr = SocketAddr::from(([127, 0, 0, 1], 1000));
+                assert!(budget.reserve(fresh_addr, &replacement, None).is_none());
+                drop(leases.pop());
+                // A replacement has a fresh peer counter, but shares the global bound.
+                let new = budget.reserve(fresh_addr, &replacement, None).unwrap();
+                assert_eq!(budget.global.get(), 128);
+                drop(new);
+                drop(leases);
+                assert_eq!(budget.global.get(), 0);
+                listener.terminate().await;
+                replacement_listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_and_cleanup_have_per_session_capacity() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, _) = crate::listen::authorized_control_test_listener(addr);
+                let (_requests, request_rx) = channel();
+                let (event_tx, mut events) = channel();
+                let (_clipboard, clipboard_rx) = tokio::sync::mpsc::channel(32);
+                let mut dispatcher = ListenTask {
+                    listener,
+                    emulation_proxy: EmulationProxy::new(
+                        Some(input_emulation::Backend::Dummy),
+                        Default::default(),
+                        Default::default(),
+                    ),
+                    request_rx,
+                    event_tx,
+                    clipboard_rx,
+                };
+                let timeout_budget = TimeoutBudget::default();
+                for _ in 0..64 {
+                    dispatcher.expire_peer(addr, &timeout_budget);
+                }
+                let mut timeouts = 0;
+                let mut overloaded = 0;
+                while let Some(Some(event)) = futures::FutureExt::now_or_never(events.recv()) {
+                    match event {
+                        EmulationEvent::Disconnected { .. } => timeouts += 1,
+                        EmulationEvent::InputOverloaded { .. } => overloaded += 1,
+                        _ => panic!("unexpected watchdog notice"),
+                    }
+                }
+                assert_eq!(overloaded, 1);
+                let conn = dispatcher.listener.clipboard_connection(addr).unwrap();
+                assert!(
+                    dispatcher
+                        .listener
+                        .authorization()
+                        .token(addr, &conn)
+                        .is_none()
+                );
+                assert_eq!(
+                    timeout_budget.global.get(),
+                    4,
+                    "queued cleanup must retain watchdog capacity after reports drop"
+                );
+                assert_eq!(
+                    timeouts, 4,
+                    "paused Service must not accumulate unlimited timeouts for one session"
+                );
+                dispatcher.emulation_proxy.terminate().await;
+                assert_eq!(timeout_budget.global.get(), 0);
+                dispatcher.listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn listener_error_reports_keep_generation_through_service_queue() {
         tokio::task::LocalSet::new()
             .run_until(async {
@@ -1508,11 +1721,23 @@ mod resume_tests {
             remove_started: Some(started.clone()),
             ..Default::default()
         };
-        tx.send(ProxyRequest::Remove(addr, Some(lease), Some(lifecycle)))
-            .unwrap();
+        let timeout_count = Rc::new(Cell::new(1));
+        let timeout = Rc::new(TimeoutLease {
+            global: timeout_count.clone(),
+            peer: Rc::new(Cell::new(1)),
+            _admission: None,
+        });
+        tx.send(ProxyRequest::Remove(
+            addr,
+            Some(lease),
+            Some(lifecycle),
+            Some(timeout),
+        ))
+        .unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         let control = async {
             started.notified().await;
+            assert_eq!(timeout_count.get(), 1);
             assert_eq!(slots.get(), 1);
             assert_eq!(budget.control_available(), (127, 31));
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1536,6 +1761,7 @@ mod resume_tests {
         .unwrap();
         assert_eq!(budget.control_available(), (128, 32));
         assert_eq!(slots.get(), 0);
+        assert_eq!(timeout_count.get(), 0);
         assert!(task.handles.is_empty());
         assert!(!backend.held);
     }
@@ -1673,7 +1899,8 @@ mod resume_tests {
             Some(old_lease),
         ))
         .unwrap();
-        tx.send(ProxyRequest::Remove(addr, None, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         let mut backend = StallingBackend {
             stall: Some("remove"),
@@ -1721,7 +1948,8 @@ mod resume_tests {
             Some(lease),
         ))
         .unwrap();
-        tx.send(ProxyRequest::Remove(addr, None, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         let mut backend = StallingBackend {
             fail_all_removes: true,
@@ -1799,8 +2027,10 @@ mod resume_tests {
             "replacement cleanup must not release healthy peer"
         );
         assert!(backend.held_handles.contains(&2));
-        tx.send(ProxyRequest::Remove(addr, None, None)).unwrap();
-        tx.send(ProxyRequest::Remove(other, None, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
+        tx.send(ProxyRequest::Remove(other, None, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         task.do_emulation_session(&mut backend).await.unwrap();
         assert_eq!(backend.removes, 5);
@@ -2098,7 +2328,8 @@ mod resume_tests {
             Some(first),
         ))
         .unwrap();
-        tx.send(ProxyRequest::Remove(addr, None, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Input(
             press(),
             addr,
@@ -2106,7 +2337,8 @@ mod resume_tests {
             Some(second),
         ))
         .unwrap();
-        tx.send(ProxyRequest::Remove(addr, None, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         tokio::time::timeout(
             Duration::from_millis(200),
@@ -2176,7 +2408,8 @@ mod resume_tests {
             None,
         ))
         .unwrap();
-        tx.send(ProxyRequest::Remove(addr, None, None)).unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
         tx.send(ProxyRequest::Terminate).unwrap();
         task.do_emulation_session(&mut emulation).await.unwrap();
         assert!(!task.handles.contains_key(&other));

@@ -531,7 +531,14 @@ impl Service {
                 self.remove_incoming(addr);
                 self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }
-            EmulationEvent::Disconnected { addr } => {
+            EmulationEvent::Disconnected {
+                addr,
+                conn,
+                timeout: _timeout,
+            } => {
+                if !self.emulation.clipboard_session_is_current(addr, &conn) {
+                    return;
+                }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -1873,6 +1880,22 @@ mod tests {
                     if entered { break; }
                 }
             }).await.unwrap();
+            assert!(service.incoming_conns.contains(&old_addr));
+            // A delayed timeout belonging to a different connection at this
+            // address cannot remove the current return edge.
+            let (mut obsolete_listener, obsolete_conn) = crate::listen::control_test_listener(old_addr);
+            let (timeout, timeout_slots) = crate::emulation::timeout_lease_for_test(&obsolete_conn);
+            let notices_before = service.pending_frontend_events.len();
+            service.handle_emulation_event(EmulationEvent::Disconnected { addr: old_addr, conn: obsolete_conn, timeout }).await;
+            assert!(service.incoming_conns.contains(&old_addr));
+            assert_eq!(service.pending_frontend_events.len(), notices_before);
+            assert_eq!(timeout_slots.get(), 0);
+            obsolete_listener.terminate().await;
+            let (timeout, timeout_slots) = crate::emulation::timeout_lease_for_test(&old_server);
+            service.handle_emulation_event(EmulationEvent::Disconnected { addr: old_addr, conn: old_server.clone(), timeout }).await;
+            assert!(!service.incoming_conns.contains(&old_addr));
+            assert_eq!(timeout_slots.get(), 0);
+            service.handle_emulation_event(EmulationEvent::Entered { input: None, control: None, addr: old_addr, pos: lan_mouse_ipc::Position::Left, fingerprint: reload_fp.clone(), conn: old_server.clone() }).await;
             assert!(service.incoming_conns.contains(&old_addr));
             let old_token = service.incoming_authorization.token(old_addr, &old_server).unwrap();
             let mut reply = [0u8; lan_mouse_proto::MAX_EVENT_SIZE];

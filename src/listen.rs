@@ -296,7 +296,7 @@ impl IncomingAuthorization {
         );
     }
 
-    fn reader_admission(&self, addr: SocketAddr, conn: &ArcConn) -> Option<ReaderLease> {
+    pub(crate) fn reader_admission(&self, addr: SocketAddr, conn: &ArcConn) -> Option<ReaderLease> {
         self.admissions
             .borrow()
             .get(&addr)

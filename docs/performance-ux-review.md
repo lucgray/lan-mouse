@@ -23,7 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
-| R96 | 部分实现：接入/自然断线代次跨队列 | reader、Accept/Connected、自然Disconnected/ConnectionClosed及派生cleanup共享32名额；控制失败/撤销/错误及重复lifecycle仍待有界 |
+| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度至Service及cleanup结束；backend反馈/其他lifecycle总量仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
@@ -1891,3 +1891,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 真实Linux/Windows千次往返、原生故障释放、完整p95≤20ms/p99≤50ms和8h RSS验收缺失，不能认定90分。
 
 日志：rejected-input-budget-baseline.log、rejected-input-budget-fixed.log、error-report-budget-baseline.log、error-report-budget-fixed.log、error-report-budget-proxy.log、error-report-budget-workspace.log、error-report-budget-clippy.log、error-report-budget-isolated-service.log。
+
+
+## 第八十一轮：watchdog重复超时工作预算和迟到身份保护
+
+### R96 后续 / P1
+
+- 源码：Ack/Pong等bookkeeping帧只刷新last_response，原control额度马上释放；下一次静默watchdog无额度地产生Disconnected和proxy Remove。重复周期可以绕过输入/control额度。提取生产expire_peer后受控会话直接调用64次、暂停Service，产生64次timeout，期望4断言失败；不是实际等待64个五秒timer周期。日志watchdog-budget-baseline.log。
+- [x] 增加独立watchdog周期预算global128/精确会话4。一个TimeoutLease共享给Service Disconnected和proxy Remove，挂起cleanup与排队/已取出notice均保留；原ReaderLease也跟随它。正常键鼠帧不增加分配，不续写原input deadline。
+- [x] 第5次pending周期取消该peer的reader token并发出一次带reader owner的overload报告；后续过期调用被已取消token过滤，使用正常read_loop断开/清理路径。dispatcher不等待quota，不静默丢失后续cleanup，不影响健康peer的独立counter。
+- [x] timeout通知携带精确conn，Service拒绝非current连接的迟到timeout，防止按地址清掉已替代连接的返回边缘。
+
+### 验证与边界
+
+- 原64次生产routine基线修复后4条timeout、1条overload、token取消；消费/丢弃报告后4份proxy cleanup仍占预算，正常terminate/drain后为0。组件受控Conn，没有真实timer或网络风暴结论。
+- 预算回归覆盖global128上限/每peer4、共享owner最后drop释放原reader名额、replacement独立counter但不能越过global、drop回收。实际worker挂起destroy回归增加watchdog owner，await期间仍保留，cleanup返回后恢复。
+- 工作区all-features root181通过/3忽略，其他组件全部通过；严格Clippy/fmt/diff通过。额外隔离Dummy Service回归1条通过：错误身份timeout不删当前edge/不发布断线反馈并归还额度，current timeout正常删除且后续Entered可恢复。第80轮69421e9 Rust37260450472/Nix37260450471检查时in_progress，未称成功。未部署已安装服务。
+- [ ] R96仍部分完成：backend状态/显式Reenable/配置请求及其他工作源尚需总量预算或合并；独立native cleanup task和失败metadata仍待审。watchdog预算是周期pair上限，不是全进程总事件/RSS证明。
+- [ ] R97 / P2 新发现：silence阈值1s但timer每5s扫描，正常调度下可能接近6s才触发释放，加上dispatcher/native等待可更长。当前源码证据直接存在，实际时间线基线和修复需下一轮完成，不能把1s阈值说成1s释放保证。
+- [ ] 真实双机千次往返、原生释放/故障恢复、完整p95/p99和8h RSS验收仍缺，不认定90分。
+
+日志：watchdog-budget-baseline.log、watchdog-budget-fixed.log、watchdog-budget-workspace.log、watchdog-budget-clippy.log、watchdog-budget-isolated-service.log。

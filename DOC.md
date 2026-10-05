@@ -1090,3 +1090,22 @@ the original input reservation until Service processing/drop; sharing does not
 renew freshness or create another permit. Repeated lifecycle work still needs
 separate queue bounds.
 It does not establish a total notification count or whole-service RSS bound.
+
+
+### Watchdog work admission
+
+Watchdog timeout work has a separate budget of 128 pending cycles globally and
+4 per exact connection. A shared TimeoutLease remains owned by both the
+Disconnected Service notice and proxy Remove through asynchronous cleanup, and
+also retains the original reader generation. Ordinary input frames do not gain
+new allocations from this budget. Once a peer's pending budget is full, its
+reader token is canceled and one overload report follows the normal bounded
+reader disconnect path; the dispatcher does not wait for queue capacity.
+A replacement connection starts with a fresh peer counter but shares the global
+limit. Service checks the timeout's exact connection before removing a return
+edge, so a delayed old timeout cannot remove a replacement's registration.
+
+This bounds watchdog cycles, not all backend status/re-enable/configuration
+work or detached native cleanup tasks. The existing watchdog still checks a
+one-second silence threshold every five seconds; detection latency, physical
+release and full-pipeline RSS/latency remain separate acceptance work.
