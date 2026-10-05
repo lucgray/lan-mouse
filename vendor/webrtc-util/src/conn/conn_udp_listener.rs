@@ -48,6 +48,9 @@ impl Listener for ListenerImpl {
         let (accept_ch_rx, done_ch_rx) = &mut *self.ch_rx.lock().await;
 
         loop {
+            if !self.accepting.load(Ordering::SeqCst) {
+                return Err(Error::ErrClosedListener);
+            }
             tokio::select! {
                 c = accept_ch_rx.recv() => {
                     if let Some(c) = c {
@@ -169,10 +172,24 @@ impl ListenConfig {
         let mut housekeeping = tokio::time::interval(tokio::time::Duration::from_secs(1));
         housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut listening = true;
         loop {
+            if !listening && conns.lock().await.is_empty() {
+                break;
+            }
             tokio::select! {
-                _ = done_ch_rx.changed() => {
-                    break;
+                _ = done_ch_rx.changed(), if listening => {
+                    listening = false;
+                    // Listener close stops admission, not accepted transports.
+                    // Retire queued entries now; continue dispatch until the
+                    // final accepted connection closes its table entry.
+                    let retired: Vec<_> = {
+                        let sessions = conns.lock().await;
+                        sessions.values().filter(|conn| conn.state.compare_exchange(
+                            SESSION_QUEUED, SESSION_CLOSED,
+                            Ordering::SeqCst, Ordering::SeqCst).is_ok()).cloned().collect()
+                    };
+                    for conn in retired { let _ = conn.close().await; }
                 }
                 _ = housekeeping.tick() => {
                     ListenConfig::expire_pending_sessions(&conns).await;
@@ -263,6 +280,11 @@ impl ListenConfig {
                 let mut sessions = conns.lock().await;
                 if let Some(existing) = sessions.get(&raddr.to_string()) {
                     return Ok(Some(existing.clone()));
+                }
+                // Recheck after the async filter/locks: close may have stopped
+                // admission since the first check, before queue retirement.
+                if !accepting.load(Ordering::SeqCst) {
+                    return Err(Error::ErrClosedListener);
                 }
                 if sessions.len() >= MAX_UDP_SESSIONS {
                     return Err(Error::ErrListenQueueExceeded);
@@ -430,6 +452,114 @@ mod bounded_session_tests {
         conn.close().await.unwrap();
         other.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn listener_close_keeps_accepted_peer_receiving_and_retires_queue() {
+        let listener = listen("127.0.0.1:0").await.unwrap();
+        let addr = listener.addr().await.unwrap();
+        let active = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        active.send_to(b"first", addr).await.unwrap();
+        let (conn, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 32];
+        conn.recv(&mut buf).await.unwrap();
+        let queued = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        queued.send_to(b"queued", addr).await.unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        listener.close().await.unwrap();
+        active.send_to(b"after-close", addr).await.unwrap();
+        let n = tokio::time::timeout(tokio::time::Duration::from_millis(250), conn.recv(&mut buf))
+            .await
+            .expect("accepted peer must keep receiving after listener close")
+            .unwrap();
+        assert_eq!(&buf[..n], b"after-close");
+        assert!(listener.accept().await.is_err());
+        conn.close().await.unwrap();
+        listener.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_listener_retires_queue_and_dispatch_task_exits_after_last_peer() {
+        let socket: Arc<dyn Conn + Send + Sync> =
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let accepted = Arc::new(UdpConn::new(
+            socket.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::downgrade(&sessions),
+        ));
+        accepted.state.store(SESSION_ACCEPTED, Ordering::SeqCst);
+        let queued = Arc::new(UdpConn::new(
+            socket.clone(),
+            "127.0.0.1:2".parse().unwrap(),
+            Arc::downgrade(&sessions),
+        ));
+        queued.buffer.write(b"queued").await.unwrap();
+        for conn in [&accepted, &queued] {
+            sessions
+                .lock()
+                .await
+                .insert(conn.raddr.to_string(), conn.clone());
+        }
+        let (done_tx, done_rx) = watch::channel(());
+        let (accept_tx, _accept_rx) = mpsc::channel(128);
+        let task = tokio::spawn(ListenConfig::read_loop(
+            done_rx,
+            socket,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(Mutex::new(Some(accept_tx))),
+            sessions.clone(),
+        ));
+        drop(done_tx);
+        tokio::time::timeout(tokio::time::Duration::from_millis(250), async {
+            while sessions.lock().await.len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(queued.buffer.is_closed().await);
+        assert!(queued.recv(&mut [0u8; 32]).await.is_err());
+        assert!(!task.is_finished(), "accepted session still owns dispatch");
+        accepted.close().await.unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_millis(1250), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_during_filter_prevents_late_session_publication() {
+        let socket: Arc<dyn Conn + Send + Sync> =
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let accepting = Arc::new(AtomicBool::new(true));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(128);
+        let accepts = Arc::new(Mutex::new(Some(tx)));
+        let filter_accepting = accepting.clone();
+        let filter: Option<AcceptFilterFn> = Some(Box::new(move |_| {
+            let accepting = filter_accepting.clone();
+            Box::pin(async move {
+                accepting.store(false, Ordering::SeqCst);
+                true
+            })
+        }));
+        assert!(matches!(
+            ListenConfig::get_udp_conn(
+                &socket,
+                &accepting,
+                &filter,
+                &accepts,
+                &sessions,
+                "127.0.0.1:1".parse().unwrap(),
+                b"hello"
+            )
+            .await,
+            Err(Error::ErrClosedListener)
+        ));
+        assert!(sessions.lock().await.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn session_table_budget_preserves_existing_peer_and_recovers_after_close() {
         let socket: Arc<dyn Conn + Send + Sync> =

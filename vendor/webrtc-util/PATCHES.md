@@ -14,6 +14,9 @@ Production changes: `src/conn/conn_udp_listener.rs`, `src/buffer/mod.rs`.
   at capacity. Unknown peers above capacity receive the existing queue-full error.
 - Queued sessions expire after two seconds, checked by a one-second sweep and
   again at dequeue. Atomic claim/expiry excludes already accepted sessions.
+- Listener close stops admission and retires queued sessions, preserving
+  accepted-peer dispatch until the final session closes. Recheck admission
+  after async filtering to prevent late publication after close.
 - UDP close discards data and releases allocation before freeing its table slot;
   pending reads wake, future sends/writes fail. Generic Buffer::close still drains.
 

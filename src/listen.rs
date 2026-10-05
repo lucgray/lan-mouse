@@ -2131,6 +2131,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dtls_listener_close_preserves_bidirectional_data_and_releases_port_after_peer_close() {
+        let cfg = Config {
+            certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+            insecure_skip_verify: true,
+            ..Default::default()
+        };
+        let listener =
+            listen_with_handshake_timeout("127.0.0.1:0", cfg.clone(), Duration::from_secs(2))
+                .await
+                .unwrap();
+        let addr = listener.addr().await.unwrap();
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        socket.connect(addr).await.unwrap();
+        let (client, server) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(DTLSConn::new(socket, cfg, true, None), listener.accept())
+        })
+        .await
+        .unwrap();
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        listener.close().await.unwrap();
+        assert!(listener.accept().await.is_err());
+        client.send(b"input-after-close").await.unwrap();
+        let mut buffer = [0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(1), server.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..n], b"input-after-close");
+        server.send(b"reply-after-close").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..n], b"reply-after-close");
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+        drop(server);
+        drop(listener);
+        tokio::time::timeout(Duration::from_millis(1250), async {
+            loop {
+                if let Ok(socket) = tokio::net::UdpSocket::bind(addr).await {
+                    drop(socket);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("last peer close must release the old listening socket");
+    }
+
+    #[tokio::test]
     async fn real_udp_pending_expiry_skips_stale_peer_and_keeps_accepted_peer_live() {
         let listener = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
             .await

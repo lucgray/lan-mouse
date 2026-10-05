@@ -1026,3 +1026,15 @@ with ErrDeadlineExceeded on expiry and the constructor guard scheduling cleanup.
 The original dependency listen/new signatures and untimed behavior remain.
 Raw backlog waiting is outside this duration; slow/lossy real networks still
 need validation. Wire encoding is unchanged.
+
+
+### Closing a listener while peers remain connected
+
+Closing a raw UDP/DTLS listener stops admission and wakes pending accepts, but
+keeps dispatching packets for already accepted peers. Queued, unaccepted raw
+sessions are retired when the close signal is observed. A final admission check
+after the asynchronous accept filter prevents publication after closure.
+The dispatch task exits once the accepted-session table is empty, checked at
+packet processing and the one-second housekeeping tick. Accepted peers retain
+the socket until they close; this preserves the documented DTLS contract during
+port replacement. A listener close is not an instruction to disconnect peers.

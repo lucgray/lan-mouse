@@ -22,6 +22,7 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
+| R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
 | R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
@@ -1717,3 +1718,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 丢包风暴下可用性、同监听器握手并发、清理task全局额度、真实原生释放、千次双机切换、p95/p99和8h RSS仍待验。本轮不认定90分，未部署本机程序。
 
 日志：udp-session-budget-baseline.log、udp-session-budget-fixed.log、udp-session-budget-buffer-tests.log、udp-session-budget-workspace.log、udp-session-budget-dtls-tests.log、udp-session-budget-clippy.log。
+
+
+## 第七十二轮：监听器关闭后保留已接入连接收包
+
+### R93 / P1
+
+- 源码：raw read_loop 在 done watch 后直接 break；DTLS Listener.close 明确约定不关闭已接入连接。根程序换端口时关闭旧 listener，已接入 reader/conn 仍保留；其收包停止，而发送仍可能成功，构成输入停滞路径。不是这次真机故障的独立日志归因。
+- 真实 loopback UDP 基线：接入/读取首包后关闭 listener，peer发送 after-close，接收250ms超时失败；日志 udp-listener-close-baseline.log。
+- [x] close 后只停止 admission，read_loop 回收 Queued 状态并保留 Accepted 分发；最后表项关闭后退出。一次处理关闭信号后禁用watch分支，避免已关闭channel忙循环。accept发现关闭立即报错，不交出残留队列。
+- [x] get_udp_conn 在异步filter和锁之后再次核对accepting，避免关闭期间迟到的新会话发布。现有地址lookup仍可继续路由。共享socket最后的owner释放前保持有效，不强制关闭已接入peer。
+
+### 验证与边界
+
+- UDP依赖12条通过，新增：关闭listener后active peer继续收包/新accept拒绝；Queued被关闭丢弃、Accepted保留、最后peer关闭后read_loop任务完成；filter内部触发关闭后表和accept队列为空。
+- 新根测试执行真实DTLS握手，关闭listener后双方均可收发应用数据；关闭peer并释放listener后原端口可重新bind。工作区all-features root 162 / 3忽略，其他组件通过且计数与上一轮一致；原DTLS library 61条、严格Clippy/fmt/diff通过。上一758f3dd的Rust/Nix CI检查时均in_progress，未当作已通过。
+- [ ] 与正在执行的accept并发关闭的边界仍以原有异步接口语义为准，非穷尽线程交错验证；永久不关闭的已接入peer会持有旧socket，必须依赖应用心跳/授权/reader关闭。read_loop表空检查还由一秒tick推进，未宣称立即同步释放。
+- [ ] 同监听器并发握手、全局cleanup资源、原生恢复、千次双机切换、完整时延与8h RSS仍未验收；不能认定90分。未部署当前修复到本机。
+
+日志：udp-listener-close-baseline.log、udp-listener-close-fixed.log、udp-listener-close-workspace.log、udp-listener-close-dtls.log、udp-listener-close-clippy.log。
