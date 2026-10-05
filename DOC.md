@@ -950,3 +950,15 @@ listening socket remains available to other peers. Registration precedes
 accept publication, with rollback when the pending accept queue is full.
 Already buffered packets may drain after close. Canceled/incomplete DTLS
 handshakes and global underlying buffer/session limits remain separate work.
+
+
+### Raw UDP session receive backlog
+
+Each accepted raw UDP session now holds at most 256 datagrams and 256KiB of
+queued data including two-byte packet length headers (the backing ring can
+allocate one additional slack byte). A full buffer drops new UDP datagrams
+without waiting for a reader; draining restores capacity and preserves queued
+FIFO. This reduces the original Buffer's 4MiB per-session allocation ceiling;
+it does not bound total sessions/handshakes or establish full-service RSS.
+Overflow is lossy and high-rate hardware input/clipboard sharing needs manual
+validation. Public signatures and DTLS wire encoding are unchanged.

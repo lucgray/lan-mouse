@@ -17,6 +17,7 @@
 | R83 | fatal release 反馈/错误上下文已实现 | 整条 fatal 清理链只发一次进度；释放/退出连续等待保持 owner，最终保留三个阶段原因；生产 helper 模型验证，物理故障未验收 |
 | R84 | 应用入站 reader 上限已实现 | 每 Listener 32 个，覆盖排队任务/接收/close；满额保留旧会话，33 个真实 DTLS 回归通过；握手内部、事件队列与其他 cleanup 仍未全局有界 |
 | R85 | 已实现并通过真实 UDP 回归 | vendored webrtc-util 0.11.0 关闭时移除精确会话、唤醒读取、拒绝关闭后发送；同地址重连及重复关闭隔离；未完成握手和底层缓冲总量仍待处理 |
+| R86 | 已实现并通过缓冲阶段回归 | 单原始 UDP 会话 256 包/256KiB（含两字节帧头），满则沿既有 UDP 路径丢包；FIFO/读取后额度恢复/其他缓冲隔离；全服务总量及实机高频输入仍待验 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1563,7 +1564,7 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 
 ### R85 / P1（R13 的一部分）
 
-- 基线直接运行锁定的 webrtc-util 0.11.0 原始 UDP listener：close 返回成功、调用方释放 Arc 后 Weak 仍存活；旧会话继续接收 after-close，同地址不产生新 accept。源码确认 close 仅 Ok(())，listener 表持有强引用且从不删除；Buffer::new(0,0) 无总量限制。日志 udp-parent-retention-baseline.log。
+- 基线直接运行锁定的 webrtc-util 0.11.0 原始 UDP listener：close 返回成功、调用方释放 Arc 后 Weak 仍存活；旧会话继续接收 after-close，同地址不产生新 accept。源码确认 close 仅 Ok(())，listener 表持有强引用且从不删除；Buffer::new(0,0) 不设置包数/字节参数，但 Buffer::grow 有 4MiB 单缓冲扩容硬上限；会话数量无总量限制（第 65 轮核对后纠正措辞）。日志 udp-parent-retention-baseline.log。
 - [x] 将该确切版本源码与 MIT/Apache-2.0 许可保留于 vendor/webrtc-util，使用 Cargo patch；生产修改仅 conn_udp_listener.rs。close 按对象身份移除当前表项、关闭 Buffer/唤醒读取；send/send_to 拒绝已关闭会话。使用 Weak 回指表，避免循环引用；重复旧 close 不删除同地址替代会话，不关闭共享 socket。
 - [x] 先建立表项再发布 accept，避免消费者立即 close 后才被重新插入；accept 队列满则撤回未发布表项。PATCHES.md 记录原版本、checksum、改动及维护边界。
 - [x] 上一 HEAD afdef25 的 Nix macOS run 37215923027 在测试清理中失败：先 terminate listener 后 client.close 得到 ConnectionRefused。夹具改为先关客户端再停 listener，保留错误断言；生产 shutdown 本轮未改。该修正仍须新 macOS CI 验证。
@@ -1575,3 +1576,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R13 全服务资源、R60 原生恢复、真机千次往返、完整 p95/p99 与 8h RSS 仍未验收，不认定达到 90 分。无 wire/public API 变化，未部署已安装程序。
 
 日志：udp-parent-retention-baseline.log、udp-parent-retention-fixed.log、udp-parent-retention-workspace.log、udp-parent-retention-clippy.log、udp-parent-retention-dependency-tests.log、udp-parent-retention-prior-nix-failure.log。
+
+
+## 第六十五轮：降低每 UDP 会话的原始积压上限
+
+### R86 / P2（R13 的一部分）
+
+- 核对真实 Buffer::grow：零限额仍有 4MiB 单次缓冲扩容硬上限，因此纠正第 64 轮“无限缓冲”暗示。包数参数为零、单会话可积压到此硬上限；会话数量/总资源仍无界。原 ListenConfig read_loop 忽略写缓冲失败并继续其他数据报，不等待腾出空间。
+- 基线使用生产 UdpConn::new 与 Buffer.write 构造积压：第 257 个单字节包和占满 256KiB 后的下一包均仍被接纳；拟定限额测试均失败。日志 udp-buffer-budget-baseline.log。这是生产缓冲阶段受控注入，不是 UDP socket 洪泛或 RSS 实测。
+- [x] vendored UdpConn 默认缓冲设为 256 包、256KiB，字节计数含每包两字节长度。底层 Vec 最大 256KiB+1（环形 slack），每会话还有其他对象开销。达到任一限额由既有 read_loop 丢弃该数据报并继续分发，不引入全局等待、逐包日志或协议更改。
+- [x] 新回归覆盖包数与字节两种先到的限额、FIFO、读取后重新写入、另一会话缓冲可读、关闭后的读取结束；构造的两个会话共用实际 UdpSocket，但写入由测试直接调用生产 buffer，不夸大为真实网络调度公平性。
+
+### 验证与待验收
+
+- 原 UDP 依赖回归与两个新增缓冲阶段测试共 6 条通过；工作区 all-features：root 151 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 Clippy/fmt/diff 通过。Rust CI 各系统 test job 增加独立 manifest 的 UDP 测试，格式 job 单独检查补丁模块；否则 excluded vendored crate 的测试不在 workspace test 范围内。
+- [ ] 256 包/256KiB 是积压容量选择，未证明所有高轮询鼠标/拖动/剪贴板并发场景无感；溢出可能丢失离散数据报，已有心跳故障释放仍不等于可靠输入 ACK。完整高频输入与端到端延迟需真机验收。
+- [ ] 此处不限制底层总会话/握手数量；未完成握手仍可能持有 map/task，32 个应用 reader 并不能给这层总 RSS 上限。下一轮继续检查 accept_any 和两秒轮询取消 DTLS accept 的所有权。
+- [ ] 原生恢复、真机千次往返、p95/p99、8h RSS 及 90 分门槛未完成。未修改已安装服务。
+
+日志：udp-buffer-budget-baseline.log、udp-buffer-budget-dependency-tests.log、udp-buffer-budget-workspace.log、udp-buffer-budget-clippy.log。

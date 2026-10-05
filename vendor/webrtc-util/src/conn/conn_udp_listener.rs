@@ -14,6 +14,10 @@ use crate::error::Error;
 
 const RECEIVE_MTU: usize = 8192;
 const DEFAULT_LISTEN_BACKLOG: usize = 128; // same as Linux default
+// Bound raw datagrams before DTLS/application admission. Overflow is dropped
+// by the existing read loop, preserving UDP semantics and other peer dispatch.
+const SESSION_BUFFER_PACKETS: usize = 256;
+const SESSION_BUFFER_BYTES: usize = 256 * 1024;
 
 pub type AcceptFilterFn =
     Box<dyn (Fn(&[u8]) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>>) + Send + Sync>;
@@ -254,7 +258,7 @@ impl UdpConn {
         UdpConn {
             pconn,
             raddr,
-            buffer: Buffer::new(0, 0),
+            buffer: Buffer::new(SESSION_BUFFER_PACKETS, SESSION_BUFFER_BYTES),
             sessions,
         }
     }
@@ -318,5 +322,54 @@ impl Conn for UdpConn {
 
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
         self
+    }
+}
+
+#[cfg(test)]
+mod bounded_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_packet_budget_preserves_fifo_and_recovers_after_drain() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let conn = UdpConn::new(socket, "127.0.0.1:1".parse().unwrap(), Weak::new());
+        for index in 0..256 {
+            conn.buffer.write(&[index as u8]).await.unwrap();
+        }
+        assert_eq!(conn.buffer.write(&[99]).await, Err(Error::ErrBufferFull));
+        let mut packet = [0u8; 1];
+        assert_eq!(conn.recv(&mut packet).await.unwrap(), 1);
+        assert_eq!(packet[0], 0);
+        conn.buffer.write(&[99]).await.unwrap();
+        for index in 1..256 {
+            assert_eq!(conn.recv(&mut packet).await.unwrap(), 1);
+            assert_eq!(packet[0], index as u8);
+        }
+        assert_eq!(conn.recv(&mut packet).await.unwrap(), 1);
+        assert_eq!(packet[0], 99);
+        conn.close().await.unwrap();
+        assert!(conn.recv(&mut packet).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_byte_budget_counts_framing_and_keeps_other_session_available() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let conn = UdpConn::new(socket.clone(), "127.0.0.1:1".parse().unwrap(), Weak::new());
+        let other = UdpConn::new(socket, "127.0.0.1:2".parse().unwrap(), Weak::new());
+        let packet = vec![7u8; 8190];
+        for _ in 0..32 {
+            conn.buffer.write(&packet).await.unwrap();
+        }
+        assert_eq!(conn.buffer.write(&[1]).await, Err(Error::ErrBufferFull));
+        other.buffer.write(&[42]).await.unwrap();
+        let mut received = [0u8; 1];
+        assert_eq!(other.recv(&mut received).await.unwrap(), 1);
+        assert_eq!(received[0], 42);
+        let mut received = vec![0u8; 8190];
+        assert_eq!(conn.recv(&mut received).await.unwrap(), packet.len());
+        assert_eq!(received, packet);
+        conn.buffer.write(&packet).await.unwrap();
+        conn.close().await.unwrap();
+        other.close().await.unwrap();
     }
 }
