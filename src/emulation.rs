@@ -48,6 +48,7 @@ pub(crate) enum EmulationEvent {
     InputRejected {
         addr: SocketAddr,
         reason: String,
+        admission: Option<crate::listen::ReaderLease>,
     },
     Connected {
         addr: SocketAddr,
@@ -68,9 +69,7 @@ pub(crate) enum EmulationEvent {
         control: Option<std::sync::Arc<crate::input_budget::ControlLease>>,
     },
     /// connection closed
-    Disconnected {
-        addr: SocketAddr,
-    },
+    Disconnected { addr: SocketAddr },
     /// actual DTLS connection ended or was replaced
     ConnectionClosed {
         addr: SocketAddr,
@@ -84,9 +83,12 @@ pub(crate) enum EmulationEvent {
     BackendFailed(String),
     InputCleanupFailed {
         addr: SocketAddr,
+        input: Option<crate::input_budget::InputAdmission>,
     },
     InputOverloaded {
         addr: SocketAddr,
+        admission: Option<crate::listen::ReaderLease>,
+        input: Option<crate::input_budget::InputAdmission>,
     },
     /// emulation was enabled
     EmulationEnabled,
@@ -363,8 +365,8 @@ impl ListenTask {
                     self.event_tx.send(EmulationEvent::ClipboardSendCompleted(completed)).expect("channel closed");
                 },
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::InputRejected { addr, reason }) => { self.event_tx.send(EmulationEvent::InputRejected { addr, reason }).expect("channel closed"); },
-                    Some(ListenEvent::InputOverloaded { addr }) => { self.event_tx.send(EmulationEvent::InputOverloaded { addr }).expect("channel closed"); },
+                    Some(ListenEvent::InputRejected { addr, reason, admission }) => { self.event_tx.send(EmulationEvent::InputRejected { addr, reason, admission }).expect("channel closed"); },
+                    Some(ListenEvent::InputOverloaded { addr, admission }) => { self.event_tx.send(EmulationEvent::InputOverloaded { addr, admission, input: None }).expect("channel closed"); },
                     Some(ListenEvent::Msg { event, addr, conn, mut budget, control: _control }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
                         log::trace!("{event} <-<-<-<-<- {addr}");
@@ -937,7 +939,7 @@ impl EmulationTask {
         loop {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr, session, budget) => {
+                    ProxyRequest::Input(event, addr, session, mut budget) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let outcome = deliver_before_deadline(budget.as_ref(), async {
                             let handle = self.handle_for(emulation, addr, budget.as_ref().map(crate::input_budget::InputLease::identity)).await?;
@@ -945,9 +947,9 @@ impl EmulationTask {
                             backend_operation(self.operation_timeout, "consume", emulation.consume(event, handle)).await?.map_err(InputEmulationError::from)?;
                             Ok(())
                         }).await;
-                        self.finish_input_delivery(outcome, addr, budget.as_ref(), emulation).await?;
+                        self.finish_input_delivery(outcome, addr, budget.as_mut(), emulation).await?;
                     },
-                    ProxyRequest::Warp(addr, pos, t, session, budget) => {
+                    ProxyRequest::Warp(addr, pos, t, session, mut budget) => {
                         if session.as_ref().is_some_and(CancellationToken::is_cancelled) { continue; }
                         let outcome = deliver_before_deadline(budget.as_ref(), async {
                             let handle = self.handle_for(emulation, addr, budget.as_ref().map(crate::input_budget::InputLease::identity)).await?;
@@ -955,7 +957,7 @@ impl EmulationTask {
                             backend_operation(self.operation_timeout, "warp", emulation.warp(handle, pos, t)).await?;
                             Ok(())
                         }).await;
-                        self.finish_input_delivery(outcome, addr, budget.as_ref(), emulation).await?;
+                        self.finish_input_delivery(outcome, addr, budget.as_mut(), emulation).await?;
                     },
                     ProxyRequest::Remove(addr, _control, _admission) => {
                         if let Some(&handle) = self.handles.get(&addr) {
@@ -980,13 +982,13 @@ impl EmulationTask {
         &mut self,
         outcome: InputDelivery,
         addr: SocketAddr,
-        lease: Option<&crate::input_budget::InputLease>,
+        mut lease: Option<&mut crate::input_budget::InputLease>,
         emulation: &mut impl ProxyBackend,
     ) -> Result<(), InputEmulationError> {
         match outcome {
             InputDelivery::Completed(result) => {
                 if let Err(error) = result {
-                    if let Some(lease) = lease {
+                    if let Some(lease) = lease.as_ref() {
                         lease.cancel();
                     }
                     match error {
@@ -996,7 +998,10 @@ impl EmulationTask {
                             // Only the replacement reader is rejected; other
                             // peers and later cleanup retries can still run.
                             self.event_tx
-                                .send(EmulationEvent::InputCleanupFailed { addr })
+                                .send(EmulationEvent::InputCleanupFailed {
+                                    addr,
+                                    input: lease.as_mut().map(|lease| lease.share_admission()),
+                                })
                                 .expect("channel closed");
                         }
                     }
@@ -1005,10 +1010,14 @@ impl EmulationTask {
             InputDelivery::Discarded => {}
             InputDelivery::Canceled | InputDelivery::Expired => {
                 if matches!(outcome, InputDelivery::Expired)
-                    && lease.is_some_and(|lease| lease.cancel())
+                    && lease.as_ref().is_some_and(|lease| lease.cancel())
                 {
                     self.event_tx
-                        .send(EmulationEvent::InputOverloaded { addr })
+                        .send(EmulationEvent::InputOverloaded {
+                            addr,
+                            admission: None,
+                            input: lease.as_mut().map(|lease| lease.share_admission()),
+                        })
                         .expect("channel closed");
                 }
                 // Canceling the reader rejects its queued work; release any
@@ -1268,6 +1277,59 @@ mod resume_tests {
                 let recovered = budget.acquire(&token).await.unwrap();
                 drop(recovered);
                 emulation.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn listener_error_reports_keep_generation_through_service_queue() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for rejected in [true, false] {
+                    let addr = "127.0.0.1:2".parse().unwrap();
+                    let (listener, _) = crate::listen::control_test_listener(addr);
+                    let incoming = listener.test_sender();
+                    let mut emulation = Emulation::new(
+                        Some(input_emulation::Backend::Dummy),
+                        Default::default(),
+                        listener,
+                        (false, 1.0),
+                    );
+                    let (admission, slots) = crate::listen::reader_slot_for_test();
+                    let report = if rejected {
+                        ListenEvent::InputRejected {
+                            addr,
+                            reason: "invalid coordinates".into(),
+                            admission: Some(admission),
+                        }
+                    } else {
+                        ListenEvent::InputOverloaded {
+                            addr,
+                            admission: Some(admission),
+                        }
+                    };
+                    incoming.send(report).unwrap_or_else(|_| panic!());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    assert_eq!(slots.get(), 1);
+                    let report = tokio::time::timeout(Duration::from_secs(1), async {
+                        loop {
+                            let event = emulation.event().await;
+                            if matches!(
+                                event,
+                                EmulationEvent::InputRejected { .. }
+                                    | EmulationEvent::InputOverloaded { .. }
+                            ) {
+                                break event;
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(slots.get(), 1);
+                    drop(report);
+                    assert_eq!(slots.get(), 0);
+                    emulation.terminate().await;
+                }
             })
             .await;
     }
@@ -1704,11 +1766,16 @@ mod resume_tests {
                 .unwrap()
                 .ptr_eq(&old_identity)
         );
+        assert_eq!(budget.available(), (255, 64));
+        assert_eq!(replacement.available(), (255, 63));
+        let report = events.recv().await.unwrap();
+        assert!(
+            matches!(report, EmulationEvent::InputCleanupFailed { addr: actual, .. } if actual == addr)
+        );
+        assert_eq!(replacement.available(), (255, 63));
+        drop(report);
         assert_eq!(budget.available(), (256, 64));
         assert_eq!(replacement.available(), (256, 64));
-        assert!(
-            matches!(events.recv().await, Some(EmulationEvent::InputCleanupFailed { addr: actual }) if actual == addr)
-        );
         assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
         backend.fail_all_removes = false;
         let recovered = replacement.for_peer();
@@ -1789,6 +1856,38 @@ mod resume_tests {
         assert!(!emulation.has_pressed_keys(fresh_handle));
     }
 
+    #[tokio::test]
+    async fn expired_input_report_keeps_admission_until_service_consumes() {
+        let (mut task, tx, mut events) = worker();
+        let budget = crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_millis(50));
+        let token = CancellationToken::new();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let lease = budget.acquire(&token).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        tx.send(ProxyRequest::Input(
+            press(),
+            addr,
+            Some(token.clone()),
+            Some(lease),
+        ))
+        .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut StallingBackend::default())
+            .await
+            .unwrap();
+        assert!(token.is_cancelled());
+        assert_eq!(
+            budget.available(),
+            (0, 0),
+            "queued expiry report must retain its input reservation"
+        );
+        let report = events.recv().await.unwrap();
+        assert!(matches!(report, EmulationEvent::InputOverloaded { .. }));
+        assert_eq!(budget.available(), (0, 0));
+        drop(report);
+        assert_eq!(budget.available(), (1, 1));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn slow_backend_expires_session_instead_of_replaying_old_input() {
         let (mut task, tx, mut events) = worker();
@@ -1823,10 +1922,14 @@ mod resume_tests {
         assert_eq!(backend.removes, 1);
         assert!(!backend.held);
         assert!(task.handles.is_empty());
-        assert_eq!(budget.available(), (256, 64));
+        assert_eq!(budget.available(), (255, 63));
+        let report = events.recv().await.unwrap();
         assert!(
-            matches!(events.recv().await, Some(EmulationEvent::InputOverloaded { addr: actual }) if actual == addr)
+            matches!(report, EmulationEvent::InputOverloaded { addr: actual, .. } if actual == addr)
         );
+        assert_eq!(budget.available(), (255, 63));
+        drop(report);
+        assert_eq!(budget.available(), (256, 64));
         assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
     }
 

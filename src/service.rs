@@ -544,15 +544,26 @@ impl Service {
                 Err(e) => self
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
             },
-            EmulationEvent::InputRejected { addr, reason } => {
+            EmulationEvent::InputRejected {
+                addr,
+                reason,
+                admission: _admission,
+            } => {
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Invalid incoming input from {addr}: {reason}. Its connection was closed."
                 )));
             }
-            EmulationEvent::InputCleanupFailed { addr } => {
+            EmulationEvent::InputCleanupFailed {
+                addr,
+                input: _input,
+            } => {
                 self.notify_frontend(FrontendEvent::Error(format!("Previous input session at {addr} could not finish cleanup. New input was rejected; retry after the backend recovers.")));
             }
-            EmulationEvent::InputOverloaded { addr } => {
+            EmulationEvent::InputOverloaded {
+                addr,
+                admission: _admission,
+                input: _input,
+            } => {
                 self.notify_frontend(FrontendEvent::Error(format!("Incoming input from {addr} is stalled; its connection was closed. Retry after the input backend recovers.")));
             }
             EmulationEvent::BackendFailed(error) => {
@@ -1900,6 +1911,20 @@ mod tests {
             service.handle_emulation_event(EmulationEvent::ReleaseNotify { input: Some(stale_admission), addr: old_addr, conn: old_server.clone() }).await;
             assert_eq!(stale_budget.available(), (1, 1), "rejecting both stale notices must return admission");
             assert!(service.pending_frontend_events.is_empty());
+            let (report_generation, report_slots) = crate::listen::reader_slot_for_test();
+            let report_budget = crate::input_budget::InputBudget::with_limits(1, 1, Duration::from_millis(50));
+            let mut report_lease = report_budget.acquire(&tokio_util::sync::CancellationToken::new()).await.unwrap();
+            let report_input = report_lease.share_admission();
+            drop(report_lease);
+            service.handle_emulation_event(EmulationEvent::InputRejected { addr: old_addr, reason: "invalid fixture".into(), admission: Some(report_generation.clone()) }).await;
+            assert_eq!(report_slots.get(), 1);
+            service.handle_emulation_event(EmulationEvent::InputOverloaded { addr: old_addr, admission: Some(report_generation), input: Some(report_input.clone()) }).await;
+            assert_eq!(report_slots.get(), 0);
+            assert_eq!(report_budget.available(), (0, 0));
+            service.handle_emulation_event(EmulationEvent::InputCleanupFailed { addr: old_addr, input: Some(report_input) }).await;
+            assert_eq!(report_budget.available(), (1, 1));
+            assert_eq!(service.pending_frontend_events.iter().filter(|event| matches!(event, FrontendEvent::Error(_))).count(), 3);
+            service.pending_frontend_events.clear();
             assert!(!service.incoming_conns.contains(&old_addr));
             service.config.flush().await.unwrap();
             let result = tokio::time::timeout(Duration::from_millis(300), webrtc_util::Conn::recv(&accepted, &mut reply)).await;

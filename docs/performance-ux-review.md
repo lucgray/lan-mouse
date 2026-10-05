@@ -1872,3 +1872,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 真实双机千次切换、原生故障恢复、完整输入延迟 p95/p99 和8小时 RSS 尚缺验收证据，不认定90分。
 
 日志：forced-disconnect-budget-baseline.log、forced-disconnect-budget-fixed.log、forced-disconnect-budget-workspace.log、forced-disconnect-budget-clippy.log、forced-disconnect-budget-isolated-service.log。
+
+
+## 第八十轮：错误报告保留原输入和连接额度
+
+### R96 后续 / P1
+
+- 两条生产路径基线失败：admit_reader/read_loop收到非有限Enter坐标，Accept和Disconnected消费后InputRejected仍在队列而连接额度归零；实际proxy处理过期输入后InputOverloaded仍待Service消费而输入额度恢复1/1。日志 rejected-input-budget-baseline.log、error-report-budget-baseline.log。证明通知所有权漏洞，不是现场卡顿的完整根因证明。
+- [x] reader的InputRejected/InputOverloaded带原ReaderLease，dispatcher转交Service；无效或超额会话已结束也不提前释放仍排队报告的代次。
+- [x] proxy过期和替代会话cleanup失败报告共享原InputAdmission，原输入释放后仍保留permit；Service处理/丢弃完毕才释放。普通成功输入不增加共享分配，deadline和取消语义不变。
+
+### 验证和剩余范围
+
+- 两项失败基线修复后通过；实际dispatcher对拒绝/超额报告矩阵验证队列、dequeue和drop保留/回收；代理过期回归验证Service暂停仍占额。既有慢后端/替代cleanup失败测试更新为报告处理前占额、处理后全部恢复，既有替代会话和健康peer保护断言保留。
+- 工作区all-features root179通过/3忽略，其余组件全部通过；代理21条回归、严格Clippy/fmt/diff通过。额外隔离Dummy Service回归1条通过，验证三种报告处理后reader/input额度归还且错误反馈保留。全量测试最初自动审批服务因额度不足未执行，同一授权操作重试后恢复并完成，未绕过审核。
+- 第79轮274a98a PR检查时Formatting通过，Rust/Nix其余检查pending，未称全部CI通过。本轮未部署本机服务。
+- [ ] R96仍部分完成：同一活代次重复timeout/恢复、没有输入来源的backend状态/cleanup反馈和生命周期工作需独立预算或合并；clone共享原额度不构成总消息数上限。原生cleanup任务总量与失败metadata、全进程RSS仍需验证。
+- [ ] 真实Linux/Windows千次往返、原生故障释放、完整p95≤20ms/p99≤50ms和8h RSS验收缺失，不能认定90分。
+
+日志：rejected-input-budget-baseline.log、rejected-input-budget-fixed.log、error-report-budget-baseline.log、error-report-budget-fixed.log、error-report-budget-proxy.log、error-report-budget-workspace.log、error-report-budget-clippy.log、error-report-budget-isolated-service.log。

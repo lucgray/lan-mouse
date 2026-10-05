@@ -172,9 +172,11 @@ pub(crate) enum ListenEvent {
     InputRejected {
         addr: SocketAddr,
         reason: String,
+        admission: Option<ReaderLease>,
     },
     InputOverloaded {
         addr: SocketAddr,
+        admission: Option<ReaderLease>,
     },
     Msg {
         event: ProtoEvent,
@@ -883,6 +885,7 @@ async fn read_loop(
                 let _ = dtls_tx.send(ListenEvent::InputRejected {
                     addr,
                     reason: error.to_string(),
+                    admission: admission.clone(),
                 });
                 break;
             }
@@ -892,6 +895,7 @@ async fn read_loop(
             let _ = dtls_tx.send(ListenEvent::InputRejected {
                 addr,
                 reason: "cursor edge position must be finite".into(),
+                admission: admission.clone(),
             });
             break;
         }
@@ -908,7 +912,10 @@ async fn read_loop(
                     log::warn!(
                         "incoming input from {addr} exceeded queue admission deadline; closing session"
                     );
-                    let _ = dtls_tx.send(ListenEvent::InputOverloaded { addr });
+                    let _ = dtls_tx.send(ListenEvent::InputOverloaded {
+                        addr,
+                        admission: admission.clone(),
+                    });
                 }
                 break;
             };
@@ -922,7 +929,10 @@ async fn read_loop(
                     log::warn!(
                         "incoming control/clipboard queue from {addr} exceeded admission deadline; closing session"
                     );
-                    let _ = dtls_tx.send(ListenEvent::InputOverloaded { addr });
+                    let _ = dtls_tx.send(ListenEvent::InputOverloaded {
+                        addr,
+                        admission: admission.clone(),
+                    });
                 }
                 break;
             };
@@ -1424,6 +1434,55 @@ mod tests {
         for _ in 1..MAX_INCOMING_READERS {
             drop(rx.recv().await.unwrap());
         }
+        assert_eq!(budget.0.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_input_notice_keeps_generation_after_disconnect_is_consumed() {
+        let budget = ReaderBudget::default();
+        let auth = IncomingAuthorization::default();
+        let (tx, mut rx) = channel();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let event = ProtoEvent::Enter(lan_mouse_proto::Position::Left, f64::NAN);
+        let (bytes, len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = event.into();
+        let conn: ArcConn = Arc::new(TestConn::new(Some(bytes[..len].to_vec())));
+        let (lease, session) = admit_reader(
+            &budget,
+            &auth,
+            addr,
+            "peer".into(),
+            &conn,
+            &CancellationToken::new(),
+            &tx,
+        )
+        .unwrap();
+        let admission = Some(lease.clone());
+        hold_reader_slot(
+            lease,
+            read_loop(
+                auth.conns.clone(),
+                addr,
+                conn,
+                tx,
+                session,
+                crate::input_budget::InputBudget::default(),
+                admission,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(rx.recv().await.unwrap()); // stale Accept
+        let report = rx.recv().await.unwrap();
+        assert!(matches!(report, ListenEvent::InputRejected { .. }));
+        let disconnect = rx.recv().await.unwrap();
+        assert!(matches!(disconnect, ListenEvent::Disconnected { .. }));
+        drop(disconnect);
+        assert_eq!(
+            budget.0.get(),
+            1,
+            "error report must retain admission after disconnect completes"
+        );
+        drop(report);
         assert_eq!(budget.0.get(), 0);
     }
 
@@ -3289,7 +3348,7 @@ mod tests {
         let mut overloaded = 0;
         while let Some(event) = rx.recv().await {
             match event {
-                ListenEvent::InputOverloaded { addr: actual } => {
+                ListenEvent::InputOverloaded { addr: actual, .. } => {
                     assert_eq!(actual, addr);
                     overloaded += 1;
                 }
@@ -3405,7 +3464,7 @@ mod tests {
             ));
             assert_eq!(budget.available(), (256, 64));
             assert!(
-                matches!(rx.recv().await, Some(ListenEvent::InputRejected { addr: actual, reason })
+                matches!(rx.recv().await, Some(ListenEvent::InputRejected { addr: actual, reason, .. })
                 if actual == addr && !reason.is_empty())
             );
             assert!(

@@ -1083,6 +1083,10 @@ Control-reply failure and authorization revocation now retain the exact
 generation through queued notifications and asynchronous close. Revocation
 forwards that owner to ConnectionClosed and proxy cleanup. The lookup registry
 uses weak references and connection identity checks, so it neither leaks slots
-nor lends a replacement connection's reservation to an old completion. Error
-reports and repeated lifecycle work still need separate queue bounds.
+nor lends a replacement connection's reservation to an old completion. Reader
+validation/admission-failure reports now retain the same generation through
+Service processing. Proxy expiry and replacement-cleanup failure reports share
+the original input reservation until Service processing/drop; sharing does not
+renew freshness or create another permit. Repeated lifecycle work still needs
+separate queue bounds.
 It does not establish a total notification count or whole-service RSS bound.
