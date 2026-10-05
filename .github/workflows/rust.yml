@@ -104,6 +104,10 @@ jobs:
         if: matrix.job == 'test'
         run: cargo test --manifest-path vendor/webrtc-util/Cargo.toml conn_udp_listener
 
+      - name: Test patched DTLS dependency
+        if: matrix.job == 'test'
+        run: cargo test --manifest-path vendor/webrtc-dtls/Cargo.toml --lib
+
       - name: cargo clippy
         if: matrix.job == 'clippy'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings

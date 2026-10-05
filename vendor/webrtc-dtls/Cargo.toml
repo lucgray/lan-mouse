@@ -198,3 +198,7 @@ version = "0.11.3"
 
 [dev-dependencies.tokio-test]
 version = "0.4"
+
+# Standalone dependency tests must exercise the same local UDP close patch.
+[patch.crates-io]
+webrtc-util = { path = "../webrtc-util" }

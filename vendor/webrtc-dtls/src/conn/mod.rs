@@ -70,6 +70,63 @@ struct ConnReaderContext {
     packet_tx: Arc<mpsc::Sender<PacketSendRequest>>,
 }
 
+type WorkerTaskSlot = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+type ReaderCloseSlot = Arc<Mutex<Option<mpsc::Sender<()>>>>;
+
+async fn stop_connection_workers(
+    reader_close: Option<ReaderCloseSlot>,
+    writer: Option<WorkerTaskSlot>,
+    reader: Option<WorkerTaskSlot>,
+) {
+    if let Some(channel) = reader_close {
+        channel.lock().await.take();
+    }
+    if let Some(slot) = writer {
+        if let Some(task) = slot.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    if let Some(slot) = reader {
+        if let Some(task) = slot.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+// Own accepted transport cleanup from the first constructor poll through
+// handshake completion, including preflight errors and canceled futures.
+struct HandshakeCleanup {
+    runtime: Option<tokio::runtime::Handle>,
+    conn: Option<Arc<dyn Conn + Send + Sync>>,
+    reader_close: Option<ReaderCloseSlot>,
+    writer: Option<WorkerTaskSlot>,
+    reader: Option<WorkerTaskSlot>,
+}
+
+impl Drop for HandshakeCleanup {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        let (reader_close, writer, reader) = (
+            self.reader_close.take(),
+            self.writer.take(),
+            self.reader.take(),
+        );
+        if let Some(runtime) = self.runtime.take() {
+            runtime.spawn(async move {
+                stop_connection_workers(reader_close, writer, reader).await;
+                if let Err(error) = conn.close().await {
+                    warn!("failed DTLS handshake transport cleanup: {error}");
+                }
+            });
+        } else {
+            warn!("DTLS handshake cleanup requires a live Tokio runtime");
+        }
+    }
+}
+
 // Conn represents a DTLS connection
 pub struct DTLSConn {
     conn: Arc<dyn Conn + Send + Sync>,
@@ -104,9 +161,9 @@ pub struct DTLSConn {
     pub(crate) handle_queue_tx: mpsc::Sender<mpsc::Sender<()>>,
     pub(crate) handshake_done_tx: Option<mpsc::Sender<()>>,
 
-    reader_close_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
-    packet_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    reader_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    reader_close_tx: ReaderCloseSlot,
+    packet_task: WorkerTaskSlot,
+    reader_task: WorkerTaskSlot,
     close_task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
 }
 
@@ -158,6 +215,13 @@ impl DTLSConn {
         is_client: bool,
         initial_state: Option<State>,
     ) -> Result<Self> {
+        let mut cleanup = HandshakeCleanup {
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            conn: Some(conn.clone()),
+            reader_close: None,
+            writer: None,
+            reader: None,
+        };
         validate_config(is_client, &config)?;
 
         let local_cipher_suites: Vec<CipherSuiteId> = parse_cipher_suites(
@@ -326,6 +390,8 @@ impl DTLSConn {
             close_task: Mutex::new(None),
         };
 
+        cleanup.reader_close = Some(c.reader_close_tx.clone());
+
         let cipher_suite1 = Arc::clone(&c.state.cipher_suite);
         let sequence_number = Arc::clone(&c.state.local_sequence_number);
 
@@ -356,7 +422,10 @@ impl DTLSConn {
             }
         });
 
-        c.packet_task.lock().await.replace(packet_task);
+        // Register synchronously: no cancellation point may detach a worker
+        // before its cleanup guard owns the handle.
+        c.packet_task = Arc::new(Mutex::new(Some(packet_task)));
+        cleanup.writer = Some(c.packet_task.clone());
 
         let local_epoch = Arc::clone(&c.state.local_epoch);
         let remote_epoch = Arc::clone(&c.state.remote_epoch);
@@ -418,12 +487,14 @@ impl DTLSConn {
             }
         });
 
-        c.reader_task.lock().await.replace(reader_task);
+        c.reader_task = Arc::new(Mutex::new(Some(reader_task)));
+        cleanup.reader = Some(c.reader_task.clone());
 
         // Do handshake
         c.handshake(initial_fsm_state).await?;
 
         trace!("Handshake Completed");
+        cleanup.conn.take();
 
         Ok(c)
     }
@@ -528,15 +599,12 @@ impl DTLSConn {
                 )
                 .await
                 .unwrap_or(Err(Error::ErrDeadlineExceeded));
-                reader_close_tx.lock().await.take();
-                // Stop an outgoing send that outlived its notification waiter.
-                if let Some(writer) = packet_task.lock().await.take() {
-                    writer.abort();
-                    let _ = writer.await;
-                }
-                if let Some(reader) = reader_task.lock().await.take() {
-                    let _ = reader.await;
-                }
+                stop_connection_workers(
+                    Some(reader_close_tx),
+                    Some(packet_task),
+                    Some(reader_task),
+                )
+                .await;
                 let transport = conn.close().await.map_err(Error::from);
                 match (notification, transport) {
                     (Ok(()), result) | (result, Ok(())) => result,

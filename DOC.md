@@ -985,5 +985,17 @@ A close notification has a 250ms best-effort deadline, followed by writer/reader
 shutdown and the original raw transport close attempt. An interrupted outgoing
 send cannot report successful completion merely because its result channel closed.
 A raw close that never completes retains its cleanup owner: global task/resource
-bounds, genuinely failed-close retry and constructor-handshake cancellation are
-still unverified. Synchronous stalls are not preempted by the async timer.
+bounds and genuinely failed-close retry remain unverified. Failed/canceled
+constructors use the guard described below. Synchronous stalls are not preempted by the async timer.
+
+
+### Failed or canceled DTLS constructors
+
+From its first poll, DTLSConn::new retains a handshake cleanup guard. On a
+preflight/handshake error or cancellation, the guard schedules worker shutdown
+and raw transport close; successful construction disarms it. Worker handles
+are registered without an intervening await. The guard captures the runtime
+handle so dropping the polled future on another thread still schedules cleanup
+on the original live runtime. Runtime shutdown, never-polled futures, global
+cleanup/session limits and genuinely failed raw close remain separate concerns.
+Standalone vendored DTLS tests link the sibling UDP patch and run in Rust CI.

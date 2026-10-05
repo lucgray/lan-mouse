@@ -13,6 +13,9 @@ Production changes are confined to src/conn/mod.rs:
 - Single notify/transport errors retain type; double errors preserve both causes.
 - Packet writer disappearing before its result now returns ErrConnClosed,
   instead of reporting a write as successful.
+- Constructor cleanup guard retains raw transport/runtime from first poll,
+  stops workers/closes raw transport on errors/cancellation and disarms on
+  successful handshake. Synchronous handle registration avoids a cancel gap.
 - Constructor records worker handles; the original test constructor fixture in
   conn_test.rs initializes the new private fields. One upstream trailing space
   was removed. No other upstream source file changes.
@@ -20,7 +23,10 @@ Production changes are confined to src/conn/mod.rs:
 Root real UDP/DTLS tests inject send/close errors and pending futures, cancel
 all close waiters and drop the DTLS object, and check eventual cleanup. The
 original close task-leak regression is run separately. No wire/public signature
-changes. Synchronous stalls, truly failed/pending raw close recovery, constructor
-handshake cancellation and global task/session bounds remain separate work.
+changes. Synchronous stalls, truly failed/pending raw close recovery, runtime shutdown/never-polled futures and global task/session bounds remain
+separate work.
 A pending raw close retains its owned task/transport; task counts are not globally
 bounded by this patch and the application reader budget does not account for it.
+
+Standalone Cargo.toml links ../webrtc-util through a local patch so original
+DTLS library tests exercise the same UDP close behavior as the application.

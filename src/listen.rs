@@ -860,6 +860,23 @@ mod tests {
         closes: AtomicUsize,
     }
 
+    impl FailingCloseNotifyConn {
+        fn new(inner: ArcConn, fail_close: bool) -> Self {
+            Self {
+                inner,
+                fail_close,
+                fail_sends: AtomicBool::new(false),
+                active_sends: AtomicUsize::new(0),
+                hold_sends: AtomicBool::new(false),
+                hold_closes: AtomicBool::new(false),
+                send_gate: tokio::sync::Semaphore::new(0),
+                close_gate: tokio::sync::Semaphore::new(0),
+                close_finished: tokio::sync::Notify::new(),
+                closes: AtomicUsize::new(0),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Conn for FailingCloseNotifyConn {
         async fn connect(&self, addr: SocketAddr) -> webrtc_util::Result<()> {
@@ -937,18 +954,7 @@ mod tests {
         let handshake = async {
             tokio::join!(DTLSConn::new(socket.clone(), cfg, true, None), async {
                 let (raw, _) = parent.accept().await.unwrap();
-                let transport = Arc::new(FailingCloseNotifyConn {
-                    inner: raw,
-                    fail_sends: AtomicBool::new(false),
-                    fail_close,
-                    active_sends: AtomicUsize::new(0),
-                    hold_sends: AtomicBool::new(false),
-                    hold_closes: AtomicBool::new(false),
-                    send_gate: tokio::sync::Semaphore::new(0),
-                    close_gate: tokio::sync::Semaphore::new(0),
-                    close_finished: tokio::sync::Notify::new(),
-                    closes: AtomicUsize::new(0),
-                });
+                let transport = Arc::new(FailingCloseNotifyConn::new(raw, fail_close));
                 let server = DTLSConn::new(transport.clone(), server_cfg, false, None)
                     .await
                     .unwrap();
@@ -1067,6 +1073,77 @@ mod tests {
         server.close().await.unwrap();
         client.close().await.unwrap();
         parent.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_or_canceled_dtls_constructor_releases_raw_session_and_workers() {
+        for failure in ["cancel", "validation", "flight_send"] {
+            let parent = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+                .await
+                .unwrap();
+            let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            socket.connect(parent.addr().await.unwrap()).await.unwrap();
+            let cfg = Config {
+                certificates: vec![Certificate::generate_self_signed(vec![]).unwrap()],
+                insecure_skip_verify: true,
+                ..Default::default()
+            };
+            let client = tokio::spawn(DTLSConn::new(socket.clone(), cfg.clone(), true, None));
+            let (raw, _) = tokio::time::timeout(Duration::from_secs(1), parent.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let transport = Arc::new(FailingCloseNotifyConn::new(raw, false));
+            transport
+                .hold_sends
+                .store(failure == "cancel", Ordering::SeqCst);
+            transport
+                .fail_sends
+                .store(failure == "flight_send", Ordering::SeqCst);
+            let server_cfg = if failure == "validation" {
+                Config::default()
+            } else {
+                cfg
+            };
+            let mut constructing =
+                Box::pin(DTLSConn::new(transport.clone(), server_cfg, false, None));
+            let result = tokio::time::timeout(Duration::from_millis(50), &mut constructing).await;
+            // Drop the polled constructor outside an entered Tokio context;
+            // cleanup must use the runtime handle captured during polling.
+            std::thread::spawn(move || drop(constructing))
+                .join()
+                .unwrap();
+            if failure == "cancel" {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            client.abort();
+            let _ = client.await;
+            tokio::time::timeout(Duration::from_secs(1), transport.close_finished.notified())
+                .await
+                .unwrap();
+            assert_eq!(transport.closes.load(Ordering::SeqCst), 1);
+            assert_eq!(transport.active_sends.load(Ordering::SeqCst), 0);
+            socket.send(b"after-failed-handshake").await.unwrap();
+            let (fresh, _) = tokio::time::timeout(Duration::from_secs(1), parent.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut packet = [0u8; 8192];
+                loop {
+                    let length = fresh.recv(&mut packet).await.unwrap();
+                    if &packet[..length] == b"after-failed-handshake" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            fresh.close().await.unwrap();
+            parent.close().await.unwrap();
+        }
     }
 
     use std::sync::Mutex;

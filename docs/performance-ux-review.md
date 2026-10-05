@@ -20,6 +20,7 @@
 | R86 | 已实现并通过缓冲阶段回归 | 单原始 UDP 会话 256 包/256KiB（含两字节帧头），满则沿既有 UDP 路径丢包；FIFO/读取后额度恢复/其他缓冲隔离；全服务总量及实机高频输入仍待验 |
 | R87 | 已实现并通过真实 DTLS 故障回归 | close-notify 失败仍停止内部 reader 并关闭底层 UDP；单/双错误保留，旧会话不阻碍同地址新接入；pending/取消与底层真实关闭失败仍待处理 |
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
+| R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
 | R44 | 已实现并通过真实 GTK 交互回归 | 保留当前确认/说明编辑；64 个有界去重待处理项、128 个 30 秒关闭冷却记录；同步授权跳过已授权项，断线清理旧代次窗口/idle，按钮和 WM 关闭推进下一项 |
@@ -1636,3 +1637,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 物理鼠标恢复、双机千次往返、端到端 p95/p99、8h RSS 与 90 分门槛仍未满足。第 66 轮 CI 检查时 Rust queued/Nix in_progress。未修改已安装服务。
 
 日志：dtls-close-owner-baseline.log、dtls-close-owner-fixed.log、dtls-close-owner-workspace.log、dtls-close-owner-clippy.log、dtls-close-owner-original-tests.log。
+
+
+## 第六十八轮：失败和取消的构造握手释放底层会话
+
+### R89 / P1（R13 的一部分）
+
+- DTLSConn::new 预检与 handshake.await? 失败没有 raw close owner。基线让真实 UDP 客户端发起握手，server 第一 flight send 被 Semaphore 挂起；50ms 取消构造后，一秒内没有底层 close 完成通知，回归失败。日志 dtls-handshake-cleanup-baseline.log。基线直接验证取消路径；预检/发送错误遗漏也由旧代码错误返回路径确认，不将未运行的矩阵阶段称为基线实测。
+- [x] HandshakeCleanup 从构造第一次 poll 起保留 raw transport，记录 reader close 通道、writer/reader slot，以及当时的 Tokio Handle；只有完整握手成功才解除。错误返回或 future Drop 调度独立清理任务，停止/等待 worker 后 await 底层 close；raw close Err 记录 warn。
+- [x] 保存 runtime Handle 使 future 在非 entered Tokio 线程 Drop 仍可调度到原 runtime；不依赖 Drop 当下的 ambient context。worker spawn 后同步登记 JoinHandle 到 guard，不再用 await 锁登记，消除登记前取消时 detach 的间隙。正常 close 复用同一 worker 停止 helper，无 public/wire 变化。
+- [x] 回归三种路径：构造取消、无证书配置校验失败、第一 flight 发送错误。它们使用实际 loopback UDP，故障与等待由 transport wrapper 注入；验证底层 close 恰一次、pending send future 结束、同一源地址可新 accept 并收后续标记。已 poll 的构造 future 在单独 std thread 释放，验证保存的 runtime。不是实机授权丢包/鼠标恢复测试。
+
+### 验证与剩余缺口
+
+- 完整工作区 all-features：root 155 / 3 忽略、capture 58 / 1 忽略、emulation 40、GTK 14 / 4 忽略、CLI 3、IPC 4、input-event 5、proto 11。严格 all-targets Clippy、fmt/diff 通过。vendored DTLS 原 library 61 条全部通过，覆盖证书/PSK/密码套件/协议/超时与 close 等测试；Rust CI 每个 test job 增加该独立测试集，manifest 的 sibling UDP patch 保证与应用使用相同补丁。
+- [ ] 清理任务依赖 runtime 仍存活；runtime 整体停止不保证 guard 任务完成，首次 poll 就无 runtime 的早期错误只能 warn。不执行未曾 poll 的构造 future 也不会运行 guard；应用 accept 路径是在同一 poll 内进入 new.await。
+- [ ] raw close 永久 pending/Err 的任务保留与重试、全服务 task/session 总额度、worker panic 诊断仍未解决。构造清理任务没有全局上限；不能把 map 的成功删除回归说成总 RSS 已有界。
+- [ ] accept_any/select_all 和两秒轮询仍可能取消其他设备的合法进行中握手；本轮让取消后的资源回收，不保证这些握手不会被中断。后续核对并发接入体验和 listener futures 是否应跨事件保留。
+- [ ] 第 67 轮检查时 CI queued；新 HEAD 需对应原生 CI。千次双机往返、完整延迟、原生恢复与 8h RSS 未验收，不认定 90 分。未修改已安装程序。
+
+日志：dtls-handshake-cleanup-baseline.log、dtls-handshake-cleanup-fixed.log、dtls-handshake-cleanup-workspace.log、dtls-handshake-cleanup-clippy.log、dtls-handshake-cleanup-original-tests.log。
