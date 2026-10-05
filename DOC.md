@@ -948,8 +948,9 @@ sends. A reconnect from the same source address can create a fresh session;
 repeating close on the old session cannot remove the replacement. The shared
 listening socket remains available to other peers. Registration precedes
 accept publication, with rollback when the pending accept queue is full.
-Already buffered packets may drain after close. Canceled/incomplete DTLS
-handshakes and global underlying buffer/session limits remain separate work.
+UDP close discards queued packets and frees their backing allocation before
+removing the table entry. Generic Buffer::close retains its draining behavior.
+Canceled DTLS constructors retain cleanup ownership as described below.
 
 
 ### Raw UDP session receive backlog
@@ -959,7 +960,12 @@ queued data including two-byte packet length headers (the backing ring can
 allocate one additional slack byte). A full buffer drops new UDP datagrams
 without waiting for a reader; draining restores capacity and preserves queued
 FIFO. This reduces the original Buffer's 4MiB per-session allocation ceiling;
-it does not bound total sessions/handshakes or establish full-service RSS.
+Each raw listener indexes at most 128 sessions; existing peers remain routable
+at capacity and new peers above capacity are dropped. Queued sessions expire
+after two seconds with a one-second sweep and a dequeue age check. Atomic
+claim/expiry excludes accepted sessions. Closed buffers are freed before their
+slots become reusable. This bounds indexed raw ring allocation, not aggregate
+DTLS/cleanup resources or full-service RSS.
 Overflow is lossy and high-rate hardware input/clipboard sharing needs manual
 validation. Public signatures and DTLS wire encoding are unchanged.
 

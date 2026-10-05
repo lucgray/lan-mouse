@@ -2130,6 +2130,45 @@ mod tests {
         close_listeners(pool.into_listeners()).await;
     }
 
+    #[tokio::test]
+    async fn real_udp_pending_expiry_skips_stale_peer_and_keeps_accepted_peer_live() {
+        let listener = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.addr().await.unwrap();
+        let active = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        active.connect(addr).await.unwrap();
+        active.send(b"first").await.unwrap();
+        let (conn, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conn.recv(&mut [0u8; 32]).await.unwrap(), 5);
+        let stale = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stale.connect(addr).await.unwrap();
+        stale.send(b"stale").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(3200)).await;
+        let fresh = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        fresh.connect(addr).await.unwrap();
+        fresh.send(b"fresh").await.unwrap();
+        let (new, peer) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer, fresh.local_addr().unwrap());
+        assert_eq!(new.recv(&mut [0u8; 32]).await.unwrap(), 5);
+        active.send(b"live-again").await.unwrap();
+        let mut buffer = [0u8; 32];
+        let length = tokio::time::timeout(Duration::from_secs(1), conn.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..length], b"live-again");
+        new.close().await.unwrap();
+        conn.close().await.unwrap();
+        listener.close().await.unwrap();
+    }
+
     struct SlowListener(Arc<AtomicBool>);
     #[async_trait::async_trait]
     impl Listener for SlowListener {

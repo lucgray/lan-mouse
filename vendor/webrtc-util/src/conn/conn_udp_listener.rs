@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Weak;
 
-use portable_atomic::AtomicBool;
+use portable_atomic::{AtomicBool, AtomicU8};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
 
@@ -18,6 +18,11 @@ const DEFAULT_LISTEN_BACKLOG: usize = 128; // same as Linux default
 // by the existing read loop, preserving UDP semantics and other peer dispatch.
 const SESSION_BUFFER_PACKETS: usize = 256;
 const SESSION_BUFFER_BYTES: usize = 256 * 1024;
+const MAX_UDP_SESSIONS: usize = 128;
+const PENDING_SESSION_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(2);
+const SESSION_QUEUED: u8 = 0;
+const SESSION_ACCEPTED: u8 = 1;
+const SESSION_CLOSED: u8 = 2;
 
 pub type AcceptFilterFn =
     Box<dyn (Fn(&[u8]) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>>) + Send + Sync>;
@@ -42,16 +47,25 @@ impl Listener for ListenerImpl {
     async fn accept(&self) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr)> {
         let (accept_ch_rx, done_ch_rx) = &mut *self.ch_rx.lock().await;
 
-        tokio::select! {
-            c = accept_ch_rx.recv() =>{
-                if let Some(c) = c{
-                    let raddr = c.raddr;
-                    Ok((c, raddr))
-                }else{
-                    Err(Error::ErrClosedListenerAcceptCh)
+        loop {
+            tokio::select! {
+                c = accept_ch_rx.recv() => {
+                    if let Some(c) = c {
+                        // Claim and expiry compete atomically. Never start a
+                        // handshake for an entry already retired by housekeeping.
+                        if c.mark_expired() {
+                            let _ = c.close().await;
+                            continue;
+                        }
+                        if c.state.compare_exchange(SESSION_QUEUED, SESSION_ACCEPTED,
+                            Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            let raddr = c.raddr;
+                            return Ok((c, raddr));
+                        }
+                    } else { return Err(Error::ErrClosedListenerAcceptCh); }
                 }
+                _ = done_ch_rx.changed() => return Err(Error::ErrClosedListener),
             }
-            _ = done_ch_rx.changed() =>  Err(Error::ErrClosedListener),
         }
     }
 
@@ -152,11 +166,16 @@ impl ListenConfig {
         conns: Arc<Mutex<HashMap<String, Arc<UdpConn>>>>,
     ) {
         let mut buf = vec![0u8; RECEIVE_MTU];
+        let mut housekeeping = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 _ = done_ch_rx.changed() => {
                     break;
+                }
+                _ = housekeeping.tick() => {
+                    ListenConfig::expire_pending_sessions(&conns).await;
                 }
                 result = pconn.recv_from(&mut buf) => {
                     match result {
@@ -187,6 +206,21 @@ impl ListenConfig {
                     };
                 }
             }
+        }
+    }
+
+    async fn expire_pending_sessions(conns: &Arc<Mutex<HashMap<String, Arc<UdpConn>>>>) {
+        let retired: Vec<_> = {
+            let sessions = conns.lock().await;
+            sessions
+                .values()
+                .filter(|conn| conn.mark_expired())
+                .cloned()
+                .collect()
+        };
+        // Do not hold the map lock while close removes entries/frees buffers.
+        for conn in retired {
+            let _ = conn.close().await;
         }
     }
 
@@ -227,6 +261,12 @@ impl ListenConfig {
                 // Install before publishing: the receiver can close immediately
                 // after try_send, and close must find its table entry.
                 let mut sessions = conns.lock().await;
+                if let Some(existing) = sessions.get(&raddr.to_string()) {
+                    return Ok(Some(existing.clone()));
+                }
+                if sessions.len() >= MAX_UDP_SESSIONS {
+                    return Err(Error::ErrListenQueueExceeded);
+                }
                 sessions.insert(raddr.to_string(), Arc::clone(&udp_conn));
                 if tx.try_send(Arc::clone(&udp_conn)).is_err() {
                     sessions.remove(&raddr.to_string());
@@ -246,10 +286,25 @@ pub struct UdpConn {
     pconn: Arc<dyn Conn + Send + Sync>,
     raddr: SocketAddr,
     buffer: Buffer,
+    state: AtomicU8,
+    queued_at: tokio::time::Instant,
     sessions: Weak<Mutex<HashMap<String, Arc<UdpConn>>>>,
 }
 
 impl UdpConn {
+    fn mark_expired(&self) -> bool {
+        self.queued_at.elapsed() >= PENDING_SESSION_TIMEOUT
+            && self
+                .state
+                .compare_exchange(
+                    SESSION_QUEUED,
+                    SESSION_CLOSED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+    }
+
     fn new(
         pconn: Arc<dyn Conn + Send + Sync>,
         raddr: SocketAddr,
@@ -259,6 +314,8 @@ impl UdpConn {
             pconn,
             raddr,
             buffer: Buffer::new(SESSION_BUFFER_PACKETS, SESSION_BUFFER_BYTES),
+            state: AtomicU8::new(SESSION_QUEUED),
+            queued_at: tokio::time::Instant::now(),
             sessions,
         }
     }
@@ -280,14 +337,14 @@ impl Conn for UdpConn {
     }
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
-        if self.buffer.is_closed().await {
+        if self.state.load(Ordering::SeqCst) == SESSION_CLOSED || self.buffer.is_closed().await {
             return Err(Error::ErrUseClosedNetworkConn);
         }
         self.pconn.send_to(buf, self.raddr).await
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize> {
-        if self.buffer.is_closed().await {
+        if self.state.load(Ordering::SeqCst) == SESSION_CLOSED || self.buffer.is_closed().await {
             return Err(Error::ErrUseClosedNetworkConn);
         }
         self.pconn.send_to(buf, target).await
@@ -302,6 +359,10 @@ impl Conn for UdpConn {
     }
 
     async fn close(&self) -> Result<()> {
+        self.state.store(SESSION_CLOSED, Ordering::SeqCst);
+        // Release queued allocation before freeing the table slot. Closing
+        // sessions remain in the budget until their raw buffer is discarded.
+        self.buffer.close_and_discard().await;
         // Remove only this generation. A repeated close must not remove a
         // newly accepted connection that reused the same source address.
         if let Some(sessions) = self.sessions.upgrade() {
@@ -314,9 +375,6 @@ impl Conn for UdpConn {
                 sessions.remove(&key);
             }
         }
-        // Wake pending reads and reject future writes without closing the
-        // shared UDP socket used by other peers.
-        self.buffer.close().await;
         Ok(())
     }
 
@@ -371,5 +429,124 @@ mod bounded_session_tests {
         conn.buffer.write(&packet).await.unwrap();
         conn.close().await.unwrap();
         other.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn session_table_budget_preserves_existing_peer_and_recovers_after_close() {
+        let socket: Arc<dyn Conn + Send + Sync> =
+            Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let accepting = Arc::new(AtomicBool::new(true));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(256);
+        let accepts = Arc::new(Mutex::new(Some(tx)));
+        for port in 10000..10128 {
+            ListenConfig::get_udp_conn(
+                &socket,
+                &accepting,
+                &None,
+                &accepts,
+                &sessions,
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                b"hello",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let extra: SocketAddr = "127.0.0.1:10128".parse().unwrap();
+        assert!(matches!(
+            ListenConfig::get_udp_conn(
+                &socket, &accepting, &None, &accepts, &sessions, extra, b"hello"
+            )
+            .await,
+            Err(Error::ErrListenQueueExceeded)
+        ));
+        assert_eq!(sessions.lock().await.len(), 128);
+        let first_addr: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        let first = sessions
+            .lock()
+            .await
+            .get(&first_addr.to_string())
+            .unwrap()
+            .clone();
+        let existing = ListenConfig::get_udp_conn(
+            &socket, &accepting, &None, &accepts, &sessions, first_addr, b"hello",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &existing));
+        first.close().await.unwrap();
+        ListenConfig::get_udp_conn(
+            &socket, &accepting, &None, &accepts, &sessions, extra, b"hello",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(sessions.lock().await.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn session_close_discards_queued_raw_data() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let conn = UdpConn::new(socket, "127.0.0.1:1".parse().unwrap(), Weak::new());
+        conn.buffer.write(&[9]).await.unwrap();
+        conn.close().await.unwrap();
+        assert!(conn.recv(&mut [0u8; 1]).await.is_err());
+    }
+    #[tokio::test]
+    async fn pending_expiry_keeps_accepted_and_fresh_sessions_and_prevents_late_accept() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut queued = UdpConn::new(
+            socket.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::downgrade(&sessions),
+        );
+        queued.queued_at -= tokio::time::Duration::from_secs(3);
+        let queued = Arc::new(queued);
+        let mut accepted = UdpConn::new(
+            socket.clone(),
+            "127.0.0.1:2".parse().unwrap(),
+            Arc::downgrade(&sessions),
+        );
+        accepted.queued_at -= tokio::time::Duration::from_secs(3);
+        accepted.state.store(SESSION_ACCEPTED, Ordering::SeqCst);
+        let accepted = Arc::new(accepted);
+        let fresh = Arc::new(UdpConn::new(
+            socket,
+            "127.0.0.1:3".parse().unwrap(),
+            Arc::downgrade(&sessions),
+        ));
+        for conn in [&queued, &accepted, &fresh] {
+            conn.buffer.write(&[7]).await.unwrap();
+            sessions
+                .lock()
+                .await
+                .insert(conn.raddr.to_string(), conn.clone());
+        }
+        ListenConfig::expire_pending_sessions(&sessions).await;
+        assert_eq!(sessions.lock().await.len(), 2);
+        assert!(
+            !sessions
+                .lock()
+                .await
+                .contains_key(&queued.raddr.to_string())
+        );
+        assert!(
+            queued
+                .state
+                .compare_exchange(
+                    SESSION_QUEUED,
+                    SESSION_ACCEPTED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst
+                )
+                .is_err()
+        );
+        assert!(queued.recv(&mut [0u8; 1]).await.is_err());
+        assert_eq!(accepted.recv(&mut [0u8; 1]).await.unwrap(), 1);
+        assert_eq!(fresh.recv(&mut [0u8; 1]).await.unwrap(), 1);
+        accepted.close().await.unwrap();
+        fresh.close().await.unwrap();
     }
 }

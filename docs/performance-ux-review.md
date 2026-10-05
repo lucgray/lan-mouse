@@ -22,6 +22,7 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
+| R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
 | R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
 | R42 | 已实现并通过队列/真实认证回归 | 认证提示独立于输入无界事件链；64 待提示/128 最近指纹上限、250ms 全局投递间隔、两秒重试去重；回调直接记录指纹，排队后授权不再提示；全进程网络风暴资源仍待验 |
 | R43 | 已实现并通过校验器回归 | 空证书链返回认证错误，多个证书只以 leaf 指纹授权，已授权 intermediate 不授权其他 leaf；不再断言数量并终止进程 |
@@ -1697,3 +1698,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 停滞握手在本监听器仍会占用单 accept 至期限；同监听器并发接入、底层会话/清理 task 全局额度、worker panic 与永久 raw close 的恢复仍未完成。原生释放、千次双机往返、完整时延和 8h RSS 未验收，不认定 90 分。未部署本机程序。
 
 日志：handshake-deadline-baseline.log、handshake-deadline-fixed.log、handshake-deadline-workspace.log、handshake-deadline-clippy.log、handshake-deadline-original-tests.log。
+
+
+## 第七十一轮：UDP 会话额度、排队回收与关闭缓冲
+
+### R92 / P1
+
+- 基线调用生产 get_udp_conn，使用真实 socket 与合成来源地址：第129个会话仍获准；关闭后旧缓冲仍可读。两条行为断言失败，日志 udp-session-budget-baseline.log。这是表/缓冲阶段验证，不是网络洪泛或现场卡顿归因。
+- [x] 每 raw listener 最多128个索引会话；满额仍返回现有 peer，未知地址沿既有 queue-full/drop 路径拒绝，关闭后可复用名额。
+- [x] 排队会话两秒后过期，每秒扫一次且 dequeue 再检查；Queued→Accepted/Closed 用原子竞争，已接入会话不参与过期回收。
+- [x] UDP close 标记关闭，先清空并释放原始缓冲，再按对象身份移除表项；重复关闭不会删同地址替代对象。通用 Buffer.close 保留排空语义，只有 UDP 会话选择丢弃。缓冲释放在互斥锁外完成。
+
+### 验证与边界
+
+- UDP 依赖9条、Buffer 9条：额度/已有地址/关闭后恢复、排队过期/已接入与新排队保留、禁止过期后 claim、关闭丢弃及 allocation capacity归零。真实 loopback UDP 等待3.2秒后跳过过期peer、接受新peer，已接入peer继续收包。
+- 工作区 all-features：root 161 / 3忽略、capture 58 / 1忽略、emulation 40、GTK 14 / 4忽略、CLI 3、IPC 4、input-event 5、proto 11；严格Clippy/格式/diff通过，DTLS library 61条通过。CI补充Buffer测试和该模块格式检查。
+- [ ] 每监听器索引的raw ring最多128×(256KiB+1)，约32MiB；不包括双监听器、DTLS解密缓冲、清理task、应用事件、分配器保留，不等于全服务RSS。已接入会话依赖原有心跳/认证/reader清理。
+- [ ] 丢包风暴下可用性、同监听器握手并发、清理task全局额度、真实原生释放、千次双机切换、p95/p99和8h RSS仍待验。本轮不认定90分，未部署本机程序。
+
+日志：udp-session-budget-baseline.log、udp-session-budget-fixed.log、udp-session-budget-buffer-tests.log、udp-session-budget-workspace.log、udp-session-budget-dtls-tests.log、udp-session-budget-clippy.log。

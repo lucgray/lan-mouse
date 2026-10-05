@@ -23,6 +23,8 @@ jobs:
         run: cargo fmt --check
       - name: Check patched UDP module formatting
         run: rustfmt --check --edition 2021 vendor/webrtc-util/src/conn/conn_udp_listener.rs
+      - name: Check patched buffer formatting
+        run: rustfmt --check --edition 2021 --config skip_children=true,style_edition=2021 vendor/webrtc-util/src/buffer/mod.rs
       - name: Check patched DTLS module formatting
         run: rustfmt --check --edition 2021 --config skip_children=true,style_edition=2021 vendor/webrtc-dtls/src/conn/mod.rs
       - name: Check patched DTLS listener formatting
@@ -105,6 +107,10 @@ jobs:
       - name: Test patched UDP dependency
         if: matrix.job == 'test'
         run: cargo test --manifest-path vendor/webrtc-util/Cargo.toml conn_udp_listener
+
+      - name: Test patched buffer dependency
+        if: matrix.job == 'test'
+        run: cargo test --manifest-path vendor/webrtc-util/Cargo.toml buffer
 
       - name: Test patched DTLS dependency
         if: matrix.job == 'test'

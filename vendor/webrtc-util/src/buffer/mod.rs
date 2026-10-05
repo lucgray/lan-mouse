@@ -263,6 +263,20 @@ impl Buffer {
         }
     }
 
+    // UDP session retirement must release its allocation even while an accept
+    // queue retains an Arc. Keep ordinary Buffer::close's drain semantics.
+    pub(crate) async fn close_and_discard(&self) {
+        let mut b = self.buffer.lock().await;
+        b.closed = true;
+        let data = std::mem::take(&mut b.data);
+        b.head = 0;
+        b.tail = 0;
+        b.count = 0;
+        drop(b);
+        self.notify.notify_waiters();
+        drop(data);
+    }
+
     // Close will unblock any readers and prevent future writes.
     // Data in the buffer can still be read, returning io.EOF when fully depleted.
     pub async fn close(&self) {
@@ -318,5 +332,28 @@ impl Buffer {
         let mut b = self.buffer.lock().await;
 
         b.limit_size = limit
+    }
+}
+
+#[cfg(test)]
+mod close_discard_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_and_discard_releases_allocation_and_rejects_reads_and_writes() {
+        let buffer = Buffer::new(256, 256 * 1024);
+        buffer.write(&vec![7; 8190]).await.unwrap();
+        assert!(buffer.buffer.lock().await.data.capacity() > 0);
+        buffer.close_and_discard().await;
+        buffer.close_and_discard().await;
+        let state = buffer.buffer.lock().await;
+        assert_eq!(state.data.capacity(), 0);
+        assert_eq!(state.count, 0);
+        drop(state);
+        assert_eq!(
+            buffer.read(&mut [0u8; 8190], None).await,
+            Err(Error::ErrBufferClosed)
+        );
+        assert_eq!(buffer.write(&[1]).await, Err(Error::ErrBufferClosed));
     }
 }
