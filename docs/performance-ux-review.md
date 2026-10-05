@@ -22,6 +22,7 @@
 | R88 | 已实现并通过真实 DTLS 等待取消回归 | 单一 close owner 保留完整通知/worker/传输清理，调用方取消和对象释放不取消它；250ms 通知期限；pending 底层 close 的全局资源与真正失败恢复仍待验 |
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
+| R94 | 部分实现：入站控制队列额度 | 每peer32/global128控制或剪贴板帧，250ms超额关闭原会话，不占键鼠额度；Service转发与生命周期队列仍待有界 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
 | R91 | 已实现并通过真实 DTLS 期限回归 | 两秒从 raw accept 后开始，不含首包等待；空闲后延迟握手可完成、停滞握手超时后健康peer可接入；全局额度/慢网验收仍待完成 |
@@ -1737,3 +1738,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 同监听器并发握手、全局cleanup资源、原生恢复、千次双机切换、完整时延与8h RSS仍未验收；不能认定90分。未部署当前修复到本机。
 
 日志：udp-listener-close-baseline.log、udp-listener-close-fixed.log、udp-listener-close-workspace.log、udp-listener-close-dtls.log、udp-listener-close-clippy.log。
+
+
+## 第七十三轮：入站控制与剪贴板队列限额
+
+### R94 / P1
+
+- 源码：只有Enter/键鼠帧申请InputLease，Ping/Hello/Leave/剪贴板等decoded帧无额度直接send进local_channel。消费者慢时可累计无限控制或大文本数据。
+- 基线生产read_loop配受控Conn，有限96次Ping、暂停消费listener队列；96条全部入队，期望最多32的断言失败。日志inbound-control-budget-baseline.log；不是网络洪泛/RSS/物理延迟测量。
+- [x] 独立ControlLease跟随ListenEvent::Msg，按peer32/global128约束listener阶段；共享全局semaphore跨family/端口，for_peer建立独立peer额度。250ms申请期限，取消可立即退出；超额报告现有InputOverloaded并关闭原会话，正常控制帧不套50ms输入freshness。
+- [x] 原InputLease和global256/peer64额度保留；控制饱和不占键鼠额度。dispatcher处理/丢弃消息或队列释放后归还控制额度。
+
+### 验证与剩余链路
+
+- 生产read_loop受控96次Ping、Hello、Leave、文本clipboard矩阵：每次恰好32条入队，额度保持96/0直至排空；一次超额、一次断线，原会话关闭且健康peer表项保留，排空后额度128/32恢复。
+- budget回归：4个peer共享128额度，每peer32，饱和后另peer不能超过global；等待取消释放，无需等250ms；控制满额时仍可申请键鼠InputLease。工作区all-features root 164 / 3忽略，其他组件计数与第72轮一致；严格Clippy/fmt/diff通过。第72轮e49bed2 Rust/Nix CI检查时均in_progress；第70轮13597b2 Rust completed/success，未把被新提交取消的第71轮当作通过。
+- [ ] ControlLease在dispatcher结束时释放，ClipboardReceived/PeerHello/Enter/Leave派生消息转入Service事件链时仍未跨队列持有额度；连接churn/lifecycle通知也未全局有界。R94只部分完成，后续必须验证并补足这些链路，不能称全进程内存已受控。
+- [ ] 大clipboard128×64KiB最多约8MiB为该listener队列payload上界估算，另有正在decode的reader帧、raw/DTLS、后续Service队列与allocator；不是RSS实测。真实高频输入、原生恢复、1000双机切换、p95/p99与8h RSS未验收，不认定90分，未部署本机。
+
+日志：inbound-control-budget-baseline.log、inbound-control-budget-fixed.log、inbound-control-budget-workspace.log、inbound-control-budget-clippy.log。

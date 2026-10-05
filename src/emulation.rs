@@ -357,7 +357,7 @@ impl ListenTask {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::InputRejected { addr, reason }) => { self.event_tx.send(EmulationEvent::InputRejected { addr, reason }).expect("channel closed"); },
                     Some(ListenEvent::InputOverloaded { addr }) => { self.event_tx.send(EmulationEvent::InputOverloaded { addr }).expect("channel closed"); },
-                    Some(ListenEvent::Msg { event, addr, conn, budget }) => {
+                    Some(ListenEvent::Msg { event, addr, conn, budget, control: _control }) => {
                         if !self.listener.is_current(addr, &conn) { continue; }
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());

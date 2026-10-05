@@ -1038,3 +1038,20 @@ The dispatch task exits once the accepted-session table is empty, checked at
 packet processing and the one-second housekeeping tick. Accepted peers retain
 the socket until they close; this preserves the documented DTLS contract during
 port replacement. A listener close is not an instruction to disconnect peers.
+
+
+### Incoming control and clipboard queue admission
+
+Decoded frames outside ordinary keyboard/pointer input and Enter now retain
+an independent queue lease in ListenEvent::Msg: at most 32 per peer and 128
+shared across the LanMouseListener's peers/families/port replacements. Admission
+waits at most 250ms and is cancellation-aware; exhaustion cancels/closes only
+that session and reports the existing overload event. The lease remains held
+while the listener queue or its dispatcher owns the message. Control frames do
+not receive the 50ms input freshness deadline, and input queue permits remain
+independent. Dropping/draining queued messages restores admission capacity.
+
+This bounds the listener stage only. ClipboardReceived/PeerHello/lifecycle
+messages forwarded into the Service queue currently do not carry this lease;
+that downstream queue and connection-churn notifications remain separate work.
+High-rate real-device fairness and whole-service RSS are not established.

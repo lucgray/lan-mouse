@@ -7,7 +7,19 @@ use tokio_util::sync::CancellationToken;
 
 const GLOBAL_INPUT_LIMIT: usize = 256;
 const PEER_INPUT_LIMIT: usize = 64;
+const GLOBAL_CONTROL_LIMIT: usize = 128;
+const PEER_CONTROL_LIMIT: usize = 32;
+const CONTROL_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
+
 const MAX_INPUT_AGE: Duration = Duration::from_millis(50);
+
+/// Bounds decoded control/clipboard frames while queued in the listener.
+/// It carries no input freshness deadline; control messages are never silently
+/// discarded as stale keyboard/motion input.
+pub(crate) struct ControlLease {
+    _global: OwnedSemaphorePermit,
+    _peer: OwnedSemaphorePermit,
+}
 
 /// Admission follows the frame through both listener and proxy queues, and is
 /// released only after delivery (or rejection), not merely after forwarding.
@@ -45,6 +57,8 @@ pub(crate) struct InputBudget {
     peer: Arc<Semaphore>,
     identity: Arc<()>,
     timeout: Duration,
+    control_global: Arc<Semaphore>,
+    control_peer: Arc<Semaphore>,
 }
 
 impl Default for InputBudget {
@@ -54,6 +68,8 @@ impl Default for InputBudget {
             peer: Arc::new(Semaphore::new(PEER_INPUT_LIMIT)),
             identity: Arc::new(()),
             timeout: Duration::from_millis(250),
+            control_global: Arc::new(Semaphore::new(GLOBAL_CONTROL_LIMIT)),
+            control_peer: Arc::new(Semaphore::new(PEER_CONTROL_LIMIT)),
         }
     }
 }
@@ -61,9 +77,25 @@ impl Default for InputBudget {
 impl InputBudget {
     pub(crate) fn for_peer(&self) -> Self {
         Self {
+            control_peer: Arc::new(Semaphore::new(PEER_CONTROL_LIMIT)),
             peer: Arc::new(Semaphore::new(PEER_INPUT_LIMIT)),
             identity: Arc::new(()),
             ..self.clone()
+        }
+    }
+
+    pub(crate) async fn acquire_control(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<ControlLease> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            result = tokio::time::timeout(CONTROL_ADMISSION_TIMEOUT, async {
+                let peer = self.control_peer.clone().acquire_owned().await.ok()?;
+                let global = self.control_global.clone().acquire_owned().await.ok()?;
+                Some(ControlLease { _global: global, _peer: peer })
+            }) => result.ok().flatten(),
         }
     }
 
@@ -82,6 +114,14 @@ impl InputBudget {
     }
 
     #[cfg(test)]
+    pub(crate) fn control_available(&self) -> (usize, usize) {
+        (
+            self.control_global.available_permits(),
+            self.control_peer.available_permits(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn available(&self) -> (usize, usize) {
         (
             self.global.available_permits(),
@@ -96,6 +136,7 @@ impl InputBudget {
             peer: Arc::new(Semaphore::new(peer)),
             identity: Arc::new(()),
             timeout,
+            ..Self::default()
         }
     }
 }
@@ -103,6 +144,43 @@ impl InputBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn control_capacity_is_global_with_peer_isolation_and_cancellation() {
+        let budget = InputBudget::default();
+        let token = CancellationToken::new();
+        let first = budget.for_peer();
+        let mut held = Vec::new();
+        for _ in 0..32 {
+            held.push(first.acquire_control(&token).await.unwrap());
+        }
+        assert_eq!(first.control_peer.available_permits(), 0);
+        assert_eq!(budget.control_global.available_permits(), 96);
+        let canceled = CancellationToken::new();
+        let waiting = first.acquire_control(&canceled);
+        let cancel = async {
+            tokio::task::yield_now().await;
+            canceled.cancel();
+        };
+        let (lease, ()) = tokio::join!(waiting, cancel);
+        assert!(lease.is_none());
+        for _ in 0..3 {
+            let peer = budget.for_peer();
+            for _ in 0..32 {
+                held.push(peer.acquire_control(&token).await.unwrap());
+            }
+        }
+        assert_eq!(budget.control_global.available_permits(), 0);
+        assert!(budget.for_peer().acquire_control(&token).await.is_none());
+        // Saturating control traffic cannot take input queue capacity.
+        assert_eq!(budget.available(), (256, 64));
+        let input = budget.acquire(&token).await.unwrap();
+        drop(held);
+        assert_eq!(budget.control_global.available_permits(), 128);
+        assert_eq!(first.control_peer.available_permits(), 32);
+        let lease = first.acquire_control(&token).await.unwrap();
+        drop((lease, input));
+    }
 
     #[tokio::test]
     async fn cloned_peer_keeps_identity_and_replacement_gets_a_fresh_identity() {

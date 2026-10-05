@@ -179,6 +179,7 @@ pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
         budget: Option<crate::input_budget::InputLease>,
+        control: Option<crate::input_budget::ControlLease>,
         addr: SocketAddr,
         conn: ArcConn,
     },
@@ -856,10 +857,25 @@ async fn read_loop(
         } else {
             None
         };
+        let control = if budget.is_none() {
+            let Some(lease) = input_budget.acquire_control(&cancellation).await else {
+                if !cancellation.is_cancelled() {
+                    log::warn!(
+                        "incoming control/clipboard queue from {addr} exceeded admission deadline; closing session"
+                    );
+                    let _ = dtls_tx.send(ListenEvent::InputOverloaded { addr });
+                }
+                break;
+            };
+            Some(lease)
+        } else {
+            None
+        };
         if dtls_tx
             .send(ListenEvent::Msg {
                 event,
                 budget,
+                control,
                 addr,
                 conn: conn.clone(),
             })
@@ -1476,6 +1492,7 @@ mod tests {
     struct TestConn {
         packet: Mutex<Option<Vec<u8>>>,
         repeat_packet: bool,
+        remaining_reads: Option<AtomicUsize>,
         closed: AtomicBool,
         close_gate: Option<Arc<tokio::sync::Semaphore>>,
         send_result: Mutex<Option<webrtc_util::Result<usize>>>,
@@ -1489,6 +1506,7 @@ mod tests {
             Self {
                 packet: Mutex::new(packet),
                 repeat_packet: false,
+                remaining_reads: None,
                 closed: AtomicBool::new(false),
                 close_gate: None,
                 send_result: Mutex::new(None),
@@ -1505,6 +1523,14 @@ mod tests {
             Ok(())
         }
         async fn recv(&self, buffer: &mut [u8]) -> webrtc_util::Result<usize> {
+            if let Some(remaining) = &self.remaining_reads {
+                if remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_err()
+                {
+                    return Ok(0);
+                }
+            }
             let packet = {
                 let mut stored = self.packet.lock().unwrap();
                 if self.repeat_packet {
@@ -1759,6 +1785,7 @@ mod tests {
                 incoming
                     .send(ListenEvent::Msg {
                         budget: None,
+                        control: None,
                         addr,
                         conn,
                         event: ProtoEvent::Input(input_event::Event::Clipboard(
@@ -2748,6 +2775,7 @@ mod tests {
                 incoming
                     .send(ListenEvent::Msg {
                         budget: None,
+                        control: None,
                         addr,
                         conn: slow.clone(),
                         event: ProtoEvent::Hello {
@@ -2763,6 +2791,7 @@ mod tests {
                 incoming
                     .send(ListenEvent::Msg {
                         budget: None,
+                        control: None,
                         addr,
                         conn: slow.clone(),
                         event: ProtoEvent::Input(input_event::Event::Clipboard(
@@ -3195,6 +3224,76 @@ mod tests {
                 rx.recv().await.is_none(),
                 "invalid input was admitted or reported repeatedly"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn control_frames_cannot_accumulate_unbounded_in_listener_queue() {
+        let events = [
+            ProtoEvent::Ping,
+            ProtoEvent::Hello {
+                commit: *b"testpeer",
+            },
+            ProtoEvent::Leave(0, 0.5),
+            ProtoEvent::Input(input_event::Event::Clipboard(
+                input_event::ClipboardEvent::Text("burst".into()),
+            )),
+        ];
+        for event in events {
+            let packet = if matches!(event, ProtoEvent::Input(input_event::Event::Clipboard(_))) {
+                lan_mouse_proto::encode_clipboard_event(&event).unwrap()
+            } else {
+                let (bytes, n): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+                bytes[..n].to_vec()
+            };
+            let conn = Arc::new(TestConn {
+                repeat_packet: true,
+                remaining_reads: Some(AtomicUsize::new(96)),
+                ..TestConn::new(Some(packet))
+            });
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let healthy_addr = "127.0.0.1:3".parse().unwrap();
+            let healthy: ArcConn = Arc::new(TestConn::new(None));
+            let conns = Rc::new(RefCell::new(vec![
+                (addr, conn.clone() as ArcConn),
+                (healthy_addr, healthy.clone()),
+            ]));
+            let budget = crate::input_budget::InputBudget::default();
+            let (tx, mut rx) = channel();
+            read_loop(
+                conns.clone(),
+                addr,
+                conn.clone(),
+                tx,
+                CancellationToken::new(),
+                budget.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                budget.control_available(),
+                (96, 0),
+                "queued frames must retain their permits"
+            );
+            let mut messages = 0;
+            let mut overloaded = 0;
+            let mut disconnected = 0;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    ListenEvent::Msg {
+                        control: Some(_lease),
+                        ..
+                    } => messages += 1,
+                    ListenEvent::InputOverloaded { .. } => overloaded += 1,
+                    ListenEvent::Disconnected { .. } => disconnected += 1,
+                    _ => panic!("unexpected listener event"),
+                }
+            }
+            assert_eq!((messages, overloaded, disconnected), (32, 1, 1));
+            assert_eq!(budget.control_available(), (128, 32));
+            assert!(conn.closed.load(Ordering::SeqCst));
+            assert!(is_current(&conns.borrow(), healthy_addr, &healthy));
+            assert_eq!(conns.borrow().len(), 1);
         }
     }
 
