@@ -1,6 +1,6 @@
 # Lan Mouse 性能与体验审查清单
 
-初次审查日期：2026-10-03；修复状态更新：2026-10-05。初次审查对象：`work/src-latest`，当时 HEAD `1185ee3`，工作树干净；与运行中的 fork.7 相比，源码额外包含 Windows 返回光标修复。本文不表示该修复已经部署。
+初次审查日期：2026-10-03；修复状态更新：2026-10-06。初次审查对象：`work/src-latest`，当时 HEAD `1185ee3`，工作树干净；与运行中的 fork.7 相比，源码额外包含 Windows 返回光标修复。本文不表示该修复已经部署。
 
 ## 当前修复状态（fix/input-reliability-review）
 
@@ -23,11 +23,11 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
-| R100 | emulation路径已实现并通过队列/实际worker/Service回归 | 显式retry共享1名额跨dispatcher/proxy/active attempt/Enabled/Disabled/Failed反馈；初始化一次批次有限；capture与其他lifecycle仍待审 |
+| R100 | emulation及capture显式重试已实现并通过回归 | 每实例共享1名额覆盖请求/active attempt/终态反馈；capture还覆盖慢清理进度；其他lifecycle/物理恢复仍待验 |
 | R98 | 已实现并通过两层洪泛/实际worker回归 | 反转与灵敏度合并为最新快照，每hop最多1个pending marker；输入帧顺序保留，中间设置不重播；全进程RSS未证明 |
 | R99 | 已实现并通过挂起/失败初始化回归 | 初始化等待不丢配置，失败保留目标值，成功后输入前应用最新设置；真实平台启动仍待验 |
 | R97 | 已实现并通过实际dispatcher/虚拟时间回归 | 可复用timer按最近peer的1s截止点唤醒、活动刷新/独立peer重设/无peer停用扫描；原生释放时延仍未验收 |
-| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation retry跨终态反馈1名额；capture/Release/其他lifecycle仍待审 |
+| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation/capture retry跨终态反馈各1名额；Release/其他lifecycle仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
@@ -1975,3 +1975,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 真实双机1000次往返、原生故障释放/恢复、完整p95/p99与8h RSS尚缺验收，不认定90分。未部署已安装服务。
 
 日志：reenable-budget-baseline.log、reenable-budget-fixed.log、reenable-budget-workspace.log、reenable-budget-clippy.log、reenable-budget-isolated-service.log。
+
+
+## 第八十五轮：捕获端显式重试、慢清理和反馈共用生命周期
+
+### R100 / P1、R96 后续
+
+- 基线：调用生产Capture::reenable API，暂停消费者，1万调用留下1万条请求，期望1条断言失败（capture-retry-baseline.log）。run在故障后按队列逐次重启，重复点击会留下过时的恢复尝试；这不是物理GUI/原生后端压力测量。
+- [x] 每Capture实例producer仅持Weak；Reenable请求、task初始化/活动backend、释放/terminate及Enabled/Disabled/Failed/CleanupPending反馈共享一份CaptureRetryLease。重复调用合并，最后owner处理/drop后恢复新显式retry；初始启动有限批次无marker，活动backend仍忽略reenable。
+- [x] 原native释放/退出future保持所有权，250ms单次进度通知不取消cleanup或允许替代backend。Failed report包含初始化错误；终态等待消费时仍保留retry名额，不把请求积压转移到反馈队列。仅内部事件字段改变，无协议序列化变动。
+
+### 验证与未完成项
+
+- 1万调用只一条请求；dequeue持有仍不能再排，最后drop可重新提交。实际Dummy do_capture验证Enabled消费后活动backend仍持名额；退出后queued/held Disabled阻止新retry，最后drop恢复；实际失败报告helper同样覆盖持有/回收。
+- 原release+terminate挂起测试补充共享retry：跨两阶段保留清理owner、单次进度及三层错误原因，cleanup结束后held进度反馈仍保留名额，最后drop回收。隔离Dummy Service回归1条通过，四类状态/错误反馈处理正确，最后owner释放。
+- 工作区all-features root194通过/3忽略；capture58通过/1忽略、emulation40、event5、CLI3、GTK14/4忽略、IPC4、proto11全部通过；严格Clippy通过。单独沙箱capture测试13通过、真实DTLS一条因本地网络权限失败；获准的完整回归中该测试通过。日志保留真实结果，不把权限失败称代码回归。
+- 前一提交23c8579 Rust37437135796检查时仍in_progress：Windows build/check/clippy/test全成功，Intel macOS部分仍运行；新HEAD仍需CI。未部署已安装服务。
+- [ ] Release、其他捕获配置/生命周期、独立native cleanup任务及失败metadata的总量仍需审计。千次真实双机往返、原生故障释放/恢复、完整p95/p99和8h RSS尚无验收，不认定90分。
+
+日志：capture-retry-baseline.log、capture-retry-sandbox.log、capture-retry-workspace.log、capture-retry-clippy.log、capture-retry-isolated-service.log。

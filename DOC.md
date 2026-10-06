@@ -1144,6 +1144,20 @@ can be submitted. There is no new automatic retry loop.
 The weak producer registry does not keep attempts alive itself. Initial startup
 has one finite status batch without a retry owner; subsequent explicit retry
 cycles retain ownership instead of transferring backlog to status queues.
-Cleanup refusal still prevents constructing a replacement backend. Capture retry,
-release requests, other feedback and detached native cleanup require separate
+Cleanup refusal still prevents constructing a replacement backend. Release
+requests, other feedback and detached native cleanup require separate
 resource/physical recovery validation; this is not a total process RSS bound.
+
+
+### Explicit capture retry ownership
+
+Repeated Capture::reenable calls coalesce into one outstanding explicit retry
+per Capture instance. A weak source registry tracks the shared CaptureRetryLease
+through the queued request, backend initialization/active session, native cleanup,
+and Enabled/Disabled/Failed/CleanupPending feedback until Service handles or drops
+it. Holding a dequeued status still retains the attempt; a new explicit retry is
+accepted after its final owner drops. Initial startup has one finite status batch
+without this marker. Re-enable while active remains a no-op; no automatic retry
+is introduced. The existing release/termination future stays owned while pending,
+including after the single 250 ms progress notice. Coalescing does not timeout or
+cancel native cleanup, nor prove bounded Release/configuration work or total RSS.

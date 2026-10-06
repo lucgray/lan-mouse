@@ -723,23 +723,23 @@ impl Service {
                     self.emulation.send_leave_event(incoming.addr, t);
                 }
             }
-            ICaptureEvent::CaptureCleanupPending(reason) => {
+            ICaptureEvent::CaptureCleanupPending(reason, _retry) => {
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Input capture cleanup is still pending: {reason}. Waiting for backend cleanup before capture can be re-enabled."
                 )));
             }
-            ICaptureEvent::CaptureFailed(error) => {
+            ICaptureEvent::CaptureFailed(error, _retry) => {
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Input capture stopped: {error}"
                 )));
             }
-            ICaptureEvent::CaptureDisabled => {
+            ICaptureEvent::CaptureDisabled(_retry) => {
                 self.capture_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
-            ICaptureEvent::CaptureEnabled => {
+            ICaptureEvent::CaptureEnabled(_retry) => {
                 self.capture_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
             }
@@ -1702,19 +1702,25 @@ mod tests {
         .unwrap();
         tokio::task::LocalSet::new().run_until(async move {
             let mut service = Service::new(config).await.unwrap();
-            service.handle_capture_event(ICaptureEvent::CaptureEnabled);
+            let retry = std::rc::Rc::new(crate::capture::CaptureRetryLease);
+            let pending = std::rc::Rc::downgrade(&retry);
+            service.handle_capture_event(ICaptureEvent::CaptureEnabled(Some(retry.clone())));
             service.pending_frontend_events.clear();
-            service.handle_capture_event(ICaptureEvent::CaptureCleanupPending("activation stream closed unexpectedly".into()));
+            service.handle_capture_event(ICaptureEvent::CaptureCleanupPending("activation stream closed unexpectedly".into(), Some(retry.clone())));
             assert!(matches!(service.capture_status, Status::Disabled));
             assert_eq!(service.pending_frontend_events.len(), 2);
             assert!(matches!(&service.pending_frontend_events[0], FrontendEvent::CaptureStatus(Status::Disabled)));
             assert!(matches!(&service.pending_frontend_events[1], FrontendEvent::Error(message) if
                 message.contains("cleanup is still pending") && message.contains("activation stream")));
             service.pending_frontend_events.clear();
-            service.handle_capture_event(ICaptureEvent::CaptureFailed("activation stream closed unexpectedly; backend termination also failed: cleanup failed".into()));
+            service.handle_capture_event(ICaptureEvent::CaptureFailed("activation stream closed unexpectedly; backend termination also failed: cleanup failed".into(), Some(retry.clone())));
             assert_eq!(service.pending_frontend_events.len(), 1);
             assert!(matches!(&service.pending_frontend_events[0], FrontendEvent::Error(message) if
                 message.contains("Input capture stopped") && message.contains("cleanup failed")));
+            service.pending_frontend_events.clear();
+            service.handle_capture_event(ICaptureEvent::CaptureDisabled(Some(retry)));
+            assert!(matches!(service.capture_status, Status::Disabled));
+            assert!(pending.upgrade().is_none(), "Service releases the final retry owner after handling status");
             service.capture.terminate().await;
             service.emulation.terminate().await;
             service.conn_sender.terminate().await;
