@@ -1161,3 +1161,21 @@ without this marker. Re-enable while active remains a no-op; no automatic retry
 is introduced. The existing release/termination future stays owned while pending,
 including after the single 250 ms progress notice. Coalescing does not timeout or
 cancel native cleanup, nor prove bounded Release/configuration work or total RSS.
+
+
+### Consecutive explicit capture releases
+
+Consecutive Capture::release calls share one pending request until that request
+is discarded while disabled or its native restoration and peer cleanup complete.
+The producer stores only a Weak reference. Other submitted capture commands
+(create/destroy, accepted re-enable and all settings updates) start a new release
+group, preserving their FIFO boundaries: Release/Create/Release remains three
+ordered operations. A held/dequeued release keeps its group's admission occupied.
+The session loop cannot process a new capture while its release await is active.
+
+ClientLeft hook feedback does not retain this admission after release completes:
+a delayed hook report must not suppress a release for a later capture. This
+coalescing bounds repeated releases within a group, not alternating lifecycle
+commands, all feedback, detached cleanup work or total process memory. No native
+release timeout or new cancellation behavior is introduced, and wire formats are
+unchanged. Real platform restoration and release latency still need validation.

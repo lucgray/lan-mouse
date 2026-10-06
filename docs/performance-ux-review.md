@@ -23,11 +23,12 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R101 | 连续显式释放合并及FIFO边界已实现 | 每连续group最多1份pending/处理中Release，覆盖native/对端cleanup；中间控制变更新group保留顺序；交替变更与生命周期总量未闭合 |
 | R100 | emulation及capture显式重试已实现并通过回归 | 每实例共享1名额覆盖请求/active attempt/终态反馈；capture还覆盖慢清理进度；其他lifecycle/物理恢复仍待验 |
 | R98 | 已实现并通过两层洪泛/实际worker回归 | 反转与灵敏度合并为最新快照，每hop最多1个pending marker；输入帧顺序保留，中间设置不重播；全进程RSS未证明 |
 | R99 | 已实现并通过挂起/失败初始化回归 | 初始化等待不丢配置，失败保留目标值，成功后输入前应用最新设置；真实平台启动仍待验 |
 | R97 | 已实现并通过实际dispatcher/虚拟时间回归 | 可复用timer按最近peer的1s截止点唤醒、活动刷新/独立peer重设/无peer停用扫描；原生释放时延仍未验收 |
-| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation/capture retry跨终态反馈各1名额；Release/其他lifecycle仍待审 |
+| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation/capture retry跨终态反馈各1名额；连续Release每group1份；交替请求/其他lifecycle仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
@@ -1994,3 +1995,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] Release、其他捕获配置/生命周期、独立native cleanup任务及失败metadata的总量仍需审计。千次真实双机往返、原生故障释放/恢复、完整p95/p99和8h RSS尚无验收，不认定90分。
 
 日志：capture-retry-baseline.log、capture-retry-sandbox.log、capture-retry-workspace.log、capture-retry-clippy.log、capture-retry-isolated-service.log。
+
+
+## 第八十六轮：连续释放请求合并并保留控制顺序
+
+### R101 / P2、R96 后续
+
+- 基线：生产Capture::release API暂停消费者，1万次调用留下1万条Release，期望1条断言失败（capture-release-baseline.log）。这些请求仍按处理时的当前捕获释放；未证明本机症状由这一条路径单独造成。
+- [x] 每连续释放group只保留一份CaptureReleaseLease，producer仅Weak；queued/dequeued/实际release_requested持有到native恢复与peer cleanup返回，重复调用合并。disabled worker丢弃无效Release后归还；未增加native超时或取消。
+- [x] Create、Destroy、实际提交Reenable及五类设置请求均分隔group，Release/变更/Release保留三个FIFO位置。不把变更后释放合到旧group；这一选择意味着交替配置/生命周期请求仍未全局有界。
+- [x] ClientLeft hook反馈不持该名额：release结束后新显式释放可提交，即使旧hook通知未消费；避免迟到反馈压住后来会话的释放。原hook消息/peer cleanup语义保留，未更改wire序列化。
+
+### 验证与剩余验收
+
+- 同一基线修复后1万次只1条；held/dequeued请求保留名额，最后drop恢复。八类控制API边界逐一验证两份独立release及中间请求位置、第二次重复release合并。
+- 实际Dummy release_requested+挂起peer send验证清理等待持owner；此时1万次API调用均合并；取消等待按现有流程完成后名额释放，新请求可在旧ClientLeft尚排队时提交。不是物理native挂起/恢复测量。
+- 工作区all-features root196通过/3忽略，其他组件全部通过；严格Clippy/fmt/diff通过；隔离Dummy Service外部重载/授权/旧返回通知回归1条通过。未部署已安装服务。
+- 上一轮10bb9dc Rust37438126025 in_progress、Nix37438126132 queued；再前23c8579 Rust/Nix37437135796/37437135965已cancelled，不能把曾经部分jobs成功写成完整CI成功。本轮HEAD仍需CI。
+- [ ] 交替设置与Release、Create/Destroy等生命周期总量、hook/backend反馈、独立native cleanup及失败metadata仍待审计。真实双机1000次往返、原生释放恢复、完整p95/p99和8h RSS未验收，不认定90分。
+
+日志：capture-release-baseline.log、capture-release-fixed.log、capture-release-workspace.log、capture-release-clippy.log、capture-release-isolated-service.log。
