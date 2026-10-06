@@ -1250,3 +1250,21 @@ idle wake. Physical pressed-key tracking remains incremental across batches.
 The losing next() future can be canceled by a ready control branch without losing
 later valid input. This is a routing work-count limit, not a wall-clock/native
 poll latency guarantee; a synchronous backend poll can still block independently.
+
+
+### Libei capture task completion
+
+Libei stores capture-task completion state separately from is_finished. Stream
+polling and termination consume the task result once, including an already-finished
+task that has not yet been joined. Native CaptureError results remain unchanged;
+Tokio panic/cancellation JoinError becomes an I/O CaptureError with task context
+instead of causing a second panic in the capture handler. Repeated stream polls
+are fused after completion, and termination after consumed completion succeeds
+without polling the completed JoinHandle again.
+
+Canceling a join wait leaves the original handle owned and its result unconsumed,
+so later cleanup can await that same task. This adds no automatic retry or native
+cleanup timeout. It preserves reporting and existing owned cleanup opportunities;
+it does not prove portal/EIS resources or the physical pointer were restored after
+a task fault. Real compositor suspend/restart and portal failure recovery need
+platform validation.

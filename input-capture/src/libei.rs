@@ -84,12 +84,51 @@ enum LibeiNotifyEvent {
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
     input_capture: Pin<Box<InputCapture>>,
-    capture_task: JoinHandle<Result<(), CaptureError>>,
+    capture_task: CaptureTaskCompletion,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     cancellation_token: CancellationToken,
     terminated: bool,
+}
+
+struct CaptureTaskCompletion {
+    handle: JoinHandle<Result<(), CaptureError>>,
+    joined: bool,
+}
+
+impl CaptureTaskCompletion {
+    fn result(
+        result: Result<Result<(), CaptureError>, tokio::task::JoinError>,
+    ) -> Result<(), CaptureError> {
+        result.unwrap_or_else(|error| {
+            Err(io::Error::other(format!("libei capture task failed: {error}")).into())
+        })
+    }
+
+    fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<(), CaptureError>>> {
+        if self.joined {
+            return Poll::Ready(None);
+        }
+        match self.handle.poll_unpin(cx) {
+            Poll::Ready(result) => {
+                self.joined = true;
+                Poll::Ready(Some(Self::result(result)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    async fn join(&mut self) -> Result<(), CaptureError> {
+        if self.joined {
+            return Ok(());
+        }
+        // is_finished does not mean the result was consumed. Await even an
+        // already-finished handle, and mark it joined only after completion.
+        let result = (&mut self.handle).await;
+        self.joined = true;
+        Self::result(result)
+    }
 }
 
 /// returns (start pos, end pos), inclusive
@@ -359,7 +398,10 @@ impl LibeiInputCapture {
         let producer = Self {
             input_capture,
             event_rx,
-            capture_task,
+            capture_task: CaptureTaskCompletion {
+                handle: capture_task,
+                joined: false,
+            },
             notify_capture,
             notify_release,
             cancellation_token,
@@ -792,13 +834,8 @@ impl LanMouseInputCapture for LibeiInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancellation_token.cancel();
-        let task = &mut self.capture_task;
         log::debug!("waiting for capture to terminate...");
-        let res = if !task.is_finished() {
-            task.await.expect("libei task panic")
-        } else {
-            Ok(())
-        };
+        let res = self.capture_task.join().await;
         self.terminated = true;
         log::debug!("done!");
         res
@@ -822,12 +859,101 @@ impl Stream for LibeiInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match self.capture_task.poll_unpin(cx) {
-            Poll::Ready(r) => match r.expect("failed to join") {
-                Ok(()) => Poll::Ready(None),
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
+        match self.capture_task.poll_result(cx) {
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(Some(Ok(())) | None) => Poll::Ready(None),
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::future::poll_fn;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finished_capture_task_failure_is_not_silently_successful() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let handle =
+                    tokio::task::spawn_local(async { Err(CaptureError::ActivationClosed) });
+                tokio::task::yield_now().await;
+                assert!(handle.is_finished());
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                assert!(matches!(
+                    completion.join().await,
+                    Err(CaptureError::ActivationClosed)
+                ));
+                assert!(completion.join().await.is_ok());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_capture_task_reports_error_without_panicking() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let handle =
+                    tokio::task::spawn_local(std::future::pending::<Result<(), CaptureError>>());
+                handle.abort();
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                let result = poll_fn(|cx| completion.poll_result(cx)).await.unwrap();
+                assert!(result.unwrap_err().to_string().contains("cancel"));
+                assert!(poll_fn(|cx| completion.poll_result(cx)).await.is_none());
+                assert!(completion.join().await.is_ok());
+            })
+            .await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_task_panic_is_returned_once_as_cleanup_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let handle: JoinHandle<Result<(), CaptureError>> =
+                    tokio::task::spawn_local(async { panic!("simulated EIS panic") });
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                let error = completion.join().await.unwrap_err().to_string();
+                assert!(
+                    error.contains("libei capture task failed")
+                        && error.contains("simulated EIS panic")
+                );
+                assert!(completion.join().await.is_ok());
+                assert!(poll_fn(|cx| completion.poll_result(cx)).await.is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_join_wait_preserves_task_and_later_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (send, wait) = tokio::sync::oneshot::channel();
+                let handle = tokio::task::spawn_local(async {
+                    wait.await.unwrap();
+                    Err(CaptureError::ActivationClosed)
+                });
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                assert!(completion.join().now_or_never().is_none());
+                assert!(!completion.joined);
+                send.send(()).unwrap();
+                assert!(matches!(
+                    completion.join().await,
+                    Err(CaptureError::ActivationClosed)
+                ));
+                assert!(poll_fn(|cx| completion.poll_result(cx)).await.is_none());
+            })
+            .await;
     }
 }

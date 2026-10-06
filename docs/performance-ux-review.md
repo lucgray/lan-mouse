@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R106 | libei任务完成/错误读取已实现 | panic/cancel JoinError转CaptureError，已结束未join结果不丢，消费后fused；取消等待保留原handle；真实portal恢复未验收 |
 | R105 | 不可路由突发的轮询让出已实现 | 每poll最多跳过32条后自唤醒/Pending，控制ready可先运行，按键跟踪及后续有效事件保留；native阻塞/完整时延未实测 |
 | R104 | 删除后的缓存/迟到事件保护已实现 | 删除仅清该句柄fanout，全部logical路由在native await前退役；迟到未知句柄不panic/不改当前capture；真实native时序待验 |
 | R103 | 捕获设置按连续group合并已实现 | 五类设置最新字段共1份pending快照；控制边界分group；dequeue/take后清理等待中新编辑有新通知；交替生命周期及总RSS未闭合 |
@@ -2098,3 +2099,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 底层native同步阻塞、交替生命周期资源总量、独立cleanup/失败metadata仍待审。真实双机1000次往返、原生热更新/释放恢复、完整p95/p99与8h RSS未验收；第90轮不等于已达到90分。
 
 日志：capture-poll-fairness-baseline.log、capture-poll-fairness-fixed.log、capture-poll-control.log、capture-poll-fairness-workspace.log、capture-poll-fairness-clippy.log、capture-poll-fairness-isolated-service.log。
+
+
+## 第九十一轮：libei子任务JoinError、完成结果与终止
+
+### R106 / P1
+
+- 底层审查发现libei stream对JoinError使用expect("failed to join")，terminate等待使用expect("libei task panic")；terminate对is_finished任务直接Ok，实际未区分结果尚未读取与已经消费。子任务取消/崩溃可引发父层再次panic，已结束的native失败也可能被当成功。
+- 将原完成语义提取到生产CaptureTaskCompletion后，两个实际LocalSet任务基线失败：已finished的ActivationClosed返回Ok；abort子任务在poll_result触发JoinError::Cancelled的expect panic（libei-completion-baseline.log，实际2条测试）。不需要真实portal来复现这些任务管理路径。
+- [x] 明确joined状态；poll/terminate对尚未消费结果读取一次，即使is_finished。原CaptureError保持variant，JoinError转换带libei上下文的Io CaptureError，供既有错误反馈/owned cleanup接收。
+- [x] 消费后stream fused None，terminate不再重复poll完成JoinHandle；join等待取消时joined仍false、原handle仍持有，后续等待读取原结果。未新建替代任务、自动重试或native超时。
+
+### 验证与剩余native范围
+
+- 两条失败基线通过。补充真实Tokio child panic通过join转换一次错误、随后join/poll无二次panic；取消一次join等待后放行原task，ActivationClosed仍返回，之后fused。模拟child panic打印panic hook日志属于测试注入，4条测试均成功；它不表示新版本仍在父层panic。
+- 工作区all-features root201通过/3忽略、input-capture67通过/1忽略，其他组件全部通过；严格Clippy/fmt/diff通过；隔离Dummy Service捕获进度/最终错误/owner释放回归1条通过。tests只模型task lifecycle，没有实例化真实ashpd portal/EIS session。未部署本机程序。
+- 开始检查时e2d6451 Rust37443767520/Nix37443767350 pending。随后追踪旧48de28f Rust37442258263 completed/cancelled，只有Intel macOS test cancelled；Windows build/check/clippy/test全success，其他已结束jobs success。不能把该run或当前HEAD写成完整native矩阵成功。
+- [ ] layer-shell内部读/dispatch及libei更新/设备事件路径仍需审；交替生命周期、独立native cleanup资源/失败metadata及真实portal fault恢复未闭合。真实双机千次往返、原生释放/恢复、完整p95/p99和8h RSS仍未验收，不认定90分。
+
+日志：libei-completion-baseline.log、libei-completion-fixed.log、libei-completion-workspace.log、libei-completion-clippy.log、libei-completion-isolated-service.log。
