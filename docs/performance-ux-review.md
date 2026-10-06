@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R111 | libei fallback屏障几何匹配已实现 | 有限线段/f64平方距离，保留小数及端点精度；退化点/空集合/非法坐标处理；原生多屏与缺失metadata待验 |
 | R110 | libei更新突发协作让出已实现 | 每32条更新yield，包含首条；ready控制及同线程取消先于256条排空，原计时/快照保留；native时延未实测 |
 | R109 | libei更新源关闭处理已实现 | zones/notify EOF在窗口前/中报告错误并结束等待；主动退出优先，活动会话仍清理；原生断连恢复未验收 |
 | R108 | libei分支错误及联合等待退出已实现 | EIS错误不转成功；activation及初始化错误取消对应等待分支；主动退出优先，仍等待分支和原清理；真实portal故障待验 |
@@ -2201,3 +2202,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 真实native内部读/dispatch、生命周期资源总量和故障恢复仍需审。千次双机往返、完整pipeline p95≤20ms/p99≤50ms及8h RSS验收缺少证据，不认定90分。
 
 日志：libei-update-fairness-baseline.log、libei-update-fairness-fixed.log、libei-update-fairness-workspace.log、libei-update-fairness-clippy.log。
+
+
+## 第九十六轮：libei未知屏障ID的几何fallback
+
+### R111 / P1
+
+- find_corresponding_client使用到无限直线的距离，再as i32比较。跨屏共线延长线可胜过真实邻近边缘；0.75与0.25距离都截成0；退化零长度线段产生NaN后cast成0；i32端点转f32可合并相邻坐标。空屏障expect触发panic，NaN cursor没有拒绝。
+- 将原selector返回形式提取为Result但保持原计算/expect，六条基线测试全部失败：有限端点、亚像素距离、退化线段、大整数端点精度、空集合panic及NaN cursor。只是受控几何fixture，不是真实KDE/Hyprland双机故障复现。
+- [x] 换为有限线段投影，比例clamp到0..1；零长度线段视为点。f64精确保留i32端点，计算平方距离直接比较，不需powf/sqrt或整数截断，也不产生每barrier分配。
+- [x] 空集合/非finite cursor转Io CaptureError，两个fallback调用用?返回到已有owned会话结束/清理。有效explicit ID仍直接查map；完全相同距离保留first barrier顺序。
+
+### 验证与剩余调用层
+
+- 六条失败回归全部通过；补充corner精确平局及逆序端点、端点外投影、点距离与f32极值/i32极值下f64结果finite。fixed非法坐标覆盖NaN、正/负Infinity。
+- libei模块29条通过；工作区all-features root201通过/3忽略、input-capture92通过/1忽略及其他组件通过；严格Clippy/fmt/diff通过。没有真实portal/EIS、多屏cursor自动化或本机部署；删除昂贵计算不等于完整pipeline性能已量化。
+- bbfc29f Rust37448385917 queued、Nix37448385916 in_progress；52703a0两workflow cancelled。本轮HEAD仍需CI。
+- [ ] activation/release缺失cursor metadata仍有expect，portal拒绝的barrier集合及layer-shell错误路径仍需审。真实原生恢复、千次双机往返、完整p95≤20ms/p99≤50ms与8h RSS验收仍缺证据，不认定90分。
+
+日志：libei-barrier-geometry-baseline.log、libei-barrier-geometry-fixed.log、libei-barrier-geometry-workspace.log、libei-barrier-geometry-clippy.log。

@@ -673,7 +673,7 @@ async fn do_capture_session(
                     let barrier_id = match activated.barrier_id() {
                         Some(ActivatedBarrier::Barrier(id)) => id,
                         // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor")),
+                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"))?,
                     };
 
                     // find client corresponding to barrier
@@ -681,7 +681,7 @@ async fn do_capture_session(
                         Some(id) => *id,
                         None => {
                             log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                            let id = find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"));
+                            let id = find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"))?;
                             let pos = *pos_for_barrier_id.get(&id).expect("invalid barrier id");
                             pos
                         },
@@ -773,32 +773,40 @@ async fn release_capture(
     Ok(())
 }
 
-fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> BarrierID {
+fn find_corresponding_client(
+    barriers: &[ICBarrier],
+    pos: (f32, f32),
+) -> Result<BarrierID, CaptureError> {
+    if !pos.0.is_finite() || !pos.1.is_finite() {
+        return Err(io::Error::other("libei activation has nonfinite cursor coordinates").into());
+    }
     barriers
         .iter()
-        .copied()
-        .min_by_key(|b| {
-            let (x1, y1, x2, y2) = b.position;
-            let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
-            distance_to_line(((x1, y1), (x2, y2)), pos) as i32
+        .map(|barrier| {
+            (
+                barrier.barrier_id,
+                distance_to_segment_squared(barrier.position, pos),
+            )
         })
-        .expect("could not find barrier corresponding to client")
-        .barrier_id
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(id, _)| id)
+        .ok_or_else(|| io::Error::other("libei activation has no matching barrier geometry").into())
 }
 
-fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
-    let ((x1, y1), (x2, y2)) = line;
-    let (x0, y0) = p;
-    /*
-     * we use the fact that for the triangle spanned by the line and p,
-     * the height of the triangle is the desired distance and can be calculated by
-     * h = 2A / b with b being the line_length and
-     */
-    let double_triangle_area = ((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1).abs();
-    let line_length = ((y2 - y1).powf(2.0) + (x2 - x1).powf(2.0)).sqrt();
-    let distance = double_triangle_area / line_length;
-    log::debug!("distance to line({line:?}, {p:?}) = {distance}");
-    distance
+fn distance_to_segment_squared(segment: (i32, i32, i32, i32), pos: (f32, f32)) -> f64 {
+    // Preserve integer endpoint precision and avoid f32 overflow for finite cursors.
+    let (x1, y1, x2, y2) = segment;
+    let (x1, y1, x2, y2) = (f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2));
+    let (x, y) = (f64::from(pos.0), f64::from(pos.1));
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let length_squared = dx * dx + dy * dy;
+    let projection = if length_squared == 0. {
+        0.
+    } else {
+        (((x - x1) * dx + (y - y1) * dy) / length_squared).clamp(0., 1.)
+    };
+    let (offset_x, offset_y) = (x - (x1 + projection * dx), y - (y1 + projection * dy));
+    offset_x * offset_x + offset_y * offset_y
 }
 
 async fn handle_ei_event(
@@ -922,6 +930,96 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+
+    fn barrier(id: u32, position: (i32, i32, i32, i32)) -> ICBarrier {
+        ICBarrier::new(NonZeroU32::new(id).unwrap(), position)
+    }
+
+    #[test]
+    fn nearest_barrier_respects_segment_endpoints() {
+        let barriers = [
+            barrier(1, (0, 0, 0, 100)),
+            barrier(2, (-100, 500, 100, 500)),
+        ];
+        assert_eq!(
+            find_corresponding_client(&barriers, (0., 500.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_preserves_fractional_distance() {
+        let barriers = [barrier(1, (0, 0, 0, 100)), barrier(2, (1, 0, 1, 100))];
+        assert_eq!(
+            find_corresponding_client(&barriers, (0.75, 50.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_handles_point_segments() {
+        let barriers = [barrier(1, (0, 0, 0, 0)), barrier(2, (100, 0, 100, 100))];
+        assert_eq!(
+            find_corresponding_client(&barriers, (100., 50.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_preserves_integer_endpoint_precision() {
+        let barriers = [
+            barrier(1, (16_777_217, 0, 16_777_217, 100)),
+            barrier(2, (16_777_216, 0, 16_777_216, 100)),
+        ];
+        assert_eq!(
+            find_corresponding_client(&barriers, (16_777_216., 50.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_reports_empty_geometry() {
+        assert!(find_corresponding_client(&[], (0., 0.)).is_err());
+    }
+
+    #[test]
+    fn nearest_barrier_rejects_nonfinite_cursor_coordinates() {
+        let barriers = [barrier(1, (0, 0, 0, 100))];
+        for pos in [(f32::NAN, 0.), (0., f32::INFINITY), (f32::NEG_INFINITY, 0.)] {
+            assert!(find_corresponding_client(&barriers, pos).is_err());
+        }
+    }
+
+    #[test]
+    fn nearest_barrier_keeps_first_exact_tie() {
+        let barriers = [barrier(5, (0, 0, 0, 100)), barrier(6, (0, 0, 100, 0))];
+        assert_eq!(
+            find_corresponding_client(&barriers, (0., 0.))
+                .unwrap()
+                .get(),
+            5
+        );
+    }
+
+    #[test]
+    fn barrier_distance_handles_reversed_endpoints_and_large_finite_coordinates() {
+        assert_eq!(distance_to_segment_squared((0, 100, 0, 0), (1., 50.)), 1.);
+        assert_eq!(distance_to_segment_squared((0, 0, 0, 100), (1., 101.)), 2.);
+        assert_eq!(distance_to_segment_squared((2, 3, 2, 3), (5., 7.)), 25.);
+        let distance = distance_to_segment_squared(
+            (i32::MIN, i32::MAX, i32::MAX, i32::MIN),
+            (f32::MAX, f32::MIN),
+        );
+        assert!(distance.is_finite() && distance > 0.);
+    }
 
     struct ReadyZoneBurst {
         remaining: usize,

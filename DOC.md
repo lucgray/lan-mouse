@@ -1323,3 +1323,19 @@ debounce deadline are checked again after continuation; yielding does not reset
 that timer or discard the desired client snapshot. No extra per-event timer or
 allocation is added. This is a work-count limit, not a native polling or physical
 input-latency guarantee.
+
+
+### Libei activation geometry fallback
+
+When an activation lacks a usable barrier ID, the fallback selects the nearest
+finite barrier segment. Distance projection is clamped to the segment endpoints,
+so another monitor's collinear edge is not treated as an infinite matching line.
+Squared distances use f64 and preserve fractional comparisons and integer barrier
+endpoint precision. A zero-length segment is treated as a point; exact distance
+ties retain the first configured barrier. Valid explicit barrier IDs still use
+the existing direct lookup.
+
+Empty fallback geometry or nonfinite cursor coordinates return a capture error
+through the existing session cleanup path. This does not validate missing cursor
+metadata at other activation/release call sites or change native barrier setup.
+Actual compositor and multi-monitor activation behavior needs platform testing.
