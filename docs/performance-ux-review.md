@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
 | R111 | libei fallback屏障几何匹配已实现 | 有限线段/f64平方距离，保留小数及端点精度；退化点/空集合/非法坐标处理；原生多屏与缺失metadata待验 |
 | R110 | libei更新突发协作让出已实现 | 每32条更新yield，包含首条；ready控制及同线程取消先于256条排空，原计时/快照保留；native时延未实测 |
 | R109 | libei更新源关闭处理已实现 | zones/notify EOF在窗口前/中报告错误并结束等待；主动退出优先，活动会话仍清理；原生断连恢复未验收 |
@@ -2221,3 +2222,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] activation/release缺失cursor metadata仍有expect，portal拒绝的barrier集合及layer-shell错误路径仍需审。真实原生恢复、千次双机往返、完整p95≤20ms/p99≤50ms与8h RSS验收仍缺证据，不认定90分。
 
 日志：libei-barrier-geometry-baseline.log、libei-barrier-geometry-fixed.log、libei-barrier-geometry-workspace.log、libei-barrier-geometry-clippy.log。
+
+
+## 第九十七轮：portal failed_barriers被忽略
+
+### R112 / P1
+
+- 本地锁定ashpd0.13.9的SetPointerBarriersResponse::failed_barriers提供失败ID列表；update_barriers原实现仅debug打印response，返回全部请求barriers/id_map。fallback几何及direct lookup仍包含已拒绝ID；全部失败也继续enable，UI可显示capture成功但无可用边缘。
+- accepted_barriers提取原响应处理（原样返回）后两条基线失败：明确已拒绝的最近边缘仍被selector选中；全部拒绝没有错误。fixture使用生产selector/路由及受控failed-ID切片，不是实际D-Bus响应。
+- [x] response.failed_barriers作为过滤输入，HashSet去重后同步retain几何和路由；只在非空failed列表构造集合，不增加逐输入帧成本。部分成功保留可用屏障顺序，并记录警告与剩余数量。
+- [x] 全部拒绝或空请求集合返回带请求数量的Io CaptureError；update_barriers使用CaptureError，普通ashpd错误保持From转换。失败位于enable前，沿既有session sibling completion及disable/close处理，不静默重建。
+
+### 验证与剩余native/体验范围
+
+- 两条失败回归修复后通过，确认失败ID退出fallback与map；全拒绝/空请求错误。另两条验证部分拒绝保持Vec顺序及两个route、重复/未知失败ID不伤及可用边缘、全成功保留原成员/路由。
+- libei模块33条通过；工作区all-features root201通过/3忽略、input-capture96通过/1忽略及其他组件通过；严格Clippy/fmt/diff通过。未实例化真实portal/EIS响应，没有本机部署或物理恢复证据。
+- c2217ac Rust37448921549、Nix37448921533 queued；bbfc29f两workflow cancelled。本轮HEAD仍需跨平台CI，不能称全部平台成功。
+- [ ] partial acceptance目前只log warning，GUI逐边可用状态仍需评估；activation session身份/缺失cursor metadata与layer-shell错误路径继续审。原生故障恢复、千次双机往返、完整p95≤20ms/p99≤50ms及8h RSS验收仍缺证据，不认定90分。
+
+日志：libei-rejected-barriers-baseline.log、libei-rejected-barriers-fixed.log、libei-rejected-barriers-workspace.log、libei-rejected-barriers-clippy.log。

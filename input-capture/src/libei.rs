@@ -17,7 +17,7 @@ use reis::{
 };
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Write},
     num::NonZeroU32,
@@ -225,12 +225,36 @@ fn select_barriers(
     (barriers, pos_for_barrier)
 }
 
+fn accepted_barriers(
+    mut barriers: Vec<ICBarrier>,
+    mut id_map: HashMap<BarrierID, Position>,
+    failed: &[BarrierID],
+) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), CaptureError> {
+    let requested = barriers.len();
+    if !failed.is_empty() {
+        let failed: HashSet<_> = failed.iter().copied().collect();
+        barriers.retain(|barrier| !failed.contains(&barrier.barrier_id));
+        id_map.retain(|id, _| !failed.contains(id));
+        log::warn!(
+            "portal rejected pointer barriers {failed:?}; {} of {requested} remain",
+            barriers.len()
+        );
+    }
+    if barriers.is_empty() {
+        return Err(io::Error::other(format!(
+            "portal accepted no pointer barriers ({requested} requested)"
+        ))
+        .into());
+    }
+    Ok((barriers, id_map))
+}
+
 async fn update_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), ashpd::Error> {
+) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), CaptureError> {
     let zones = input_capture
         .zones(session, Default::default())
         .await?
@@ -252,7 +276,7 @@ async fn update_barriers(
         .await?;
     let response = response.response()?;
     log::debug!("{response:?}");
-    Ok((barriers, id_map))
+    accepted_barriers(barriers, id_map, response.failed_barriers())
 }
 
 fn capabilities() -> BitFlags<Capabilities> {
@@ -1019,6 +1043,75 @@ mod tests {
             (f32::MAX, f32::MIN),
         );
         assert!(distance.is_finite() && distance > 0.);
+    }
+
+    #[test]
+    fn rejected_barriers_do_not_participate_in_fallback_or_routes() {
+        let rejected = barrier(1, (0, 0, 0, 100));
+        let accepted = barrier(2, (1, 0, 1, 100));
+        let routes = HashMap::from([
+            (rejected.barrier_id, Position::Left),
+            (accepted.barrier_id, Position::Right),
+        ]);
+        let (barriers, routes) =
+            accepted_barriers(vec![rejected, accepted], routes, &[rejected.barrier_id]).unwrap();
+        assert_eq!(
+            find_corresponding_client(&barriers, (0., 50.)).unwrap(),
+            accepted.barrier_id
+        );
+        assert!(!routes.contains_key(&rejected.barrier_id));
+        assert_eq!(routes.get(&accepted.barrier_id), Some(&Position::Right));
+    }
+
+    #[test]
+    fn all_rejected_barriers_report_setup_failure() {
+        let rejected = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(rejected.barrier_id, Position::Left)]);
+        assert!(accepted_barriers(vec![rejected], routes, &[rejected.barrier_id]).is_err());
+        assert!(accepted_barriers(vec![], HashMap::new(), &[]).is_err());
+    }
+
+    #[test]
+    fn partial_barrier_rejection_preserves_order_and_ignores_unknown_duplicates() {
+        let first = barrier(1, (0, 0, 0, 100));
+        let rejected = barrier(2, (0, 0, 100, 0));
+        let last = barrier(3, (100, 0, 100, 100));
+        let routes = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (rejected.barrier_id, Position::Top),
+            (last.barrier_id, Position::Right),
+        ]);
+        let unknown = NonZeroU32::new(99).unwrap();
+        let (barriers, routes) = accepted_barriers(
+            vec![first, rejected, last],
+            routes,
+            &[unknown, rejected.barrier_id, rejected.barrier_id],
+        )
+        .unwrap();
+        assert_eq!(
+            barriers.iter().map(|b| b.barrier_id).collect::<Vec<_>>(),
+            vec![first.barrier_id, last.barrier_id]
+        );
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.get(&first.barrier_id), Some(&Position::Left));
+        assert_eq!(routes.get(&last.barrier_id), Some(&Position::Right));
+    }
+
+    #[test]
+    fn accepted_barrier_response_retains_all_requested_routes() {
+        let first = barrier(1, (0, 0, 0, 100));
+        let last = barrier(2, (100, 0, 100, 100));
+        let original = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (last.barrier_id, Position::Right),
+        ]);
+        let (barriers, routes) =
+            accepted_barriers(vec![first, last], original.clone(), &[]).unwrap();
+        assert_eq!(routes, original);
+        assert_eq!(
+            barriers.iter().map(|b| b.barrier_id).collect::<Vec<_>>(),
+            vec![first.barrier_id, last.barrier_id]
+        );
     }
 
     struct ReadyZoneBurst {

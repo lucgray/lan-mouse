@@ -1339,3 +1339,18 @@ Empty fallback geometry or nonfinite cursor coordinates return a capture error
 through the existing session cleanup path. This does not validate missing cursor
 metadata at other activation/release call sites or change native barrier setup.
 Actual compositor and multi-monitor activation behavior needs platform testing.
+
+
+### Portal barrier acceptance
+
+The set_pointer_barriers response's failed IDs are removed from both the libei
+geometry snapshot and its position routing map. Rejected edges cannot remain
+fallback candidates. Partial acceptance retains the surviving barriers in their
+original order and logs the rejected IDs and remaining count. Duplicate or unknown
+failed IDs do not remove unrelated barriers.
+
+If no barriers remain, including an empty requested geometry, setup returns a
+capture error before enabling the session. Existing session completion and cleanup
+handle that failure. Partial acceptance currently has a log warning rather than
+a separate per-edge frontend status. Native rejection/reconfiguration and actual
+physical pointer recovery still need platform validation.
