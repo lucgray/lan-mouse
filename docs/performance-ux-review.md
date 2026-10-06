@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R110 | libei更新突发协作让出已实现 | 每32条更新yield，包含首条；ready控制及同线程取消先于256条排空，原计时/快照保留；native时延未实测 |
 | R109 | libei更新源关闭处理已实现 | zones/notify EOF在窗口前/中报告错误并结束等待；主动退出优先，活动会话仍清理；原生断连恢复未验收 |
 | R108 | libei分支错误及联合等待退出已实现 | EIS错误不转成功；activation及初始化错误取消对应等待分支；主动退出优先，仍等待分支和原清理；真实portal故障待验 |
 | R107 | libei设备批次状态合并已实现 | 合并窗口仅保留至多四边目标状态，删除/重建顺序保持；50ms和会话重建不变，真实portal/RSS仍待验 |
@@ -2181,3 +2182,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 健康但持续ready的native信号突发对executor/计时器的公平性仍需审；本轮消除EOF重复poll，不证明任意native同步工作及时让出。原生故障恢复、真实千次双机往返、完整p95≤20ms/p99≤50ms及8h RSS仍缺验证，不认定90分。
 
 日志：libei-update-closure-baseline.log、libei-update-closure-fixed.log、libei-update-closure-workspace.log、libei-update-closure-clippy.log、libei-update-closure-isolated-service.log。
+
+
+## 第九十五轮：libei持续ready更新突发的执行权
+
+### R110 / P2
+
+- EOF修复后，合法但持续ready的zone stream仍可在wait_session_updates循环里连续处理；async调用立即ready不等于executor会轮询其他任务。生产watcher使用受控256条ReadyZoneBurst，首次poll消费全部256，违反最多32条就让出的基线断言。
+- [x] 首事件计入批次，每32条zone/client更新调用yield_now；继续后先检查既有取消及原50ms timer。没有重新计时、丢弃client快照或增加逐事件定时器/分配。
+- [x] 小批量和idle路径沿原等待；对单次native poll内同步阻塞、portal方法耗时和调度器总体拥塞不作时间承诺。
+
+### 验证与范围
+
+- 失败基线修复后首次poll仅处理32条，原future继续时取消成功，不再消费后续zone，旧client快照保持。实际biased Tokio select先poll watcher再poll ready oneshot，控制获处理时仍有224条zone未消费。
+- 同一current-thread runtime中spawn取消任务，watcher.await期间退出任务能在256条排空前运行并结束watcher；没有用多线程来掩盖单线程阻塞。正常50ms debounce、EOF/主动退出与成员顺序回归仍通过。
+- libei模块21条通过；工作区all-features root201通过/3忽略、input-capture84通过/1忽略及其他组件通过；严格Clippy/fmt/diff通过。该fixture用受控Stream和真实Tokio future，未实例化ashpd portal/EIS，未部署本机服务。
+- 52703a0 Rust37447950365、Nix37447950349 queued，19759df两workflow cancelled；本轮HEAD仍需CI，不能称全平台验收。
+- [ ] 真实native内部读/dispatch、生命周期资源总量和故障恢复仍需审。千次双机往返、完整pipeline p95≤20ms/p99≤50ms及8h RSS验收缺少证据，不认定90分。
+
+日志：libei-update-fairness-baseline.log、libei-update-fairness-fixed.log、libei-update-fairness-workspace.log、libei-update-fairness-clippy.log。

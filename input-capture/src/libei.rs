@@ -548,6 +548,8 @@ async fn next_session_update(
     }
 }
 
+const MAX_SESSION_UPDATES_PER_YIELD: usize = 32;
+
 async fn wait_session_updates(
     zones_changed: &mut (impl Stream + Unpin),
     capture_event: &mut Receiver<LibeiNotifyEvent>,
@@ -567,6 +569,7 @@ async fn wait_session_updates(
 
     let sleep = tokio::time::sleep(std::time::Duration::from_millis(50));
     tokio::pin!(sleep);
+    let mut processed = 1;
     loop {
         tokio::select! {
             biased;
@@ -578,6 +581,11 @@ async fn wait_session_updates(
                     client_updates.record(event);
                 }
             },
+        }
+        processed += 1;
+        if processed == MAX_SESSION_UPDATES_PER_YIELD {
+            tokio::task::yield_now().await;
+            processed = 0;
         }
     }
 }
@@ -914,6 +922,109 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+
+    struct ReadyZoneBurst {
+        remaining: usize,
+        changes: Rc<Cell<usize>>,
+    }
+
+    impl Stream for ReadyZoneBurst {
+        type Item = ();
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+            if self.remaining == 0 {
+                return Poll::Pending;
+            }
+            self.remaining -= 1;
+            self.changes.set(self.changes.get() + 1);
+            Poll::Ready(Some(()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_burst_yields_before_draining_ready_signals() {
+        let changes = Rc::new(Cell::new(0));
+        let mut zones = ReadyZoneBurst {
+            remaining: 256,
+            changes: changes.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        let stop = CancellationToken::new();
+        let session_finished = CancellationToken::new();
+        {
+            let wait = wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &session_finished,
+            );
+            tokio::pin!(wait);
+            assert!(wait.as_mut().now_or_never().is_none());
+            assert!(
+                changes.get() <= 32,
+                "drained {} ready changes",
+                changes.get()
+            );
+            stop.cancel();
+            assert!(wait.await.is_ok());
+        }
+        assert_eq!(changes.get(), 32);
+        assert_eq!(updates.finish(), vec![Position::Left]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_control_runs_before_update_burst_drains() {
+        let changes = Rc::new(Cell::new(0));
+        let mut zones = ReadyZoneBurst {
+            remaining: 256,
+            changes: changes.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let session_finished = CancellationToken::new();
+        let (send_control, receive_control) = tokio::sync::oneshot::channel();
+        send_control.send(()).unwrap();
+        tokio::select! {
+            biased;
+            result = wait_session_updates(&mut zones, &mut events, &mut updates,
+                &stop, &session_finished) => panic!("update watcher exited early: {result:?}"),
+            result = receive_control => result.unwrap(),
+        }
+        assert_eq!(changes.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        assert_eq!(zones.remaining, 256 - MAX_SESSION_UPDATES_PER_YIELD);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_shutdown_interrupts_ready_update_burst() {
+        let changes = Rc::new(Cell::new(0));
+        let mut zones = ReadyZoneBurst {
+            remaining: 256,
+            changes: changes.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let stop_task = stop.clone();
+        let cancel_task = tokio::spawn(async move {
+            stop_task.cancel();
+        });
+        assert!(
+            wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &CancellationToken::new()
+            )
+            .await
+            .is_ok()
+        );
+        cancel_task.await.unwrap();
+        assert!(changes.get() < 256, "shutdown waited for the entire burst");
+        assert_eq!(updates.retained_positions(), 0);
+    }
 
     // Prevent a regressed EOF busy loop from trapping the test runtime.
     struct EofProbe {

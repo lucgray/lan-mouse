@@ -1309,6 +1309,17 @@ before that error is returned. Idle watcher errors also propagate to the owner.
 Requested backend or session shutdown has priority over closed sources. The two
 update sources retain fair selection, and a ready debounce timer takes priority
 over further updates. The window is still measured from its first update. These
-changes do not guarantee that native portal operations or an always-ready source
-will yield promptly; native fault recovery and physical pointer behavior need
-platform validation.
+changes do not bound synchronous native polling or portal-operation time; native
+fault recovery and physical pointer behavior need platform validation.
+
+
+### Cooperative libei update bursts
+
+The update watcher yields after every 32 processed notifications, counting both
+zone signals and client changes. This gives the executor and joined control
+branches a polling opportunity even when a source keeps returning ready changes.
+The first update counts toward the first batch. Cancellation and the original
+debounce deadline are checked again after continuation; yielding does not reset
+that timer or discard the desired client snapshot. No extra per-event timer or
+allocation is added. This is a work-count limit, not a native polling or physical
+input-latency guarantee.
