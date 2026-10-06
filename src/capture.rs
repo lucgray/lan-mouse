@@ -523,7 +523,7 @@ impl CaptureTask {
                         self.enter_binds = binds;
                         capture.set_enter_binds(self.capture_enter_binds());
                     }
-                    CaptureRequest::SetRemap(remap) => self.remap = *remap,
+                    CaptureRequest::SetRemap(remap) => self.update_remap(capture, *remap).await?,
                     CaptureRequest::SetScrollInvert(scroll_invert) => {
                         self.scroll_invert = scroll_invert
                     }
@@ -704,6 +704,27 @@ impl CaptureTask {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn update_remap(
+        &mut self,
+        capture: &mut InputCapture,
+        remap: KeyRemap,
+    ) -> Result<(), CaptureError> {
+        if self.remap.same_rules(&remap) {
+            // A reload must not erase a held chord's resolved target.
+            return Ok(());
+        }
+        let release = if self.active_client.is_some() {
+            // Send releases with the rules that produced the original downs.
+            self.release_capture(capture, None).await
+        } else {
+            Ok(())
+        };
+        // Retain the new desired rules even if native release fails. The caller
+        // propagates that failure into the existing owned cleanup path.
+        self.remap = remap;
+        release
     }
 
     async fn release_requested(
@@ -971,6 +992,80 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reapplying_remap_rules_preserves_active_chord() {
+        for (chord, pending) in [(true, false), (true, true), (false, false)] {
+            check_remap_update(false, chord, pending).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn changing_remap_rules_releases_old_capture_before_switching() {
+        for chord in [false, true] {
+            check_remap_update(true, chord, false).await;
+        }
+    }
+
+    async fn check_remap_update(changed: bool, chord: bool, pending: bool) {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients);
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { succeed_send: true, ..Default::default() });
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let rules = || if chord {
+                KeyRemap::new(Default::default(), vec![crate::remap::ChordRemap {
+                    modifier: scancode::Linux::KeyLeftMeta, trigger: scancode::Linux::KeyTab,
+                    to: scancode::Linux::KeyLeftAlt,
+                }])
+            } else {
+                KeyRemap::new(HashMap::from([(scancode::Linux::KeyLeftMeta, scancode::Linux::KeyLeftCtrl)]), vec![])
+            };
+            let (event_tx, mut events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None, active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: rules(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let key = |key, state| Event::Keyboard(KeyboardEvent::Key { time: 0, key: key as u32, state });
+            let mut downs = task.remap.apply(key(scancode::Linux::KeyLeftMeta, 1));
+            if chord {
+                assert!(downs.is_empty());
+                if !pending {
+                    downs = task.remap.apply(key(scancode::Linux::KeyTab, 1));
+                    assert!(downs.iter().any(|event| *event == key(scancode::Linux::KeyLeftAlt, 1)));
+                }
+            } else {
+                assert_eq!(downs, vec![key(scancode::Linux::KeyLeftCtrl, 1)]);
+            }
+            for event in downs { task.conn.send(ProtoEvent::Input(event), handle).await.unwrap(); }
+            let sent_before = transport.sent.lock().unwrap().len();
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            task.update_remap(&mut capture, if changed { Default::default() } else { rules() }).await.unwrap();
+            if changed {
+                assert!(task.active_client.is_none(), "old capture must be released before new rules become active");
+                assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+                let frames: Vec<_> = transport.sent.lock().unwrap().iter().map(|bytes| lan_mouse_proto::decode_event_frame(bytes).unwrap()).collect();
+                assert!(matches!(frames.last(), Some(ProtoEvent::Leave(..))));
+                assert!(task.remap.is_empty());
+            } else {
+                assert_eq!(task.active_client, Some(handle));
+                let expected = if pending { None } else if chord { Some(scancode::Linux::KeyLeftAlt) } else { Some(scancode::Linux::KeyLeftCtrl) };
+                assert_eq!(task.remap.release_key(scancode::Linux::KeyLeftMeta), expected, "same rules must preserve held override or pending chord");
+                assert_eq!(transport.sent.lock().unwrap().len(), sent_before);
+                assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
+            }
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+        }).await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn capture_release_flood_keeps_one_request() {

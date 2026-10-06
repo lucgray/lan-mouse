@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R102 | 映射热更新状态及旧会话释放保护已实现 | 相同规则保留pending/active chord，规则变化先用旧规则释放capture再安装新规则；真实native热更新未验收 |
 | R101 | 连续显式释放合并及FIFO边界已实现 | 每连续group最多1份pending/处理中Release，覆盖native/对端cleanup；中间控制变更新group保留顺序；交替变更与生命周期总量未闭合 |
 | R100 | emulation及capture显式重试已实现并通过回归 | 每实例共享1名额覆盖请求/active attempt/终态反馈；capture还覆盖慢清理进度；其他lifecycle/物理恢复仍待验 |
 | R98 | 已实现并通过两层洪泛/实际worker回归 | 反转与灵敏度合并为最新快照，每hop最多1个pending marker；输入帧顺序保留，中间设置不重播；全进程RSS未证明 |
@@ -2015,3 +2016,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 交替设置与Release、Create/Destroy等生命周期总量、hook/backend反馈、独立native cleanup及失败metadata仍待审计。真实双机1000次往返、原生释放恢复、完整p95/p99和8h RSS未验收，不认定90分。
 
 日志：capture-release-baseline.log、capture-release-fixed.log、capture-release-workspace.log、capture-release-clippy.log、capture-release-isolated-service.log。
+
+
+## 第八十七轮：映射配置热更新保留会话状态及释放顺序
+
+### R102 / P1
+
+- 检查配置交替请求时发现active SetRemap直接替换KeyRemap，其pending/active/raw_mask也是会话状态。Service外部重载会排入SetRemap，捕获事件与请求在select中交错，不能把前面的Destroy视为SetRemap时必然仍inactive的保证。
+- 原赋值语义提取到生产update_remap helper后，两条基线均失败：相同规则重载已解析Meta+Tab→Alt丢失override，release_key返回Meta而应为Alt；规则变化后active capture仍Some，未先释放旧会话（capture-remap-update-baseline.log）。证明受控状态/顺序问题，不等于复现用户物理粘键。
+- [x] KeyRemap::same_rules只比较keys/chords配置，忽略session动态状态；相同规则保留原对象，不丢pending或active override，也不主动断开捕获。
+- [x] active规则变化先await原release_capture，pressed-key cleanup使用旧映射，清modifier/remap并原路径恢复指针/发送Leave，再安装新规则。配置变化会返回本机，需要重新进入peer；inactive/disabled直接安装。release error保留新目标配置并传播到既有owned失败清理，未加入native timeout/自动重试。
+
+### 验证及待完成范围
+
+- 两条基线修复后通过；矩阵覆盖相同规则的普通Meta→Ctrl、pending chord、已解析Meta+Tab→Alt，以及普通/组合规则变化。真实task helper、Dummy native、受控成功transport检查映射down发送、unchanged不额外发cleanup/ClientLeft、resolved/pending释放目标保留；changed清active、发ClientLeft及最终Leave后采用新规则。
+- Dummy没有物理按键pressed_keys；矩阵不是native key-up或Windows held-state实测。release error后desired规则保留本轮是源码路径证据，未新增native失败注入证明。
+- 工作区all-features root198通过/3忽略，其他组件全部通过；严格Clippy/fmt/diff通过；隔离Dummy Service外部重载/授权回归1条通过。未部署已安装服务。
+- a2ffccd Rust37438799080 queued、Nix37438799096 in_progress；上一轮10bb9dc Rust/Nix37438126025/37438126132均cancelled。本轮HEAD仍需跨平台CI，不将部分历史成功当完整验收。
+- [ ] 交替设置/Release及Create/Destroy队列总量、其他lifecycle/native cleanup仍需处理。真实双机1000次往返、native热更新/释放恢复、完整p95/p99与8h RSS仍未验收，不认定90分。
+
+日志：capture-remap-update-baseline.log、capture-remap-update-fixed.log、capture-remap-update-workspace.log、capture-remap-update-clippy.log、capture-remap-update-isolated-service.log。

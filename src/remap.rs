@@ -49,7 +49,7 @@ pub struct ChordRemap {
 }
 
 /// Resolution state of a chord-eligible modifier that's currently held.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChordEntry {
     trigger: scancode::Linux,
     to: scancode::Linux,
@@ -131,6 +131,11 @@ impl KeyRemap {
         self.pending.clear();
         self.active.clear();
         self.raw_mask = (0, 0, 0, 0);
+    }
+
+    /// Compare configuration only; held-key/chord state belongs to the session.
+    pub(crate) fn same_rules(&self, other: &Self) -> bool {
+        self.keys == other.keys && self.chords == other.chords
     }
 
     pub(crate) fn is_empty(&self) -> bool {

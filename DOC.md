@@ -1179,3 +1179,19 @@ coalescing bounds repeated releases within a group, not alternating lifecycle
 commands, all feedback, detached cleanup work or total process memory. No native
 release timeout or new cancellation behavior is introduced, and wire formats are
 unchanged. Real platform restoration and release latency still need validation.
+
+
+### Applying capture key-remap settings
+
+Reapplying identical key/chord rules preserves the current held-key/chord state,
+including pending chord modifiers and resolved override targets. Rule comparison
+ignores session state. While capture is active, changing the rules first releases
+that capture using the previous mapping, then installs the new rules. The pointer
+returns locally through the existing release path; re-enter the peer to use the
+new mapping. Inactive/disabled capture can install rules directly.
+
+A release error still propagates into owned capture cleanup, with the new desired
+rules retained for the next explicit recovery. This does not add native release
+timeouts or auto retries. Configuration requests keep their FIFO boundaries and
+are not globally bounded by this change. Physical hot reload and remote key
+release on native backends still require platform verification.
