@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R105 | 不可路由突发的轮询让出已实现 | 每poll最多跳过32条后自唤醒/Pending，控制ready可先运行，按键跟踪及后续有效事件保留；native阻塞/完整时延未实测 |
 | R104 | 删除后的缓存/迟到事件保护已实现 | 删除仅清该句柄fanout，全部logical路由在native await前退役；迟到未知句柄不panic/不改当前capture；真实native时序待验 |
 | R103 | 捕获设置按连续group合并已实现 | 五类设置最新字段共1份pending快照；控制边界分group；dequeue/take后清理等待中新编辑有新通知；交替生命周期及总RSS未闭合 |
 | R102 | 映射热更新状态及旧会话释放保护已实现 | 相同规则保留pending/active chord，规则变化先用旧规则释放capture再安装新规则；真实native热更新未验收 |
@@ -2078,3 +2079,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 交替设置/Release/Create/Destroy总量、其他lifecycle/native cleanup等仍需审计；真实双机1000次往返、原生热更新/释放恢复、完整p95/p99及8h RSS尚未验收，不认定90分。
 
 日志：capture-destroy-fanout-baseline.log、capture-stale-handle-baseline.log、capture-destroy-fanout-fixed.log、capture-stale-handle-fixed.log、capture-destroy-workspace.log、capture-destroy-clippy.log、capture-destroy-isolated-service.log。
+
+
+## 第九十轮：不可路由捕获突发的公平轮询
+
+### R105 / P2
+
+- 源码poll_next对无position_map或enter-only过滤后无目标的事件直接continue，单次poll可持续排空native ready流。生产stream基线：256条不可路由帧后接有效Begin，首poll直接返回有效Begin，期望中途Pending的断言失败（capture-poll-fairness-baseline.log，实际1条测试）。这不是实机事件速率/卡顿测量。
+- [x] 每poll最多消费32条不可路由事件后wake_by_ref并Pending，保证native无新通知时仍可继续。可路由帧及缓存fanout立即返回，未加timer或普通帧新分配；只在处理达到额度时自唤醒，backend idle不持续自唤醒。
+- [x] 保留每帧物理pressed_keys更新，不因让出丢按下/松开；未丢后续可交付帧。计数限制只覆盖本层routing循环，不限定底层native单次poll内部工作或墙钟耗时。
+
+### 验证与剩余验收
+
+- 缺失position和enter-only过滤两矩阵：256条各分8批/8次显式wake，后续两条有效Begin FIFO不变，idle poll无额外wake。另一回归跨32条unroutable Ctrl down让出仍记录pressed，随后Ctrl up与有效Begin处理后正确清除。
+- 实际Tokio select采用biased让native分支先poll；ready oneshot控制仍在突发排空前处理。取消losing next()后后续有效帧继续交付。这个模型证明ready分支可获得轮询机会，不是物理鼠标释放时间或全Service p95/p99。
+- 工作区all-features root201通过/3忽略、input-capture63通过/1忽略，其他组件全部通过；严格Clippy/fmt/diff通过；隔离Dummy Service外部重载/授权回归1条通过。未部署已安装服务。
+- 前一48de28f Rust37442258263 queued、Nix37442258291 in_progress；7f9aa3e两workflow37441089003/37441089151已cancelled。本轮HEAD仍需跨平台CI。
+- [ ] 底层native同步阻塞、交替生命周期资源总量、独立cleanup/失败metadata仍待审。真实双机1000次往返、原生热更新/释放恢复、完整p95/p99与8h RSS未验收；第90轮不等于已达到90分。
+
+日志：capture-poll-fairness-baseline.log、capture-poll-fairness-fixed.log、capture-poll-control.log、capture-poll-fairness-workspace.log、capture-poll-fairness-clippy.log、capture-poll-fairness-isolated-service.log。

@@ -339,6 +339,9 @@ impl InputCapture {
     }
 }
 
+// Bound routing work per poll so control futures can run during native bursts.
+const MAX_UNROUTABLE_EVENTS_PER_POLL: usize = 32;
+
 impl Stream for InputCapture {
     type Item = Result<(CaptureHandle, CaptureEvent), CaptureError>;
 
@@ -354,6 +357,7 @@ impl Stream for InputCapture {
             return Poll::Ready(Some(Ok(e)));
         }
 
+        let mut unroutable = 0;
         loop {
             // ready
             let event = ready!(self.capture.poll_next_unpin(cx));
@@ -392,7 +396,16 @@ impl Stream for InputCapture {
                 .unwrap_or_default();
 
             match handles.len() {
-                0 => continue,
+                0 => {
+                    unroutable += 1;
+                    if unroutable == MAX_UNROUTABLE_EVENTS_PER_POLL {
+                        // Native readiness may not produce another wake. Arrange
+                        // a continuation without draining the whole ready burst.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
                 1 => return Poll::Ready(Some(Ok((handles[0], event)))),
                 _ => {
                     for id in handles {
@@ -736,6 +749,155 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unroutable_burst_yields_and_self_wakes_before_draining_the_backend() {
+        use futures::task::{ArcWake, waker};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        #[derive(Default)]
+        struct WakeCount(AtomicUsize);
+        impl ArcWake for WakeCount {
+            fn wake_by_ref(this: &Arc<Self>) {
+                this.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for filtered in [false, true] {
+            let mut events = VecDeque::from(vec![
+                (
+                    if filtered {
+                        Position::Left
+                    } else {
+                        Position::Right
+                    },
+                    CaptureEvent::Begin(0.25),
+                    filtered
+                );
+                256
+            ]);
+            events.push_back((Position::Left, CaptureEvent::Begin(0.5), false));
+            events.push_back((Position::Left, CaptureEvent::Begin(0.75), false));
+            let backend = QueuedCapture {
+                events,
+                last_event_requires_enter_only: false,
+                fail_release: false,
+                fail_destroy: false,
+                fail_enter_only: false,
+            };
+            let mut capture = InputCapture {
+                capture: Box::new(backend),
+                enter_only_handles: Default::default(),
+                enter_only_positions: Default::default(),
+                id_map: HashMap::from([(7, Position::Left)]),
+                position_map: HashMap::from([(Position::Left, vec![7])]),
+                pressed_keys: Default::default(),
+                pending: Default::default(),
+            };
+            let count = Arc::new(WakeCount::default());
+            let wake = waker(count.clone());
+            let mut context = Context::from_waker(&wake);
+            for batch in 0..8 {
+                assert!(
+                    Pin::new(&mut capture).poll_next(&mut context).is_pending(),
+                    "unroutable work must yield every 32 frames"
+                );
+                assert_eq!(count.0.load(Ordering::Relaxed), batch + 1);
+            }
+            assert!(matches!(
+                Pin::new(&mut capture).poll_next(&mut context),
+                Poll::Ready(Some(Ok((7, CaptureEvent::Begin(0.5)))))
+            ));
+            assert!(matches!(
+                Pin::new(&mut capture).poll_next(&mut context),
+                Poll::Ready(Some(Ok((7, CaptureEvent::Begin(0.75)))))
+            ));
+            assert!(Pin::new(&mut capture).poll_next(&mut context).is_pending());
+            assert_eq!(
+                count.0.load(Ordering::Relaxed),
+                8,
+                "idle must not keep waking itself"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_control_can_run_before_an_unroutable_burst_is_drained() {
+        use futures::StreamExt;
+        let mut events = VecDeque::from(vec![
+            (Position::Right, CaptureEvent::Begin(0.25), false);
+            256
+        ]);
+        events.push_back((Position::Left, CaptureEvent::Begin(0.5), false));
+        let backend = QueuedCapture {
+            events,
+            last_event_requires_enter_only: false,
+            fail_release: false,
+            fail_destroy: false,
+            fail_enter_only: false,
+        };
+        let mut capture = InputCapture {
+            capture: Box::new(backend),
+            enter_only_handles: Default::default(),
+            enter_only_positions: Default::default(),
+            id_map: HashMap::from([(7, Position::Left)]),
+            position_map: HashMap::from([(Position::Left, vec![7])]),
+            pressed_keys: Default::default(),
+            pending: Default::default(),
+        };
+        let (send, control) = tokio::sync::oneshot::channel();
+        send.send(()).unwrap();
+        tokio::select! {
+            biased;
+            _ = capture.next() => panic!("ready control must run before draining the native burst"),
+            result = control => result.unwrap(),
+        }
+        // Canceling the losing next() future must not lose later valid input.
+        assert!(matches!(
+            capture.next().await.unwrap().unwrap(),
+            (7, CaptureEvent::Begin(0.5))
+        ));
+    }
+
+    #[test]
+    fn cooperative_routing_keeps_pressed_key_tracking_across_yields() {
+        use input_event::{Event, KeyboardEvent, scancode::Linux};
+        let key = |state| {
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: Linux::KeyLeftCtrl as u32,
+                state,
+            }))
+        };
+        let mut events = VecDeque::from(vec![(Position::Right, key(1), false); 32]);
+        events.push_back((Position::Right, key(0), false));
+        events.push_back((Position::Left, CaptureEvent::Begin(0.5), false));
+        let backend = QueuedCapture {
+            events,
+            last_event_requires_enter_only: false,
+            fail_release: false,
+            fail_destroy: false,
+            fail_enter_only: false,
+        };
+        let mut capture = InputCapture {
+            capture: Box::new(backend),
+            enter_only_handles: Default::default(),
+            enter_only_positions: Default::default(),
+            id_map: HashMap::from([(7, Position::Left)]),
+            position_map: HashMap::from([(Position::Left, vec![7])]),
+            pressed_keys: Default::default(),
+            pending: Default::default(),
+        };
+        let mut context = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut capture).poll_next(&mut context).is_pending());
+        assert!(capture.keys_pressed(&[Linux::KeyLeftCtrl]));
+        assert!(matches!(
+            Pin::new(&mut capture).poll_next(&mut context),
+            Poll::Ready(Some(Ok((7, CaptureEvent::Begin(0.5)))))
+        ));
+        assert!(!capture.keys_pressed(&[Linux::KeyLeftCtrl]));
     }
 
     #[test]

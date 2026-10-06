@@ -1233,3 +1233,20 @@ lookup, including the outgoing opposite position. This prevents a late cached
 Begin/Input for a deleted handle from triggering the former routing-lookup panic.
 No protocol serialization changes are involved. Native disconnect/delete timing
 and complete physical recovery remain platform validation work.
+
+
+### Yielding during unroutable capture bursts
+
+InputCapture consumes at most 32 unroutable native events in one poll_next call.
+At that boundary it wakes its caller and returns Pending, allowing ready release,
+configuration, disconnect and cancellation futures to be polled before the native
+burst is fully drained. Missing positions and enter-only filtering share this
+budget. Routable events and cached fanout still return immediately; no timer or
+additional per-input allocation is introduced.
+
+The continuation wake is needed even when a native backend stays ready without
+another notification. Once the backend becomes pending, this path adds no repeated
+idle wake. Physical pressed-key tracking remains incremental across batches.
+The losing next() future can be canceled by a ready control branch without losing
+later valid input. This is a routing work-count limit, not a wall-clock/native
+poll latency guarantee; a synchronous backend poll can still block independently.
