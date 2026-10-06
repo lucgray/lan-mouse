@@ -206,14 +206,16 @@ impl InputCapture {
         Ok(())
     }
 
-    /// destroy the client with the given id, if it exists
+    /// Destroy a registered client, retiring its routing before native teardown.
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
         let pos = self
             .id_map
             .remove(&id)
             .expect("no position for this handle");
-
-        if self.enter_only_handles.remove(&id) {
+        // Expanded events are owned by this logical handle, even when native
+        // teardown later waits or fails. Preserve other handles' cached events.
+        self.pending.retain(|&(handle, _)| handle != id);
+        let disable_enter_only = if self.enter_only_handles.remove(&id) {
             let count = self
                 .enter_only_positions
                 .get_mut(&pos)
@@ -221,18 +223,29 @@ impl InputCapture {
             *count -= 1;
             if *count == 0 {
                 self.enter_only_positions.remove(&pos);
-                self.capture.set_enter_only(pos, false).await?;
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
 
         log::debug!("destroying capture {id} @ {pos}");
         let remaining = self.position_map.get_mut(&pos).expect("id vector");
         remaining.retain(|&i| i != id);
-
         log::debug!("remaining ids @ {pos}: {remaining:?}");
-        if remaining.is_empty() {
-            log::debug!("destroying capture @ {pos} - no remaining ids");
+        let destroy_position = remaining.is_empty();
+        if destroy_position {
             self.position_map.remove(&pos);
+        }
+        // Commit all routing state before the first native await. Errors must
+        // not leave the removed id routable or resurrect its cached fanout.
+        if disable_enter_only {
+            self.capture.set_enter_only(pos, false).await?;
+        }
+        if destroy_position {
+            log::debug!("destroying capture @ {pos} - no remaining ids");
             self.capture.destroy(pos).await?;
         }
         Ok(())
@@ -537,6 +550,8 @@ mod tests {
         events: VecDeque<(Position, CaptureEvent, bool)>,
         last_event_requires_enter_only: bool,
         fail_release: bool,
+        fail_destroy: bool,
+        fail_enter_only: bool,
     }
 
     impl Stream for QueuedCapture {
@@ -560,6 +575,9 @@ mod tests {
         }
 
         async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            if self.fail_destroy {
+                return Err(std::io::Error::other("simulated destroy failure").into());
+            }
             Ok(())
         }
 
@@ -568,6 +586,9 @@ mod tests {
             _pos: Position,
             _enabled: bool,
         ) -> Result<(), CaptureError> {
+            if self.fail_enter_only {
+                return Err(std::io::Error::other("simulated enter-only teardown failure").into());
+            }
             Ok(())
         }
 
@@ -592,6 +613,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destroy_discards_only_deleted_handles_cached_fanout() {
+        let backend = QueuedCapture {
+            events: VecDeque::from([(Position::Left, CaptureEvent::Begin(0.25), false)]),
+            last_event_requires_enter_only: false,
+            fail_release: false,
+            fail_destroy: false,
+            fail_enter_only: false,
+        };
+        let mut capture = InputCapture {
+            capture: Box::new(backend),
+            enter_only_handles: HashSet::from([2, 3]),
+            enter_only_positions: HashMap::from([(Position::Left, 2)]),
+            id_map: HashMap::from([
+                (1, Position::Left),
+                (2, Position::Left),
+                (3, Position::Left),
+            ]),
+            position_map: HashMap::from([(Position::Left, vec![1, 2, 3])]),
+            pressed_keys: Default::default(),
+            pending: Default::default(),
+        };
+        let mut context = Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            Pin::new(&mut capture).poll_next(&mut context),
+            Poll::Ready(Some(Ok((1, CaptureEvent::Begin(0.25)))))
+        ));
+        capture.destroy(2).await.unwrap();
+        assert!(matches!(
+            Pin::new(&mut capture).poll_next(&mut context),
+            Poll::Ready(Some(Ok((3, CaptureEvent::Begin(0.25)))))
+        ));
+        assert!(Pin::new(&mut capture).poll_next(&mut context).is_pending());
+    }
+
+    #[tokio::test]
+    async fn destroy_failure_keeps_deleted_handle_unroutable_and_other_events_ordered() {
+        for enter_only_error in [false, true] {
+            let backend = QueuedCapture {
+                events: VecDeque::from([
+                    (Position::Left, CaptureEvent::Begin(0.25), false),
+                    (Position::Right, CaptureEvent::Begin(0.75), false),
+                ]),
+                last_event_requires_enter_only: false,
+                fail_release: false,
+                fail_destroy: !enter_only_error,
+                fail_enter_only: enter_only_error,
+            };
+            let mut capture = InputCapture {
+                capture: Box::new(backend),
+                enter_only_handles: HashSet::from([7]),
+                enter_only_positions: HashMap::from([(Position::Left, 1)]),
+                id_map: HashMap::from([(7, Position::Left), (9, Position::Right)]),
+                position_map: HashMap::from([
+                    (Position::Left, vec![7]),
+                    (Position::Right, vec![9]),
+                ]),
+                pressed_keys: Default::default(),
+                pending: VecDeque::from([
+                    (7, CaptureEvent::Begin(0.1)),
+                    (9, CaptureEvent::Begin(0.2)),
+                ]),
+            };
+            assert!(capture.destroy(7).await.is_err());
+            assert!(!capture.id_map.contains_key(&7));
+            assert!(!capture.position_map.contains_key(&Position::Left));
+            assert!(!capture.enter_only_handles.contains(&7));
+            assert!(!capture.enter_only_positions.contains_key(&Position::Left));
+            let mut context = Context::from_waker(noop_waker_ref());
+            assert!(matches!(
+                Pin::new(&mut capture).poll_next(&mut context),
+                Poll::Ready(Some(Ok((9, CaptureEvent::Begin(0.2)))))
+            ));
+            assert!(matches!(
+                Pin::new(&mut capture).poll_next(&mut context),
+                Poll::Ready(Some(Ok((9, CaptureEvent::Begin(0.75)))))
+            ));
+            assert!(Pin::new(&mut capture).poll_next(&mut context).is_pending());
+        }
+    }
+
+    #[tokio::test]
     async fn release_discards_cached_fanout_and_retains_tracking_on_failure() {
         use input_event::{Event, KeyboardEvent, scancode::Linux};
         for fail_release in [false, true] {
@@ -600,6 +702,8 @@ mod tests {
                     events: Default::default(),
                     last_event_requires_enter_only: false,
                     fail_release,
+                    fail_destroy: false,
+                    fail_enter_only: false,
                 };
                 let mut capture = InputCapture {
                     capture: Box::new(backend),
@@ -661,6 +765,8 @@ mod tests {
             ]),
             last_event_requires_enter_only: false,
             fail_release: false,
+            fail_destroy: false,
+            fail_enter_only: false,
         };
         let mut capture = InputCapture {
             capture: Box::new(backend),

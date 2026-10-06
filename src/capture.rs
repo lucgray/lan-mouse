@@ -332,27 +332,11 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
-    }
-
     fn capture_enter_binds(&self) -> HashMap<Position, Vec<scancode::Linux>> {
         self.enter_binds
             .iter()
             .map(|(&pos, bind)| (to_capture_pos(pos), bind.clone()))
             .collect()
-    }
-
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
     }
 
     async fn create_backend_capture(
@@ -580,6 +564,12 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+        // Destroy can retire an already-expanded event. Ignore it before
+        // release/jail/peer state changes, and resolve both routing fields once.
+        let Some(&(_, pos, capture_type)) = self.captures.iter().find(|(h, ..)| *h == handle)
+        else {
+            return Ok(());
+        };
 
         let release_engaged = {
             let bind = self.release_bind.borrow();
@@ -589,9 +579,6 @@ impl CaptureTask {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture, None).await;
         }
-
-        let capture_type = self.get_type(handle);
-        let pos = self.get_pos(handle);
 
         // arm/disarm the mouse jail whenever the jail bind is engaged (see
         // update_jail_from_bind).
@@ -641,7 +628,7 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let events: Vec<ProtoEvent> = match event {
             CaptureEvent::Begin(t) => {
@@ -1033,6 +1020,80 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_handle_event_preserves_current_capture_without_panicking() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let conn = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients,
+                );
+                let sender = conn.sender();
+                let transport = Arc::new(RefusedConnection {
+                    succeed_send: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        transport.clone(),
+                    )
+                    .await;
+                let (event_tx, mut events) = channel();
+                let (_requests, request_rx) = channel();
+                let mut task = CaptureTask {
+                    retry: None,
+                    active_client: Some(handle),
+                    backend: Some(input_capture::Backend::Dummy),
+                    cancellation_token: CancellationToken::new(),
+                    captures: vec![(handle, Position::Left, CaptureType::Default)],
+                    conn,
+                    event_tx,
+                    request_rx,
+                    release_bind: Default::default(),
+                    enter_binds: Default::default(),
+                    remap: Default::default(),
+                    scroll_invert: Default::default(),
+                    state: State::Sending,
+                    jail: Cell::new(false),
+                    jail_bind: Default::default(),
+                    jail_bind_prev_engaged: Cell::new(false),
+                    window_identifier: Default::default(),
+                    enter_t: 0.5,
+                    pending_modifiers: None,
+                };
+                let mut capture =
+                    InputCapture::new(Some(input_capture::Backend::Dummy), Default::default())
+                        .await
+                        .unwrap();
+                for event in [
+                    CaptureEvent::Begin(0.75),
+                    CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+                        time: 0,
+                        dx: 1.0,
+                        dy: 2.0,
+                    })),
+                ] {
+                    task.handle_capture_event(&mut capture, (handle + 1, event))
+                        .await
+                        .unwrap();
+                    assert_eq!(task.active_client, Some(handle));
+                    assert!(matches!(task.state, State::Sending));
+                    assert!(transport.sent.lock().unwrap().is_empty());
+                    assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
+                }
+                capture.terminate().await.unwrap();
+                sender.terminate().await;
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn continuous_capture_settings_keep_one_latest_snapshot() {

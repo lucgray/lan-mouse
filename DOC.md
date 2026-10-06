@@ -1216,3 +1216,20 @@ remap release still saves the other desired fields before propagating failure.
 This bounds continuous pending settings snapshots, not alternating lifecycle
 commands, arbitrary settings payload sizes, native cleanup resources or total RSS.
 Ordinary input delivery gets no additional allocation from this change.
+
+
+### Retiring capture handles with cached events
+
+InputCapture::destroy removes a registered handle's cached fanout events and all
+logical routing/enter-only bookkeeping before its first native teardown await.
+Events already expanded for other handles retain their order. A native teardown
+error is still returned, but cannot leave the removed handle routable; logical
+retirement does not prove native resources have been released. The capture task
+retains its existing backend-error cleanup/termination behavior.
+
+The service capture handler ignores events for unregistered handles before
+changing release, jail or peer state. Valid events resolve position/type in one
+lookup, including the outgoing opposite position. This prevents a late cached
+Begin/Input for a deleted handle from triggering the former routing-lookup panic.
+No protocol serialization changes are involved. Native disconnect/delete timing
+and complete physical recovery remain platform validation work.

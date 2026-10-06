@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R104 | 删除后的缓存/迟到事件保护已实现 | 删除仅清该句柄fanout，全部logical路由在native await前退役；迟到未知句柄不panic/不改当前capture；真实native时序待验 |
 | R103 | 捕获设置按连续group合并已实现 | 五类设置最新字段共1份pending快照；控制边界分group；dequeue/take后清理等待中新编辑有新通知；交替生命周期及总RSS未闭合 |
 | R102 | 映射热更新状态及旧会话释放保护已实现 | 相同规则保留pending/active chord，规则变化先用旧规则释放capture再安装新规则；真实native热更新未验收 |
 | R101 | 连续显式释放合并及FIFO边界已实现 | 每连续group最多1份pending/处理中Release，覆盖native/对端cleanup；中间控制变更新group保留顺序；交替变更与生命周期总量未闭合 |
@@ -2057,3 +2058,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 交替控制与设置、Create/Destroy生命周期总量、hook/backend反馈和独立native cleanup/失败metadata仍未闭合。快照数量边界不是任意配置payload字节或全进程RSS边界。真实双机1000次往返、原生热更新/释放恢复、完整p95/p99及8h RSS仍未验收，不认定90分。
 
 日志：capture-settings-baseline.log、capture-settings-fixed.log、capture-settings-wait.log、capture-settings-workspace.log、capture-settings-clippy.log、capture-settings-isolated-service.log。
+
+
+## 第八十九轮：设备删除后的已展开事件及路由panic
+
+### R104 / P1
+
+- 生产InputCapture把同边缘事件展开到pending队列；destroy原来删除id_map但不清该句柄pending。fanout基线：Begin先交付1，删除2后期待3，实际仍交付已删除2，断言失败（capture-destroy-fanout-baseline.log，确认实际运行1条测试）。
+- 主程序get_type/get_pos对不存在capture调用expect。实际task handler传入迟到unknown Begin基线panic `no such capture`（capture-stale-handle-baseline.log）。对应capture任务退出风险；未证明此前用户实机失控由这一条路径单独导致。
+- [x] destroy只retain其他句柄缓存事件；id_map/position_map/enter-only集合与计数在第一条native await前完成逻辑退役，native error继续返回，不留下已删id作为后续路由目标。backend实际资源清理仍由原错误处理/terminate承担。
+- [x] task handler先查注册状态，迟到unknown Begin/Input直接忽略，不修改release/jail/peer状态。有效帧position/type合并一次lookup并复用opposite pos，普通Default路径由原3次线性查找降为1次；这是源码成本改进，未声称全pipeline延迟提高三倍。
+
+### 验证及剩余验收
+
+- 两条失败基线修复后通过。实际库fanout删除2只剩3，顺序及无残留正确；受控backend enter-only teardown与destroy两种错误均保留返回错误，logical表无旧id/旧pos，其他cached事件和后续native来源事件仍按序路由。
+- 实际task handler矩阵覆盖unknown Begin及Input，当前active/state保持、没有网络发送及Client事件、不再panic。工作区其他有效capture回归通过；不是物理native排队/故障恢复测量。
+- 工作区all-features root201通过/3忽略，input-capture60通过/1忽略，其他组件全部通过；严格Clippy/fmt/diff通过；隔离Dummy Service设备替换/授权/旧返回通知回归1条通过。未部署已安装服务。
+- 上一轮7f9aa3e Rust37441089003/Nix37441089151均in_progress；e4fbd66两workflow37439665233/37439665174已cancelled。本轮HEAD仍需对应跨平台CI。
+- [ ] 交替设置/Release/Create/Destroy总量、其他lifecycle/native cleanup等仍需审计；真实双机1000次往返、原生热更新/释放恢复、完整p95/p99及8h RSS尚未验收，不认定90分。
+
+日志：capture-destroy-fanout-baseline.log、capture-stale-handle-baseline.log、capture-destroy-fanout-fixed.log、capture-stale-handle-fixed.log、capture-destroy-workspace.log、capture-destroy-clippy.log、capture-destroy-isolated-service.log。
