@@ -1106,6 +1106,9 @@ limit. Service checks the timeout's exact connection before removing a return
 edge, so a delayed old timeout cannot remove a replacement's registration.
 
 This bounds watchdog cycles, not all backend status/re-enable/configuration
-work or detached native cleanup tasks. The existing watchdog still checks a
-one-second silence threshold every five seconds; detection latency, physical
-release and full-pipeline RSS/latency remain separate acceptance work.
+work or detached native cleanup tasks. The watchdog now waits for the nearest
+one-second silence deadline using a reusable timer. Activity moves that peer's
+deadline; expiry rearms for remaining peers, and no tracked peer disables the
+timer branch. The five-second periodic scan is removed. Deadline readiness is
+subject to executor and native-backend scheduling, so physical release and
+full-pipeline RSS/latency remain separate acceptance work.

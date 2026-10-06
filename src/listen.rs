@@ -1002,6 +1002,16 @@ pub(crate) fn authorized_control_test_listener(addr: SocketAddr) -> (LanMouseLis
 }
 
 #[cfg(test)]
+pub(crate) fn add_authorized_test_peer(listener: &LanMouseListener, addr: SocketAddr) -> ArcConn {
+    let conn: ArcConn = Arc::new(tests::TestConn::new(None));
+    listener.conns.borrow_mut().push((addr, conn.clone()));
+    listener
+        .authorization
+        .install(addr, "test-peer".into(), &conn, &CancellationToken::new());
+    conn
+}
+
+#[cfg(test)]
 pub(crate) fn reader_slot_for_test() -> (ReaderLease, Rc<Cell<usize>>) {
     let budget = ReaderBudget::default();
     (budget.try_reserve().unwrap(), budget.0.clone())

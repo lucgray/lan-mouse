@@ -14,7 +14,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use std::{
     cell::RefCell,
@@ -26,6 +26,7 @@ use std::{
 use tokio::{
     select,
     task::{JoinHandle, spawn_local},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -309,6 +310,7 @@ impl Drop for Emulation {
     }
 }
 
+const INCOMING_SILENCE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_PENDING_TIMEOUTS: usize = 128;
 const MAX_PENDING_TIMEOUTS_PER_PEER: usize = 4;
 
@@ -373,7 +375,7 @@ impl TimeoutBudget {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn timeout_lease_for_test(conn: &ArcConn) -> (Rc<TimeoutLease>, Rc<Cell<usize>>) {
     let budget = TimeoutBudget::default();
     let lease = budget
@@ -425,7 +427,10 @@ impl ListenTask {
     }
 
     async fn run(mut self) -> CleanupState<InputEmulation> {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        // Reuse one timer; rearm only when the nearest peer deadline changes.
+        let watchdog = tokio::time::sleep(INCOMING_SILENCE_TIMEOUT);
+        tokio::pin!(watchdog);
+        let mut armed_deadline = None;
         let timeout_budget = TimeoutBudget::default();
         let mut last_response = HashMap::new();
         // peers that entered this device: addr -> (edge, fingerprint).
@@ -453,6 +458,16 @@ impl ListenTask {
                 self.event_tx
                     .send(EmulationEvent::ConnectionClosed { addr, admission })
                     .expect("channel closed");
+            }
+            let next_deadline = last_response
+                .values()
+                .map(|last| *last + INCOMING_SILENCE_TIMEOUT)
+                .min();
+            if next_deadline != armed_deadline {
+                if let Some(deadline) = next_deadline {
+                    watchdog.as_mut().reset(deadline);
+                }
+                armed_deadline = next_deadline;
             }
             select! {
                 _ = revoked.notified() => {},
@@ -598,9 +613,9 @@ impl ListenTask {
                     }
                     EmulationRequest::Terminate => break,
                 },
-                _ = interval.tick() => {
+                _ = &mut watchdog, if armed_deadline.is_some() => {
                     last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
+                        if instant.elapsed() >= INCOMING_SILENCE_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.expire_peer(addr, &timeout_budget);
                             // remember a timed-out entered peer so its return
@@ -1392,6 +1407,159 @@ mod resume_tests {
                 emulation.terminate().await;
             })
             .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_tracks_nearest_deadline_of_independent_peers() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let first = "127.0.0.1:2".parse().unwrap();
+                let second = "127.0.0.1:3".parse().unwrap();
+                let (listener, first_conn) = crate::listen::authorized_control_test_listener(first);
+                let second_conn = crate::listen::add_authorized_test_peer(&listener, second);
+                let incoming = listener.test_sender();
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                loop {
+                    if matches!(emulation.event().await, EmulationEvent::EmulationEnabled) {
+                        break;
+                    }
+                }
+                incoming
+                    .send(ListenEvent::Msg {
+                        addr: first,
+                        conn: first_conn.clone(),
+                        event: ProtoEvent::Ping,
+                        budget: None,
+                        control: None,
+                    })
+                    .unwrap_or_else(|_| panic!());
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(Duration::from_millis(500)).await;
+                incoming
+                    .send(ListenEvent::Msg {
+                        addr: second,
+                        conn: second_conn.clone(),
+                        event: ProtoEvent::Ping,
+                        budget: None,
+                        control: None,
+                    })
+                    .unwrap_or_else(|_| panic!());
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(Duration::from_millis(499)).await;
+                tokio::task::yield_now().await;
+                assert!(futures::FutureExt::now_or_never(emulation.event()).is_none());
+                tokio::time::advance(Duration::from_millis(1)).await;
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                let event = futures::FutureExt::now_or_never(emulation.event())
+                    .expect("first deadline must fire independently");
+                assert!(
+                    matches!(event, EmulationEvent::Disconnected { addr, .. } if addr == first)
+                );
+                drop(event);
+                assert!(futures::FutureExt::now_or_never(emulation.event()).is_none());
+                tokio::time::advance(Duration::from_millis(499)).await;
+                tokio::task::yield_now().await;
+                assert!(futures::FutureExt::now_or_never(emulation.event()).is_none());
+                tokio::time::advance(Duration::from_millis(1)).await;
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                let event = futures::FutureExt::now_or_never(emulation.event())
+                    .expect("timer must rearm for the remaining peer");
+                assert!(
+                    matches!(event, EmulationEvent::Disconnected { addr, .. } if addr == second)
+                );
+                drop(event);
+                assert!(emulation.clipboard_session_is_current(first, &first_conn));
+                assert!(emulation.clipboard_session_is_current(second, &second_conn));
+                emulation.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_deadline_refresh_exact_expiry_idle_and_resume() {
+        tokio::task::LocalSet::new().run_until(async {
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let (listener, conn) = crate::listen::authorized_control_test_listener(addr);
+            let incoming = listener.test_sender();
+            let mut emulation = Emulation::new(Some(input_emulation::Backend::Dummy),
+                Default::default(), listener, (false, 1.0));
+            loop { if matches!(emulation.event().await, EmulationEvent::EmulationEnabled) { break; } }
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            tokio::task::yield_now().await;
+            assert!(futures::FutureExt::now_or_never(emulation.event()).is_none());
+            incoming.send(ListenEvent::Msg { addr, conn: conn.clone(),
+                event: ProtoEvent::Enter(Position::Left, 0.5), budget: None, control: None }).unwrap_or_else(|_| panic!());
+            loop { if matches!(emulation.event().await, EmulationEvent::Entered { .. }) { break; } }
+            tokio::time::advance(Duration::from_millis(999)).await;
+            tokio::task::yield_now().await;
+            assert!(futures::FutureExt::now_or_never(emulation.event()).is_none());
+            incoming.send(ListenEvent::Msg { addr, conn: conn.clone(), event: ProtoEvent::Ping,
+                budget: None, control: None }).unwrap_or_else(|_| panic!());
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            tokio::time::advance(Duration::from_millis(999)).await;
+            tokio::task::yield_now().await;
+            assert!(futures::FutureExt::now_or_never(emulation.event()).is_none(), "activity must postpone the old deadline");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            let timeout = futures::FutureExt::now_or_never(emulation.event()).expect("timeout must be ready at the exact deadline");
+            assert!(matches!(timeout, EmulationEvent::Disconnected { addr: actual, .. } if actual == addr));
+            drop(timeout);
+            assert!(emulation.clipboard_session_is_current(addr, &conn));
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+            assert!(futures::FutureExt::now_or_never(emulation.event()).is_none(), "expired peer must not report repeatedly without new activity");
+            incoming.send(ListenEvent::Msg { addr, conn: conn.clone(), event: ProtoEvent::Ping,
+                budget: None, control: None }).unwrap_or_else(|_| panic!());
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            let resumed = futures::FutureExt::now_or_never(emulation.event()).expect("Ping must restore the remembered edge");
+            assert!(matches!(resumed, EmulationEvent::Entered { addr: actual, .. } if actual == addr));
+            drop(resumed);
+            tokio::time::advance(INCOMING_SILENCE_TIMEOUT).await;
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            assert!(matches!(futures::FutureExt::now_or_never(emulation.event()), Some(EmulationEvent::Disconnected { .. })));
+            emulation.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_detects_silence_without_waiting_for_five_second_scan() {
+        tokio::task::LocalSet::new().run_until(async {
+            let addr = "127.0.0.1:2".parse().unwrap();
+            let (listener, conn) = crate::listen::authorized_control_test_listener(addr);
+            let incoming = listener.test_sender();
+            let mut emulation = Emulation::new(Some(input_emulation::Backend::Dummy),
+                Default::default(), listener, (false, 1.0));
+            incoming.send(ListenEvent::Msg { addr, conn: conn.clone(),
+                event: ProtoEvent::Enter(Position::Left, 0.5), budget: None, control: None }).unwrap_or_else(|_| panic!());
+            loop { if matches!(emulation.event().await, EmulationEvent::Entered { .. }) { break; } }
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_millis(1300), async {
+                loop { if matches!(emulation.event().await, EmulationEvent::Disconnected { addr: actual, .. } if actual == addr) { break; } }
+            }).await;
+            eprintln!("watchdog fixture timeout after {:?}: {}", started.elapsed(), result.is_ok());
+            assert!(result.is_ok(), "one-second silence must not wait for the five-second scan");
+            assert!(emulation.clipboard_session_is_current(addr, &conn));
+            incoming.send(ListenEvent::Msg { addr, conn,
+                event: ProtoEvent::Ping, budget: None, control: None }).unwrap_or_else(|_| panic!());
+            let restored = tokio::time::timeout(Duration::from_millis(200), async {
+                loop { if matches!(emulation.event().await, EmulationEvent::Entered { addr: actual, .. } if actual == addr) { break; } }
+            }).await;
+            assert!(restored.is_ok());
+            emulation.terminate().await;
+        }).await;
     }
 
     #[tokio::test]

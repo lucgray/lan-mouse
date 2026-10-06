@@ -131,6 +131,7 @@ info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 
 [dev-dependencies]
 async-trait = "0.1.80"
+tokio = { version = "1.32.0", features = ["test-util"] }
 
 [patch.crates-io]
 webrtc-util = { path = "vendor/webrtc-util" }

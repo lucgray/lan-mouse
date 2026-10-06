@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R97 | 已实现并通过实际dispatcher/虚拟时间回归 | 可复用timer按最近peer的1s截止点唤醒、活动刷新/独立peer重设/无peer停用扫描；原生释放时延仍未验收 |
 | R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度至Service及cleanup结束；backend反馈/其他lifecycle总量仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
@@ -1912,3 +1913,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 真实双机千次往返、原生释放/故障恢复、完整p95/p99和8h RSS验收仍缺，不认定90分。
 
 日志：watchdog-budget-baseline.log、watchdog-budget-fixed.log、watchdog-budget-workspace.log、watchdog-budget-clippy.log、watchdog-budget-isolated-service.log。
+
+
+## 第八十二轮：watchdog按截止点唤醒和Windows测试cfg修正
+
+### R97 / P2
+
+- 实际dispatcher/Dummy基线：进入后静默等待1.3s仍没有Disconnected，断言失败，日志watchdog-deadline-baseline.log；源码每5s扫描一次而阈值为1s，正常相位也可能接近6s才发现。它不证明实际原生键释放时间。
+- [x] 去掉5s periodic interval，last_response使用Tokio单调Instant。复用一个pinned Sleep，只在最近peer的1s截止点改变时reset；时间到达使用>=检测，处理后等待其余peer最近截止点，未跟踪peer则禁用timer分支。
+- [x] 无按帧新建计时器/额外共享分配，min扫描复用已有连接活动表；移除固定空闲轮询。已有watchdog预算、迟到身份保护、清理和Input/Ping恢复语义保留。executor忙或同步native阻塞仍可延迟实际处理，不作硬实时承诺。
+
+### 验证与CI发现
+
+- 同一实际dispatcher受控fixture修复后约1.001s收到timeout，Ping在200ms观察窗口内恢复Entered；不是完整网络输入p95/p99，也不是物理释放测量。
+- dev-dependency仅开启Tokio test-util以暂停时钟验证生产run：1小时无peer无事件；999ms未到期；Ping刷新后旧deadline不触发，新的exact 1s触发一次；10s静默不重复报告；Ping恢复后重新启用deadline。额外两个peer错开500ms，分别于1000/1500ms独立过期且保留各自连接。
+- 首次工作区all-features root183通过/3忽略，其他组件全部通过；新增多peer fixture及cfg修正后最终root184通过/3忽略；严格Clippy/fmt/diff通过。隔离Dummy Service授权/旧timeout拒绝/恢复回归1条通过。
+- [x] 查实第81轮80e297e Rust run37261183861唯一失败为Windows Clippy：timeout_lease_for_test仅被cfg(all(test, unix)) Service tests使用，却定义为cfg(test)，Windows报dead_code；改为cfg(all(test, unix))，没有关闭-D warnings。Nix run37261183867 completed/success，Rust其他jobs成功。新HEAD Windows gate仍需CI确认，Linux通过不能代替它。
+- [ ] R97源码/受控时序完成，原生释放、完整pipeline时延与executor拥塞实测仍待验。R96 backend/Reenable/配置和独立cleanup源头、全进程资源、真实双机千次往返与8h RSS仍未闭合，不认定90分。未部署本机程序。
+
+日志：watchdog-deadline-baseline.log、watchdog-deadline-fixed.log、watchdog-deadline-workspace.log、watchdog-deadline-final-root.log、watchdog-deadline-clippy.log、watchdog-deadline-isolated-service.log、round81-ci-failed.log。
