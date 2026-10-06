@@ -1195,3 +1195,24 @@ rules retained for the next explicit recovery. This does not add native release
 timeouts or auto retries. Configuration requests keep their FIFO boundaries and
 are not globally bounded by this change. Physical hot reload and remote key
 release on native backends still require platform verification.
+
+
+### Coalescing capture settings
+
+Release/jail binds, enter binds, key-remap rules and outgoing scroll inversion
+share one pending settings marker per continuous update group. Further edits
+replace their field in that marker; fields not edited are preserved. A source
+keeps only a Weak reference. Accepted release/create/destroy/re-enable commands
+end the group, so Settings/Release/Settings remains three ordered operations.
+The first marker keeps its queue position; intermediate settings history and
+its boundaries with native input events are replaced by the latest values.
+
+The worker takes an immutable owned snapshot before awaiting remap release.
+Its marker becomes empty at that point: edits received during cleanup enqueue
+a fresh notification rather than silently modifying already-consumed settings.
+Live application preserves the remap-state/release policy above and reapplies
+enter binds to the backend; disabled capture saves the desired fields. A failed
+remap release still saves the other desired fields before propagating failure.
+This bounds continuous pending settings snapshots, not alternating lifecycle
+commands, arbitrary settings payload sizes, native cleanup resources or total RSS.
+Ordinary input delivery gets no additional allocation from this change.

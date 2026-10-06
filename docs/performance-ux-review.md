@@ -23,13 +23,14 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R103 | 捕获设置按连续group合并已实现 | 五类设置最新字段共1份pending快照；控制边界分group；dequeue/take后清理等待中新编辑有新通知；交替生命周期及总RSS未闭合 |
 | R102 | 映射热更新状态及旧会话释放保护已实现 | 相同规则保留pending/active chord，规则变化先用旧规则释放capture再安装新规则；真实native热更新未验收 |
 | R101 | 连续显式释放合并及FIFO边界已实现 | 每连续group最多1份pending/处理中Release，覆盖native/对端cleanup；中间控制变更新group保留顺序；交替变更与生命周期总量未闭合 |
 | R100 | emulation及capture显式重试已实现并通过回归 | 每实例共享1名额覆盖请求/active attempt/终态反馈；capture还覆盖慢清理进度；其他lifecycle/物理恢复仍待验 |
 | R98 | 已实现并通过两层洪泛/实际worker回归 | 反转与灵敏度合并为最新快照，每hop最多1个pending marker；输入帧顺序保留，中间设置不重播；全进程RSS未证明 |
 | R99 | 已实现并通过挂起/失败初始化回归 | 初始化等待不丢配置，失败保留目标值，成功后输入前应用最新设置；真实平台启动仍待验 |
 | R97 | 已实现并通过实际dispatcher/虚拟时间回归 | 可复用timer按最近peer的1s截止点唤醒、活动刷新/独立peer重设/无peer停用扫描；原生释放时延仍未验收 |
-| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation/capture retry跨终态反馈各1名额；连续Release每group1份；交替请求/其他lifecycle仍待审 |
+| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation/capture retry跨终态反馈各1名额；连续Release和捕获设置各每group1份；交替请求/其他lifecycle仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
@@ -2036,3 +2037,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 交替设置/Release及Create/Destroy队列总量、其他lifecycle/native cleanup仍需处理。真实双机1000次往返、native热更新/释放恢复、完整p95/p99与8h RSS仍未验收，不认定90分。
 
 日志：capture-remap-update-baseline.log、capture-remap-update-fixed.log、capture-remap-update-workspace.log、capture-remap-update-clippy.log、capture-remap-update-isolated-service.log。
+
+
+## 第八十八轮：捕获设置最新快照及清理等待期间的新通知
+
+### R103 / P2、R96 后续
+
+- 基线：生产五类setter连续1万轮更新、暂停消费者，留下5万条设置请求，期望1失败（capture-settings-baseline.log）。连续设置组的API压力证明，不是实际GUI/文件重载时延或RSS实测；Service每次重载还可能产生Create/Destroy，属于后述交替组范围。
+- [x] 五类设置合入Rc<RefCell<Option<CaptureSettings>>>，producer仅Weak；每字段最新值覆盖旧值，未编辑字段保留，每连续group一份pending marker。保留第一个marker位置，不重播中间设置或它们与native输入之间的历史边界。
+- [x] 实际提交的Release/Create/Destroy/Reenable分隔设置group；设置继续分隔release group。Settings/控制/Settings和Release/设置/Release的FIFO位置均保留，未将交替生命周期工作说成全局有界。
+- [x] worker在await remap释放前take固定snapshot并清空marker。后续编辑看到None会排新marker，避免“旧marker还活着，所以没有新通知”的更新丢失。原第87轮规则一致保留状态、变化先释放、错误传入owned cleanup的策略保留；其余字段即使remap释放失败也保存desired值。
+
+### 验证及未完成范围
+
+- 修复后5万次设置提交只一份记录，交替值证明五字段最终值；dequeue但未take仍可更新原marker，take后旧快照不变、新通知独立。四类控制边界逐一保留前后不同快照。
+- 实际apply_live_settings矩阵覆盖五字段应用并保留普通映射/pending及resolved chord策略。暂停时钟+Dummy native+挂起peer send验证remap清理等待中新编辑实际入新通知，原snapshot应用A、新snapshot随后应用C及最新scroll，没有更新丢失。不是native同步阻塞/物理输入测量。
+- 工作区all-features root200通过/3忽略、其他组件全部通过；严格Clippy/fmt/diff通过；隔离Dummy Service外部重载/授权回归1条通过。未部署已安装服务。
+- e4fbd66 Rust37439665233/Nix37439665174检查时均in_progress；再前a2ffccd两workflow37438799080/37438799096均cancelled。本轮HEAD需跨平台CI，不将运行中视为成功。
+- [ ] 交替控制与设置、Create/Destroy生命周期总量、hook/backend反馈和独立native cleanup/失败metadata仍未闭合。快照数量边界不是任意配置payload字节或全进程RSS边界。真实双机1000次往返、原生热更新/释放恢复、完整p95/p99及8h RSS仍未验收，不认定90分。
+
+日志：capture-settings-baseline.log、capture-settings-fixed.log、capture-settings-wait.log、capture-settings-workspace.log、capture-settings-clippy.log、capture-settings-isolated-service.log。

@@ -27,6 +27,7 @@ pub(crate) struct Capture {
     task: JoinHandle<()>,
     reenable_pending: RefCell<std::rc::Weak<CaptureRetryLease>>,
     release_pending: RefCell<std::rc::Weak<CaptureReleaseLease>>,
+    settings_pending: RefCell<std::rc::Weak<RefCell<Option<CaptureSettings>>>>,
     event_rx: Receiver<ICaptureEvent>,
 }
 
@@ -86,16 +87,17 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// reenable input capture
     Reenable(Rc<CaptureRetryLease>),
-    /// set release bind
-    SetReleaseBind(Vec<scancode::Linux>),
-    /// set the mouse-jail bind
-    SetJailBind(Vec<scancode::Linux>),
-    /// set the binds that enter a client without an edge crossing
-    SetEnterBinds(HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>),
-    /// set the keys rewritten on their way to other devices
-    SetRemap(Box<KeyRemap>),
-    /// set the scroll axes inverted on their way to other devices
-    SetScrollInvert(ScrollInvert),
+    /// Latest settings in a continuous group; None means already consumed.
+    Settings(Rc<RefCell<Option<CaptureSettings>>>),
+}
+
+#[derive(Debug, Default)]
+struct CaptureSettings {
+    release_bind: Option<Vec<scancode::Linux>>,
+    jail_bind: Option<Vec<scancode::Linux>>,
+    enter_binds: Option<HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>>,
+    remap: Option<Box<KeyRemap>>,
+    scroll_invert: Option<ScrollInvert>,
 }
 
 impl Capture {
@@ -138,6 +140,7 @@ impl Capture {
         Self {
             reenable_pending: Default::default(),
             release_pending: Default::default(),
+            settings_pending: Default::default(),
             cancellation_token,
             request_tx,
             task,
@@ -150,6 +153,7 @@ impl Capture {
             return;
         }
         self.separate_release_requests();
+        self.separate_settings_updates();
         let retry = Rc::new(CaptureRetryLease);
         *self.reenable_pending.borrow_mut() = Rc::downgrade(&retry);
         self.request_tx
@@ -172,6 +176,7 @@ impl Capture {
         capture_type: CaptureType,
     ) {
         self.separate_release_requests();
+        self.separate_settings_updates();
         let pos = to_capture_pos(pos);
         self.request_tx
             .send(CaptureRequest::Create(handle, pos, capture_type))
@@ -180,6 +185,7 @@ impl Capture {
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
         self.separate_release_requests();
+        self.separate_settings_updates();
         self.request_tx
             .send(CaptureRequest::Destroy(handle))
             .expect("channel closed");
@@ -195,6 +201,7 @@ impl Capture {
         if self.release_pending.borrow().strong_count() != 0 {
             return;
         }
+        self.separate_settings_updates();
         let release = Rc::new(CaptureReleaseLease);
         *self.release_pending.borrow_mut() = Rc::downgrade(&release);
         self.request_tx
@@ -206,38 +213,51 @@ impl Capture {
         self.event_rx.recv().await.expect("channel closed")
     }
 
-    pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
+    fn separate_settings_updates(&self) {
+        *self.settings_pending.borrow_mut() = std::rc::Weak::new();
+    }
+
+    fn update_settings(&self, edit: impl FnOnce(&mut CaptureSettings)) -> bool {
         self.separate_release_requests();
-        let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+        if let Some(marker) = self.settings_pending.borrow().upgrade() {
+            if let Some(settings) = marker.borrow_mut().as_mut() {
+                edit(settings);
+                return true;
+            }
+        }
+        let mut settings = CaptureSettings::default();
+        edit(&mut settings);
+        let marker = Rc::new(RefCell::new(Some(settings)));
+        *self.settings_pending.borrow_mut() = Rc::downgrade(&marker);
+        self.request_tx
+            .send(CaptureRequest::Settings(marker))
+            .is_ok()
+    }
+
+    pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
+        let _ = self.update_settings(|settings| settings.release_bind = Some(bind));
     }
 
     pub(crate) fn set_jail_bind(&mut self, bind: Vec<scancode::Linux>) {
-        self.separate_release_requests();
-        self.request_tx
-            .send(CaptureRequest::SetJailBind(bind))
-            .expect("channel closed");
+        assert!(
+            self.update_settings(|settings| settings.jail_bind = Some(bind)),
+            "channel closed"
+        );
     }
 
     pub(crate) fn set_enter_binds(
         &mut self,
         binds: HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>,
     ) {
-        self.separate_release_requests();
-        let _ = self.request_tx.send(CaptureRequest::SetEnterBinds(binds));
+        let _ = self.update_settings(|settings| settings.enter_binds = Some(binds));
     }
 
     pub(crate) fn set_remap(&mut self, remap: KeyRemap) {
-        self.separate_release_requests();
-        let _ = self
-            .request_tx
-            .send(CaptureRequest::SetRemap(Box::new(remap)));
+        let _ = self.update_settings(|settings| settings.remap = Some(Box::new(remap)));
     }
 
     pub(crate) fn set_scroll_invert(&mut self, scroll_invert: ScrollInvert) {
-        self.separate_release_requests();
-        let _ = self
-            .request_tx
-            .send(CaptureRequest::SetScrollInvert(scroll_invert));
+        let _ = self.update_settings(|settings| settings.scroll_invert = Some(scroll_invert));
     }
 }
 
@@ -359,16 +379,9 @@ impl CaptureTask {
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release(_release) => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
-                            self.release_bind.borrow_mut().clone_from(&bind);
-                        }
-                        CaptureRequest::SetJailBind(bind) => {
-                            *self.jail_bind.borrow_mut() = bind;
-                        }
-                        CaptureRequest::SetEnterBinds(binds) => self.enter_binds = binds,
-                        CaptureRequest::SetRemap(remap) => self.remap = *remap,
-                        CaptureRequest::SetScrollInvert(scroll_invert) => {
-                            self.scroll_invert = scroll_invert
+                        CaptureRequest::Settings(marker) => {
+                            let settings = marker.borrow_mut().take();
+                            if let Some(settings) = settings { self.install_settings(settings); }
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -513,19 +526,11 @@ impl CaptureTask {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
-                    CaptureRequest::SetReleaseBind(bind) => {
-                        self.release_bind.borrow_mut().clone_from(&bind);
-                    }
-                    CaptureRequest::SetJailBind(bind) => {
-                        *self.jail_bind.borrow_mut() = bind;
-                    }
-                    CaptureRequest::SetEnterBinds(binds) => {
-                        self.enter_binds = binds;
-                        capture.set_enter_binds(self.capture_enter_binds());
-                    }
-                    CaptureRequest::SetRemap(remap) => self.update_remap(capture, *remap).await?,
-                    CaptureRequest::SetScrollInvert(scroll_invert) => {
-                        self.scroll_invert = scroll_invert
+                    CaptureRequest::Settings(marker) => {
+                        // Detach a fixed snapshot before awaiting remap cleanup.
+                        // Later edits must enqueue their own notification.
+                        let settings = marker.borrow_mut().take();
+                        if let Some(settings) = settings { self.apply_live_settings(capture, settings).await?; }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
@@ -704,6 +709,42 @@ impl CaptureTask {
                 .await?;
         }
         Ok(())
+    }
+
+    fn install_settings(&mut self, settings: CaptureSettings) {
+        if let Some(bind) = settings.release_bind {
+            *self.release_bind.borrow_mut() = bind;
+        }
+        if let Some(bind) = settings.jail_bind {
+            *self.jail_bind.borrow_mut() = bind;
+        }
+        if let Some(binds) = settings.enter_binds {
+            self.enter_binds = binds;
+        }
+        if let Some(remap) = settings.remap {
+            self.remap = *remap;
+        }
+        if let Some(invert) = settings.scroll_invert {
+            self.scroll_invert = invert;
+        }
+    }
+
+    async fn apply_live_settings(
+        &mut self,
+        capture: &mut InputCapture,
+        mut settings: CaptureSettings,
+    ) -> Result<(), CaptureError> {
+        let result = if let Some(remap) = settings.remap.take() {
+            self.update_remap(capture, *remap).await
+        } else {
+            Ok(())
+        };
+        let enter_binds_changed = settings.enter_binds.is_some();
+        self.install_settings(settings);
+        if enter_binds_changed {
+            capture.set_enter_binds(self.capture_enter_binds());
+        }
+        result
     }
 
     async fn update_remap(
@@ -994,6 +1035,192 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn continuous_capture_settings_keep_one_latest_snapshot() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (request_tx, mut requests) = channel();
+                let (_events, event_rx) = channel();
+                let mut source = Capture {
+                    cancellation_token: CancellationToken::new(),
+                    reenable_pending: Default::default(),
+                    release_pending: Default::default(),
+                    settings_pending: Default::default(),
+                    request_tx,
+                    event_rx,
+                    task: spawn_local(async {}),
+                };
+                for edit in 0..10_000 {
+                    let latest = edit % 2 != 0;
+                    source.set_release_bind(vec![if latest {
+                        scancode::Linux::KeyB
+                    } else {
+                        scancode::Linux::KeyA
+                    }]);
+                    source.set_jail_bind(vec![if latest {
+                        scancode::Linux::KeyD
+                    } else {
+                        scancode::Linux::KeyC
+                    }]);
+                    source.set_enter_binds(HashMap::from([(
+                        lan_mouse_ipc::Position::Left,
+                        vec![if latest {
+                            scancode::Linux::KeyF
+                        } else {
+                            scancode::Linux::KeyE
+                        }],
+                    )]));
+                    source.set_remap(KeyRemap::new(
+                        HashMap::from([(
+                            scancode::Linux::KeyA,
+                            if latest {
+                                scancode::Linux::KeyC
+                            } else {
+                                scancode::Linux::KeyB
+                            },
+                        )]),
+                        vec![],
+                    ));
+                    source.set_scroll_invert(ScrollInvert::new(latest, !latest));
+                }
+                let CaptureRequest::Settings(marker) = requests.recv().await.unwrap() else {
+                    panic!()
+                };
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                // Dequeued but not taken: source edits still merge into this snapshot.
+                source.set_release_bind(vec![scancode::Linux::KeyZ]);
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                let settings = marker.borrow_mut().take().unwrap();
+                assert_eq!(settings.release_bind, Some(vec![scancode::Linux::KeyZ]));
+                assert_eq!(settings.jail_bind, Some(vec![scancode::Linux::KeyD]));
+                assert_eq!(
+                    settings
+                        .enter_binds
+                        .as_ref()
+                        .unwrap()
+                        .get(&lan_mouse_ipc::Position::Left),
+                    Some(&vec![scancode::Linux::KeyF])
+                );
+                assert!(settings.remap.as_ref().unwrap().same_rules(&KeyRemap::new(
+                    HashMap::from([(scancode::Linux::KeyA, scancode::Linux::KeyC)]),
+                    vec![]
+                )));
+                assert_eq!(settings.scroll_invert, Some(ScrollInvert::new(true, false)));
+                // A live handler may hold the empty marker while awaiting native
+                // cleanup. The new edit needs a fresh notification, not a write
+                // into that consumed marker.
+                source.set_release_bind(vec![scancode::Linux::KeyY]);
+                let CaptureRequest::Settings(next) = requests.recv().await.unwrap() else {
+                    panic!()
+                };
+                assert!(!Rc::ptr_eq(&marker, &next));
+                assert!(marker.borrow().is_none());
+                assert_eq!(
+                    next.borrow().as_ref().unwrap().release_bind,
+                    Some(vec![scancode::Linux::KeyY])
+                );
+                assert_eq!(settings.release_bind, Some(vec![scancode::Linux::KeyZ]));
+                drop(next);
+                for boundary in 0..4 {
+                    source.set_release_bind(vec![scancode::Linux::KeyA]);
+                    match boundary {
+                        0 => source.release(),
+                        1 => source.create(1, lan_mouse_ipc::Position::Left, CaptureType::Default),
+                        2 => source.destroy(1),
+                        3 => source.reenable(),
+                        _ => unreachable!(),
+                    }
+                    source.set_release_bind(vec![scancode::Linux::KeyB]);
+                    let CaptureRequest::Settings(first) = requests.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    let control = requests.recv().await.unwrap();
+                    assert!(matches!(
+                        (&control, boundary),
+                        (CaptureRequest::Release(..), 0)
+                            | (CaptureRequest::Create(..), 1)
+                            | (CaptureRequest::Destroy(..), 2)
+                            | (CaptureRequest::Reenable(..), 3)
+                    ));
+                    let CaptureRequest::Settings(last) = requests.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    assert!(!Rc::ptr_eq(&first, &last));
+                    assert_eq!(
+                        first.borrow().as_ref().unwrap().release_bind,
+                        Some(vec![scancode::Linux::KeyA])
+                    );
+                    assert_eq!(
+                        last.borrow().as_ref().unwrap().release_bind,
+                        Some(vec![scancode::Linux::KeyB])
+                    );
+                    assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn settings_during_remap_cleanup_keep_a_fresh_notification() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients);
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { stall_send: true, ..Default::default() });
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let (request_tx, mut requests) = channel(); let (_events, event_rx) = channel();
+            let mut source = Capture {
+                cancellation_token: CancellationToken::new(), reenable_pending: Default::default(),
+                release_pending: Default::default(), settings_pending: Default::default(),
+                request_tx, event_rx, task: spawn_local(async {}),
+            };
+            source.set_release_bind(vec![scancode::Linux::KeyA]);
+            source.set_remap(Default::default());
+            let CaptureRequest::Settings(marker) = requests.recv().await.unwrap() else { panic!() };
+            let snapshot = marker.borrow_mut().take().unwrap();
+            let (event_tx, _events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None, active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: KeyRemap::new(HashMap::from([(scancode::Linux::KeyA, scancode::Linux::KeyB)]), vec![]),
+                scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            let next;
+            {
+                let apply = task.apply_live_settings(&mut capture, snapshot);
+                tokio::pin!(apply);
+                let edit = async {
+                    while transport.sent.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+                    source.set_release_bind(vec![scancode::Linux::KeyC]);
+                    source.set_scroll_invert(ScrollInvert::new(true, true));
+                    let CaptureRequest::Settings(next) = requests.recv().await.unwrap() else { panic!() };
+                    assert!(!Rc::ptr_eq(&marker, &next));
+                    assert!(marker.borrow().is_none());
+                    assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                    next
+                };
+                tokio::pin!(edit);
+                next = tokio::select! { _ = &mut apply => panic!("peer cleanup must remain pending"), next = &mut edit => next };
+                tokio::time::advance(Duration::from_millis(100)).await;
+                apply.await.unwrap();
+            }
+            assert_eq!(*task.release_bind.borrow(), vec![scancode::Linux::KeyA]);
+            let settings = next.borrow_mut().take().unwrap();
+            task.apply_live_settings(&mut capture, settings).await.unwrap();
+            assert_eq!(*task.release_bind.borrow(), vec![scancode::Linux::KeyC]);
+            assert_eq!(task.scroll_invert, ScrollInvert::new(true, true));
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn reapplying_remap_rules_preserves_active_chord() {
         for (chord, pending) in [(true, false), (true, true), (false, false)] {
             check_remap_update(false, chord, pending).await;
@@ -1048,7 +1275,16 @@ mod tests {
             for event in downs { task.conn.send(ProtoEvent::Input(event), handle).await.unwrap(); }
             let sent_before = transport.sent.lock().unwrap().len();
             let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
-            task.update_remap(&mut capture, if changed { Default::default() } else { rules() }).await.unwrap();
+            task.apply_live_settings(&mut capture, CaptureSettings {
+                release_bind: Some(vec![scancode::Linux::KeyA]), jail_bind: Some(vec![scancode::Linux::KeyB]),
+                enter_binds: Some(HashMap::from([(lan_mouse_ipc::Position::Left, vec![scancode::Linux::KeyC])])),
+                remap: Some(Box::new(if changed { Default::default() } else { rules() })),
+                scroll_invert: Some(ScrollInvert::new(true, false)),
+            }).await.unwrap();
+            assert_eq!(*task.release_bind.borrow(), vec![scancode::Linux::KeyA]);
+            assert_eq!(*task.jail_bind.borrow(), vec![scancode::Linux::KeyB]);
+            assert_eq!(task.enter_binds.get(&lan_mouse_ipc::Position::Left), Some(&vec![scancode::Linux::KeyC]));
+            assert_eq!(task.scroll_invert, ScrollInvert::new(true, false));
             if changed {
                 assert!(task.active_client.is_none(), "old capture must be released before new rules become active");
                 assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
@@ -1077,6 +1313,7 @@ mod tests {
                     cancellation_token: CancellationToken::new(),
                     reenable_pending: Default::default(),
                     release_pending: Default::default(),
+                    settings_pending: Default::default(),
                     request_tx,
                     event_rx,
                     task: spawn_local(async {}),
@@ -1118,11 +1355,7 @@ mod tests {
                         (CaptureRequest::Create(..), 0)
                             | (CaptureRequest::Destroy(..), 1)
                             | (CaptureRequest::Reenable(..), 2)
-                            | (CaptureRequest::SetReleaseBind(..), 3)
-                            | (CaptureRequest::SetJailBind(..), 4)
-                            | (CaptureRequest::SetEnterBinds(..), 5)
-                            | (CaptureRequest::SetRemap(..), 6)
-                            | (CaptureRequest::SetScrollInvert(..), 7)
+                            | (CaptureRequest::Settings(..), 3..=7)
                     ));
                     let CaptureRequest::Release(last) = requests.recv().await.unwrap() else {
                         panic!()
@@ -1149,7 +1382,7 @@ mod tests {
             let (_events, event_rx) = channel();
             let source = Capture {
                 cancellation_token: CancellationToken::new(), reenable_pending: Default::default(),
-                release_pending: Default::default(), request_tx, event_rx, task: spawn_local(async {}),
+                release_pending: Default::default(), settings_pending: Default::default(), request_tx, event_rx, task: spawn_local(async {}),
             };
             source.release();
             let CaptureRequest::Release(release) = requests.recv().await.unwrap() else { panic!() };
@@ -1202,6 +1435,7 @@ mod tests {
                     cancellation_token: CancellationToken::new(),
                     reenable_pending: Default::default(),
                     release_pending: Default::default(),
+                    settings_pending: Default::default(),
                     request_tx,
                     event_rx,
                     task: spawn_local(async {}),
