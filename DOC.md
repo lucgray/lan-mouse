@@ -1268,3 +1268,15 @@ cleanup timeout. It preserves reporting and existing owned cleanup opportunities
 it does not prove portal/EIS resources or the physical pointer were restored after
 a task fault. Real compositor suspend/restart and portal failure recovery need
 platform validation.
+
+
+### Libei client update batches
+
+During the 50ms session-update debounce, client create/destroy notifications
+update a separate desired-state snapshot containing at most four screen edges.
+Duplicate notifications do not accumulate an operation history. Destroy/recreate
+still moves that edge to the end, preserving barrier creation order. The running
+session keeps its original clients until it closes; session cancellation, portal
+restart behavior and the debounce duration are unchanged. This limits retained
+client state and removes the later history replay, but does not bound notification
+processing time, portal operations or total process memory.

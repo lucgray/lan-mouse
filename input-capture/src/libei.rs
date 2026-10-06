@@ -81,6 +81,39 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
+// Keep only the next desired state while the current session still uses its snapshot.
+struct CaptureClientUpdates {
+    clients: Vec<Position>,
+}
+
+impl CaptureClientUpdates {
+    fn new(clients: &[Position]) -> Self {
+        Self {
+            clients: clients.to_vec(),
+        }
+    }
+
+    fn record(&mut self, event: LibeiNotifyEvent) {
+        match event {
+            LibeiNotifyEvent::Create(pos) => {
+                if !self.clients.contains(&pos) {
+                    self.clients.push(pos);
+                }
+            }
+            LibeiNotifyEvent::Destroy(pos) => self.clients.retain(|p| *p != pos),
+        }
+    }
+
+    fn finish(self) -> Vec<Position> {
+        self.clients
+    }
+
+    #[cfg(test)]
+    fn retained_positions(&self) -> usize {
+        self.clients.len()
+    }
+}
+
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
     input_capture: Pin<Box<InputCapture>>,
@@ -435,7 +468,7 @@ async fn do_capture(
         let cancel_session = CancellationToken::new();
         let cancel_update = CancellationToken::new();
 
-        let mut capture_events_occurred = Vec::new();
+        let mut client_updates = CaptureClientUpdates::new(&active_clients);
         let mut zones_have_changed = false;
 
         // kill session if clients need to be updated
@@ -455,7 +488,7 @@ async fn do_capture(
                 }, /* zones have changed */
                 e = capture_event.recv() => if let Some(e) = e { /* clients changed */
                     log::debug!("capture event: {e:?}");
-                    capture_events_occurred.push(e);
+                    client_updates.record(e);
                     do_debounce = true;
                 },
             }
@@ -484,7 +517,7 @@ async fn do_capture(
                         },
                         e = capture_event.recv() => if let Some(e) = e {
                             log::debug!("capture event (coalesced): {e:?}");
-                            capture_events_occurred.push(e);
+                            client_updates.record(e);
                         } else {
                             break;
                         }
@@ -537,16 +570,7 @@ async fn do_capture(
         }
 
         // update clients if requested
-        for event in capture_events_occurred {
-            match event {
-                LibeiNotifyEvent::Create(p) => {
-                    if !active_clients.contains(&p) {
-                        active_clients.push(p);
-                    }
-                }
-                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&pos| pos != p),
-            }
-        }
+        active_clients = client_updates.finish();
 
         // break
         if cancellation_token.is_cancelled() {
@@ -871,6 +895,75 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+
+    #[test]
+    fn client_update_burst_retains_only_four_positions() {
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        for _ in 0..10_000 {
+            for pos in [
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ] {
+                updates.record(LibeiNotifyEvent::Destroy(pos));
+                updates.record(LibeiNotifyEvent::Create(pos));
+            }
+        }
+        assert!(
+            updates.retained_positions() <= 4,
+            "retained {} positions",
+            updates.retained_positions()
+        );
+        assert_eq!(
+            updates.finish(),
+            vec![
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom
+            ]
+        );
+    }
+
+    #[test]
+    fn client_updates_preserve_serial_membership_and_barrier_order() {
+        let positions = [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ];
+        let initial_states = [
+            vec![],
+            vec![Position::Top],
+            vec![Position::Right, Position::Left],
+            positions.to_vec(),
+        ];
+        // All five-operation sequences, including duplicates and destroy/recreate.
+        for initial in initial_states {
+            for mut sequence in 0..8usize.pow(5) {
+                let mut expected = initial.clone();
+                let mut updates = CaptureClientUpdates::new(&initial);
+                for _ in 0..5 {
+                    let operation = sequence % 8;
+                    sequence /= 8;
+                    let pos = positions[operation / 2];
+                    if operation % 2 == 0 {
+                        updates.record(LibeiNotifyEvent::Create(pos));
+                        if !expected.contains(&pos) {
+                            expected.push(pos);
+                        }
+                    } else {
+                        updates.record(LibeiNotifyEvent::Destroy(pos));
+                        expected.retain(|p| *p != pos);
+                    }
+                    assert!(updates.retained_positions() <= 4);
+                }
+                assert_eq!(updates.finish(), expected);
+            }
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn finished_capture_task_failure_is_not_silently_successful() {

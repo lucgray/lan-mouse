@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R107 | libei设备批次状态合并已实现 | 合并窗口仅保留至多四边目标状态，删除/重建顺序保持；50ms和会话重建不变，真实portal/RSS仍待验 |
 | R106 | libei任务完成/错误读取已实现 | panic/cancel JoinError转CaptureError，已结束未join结果不丢，消费后fused；取消等待保留原handle；真实portal恢复未验收 |
 | R105 | 不可路由突发的轮询让出已实现 | 每poll最多跳过32条后自唤醒/Pending，控制ready可先运行，按键跟踪及后续有效事件保留；native阻塞/完整时延未实测 |
 | R104 | 删除后的缓存/迟到事件保护已实现 | 删除仅清该句柄fanout，全部logical路由在native await前退役；迟到未知句柄不panic/不改当前capture；真实native时序待验 |
@@ -2118,3 +2119,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] layer-shell内部读/dispatch及libei更新/设备事件路径仍需审；交替生命周期、独立native cleanup资源/失败metadata及真实portal fault恢复未闭合。真实双机千次往返、原生释放/恢复、完整p95/p99和8h RSS仍未验收，不认定90分。
 
 日志：libei-completion-baseline.log、libei-completion-fixed.log、libei-completion-workspace.log、libei-completion-clippy.log、libei-completion-isolated-service.log。
+
+
+## 第九十二轮：libei设备变更批次的历史缓存
+
+### R107 / P2
+
+- libei在50ms debounce内将每条Create/Destroy写入Vec，等会话关闭后才逐条回放。notify channel容量1限制排队，但接收方持续排空并另存历史，因此不能限制该Vec中的操作数。该窗口的数量取决于通知速率，没有固定操作数上限。
+- 提取保持旧逻辑的生产CaptureClientUpdates，受控基线输入80,000条操作后保留80,000条，违反最多四边状态的回归断言。此模型没有真实portal，也不是测量50ms内一定会收到80,000条通知。
+- [x] 收到事件即更新独立目标快照，最多四个唯一Position；不保留历史，结束时直接安装快照。当前会话仍借用旧active_clients直到关闭。删除/重建保留原来的移到末尾语义，select_barriers遍历顺序保持。
+- [x] 原50ms计时、取消/退出分支及GNOME会话重建策略不变；没有根据最终集合相同来跳过必需的重建。每条通知仍要接收/处理，这不是CPU时间或portal延迟上限。
+
+### 验证与剩余范围
+
+- 失败基线修复后通过，80,000条操作仅保留四边。对四个初始状态枚举全部五操作序列，合计131,072组，验证重复创建、删除不存在边缘、删除后重建的最终成员及顺序与原串行语义一致；每步保留量最多4。
+- 工作区all-features root201通过/3忽略、input-capture69通过/1忽略及其他组件通过；严格Clippy/fmt/diff通过；隔离Dummy Service外部重载/授权/剪贴板回归1条通过。测试不实例化真实portal/EIS，也没有部署本机服务。
+- 本轮开始检查d3ccdc6远端HEAD及PR一致；Rust37445540761部分jobs通过、其余pending，Nix37445540754 pending，不能称全矩阵通过。本轮新HEAD还需CI。
+- [ ] native信号/通知关闭、设备事件批次及同步dispatch仍需继续审查。原生恢复、千次双机往返、完整p95≤20ms/p99≤50ms和8h RSS验收仍缺少证据，不认定90分。
+
+日志：libei-client-batch-baseline.log、libei-client-batch-fixed.log、libei-client-batch-workspace.log、libei-client-batch-clippy.log、libei-client-batch-isolated-service.log。
