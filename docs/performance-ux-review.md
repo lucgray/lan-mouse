@@ -23,6 +23,8 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R98 | 已实现并通过两层洪泛/实际worker回归 | 反转与灵敏度合并为最新快照，每hop最多1个pending marker；输入帧顺序保留，中间设置不重播；全进程RSS未证明 |
+| R99 | 已实现并通过挂起/失败初始化回归 | 初始化等待不丢配置，失败保留目标值，成功后输入前应用最新设置；真实平台启动仍待验 |
 | R97 | 已实现并通过实际dispatcher/虚拟时间回归 | 可复用timer按最近peer的1s截止点唤醒、活动刷新/独立peer重设/无peer停用扫描；原生释放时延仍未验收 |
 | R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度至Service及cleanup结束；backend反馈/其他lifecycle总量仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
@@ -1932,3 +1934,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] R97源码/受控时序完成，原生释放、完整pipeline时延与executor拥塞实测仍待验。R96 backend/Reenable/配置和独立cleanup源头、全进程资源、真实双机千次往返与8h RSS仍未闭合，不认定90分。未部署本机程序。
 
 日志：watchdog-deadline-baseline.log、watchdog-deadline-fixed.log、watchdog-deadline-workspace.log、watchdog-deadline-final-root.log、watchdog-deadline-clippy.log、watchdog-deadline-isolated-service.log、round81-ci-failed.log。
+
+
+## 第八十三轮：配置最新快照合并和初始化设置保留
+
+### R98 / P2、R99 / P2
+
+- 两层生产API基线：受控暂停消费者，1万次反转/灵敏度编辑留下2万条EmulationRequest；1万次proxy update留下1万份配置快照，期望各1条失败。日志emulation-config-coalescing-baseline.log。组件API洪泛，不是实际GUI点击或RSS测量。
+- 初始化基线：生产create_clients挂起后端create，预先队列UpdateConfig(true,2.5)，等待超时错误后task仍是(false,1.0)，期望最新设置断言失败。wait_for_termination在初始化等待中把配置当作可丢弃工作。日志emulation-config-init-baseline.log。
+- [x] 首层两字段使用统一InputConfig缓存和弱pending marker，后续编辑更新同一Rc<Cell<InputConfig>>；proxy层同样最多一份pending快照。快照处理/drop后恢复入队能力，unchanged首层值不产生工作；普通输入不增加该共享分配。
+- [x] 保留marker首次入队位置和输入帧FIFO，后续设置编辑合入最新值，不重播中间配置。配置分支在本地runtime同步读值/转发，无await；这不是保留每个中间配置与输入之间的历史边界。
+- [x] 初始化终止等待改为保存最新配置；失败仍留task目标值，create_clients完成后实际后端先update_config再接受输入。原Terminate及旧输入丢弃/cleanup保护保留。
+
+### 验证与尚未闭合范围
+
+- 三条失败基线修复后通过。首层字段合并、dequeue后尚未处理仍合并、最后drop后可提交新快照、unchanged值无工作；proxy层1万更新只1份记录。实际worker记录marker前输入使用原配置、marker后输入使用最新配置，设置只应用一次，input顺序和cleanup断言保留。
+- 挂起create放行成功fixture验证最新设置实际应用到backend且首个输入使用它；失败初始化fixture验证目标值保留。proxy回归31条通过；工作区all-features root189通过/3忽略，其他组件全部通过；严格Clippy/fmt/diff通过。额外隔离Dummy Service外部配置重载/授权撤销回归1条通过。未部署已安装服务。
+- 第82轮15a5bc3最新检查Rust37434080392/Nix37434080206均in_progress；Windows cfg修正尚不能据Linux结果认定原生CI已通过。
+- [ ] 显式Reenable/Release和backend状态通知源头仍需预算或合并；独立native cleanup任务及失败metadata仍是其他范围。1份配置marker上限不是总Service/进程事件或RSS上限，真实GUI拖动及原生初始化体验仍待验。
+- [ ] 千次真实双机往返、原生失控释放/恢复、完整p95/p99和8h RSS未完成，不认定90分。
+
+日志：emulation-config-coalescing-baseline.log、emulation-config-init-baseline.log、emulation-config-coalescing-fixed.log、emulation-config-coalescing-workspace.log、emulation-config-coalescing-clippy.log、emulation-config-coalescing-isolated-service.log。

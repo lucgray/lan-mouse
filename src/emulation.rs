@@ -34,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct Emulation {
     task: JoinHandle<CleanupState<InputEmulation>>,
     request_tx: Sender<EmulationRequest>,
+    input_config: Cell<InputConfig>,
+    config_updates: ConfigUpdates,
     event_rx: Receiver<EmulationEvent>,
     clipboard_tx: tokio::sync::mpsc::Sender<ClipboardRequest>,
     port_requests: tokio::sync::watch::Sender<Option<u16>>,
@@ -127,14 +129,31 @@ pub(crate) enum EmulationEvent {
     ClipboardSendCompleted(ClipboardCompletion),
 }
 
+/// One queued marker carries the latest combined settings until consumed.
+#[derive(Default)]
+struct ConfigUpdates {
+    pending: RefCell<std::rc::Weak<Cell<InputConfig>>>,
+}
+
+impl ConfigUpdates {
+    fn publish(&self, config: InputConfig) -> Option<Rc<Cell<InputConfig>>> {
+        if let Some(snapshot) = self.pending.borrow().upgrade() {
+            snapshot.set(config);
+            return None;
+        }
+        let snapshot = Rc::new(Cell::new(config));
+        *self.pending.borrow_mut() = Rc::downgrade(&snapshot);
+        Some(snapshot)
+    }
+}
+
 enum EmulationRequest {
     Reenable,
     /// release the peer's capture, handing the cursor back at the
     /// given normalized cross-axis position
     Release(SocketAddr, f64),
     Terminate,
-    UpdateScrollingInversion(bool),
-    UpdateMouseSensitivity(f64),
+    UpdateConfig(Rc<Cell<InputConfig>>),
 }
 
 impl Emulation {
@@ -166,6 +185,8 @@ impl Emulation {
         Self {
             task,
             request_tx,
+            input_config: Cell::new(input_config),
+            config_updates: Default::default(),
             event_rx,
             clipboard_tx,
             clipboard_conns,
@@ -266,15 +287,27 @@ impl Emulation {
     }
 
     pub(crate) fn request_scrolling_inversion(&self, invert_scroll: bool) {
-        self.request_tx
-            .send(EmulationRequest::UpdateScrollingInversion(invert_scroll))
-            .expect("channel closed")
+        let mut config = self.input_config.get();
+        config.invert_scroll = invert_scroll;
+        self.update_input_config(config);
     }
 
     pub(crate) fn request_mouse_sensitivity_change(&self, mouse_sensitivity: f64) {
-        self.request_tx
-            .send(EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity))
-            .expect("channel closed")
+        let mut config = self.input_config.get();
+        config.mouse_sensitivity = mouse_sensitivity;
+        self.update_input_config(config);
+    }
+
+    fn update_input_config(&self, config: InputConfig) {
+        if config == self.input_config.get() {
+            return;
+        }
+        self.input_config.set(config);
+        if let Some(snapshot) = self.config_updates.publish(config) {
+            self.request_tx
+                .send(EmulationRequest::UpdateConfig(snapshot))
+                .expect("channel closed");
+        }
     }
 
     pub(crate) async fn event(&mut self) -> EmulationEvent {
@@ -603,12 +636,8 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr, t) => self.listener.reply(&mut control_jobs, addr, ProtoEvent::Leave(0, t)),
-                    EmulationRequest::UpdateScrollingInversion(invert_scroll) => {
-                        self.emulation_proxy.input_config.invert_scroll = invert_scroll;
-                        self.emulation_proxy.update_config();
-                    }
-                    EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity) => {
-                        self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
+                    EmulationRequest::UpdateConfig(snapshot) => {
+                        self.emulation_proxy.input_config = snapshot.get();
                         self.emulation_proxy.update_config();
                     }
                     EmulationRequest::Terminate => break,
@@ -675,6 +704,7 @@ pub(crate) struct EmulationProxy {
     event_rx: Receiver<EmulationEvent>,
     task: JoinHandle<CleanupState<InputEmulation>>,
     input_config: InputConfig,
+    config_updates: ConfigUpdates,
 }
 
 enum ProxyRequest {
@@ -700,7 +730,7 @@ enum ProxyRequest {
     ),
     Terminate,
     Reenable,
-    UpdateConfig(InputConfig),
+    UpdateConfig(Rc<Cell<InputConfig>>),
 }
 
 impl EmulationProxy {
@@ -734,6 +764,7 @@ impl EmulationProxy {
             task,
             event_rx,
             input_config,
+            config_updates: Default::default(),
         }
     }
 
@@ -813,9 +844,11 @@ impl EmulationProxy {
     }
 
     fn update_config(&self) {
-        self.request_tx
-            .send(ProxyRequest::UpdateConfig(self.input_config))
-            .expect("channel closed");
+        if let Some(snapshot) = self.config_updates.publish(self.input_config) {
+            self.request_tx
+                .send(ProxyRequest::UpdateConfig(snapshot))
+                .expect("channel closed");
+        }
     }
 
     async fn terminate(&mut self) -> CleanupState<InputEmulation> {
@@ -1003,8 +1036,8 @@ impl EmulationTask {
                             }
                         }
                     }
-                    ProxyRequest::UpdateConfig(input_config) => {
-                        self.input_config = input_config;
+                    ProxyRequest::UpdateConfig(snapshot) => {
+                        self.input_config = snapshot.get();
                     }
                 }
             }
@@ -1026,7 +1059,7 @@ impl EmulationTask {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
             r = InputEmulation::new(self.backend, self.options, self.input_config) => r?,
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+            _ = wait_for_termination(&mut self.request_rx, &mut self.input_config) => return Ok(()),
         };
 
         let _emulation_guard = DropGuard::new(
@@ -1054,9 +1087,11 @@ impl EmulationTask {
         for handle in self.handles.values() {
             tokio::select! {
                 result = backend_operation(self.operation_timeout, "create", emulation.create(*handle)) => { result?; },
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(false),
+                _ = wait_for_termination(&mut self.request_rx, &mut self.input_config) => return Ok(false),
             }
         }
+        // Initialization may have consumed settings while waiting for handles.
+        emulation.update_config(self.input_config);
         Ok(true)
     }
 
@@ -1095,9 +1130,9 @@ impl EmulationTask {
                             }
                         }
                     }
-                    ProxyRequest::UpdateConfig(input_config) => {
-                        self.input_config = input_config;
-                        emulation.update_config(input_config);
+                    ProxyRequest::UpdateConfig(snapshot) => {
+                        self.input_config = snapshot.get();
+                        emulation.update_config(self.input_config);
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
@@ -1216,7 +1251,7 @@ fn to_emulation_pos(pos: Position) -> input_emulation::Position {
     }
 }
 
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
+async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>, input_config: &mut InputConfig) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
@@ -1224,7 +1259,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Warp(..) => continue,
             ProxyRequest::Remove(..) => continue,
             ProxyRequest::Reenable => continue,
-            ProxyRequest::UpdateConfig(_) => continue,
+            ProxyRequest::UpdateConfig(snapshot) => *input_config = snapshot.get(),
         }
     }
 }
@@ -1266,11 +1301,22 @@ mod resume_tests {
         remove_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
         remove_started: Option<std::sync::Arc<tokio::sync::Notify>>,
         held_handles: HashSet<EmulationHandle>,
+        create_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        create_started: Option<std::sync::Arc<tokio::sync::Notify>>,
+        current_config: InputConfig,
+        config_history: Vec<InputConfig>,
+        consumed_configs: Vec<InputConfig>,
     }
 
     impl ProxyBackend for StallingBackend {
         async fn create(&mut self, handle: EmulationHandle) {
             self.creates.push(handle);
+            if let Some(started) = &self.create_started {
+                started.notify_one();
+            }
+            if let Some(gate) = &self.create_gate {
+                gate.acquire().await.unwrap().forget();
+            }
             if self.stall == Some("create") {
                 std::future::pending::<()>().await;
             }
@@ -1281,6 +1327,7 @@ mod resume_tests {
             handle: EmulationHandle,
         ) -> Result<(), input_emulation::EmulationError> {
             self.consumed.push(handle);
+            self.consumed_configs.push(self.current_config);
             self.held = true;
             self.held_handles.insert(handle);
             tokio::time::sleep(self.consume_delay).await;
@@ -1317,7 +1364,10 @@ mod resume_tests {
             self.held = !self.held_handles.is_empty();
             true
         }
-        fn update_config(&mut self, _: InputConfig) {}
+        fn update_config(&mut self, config: InputConfig) {
+            self.current_config = config;
+            self.config_history.push(config);
+        }
     }
 
     fn worker() -> (
@@ -1344,6 +1394,208 @@ mod resume_tests {
             tx,
             event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn settings_consumed_during_creation_apply_before_input() {
+        let (mut task, tx, _events) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        task.handles.insert(addr, 0);
+        let newest = InputConfig {
+            invert_scroll: true,
+            mouse_sensitivity: 2.5,
+        };
+        tx.send(ProxyRequest::UpdateConfig(Rc::new(Cell::new(newest))))
+            .unwrap();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let mut backend = StallingBackend {
+            create_started: Some(started.clone()),
+            create_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let control = async {
+            started.notified().await;
+            tokio::task::yield_now().await;
+            gate.add_permits(1);
+        };
+        let (created, ()) = tokio::join!(task.create_clients(&mut backend), control);
+        assert!(created.unwrap());
+        assert_eq!(task.input_config, newest);
+        assert_eq!(backend.current_config, newest);
+        assert_eq!(backend.config_history, vec![newest]);
+        tx.send(ProxyRequest::Input(press(), addr, None, None))
+            .unwrap();
+        tx.send(ProxyRequest::Remove(addr, None, None, None))
+            .unwrap();
+        tx.send(ProxyRequest::Terminate).unwrap();
+        task.do_emulation_session(&mut backend).await.unwrap();
+        assert_eq!(backend.consumed_configs, vec![newest]);
+        assert!(!backend.held);
+    }
+
+    #[tokio::test]
+    async fn coalesced_settings_marker_preserves_input_queue_order() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (mut task, tx, events) = worker();
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let mut proxy = EmulationProxy {
+                    emulation_active: Rc::new(Cell::new(true)),
+                    exit_requested: Default::default(),
+                    request_tx: tx.clone(),
+                    event_rx: events,
+                    task: spawn_local(async { CleanupState::Complete }),
+                    input_config: Default::default(),
+                    config_updates: Default::default(),
+                };
+                proxy.consume(press(), addr, None, None);
+                for value in 0..10_000 {
+                    proxy.input_config = InputConfig {
+                        invert_scroll: value % 2 != 0,
+                        mouse_sensitivity: 1.0 + (value % 8) as f64,
+                    };
+                    proxy.update_config();
+                }
+                let newest = proxy.input_config;
+                proxy.consume(press(), addr, None, None);
+                proxy.remove_with_admission(addr, None, None);
+                tx.send(ProxyRequest::Terminate).unwrap();
+                let mut backend = StallingBackend::default();
+                task.do_emulation_session(&mut backend).await.unwrap();
+                assert_eq!(backend.config_history, vec![newest]);
+                assert_eq!(
+                    backend.consumed_configs,
+                    vec![InputConfig::default(), newest]
+                );
+                assert!(!backend.held);
+                assert_eq!(task.input_config, newest);
+                proxy.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn settings_during_handle_creation_survive_failed_initialization() {
+        let (mut task, tx, _events) = worker();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        task.handles.insert(addr, 0);
+        let newest = InputConfig {
+            invert_scroll: true,
+            mouse_sensitivity: 2.5,
+        };
+        tx.send(ProxyRequest::UpdateConfig(Rc::new(Cell::new(newest))))
+            .unwrap();
+        let mut backend = StallingBackend {
+            stall: Some("create"),
+            ..Default::default()
+        };
+        assert!(task.create_clients(&mut backend).await.is_err());
+        assert_eq!(
+            task.input_config, newest,
+            "initialization wait must preserve the latest settings for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn emulation_config_change_flood_keeps_one_pending_snapshot() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, _) = crate::listen::control_test_listener(addr);
+                let mut emulation = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                let (tx, mut requests) = channel();
+                let original = std::mem::replace(&mut emulation.request_tx, tx);
+                for value in 0..10_000 {
+                    emulation.request_scrolling_inversion(value % 2 != 0);
+                    emulation.request_mouse_sensitivity_change(1.0 + (value % 8) as f64);
+                }
+                let request = requests.recv().await.unwrap();
+                let EmulationRequest::UpdateConfig(snapshot) = &request else {
+                    panic!("wrong marker");
+                };
+                assert_eq!(
+                    snapshot.get(),
+                    InputConfig {
+                        invert_scroll: true,
+                        mouse_sensitivity: 8.0
+                    }
+                );
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                emulation.request_scrolling_inversion(false);
+                emulation.request_mouse_sensitivity_change(4.0);
+                assert_eq!(
+                    snapshot.get(),
+                    InputConfig {
+                        invert_scroll: false,
+                        mouse_sensitivity: 4.0
+                    }
+                );
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "dequeued marker still owns the pending snapshot"
+                );
+                drop(request);
+                emulation.request_mouse_sensitivity_change(3.0);
+                let EmulationRequest::UpdateConfig(snapshot) = requests.recv().await.unwrap()
+                else {
+                    panic!();
+                };
+                assert_eq!(
+                    snapshot.get(),
+                    InputConfig {
+                        invert_scroll: false,
+                        mouse_sensitivity: 3.0
+                    }
+                );
+                drop(snapshot);
+                emulation.request_mouse_sensitivity_change(3.0);
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "unchanged setting must not create work"
+                );
+                emulation.request_tx = original;
+                emulation.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_config_change_flood_keeps_one_pending_snapshot() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut proxy = EmulationProxy::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    Default::default(),
+                );
+                let (tx, mut requests) = channel();
+                let original = std::mem::replace(&mut proxy.request_tx, tx);
+                for value in 0..10_000 {
+                    proxy.input_config.invert_scroll = value % 2 != 0;
+                    proxy.input_config.mouse_sensitivity = 1.0 + (value % 8) as f64;
+                    proxy.update_config();
+                }
+                let mut count = 0;
+                while futures::FutureExt::now_or_never(requests.recv())
+                    .flatten()
+                    .is_some()
+                {
+                    count += 1;
+                }
+                assert_eq!(
+                    count, 1,
+                    "paused worker must not retain every settings snapshot"
+                );
+                proxy.request_tx = original;
+                proxy.terminate().await;
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1810,6 +2062,7 @@ mod resume_tests {
                     request_tx: proxy_tx,
                     event_rx: proxy_event_rx,
                     input_config: Default::default(),
+                    config_updates: Default::default(),
                     task: spawn_local(async move {
                         done.notified().await;
                         CleanupState::Complete

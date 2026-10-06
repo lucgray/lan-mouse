@@ -1112,3 +1112,20 @@ deadline; expiry rearms for remaining peers, and no tracked peer disables the
 timer branch. The five-second periodic scan is removed. Deadline readiness is
 subject to executor and native-backend scheduling, so physical release and
 full-pipeline RSS/latency remain separate acceptance work.
+
+
+### Latest input settings through emulation queues
+
+Scroll inversion and mouse sensitivity travel as one combined snapshot. Each
+of the Service-to-dispatcher and dispatcher-to-proxy hops retains at most one
+pending configuration marker; later edits update its shared value. The marker
+keeps its queue position and input-frame order is preserved, while intermediate
+settings snapshots are replaced by the latest value. After consumption/drop,
+a subsequent change can enqueue a new marker. An unchanged first-hop setting
+creates no work. Configuration forwarding is synchronous on the local runtime.
+
+Backend and handle initialization waits now retain configuration requests
+instead of discarding them while waiting for termination. Latest settings are
+applied before the backend starts accepting input; failed initialization keeps
+the desired configuration for recovery. This does not bound explicit re-enable,
+release or backend-status queues, and does not change network serialization.
