@@ -1295,3 +1295,20 @@ Requested EIS teardown takes priority over a simultaneously ready stream error,
 so a normal session restart is not reported as an unexpected failure. This does
 not add a native timeout or prove that a hung portal operation will finish; those
 operations remain owned and must return before their completion can be reported.
+
+
+### Libei update source closure
+
+The session update watcher distinguishes zone-change signals from the end of
+the signal stream. Unexpected zone-stream or client-notification channel closure
+returns a contextual capture error before or during the 50ms debounce. It stops
+polling that closed source and wakes the session branch through the existing
+completion wrapper. Active sessions still reach existing disable/close handling
+before that error is returned. Idle watcher errors also propagate to the owner.
+
+Requested backend or session shutdown has priority over closed sources. The two
+update sources retain fair selection, and a ready debounce timer takes priority
+over further updates. The window is still measured from its first update. These
+changes do not guarantee that native portal operations or an always-ready source
+will yield promptly; native fault recovery and physical pointer behavior need
+platform validation.

@@ -469,66 +469,16 @@ async fn do_capture(
         let cancel_update = CancellationToken::new();
 
         let mut client_updates = CaptureClientUpdates::new(&active_clients);
-        let mut zones_have_changed = false;
-
-        // kill session if clients need to be updated
-        let handle_session_update_request = async {
-            let mut do_debounce = false;
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    log::debug!("cancelled");
-                }, /* exit requested */
-                _ = cancel_update.cancelled() => {
-                    log::debug!("update task cancelled");
-                }, /* session exited */
-                _ = zones_changed.next() => {
-                    log::debug!("zones changed!");
-                    zones_have_changed = true;
-                    do_debounce = true;
-                }, /* zones have changed */
-                e = capture_event.recv() => if let Some(e) = e { /* clients changed */
-                    log::debug!("capture event: {e:?}");
-                    client_updates.record(e);
-                    do_debounce = true;
-                },
-            }
-
-            if do_debounce {
-                let debounce_duration = std::time::Duration::from_millis(50);
-                let sleep = tokio::time::sleep(debounce_duration);
-                tokio::pin!(sleep);
-
-                loop {
-                    tokio::select! {
-                        _ = &mut sleep => {
-                            break;
-                        },
-                        _ = cancellation_token.cancelled() => {
-                            log::debug!("cancelled during debounce");
-                            break;
-                        },
-                        _ = cancel_update.cancelled() => {
-                            log::debug!("update task cancelled during debounce");
-                            break;
-                        },
-                        _ = zones_changed.next() => {
-                            log::debug!("zones changed (coalesced)!");
-                            zones_have_changed = true;
-                        },
-                        e = capture_event.recv() => if let Some(e) = e {
-                            log::debug!("capture event (coalesced): {e:?}");
-                            client_updates.record(e);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // kill session (might already be dead!)
-            log::debug!("=> cancelling session");
-            cancel_session.cancel();
-        };
+        let handle_session_update_request = cancel_sibling_on_completion(
+            wait_session_updates(
+                &mut zones_changed,
+                &mut capture_event,
+                &mut client_updates,
+                &cancellation_token,
+                &cancel_update,
+            ),
+            cancel_session.clone(),
+        );
 
         if !active_clients.is_empty() {
             // create session
@@ -553,7 +503,8 @@ async fn do_capture(
             let capture_session =
                 cancel_sibling_on_completion(capture_session, cancel_update.clone());
 
-            let (capture_result, ()) = tokio::join!(capture_session, handle_session_update_request);
+            let (capture_result, update_result) =
+                tokio::join!(capture_session, handle_session_update_request);
             log::debug!("capture session + session_update task done!");
 
             // disable capture
@@ -567,8 +518,9 @@ async fn do_capture(
 
             // propagate error from capture session
             capture_result?;
+            update_result?;
         } else {
-            handle_session_update_request.await;
+            handle_session_update_request.await?;
         }
 
         // update clients if requested
@@ -577,6 +529,55 @@ async fn do_capture(
         // break
         if cancellation_token.is_cancelled() {
             break Ok(());
+        }
+    }
+}
+
+async fn next_session_update(
+    zones_changed: &mut (impl Stream + Unpin),
+    capture_event: &mut Receiver<LibeiNotifyEvent>,
+) -> Result<Option<LibeiNotifyEvent>, CaptureError> {
+    // Keep the two data sources fair when either produces a burst.
+    tokio::select! {
+        change = zones_changed.next() => change
+            .map(|_| None)
+            .ok_or_else(|| io::Error::other("libei zones change stream closed").into()),
+        event = capture_event.recv() => event
+            .map(Some)
+            .ok_or_else(|| io::Error::other("libei client notification channel closed").into()),
+    }
+}
+
+async fn wait_session_updates(
+    zones_changed: &mut (impl Stream + Unpin),
+    capture_event: &mut Receiver<LibeiNotifyEvent>,
+    client_updates: &mut CaptureClientUpdates,
+    cancellation_token: &CancellationToken,
+    cancel_update: &CancellationToken,
+) -> Result<(), CaptureError> {
+    let update = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => return Ok(()),
+        _ = cancel_update.cancelled() => return Ok(()),
+        update = next_session_update(zones_changed, capture_event) => update?,
+    };
+    if let Some(event) = update {
+        client_updates.record(event);
+    }
+
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(50));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Ok(()),
+            _ = cancel_update.cancelled() => return Ok(()),
+            _ = &mut sleep => return Ok(()),
+            update = next_session_update(zones_changed, capture_event) => {
+                if let Some(event) = update? {
+                    client_updates.record(event);
+                }
+            },
         }
     }
 }
@@ -913,6 +914,160 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+
+    // Prevent a regressed EOF busy loop from trapping the test runtime.
+    struct EofProbe {
+        initial_change: bool,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl Stream for EofProbe {
+        type Item = ();
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+            self.polls.set(self.polls.get() + 1);
+            if self.initial_change {
+                self.initial_change = false;
+                Poll::Ready(Some(()))
+            } else if self.polls.get() <= 16 {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    async fn assert_closed_zone_stream(initial_change: bool) {
+        let polls = Rc::new(Cell::new(0));
+        let mut zones = EofProbe {
+            initial_change,
+            polls: polls.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let result = wait_session_updates(
+            &mut zones,
+            &mut events,
+            &mut updates,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .now_or_never();
+        let error = result
+            .expect("EOF caused repeated polling instead of failure")
+            .unwrap_err();
+        assert!(error.to_string().contains("zones"));
+        assert_eq!(polls.get(), if initial_change { 2 } else { 1 });
+    }
+
+    async fn assert_closed_client_channel(initial_change: bool) {
+        let mut zones = futures::stream::pending::<()>();
+        let (send, mut events) = mpsc::channel(1);
+        if initial_change {
+            send.send(LibeiNotifyEvent::Create(Position::Right))
+                .await
+                .unwrap();
+        }
+        drop(send);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let result = wait_session_updates(
+            &mut zones,
+            &mut events,
+            &mut updates,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .now_or_never();
+        let error = result.expect("closed channel did not finish").unwrap_err();
+        assert!(error.to_string().contains("client notification"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_zone_stream_before_debounce_reports_failure() {
+        assert_closed_zone_stream(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_zone_stream_during_debounce_reports_failure() {
+        assert_closed_zone_stream(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_client_channel_before_debounce_reports_failure() {
+        assert_closed_client_channel(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_client_channel_during_debounce_reports_failure() {
+        assert_closed_client_channel(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_update_shutdown_has_priority_over_closed_sources() {
+        for stop_backend in [false, true] {
+            let polls = Rc::new(Cell::new(0));
+            let mut zones = EofProbe {
+                initial_change: false,
+                polls: polls.clone(),
+            };
+            let (send, mut events) = mpsc::channel(1);
+            drop(send);
+            let stop = CancellationToken::new();
+            let session_finished = CancellationToken::new();
+            if stop_backend {
+                stop.cancel();
+            } else {
+                session_finished.cancel();
+            }
+            let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+            let result = wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &session_finished,
+            )
+            .await;
+            assert!(result.is_ok());
+            assert_eq!(polls.get(), 0);
+            assert_eq!(updates.finish(), vec![Position::Left]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn healthy_updates_merge_until_original_debounce_finishes() {
+        let mut zones = futures::stream::pending::<()>();
+        let (send, mut events) = mpsc::channel(3);
+        for event in [
+            LibeiNotifyEvent::Create(Position::Left),
+            LibeiNotifyEvent::Destroy(Position::Left),
+            LibeiNotifyEvent::Create(Position::Right),
+        ] {
+            send.send(event).await.unwrap();
+        }
+        let mut updates = CaptureClientUpdates::new(&[Position::Top]);
+        let stop = CancellationToken::new();
+        let session_finished = CancellationToken::new();
+        {
+            let wait = wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &session_finished,
+            );
+            tokio::pin!(wait);
+            assert!(wait.as_mut().now_or_never().is_none());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), wait)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+        }
+        // The sender stays open throughout the debounce.
+        drop(send);
+        assert_eq!(updates.finish(), vec![Position::Top, Position::Right]);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn session_setup_failure_cancels_waiting_update_branch() {
