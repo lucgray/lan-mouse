@@ -1127,5 +1127,23 @@ creates no work. Configuration forwarding is synchronous on the local runtime.
 Backend and handle initialization waits now retain configuration requests
 instead of discarding them while waiting for termination. Latest settings are
 applied before the backend starts accepting input; failed initialization keeps
-the desired configuration for recovery. This does not bound explicit re-enable,
-release or backend-status queues, and does not change network serialization.
+the desired configuration for recovery. This settings coalescing alone does not
+bound release or other lifecycle sources, and does not change network serialization.
+
+
+### Explicit emulation retry ownership
+
+Repeated Emulation::reenable requests coalesce into one outstanding retry per
+Emulation instance. Its shared ReenableLease crosses dispatcher/proxy queues,
+the backend attempt and derived Enabled/Disabled/BackendFailed notices through
+Service processing/drop. An active recovered backend keeps that attempt alive;
+re-enable while active remains a no-op. Failed attempts remain reserved while
+their feedback is pending; after the last owner drops a fresh explicit retry
+can be submitted. There is no new automatic retry loop.
+
+The weak producer registry does not keep attempts alive itself. Initial startup
+has one finite status batch without a retry owner; subsequent explicit retry
+cycles retain ownership instead of transferring backlog to status queues.
+Cleanup refusal still prevents constructing a replacement backend. Capture retry,
+release requests, other feedback and detached native cleanup require separate
+resource/physical recovery validation; this is not a total process RSS bound.

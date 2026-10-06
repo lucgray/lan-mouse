@@ -36,6 +36,7 @@ pub(crate) struct Emulation {
     request_tx: Sender<EmulationRequest>,
     input_config: Cell<InputConfig>,
     config_updates: ConfigUpdates,
+    reenable_pending: RefCell<std::rc::Weak<ReenableLease>>,
     event_rx: Receiver<EmulationEvent>,
     clipboard_tx: tokio::sync::mpsc::Sender<ClipboardRequest>,
     port_requests: tokio::sync::watch::Sender<Option<u16>>,
@@ -85,9 +86,12 @@ pub(crate) enum EmulationEvent {
     /// the port of the listener has changed
     PortChanged(Result<u16, ListenerCreationError>),
     /// emulation was disabled
-    EmulationDisabled,
+    EmulationDisabled { retry: Option<Rc<ReenableLease>> },
     /// backend operation failed; surfaced separately from the disabled status
-    BackendFailed(String),
+    BackendFailed {
+        error: String,
+        retry: Option<Rc<ReenableLease>>,
+    },
     InputCleanupFailed {
         addr: SocketAddr,
         input: Option<crate::input_budget::InputAdmission>,
@@ -98,7 +102,7 @@ pub(crate) enum EmulationEvent {
         input: Option<crate::input_budget::InputAdmission>,
     },
     /// emulation was enabled
-    EmulationEnabled,
+    EmulationEnabled { retry: Option<Rc<ReenableLease>> },
     /// capture should be released
     ReleaseNotify {
         addr: SocketAddr,
@@ -147,8 +151,11 @@ impl ConfigUpdates {
     }
 }
 
+/// One explicit retry spans both request queues, the attempt and status notices.
+pub(crate) struct ReenableLease;
+
 enum EmulationRequest {
-    Reenable,
+    Reenable(Rc<ReenableLease>),
     /// release the peer's capture, handing the cursor back at the
     /// given normalized cross-axis position
     Release(SocketAddr, f64),
@@ -187,6 +194,7 @@ impl Emulation {
             request_tx,
             input_config: Cell::new(input_config),
             config_updates: Default::default(),
+            reenable_pending: Default::default(),
             event_rx,
             clipboard_tx,
             clipboard_conns,
@@ -272,8 +280,13 @@ impl Emulation {
     }
 
     pub(crate) fn reenable(&self) {
+        if self.reenable_pending.borrow().strong_count() != 0 {
+            return;
+        }
+        let retry = Rc::new(ReenableLease);
+        *self.reenable_pending.borrow_mut() = Rc::downgrade(&retry);
         self.request_tx
-            .send(EmulationRequest::Reenable)
+            .send(EmulationRequest::Reenable(retry))
             .expect("channel closed");
     }
 
@@ -633,7 +646,7 @@ impl ListenTask {
                 }
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
-                    EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    EmulationRequest::Reenable(retry) => self.emulation_proxy.reenable(retry),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr, t) => self.listener.reply(&mut control_jobs, addr, ProtoEvent::Leave(0, t)),
                     EmulationRequest::UpdateConfig(snapshot) => {
@@ -729,7 +742,7 @@ enum ProxyRequest {
         Option<Rc<TimeoutLease>>,
     ),
     Terminate,
-    Reenable,
+    Reenable(Rc<ReenableLease>),
     UpdateConfig(Rc<Cell<InputConfig>>),
 }
 
@@ -770,10 +783,10 @@ impl EmulationProxy {
 
     async fn event(&mut self) -> EmulationEvent {
         let event = self.event_rx.recv().await.expect("channel closed");
-        if let EmulationEvent::EmulationEnabled = event {
+        if let EmulationEvent::EmulationEnabled { .. } = event {
             self.emulation_active.replace(true);
         }
-        if let EmulationEvent::EmulationDisabled = event {
+        if let EmulationEvent::EmulationDisabled { .. } = event {
             self.emulation_active.replace(false);
         }
         event
@@ -837,9 +850,9 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
-    fn reenable(&self) {
+    fn reenable(&self, retry: Rc<ReenableLease>) {
         self.request_tx
-            .send(ProxyRequest::Reenable)
+            .send(ProxyRequest::Reenable(retry))
             .expect("channel closed");
     }
 
@@ -1003,16 +1016,21 @@ struct EmulationTask {
 
 impl EmulationTask {
     async fn run(mut self) -> CleanupState<InputEmulation> {
+        let mut retry = None;
         loop {
-            if let Err(e) = self.do_emulation().await {
+            if let Err(e) = self.do_emulation(retry.clone()).await {
                 log::warn!("input emulation exited: {e}");
                 self.event_tx
-                    .send(EmulationEvent::BackendFailed(e.to_string()))
+                    .send(EmulationEvent::BackendFailed {
+                        error: e.to_string(),
+                        retry: retry.take(),
+                    })
                     .expect("channel closed");
             }
             if self.exit_requested.get() {
                 break;
             }
+            drop(retry.take());
             // Only explicit reenable may create a replacement backend.
             loop {
                 let Some(request) = self.request_rx.recv().await else {
@@ -1020,7 +1038,10 @@ impl EmulationTask {
                     return self.cleanup;
                 };
                 match request {
-                    ProxyRequest::Reenable => break,
+                    ProxyRequest::Reenable(admission) => {
+                        retry = Some(admission);
+                        break;
+                    }
                     ProxyRequest::Terminate => {
                         let _ = self.cleanup.retry().await;
                         return self.cleanup;
@@ -1046,7 +1067,10 @@ impl EmulationTask {
         self.cleanup
     }
 
-    async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
+    async fn do_emulation(
+        &mut self,
+        retry: Option<Rc<ReenableLease>>,
+    ) -> Result<(), InputEmulationError> {
         if !self.cleanup.retry().await {
             return Err(input_emulation::EmulationError::Io(std::io::Error::other(
                 "previous input backend cleanup is incomplete; replacement was refused",
@@ -1064,8 +1088,12 @@ impl EmulationTask {
 
         let _emulation_guard = DropGuard::new(
             self.event_tx.clone(),
-            EmulationEvent::EmulationEnabled,
-            EmulationEvent::EmulationDisabled,
+            EmulationEvent::EmulationEnabled {
+                retry: retry.clone(),
+            },
+            EmulationEvent::EmulationDisabled {
+                retry: retry.clone(),
+            },
         );
 
         let res = match self.create_clients(&mut emulation).await {
@@ -1135,7 +1163,7 @@ impl EmulationTask {
                         emulation.update_config(self.input_config);
                     }
                     ProxyRequest::Terminate => break Ok(()),
-                    ProxyRequest::Reenable => continue,
+                    ProxyRequest::Reenable(_retry) => continue,
                 },
             }
         }
@@ -1258,7 +1286,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>, input_config: &mu
             ProxyRequest::Input(..) => continue,
             ProxyRequest::Warp(..) => continue,
             ProxyRequest::Remove(..) => continue,
-            ProxyRequest::Reenable => continue,
+            ProxyRequest::Reenable(_retry) => continue,
             ProxyRequest::UpdateConfig(snapshot) => *input_config = snapshot.get(),
         }
     }
@@ -1394,6 +1422,193 @@ mod resume_tests {
             tx,
             event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn repeated_reenable_calls_keep_one_pending_attempt() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, _) = crate::listen::control_test_listener(addr);
+                let mut source = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                let (tx, mut requests) = channel();
+                let original = std::mem::replace(&mut source.request_tx, tx);
+                for _ in 0..10_000 {
+                    source.reenable();
+                }
+                let EmulationRequest::Reenable(retry) = requests.recv().await.unwrap() else {
+                    panic!();
+                };
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                let mut proxy = EmulationProxy::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    Default::default(),
+                );
+                let (proxy_tx, mut proxy_requests) = channel();
+                let proxy_original = std::mem::replace(&mut proxy.request_tx, proxy_tx);
+                proxy.reenable(retry);
+                for _ in 0..10_000 {
+                    source.reenable();
+                }
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "forwarding must keep the same attempt reserved"
+                );
+                let queued = proxy_requests.recv().await.unwrap();
+                assert!(matches!(queued, ProxyRequest::Reenable(_)));
+                source.reenable();
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "dequeued request still owns admission"
+                );
+                drop(queued);
+                source.reenable();
+                assert!(matches!(
+                    requests.recv().await,
+                    Some(EmulationRequest::Reenable(_))
+                ));
+                proxy.request_tx = proxy_original;
+                proxy.terminate().await;
+                source.request_tx = original;
+                source.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reenable_feedback_backlog_keeps_attempt_reserved() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, _) = crate::listen::control_test_listener(addr);
+                let mut source = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                let (source_tx, mut requests) = channel();
+                let original = std::mem::replace(&mut source.request_tx, source_tx);
+                let (mut worker, worker_tx, mut feedback) = worker();
+                worker.cleanup = CleanupState::Failed;
+                let task = spawn_local(worker.run());
+                for _ in 0..64 {
+                    source.reenable();
+                }
+                while let Some(Some(request)) = futures::FutureExt::now_or_never(requests.recv()) {
+                    if let EmulationRequest::Reenable(retry) = request {
+                        worker_tx.send(ProxyRequest::Reenable(retry)).unwrap();
+                    }
+                }
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                let mut errors = Vec::new();
+                while let Some(Some(event)) = futures::FutureExt::now_or_never(feedback.recv()) {
+                    if matches!(event, EmulationEvent::BackendFailed { .. }) {
+                        errors.push(event);
+                    }
+                }
+                assert_eq!(
+                    errors.len(),
+                    2,
+                    "one initial failure plus one explicit retry must bound feedback"
+                );
+                for _ in 0..64 {
+                    source.reenable();
+                }
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                let report = errors.pop().unwrap();
+                drop(errors);
+                source.reenable();
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "held failed-attempt report must retain admission"
+                );
+                drop(report);
+                source.reenable();
+                let EmulationRequest::Reenable(retry) = requests.recv().await.unwrap() else {
+                    panic!();
+                };
+                worker_tx.send(ProxyRequest::Reenable(retry)).unwrap();
+                let report = feedback.recv().await.unwrap();
+                assert!(matches!(
+                    report,
+                    EmulationEvent::BackendFailed { retry: Some(_), .. }
+                ));
+                source.reenable();
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                drop(report);
+                assert_eq!(source.reenable_pending.borrow().strong_count(), 0);
+                worker_tx.send(ProxyRequest::Terminate).unwrap();
+                task.await.unwrap();
+                source.request_tx = original;
+                source.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn healthy_reenable_attempt_and_status_notices_keep_shared_admission() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let (listener, _) = crate::listen::control_test_listener(addr);
+                let mut source = Emulation::new(
+                    Some(input_emulation::Backend::Dummy),
+                    Default::default(),
+                    listener,
+                    (false, 1.0),
+                );
+                let (source_tx, mut requests) = channel();
+                let original = std::mem::replace(&mut source.request_tx, source_tx);
+                source.reenable();
+                let EmulationRequest::Reenable(retry) = requests.recv().await.unwrap() else {
+                    panic!();
+                };
+                let (mut worker, worker_tx, mut feedback) = worker();
+                let task = spawn_local(async move {
+                    worker.do_emulation(Some(retry)).await.unwrap();
+                });
+                let enabled = feedback.recv().await.unwrap();
+                assert!(matches!(
+                    enabled,
+                    EmulationEvent::EmulationEnabled { retry: Some(_), .. }
+                ));
+                drop(enabled);
+                source.reenable();
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "active backend must retain the attempt even after Enabled is consumed"
+                );
+                worker_tx.send(ProxyRequest::Terminate).unwrap();
+                task.await.unwrap();
+                source.reenable();
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "queued Disabled must retain admission after backend exits"
+                );
+                let disabled = feedback.recv().await.unwrap();
+                assert!(matches!(
+                    disabled,
+                    EmulationEvent::EmulationDisabled { retry: Some(_), .. }
+                ));
+                drop(disabled);
+                source.reenable();
+                assert!(matches!(
+                    requests.recv().await,
+                    Some(EmulationRequest::Reenable(_))
+                ));
+                source.request_tx = original;
+                source.terminate().await;
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1677,7 +1892,10 @@ mod resume_tests {
                     (false, 1.0),
                 );
                 loop {
-                    if matches!(emulation.event().await, EmulationEvent::EmulationEnabled) {
+                    if matches!(
+                        emulation.event().await,
+                        EmulationEvent::EmulationEnabled { .. }
+                    ) {
                         break;
                     }
                 }
@@ -1748,7 +1966,7 @@ mod resume_tests {
             let incoming = listener.test_sender();
             let mut emulation = Emulation::new(Some(input_emulation::Backend::Dummy),
                 Default::default(), listener, (false, 1.0));
-            loop { if matches!(emulation.event().await, EmulationEvent::EmulationEnabled) { break; } }
+            loop { if matches!(emulation.event().await, EmulationEvent::EmulationEnabled { .. }) { break; } }
             tokio::time::advance(Duration::from_secs(3600)).await;
             tokio::task::yield_now().await;
             assert!(futures::FutureExt::now_or_never(emulation.event()).is_none());

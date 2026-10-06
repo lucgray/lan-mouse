@@ -23,10 +23,11 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R100 | emulation路径已实现并通过队列/实际worker/Service回归 | 显式retry共享1名额跨dispatcher/proxy/active attempt/Enabled/Disabled/Failed反馈；初始化一次批次有限；capture与其他lifecycle仍待审 |
 | R98 | 已实现并通过两层洪泛/实际worker回归 | 反转与灵敏度合并为最新快照，每hop最多1个pending marker；输入帧顺序保留，中间设置不重播；全进程RSS未证明 |
 | R99 | 已实现并通过挂起/失败初始化回归 | 初始化等待不丢配置，失败保留目标值，成功后输入前应用最新设置；真实平台启动仍待验 |
 | R97 | 已实现并通过实际dispatcher/虚拟时间回归 | 可复用timer按最近peer的1s截止点唤醒、活动刷新/独立peer重设/无peer停用扫描；原生释放时延仍未验收 |
-| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度至Service及cleanup结束；backend反馈/其他lifecycle总量仍待审 |
+| R96 | 部分实现：接入/断线/错误跨队列与watchdog预算 | reader、接入/断线/撤销/错误通知及cleanup共享32代次；watchdog独立global128/peer4周期额度；设置每hop1快照、emulation retry跨终态反馈1名额；capture/Release/其他lifecycle仍待审 |
 | R95 | 指定派生链路已实现 | Leave持有ControlLease；Enter/输入恢复通知与proxy共享原输入reservation；Service慢消费/旧连接拒绝通过，其他lifecycle仍待处理 |
 | R93 | 已实现并通过 UDP/DTLS 回归 | 关闭监听器保留已接入 peer 收包，回收未接入队列；最后 peer 关闭后释放 socket；换端口真机体验待验 |
 | R92 | 已实现并通过 UDP 回归 | 每监听器128 raw会话、排队两秒过期、关闭先释放缓冲再释放名额；已接入设备保留，全服务资源及真机体验待验 |
@@ -1955,3 +1956,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 千次真实双机往返、原生失控释放/恢复、完整p95/p99和8h RSS未完成，不认定90分。
 
 日志：emulation-config-coalescing-baseline.log、emulation-config-init-baseline.log、emulation-config-coalescing-fixed.log、emulation-config-coalescing-workspace.log、emulation-config-coalescing-clippy.log、emulation-config-coalescing-isolated-service.log。
+
+
+## 第八十四轮：显式emulation重试与终态反馈共享名额
+
+### R100 / P1、R96 后续
+
+- 生产API基线：暂停dispatcher，1万次reenable排入1万请求，期望1失败。受控API请求转交实际worker.run，cleanup持续拒绝，64次retry生成65条BackendFailed（初始1+显式64），期望2失败。日志reenable-budget-baseline.log；不是物理后端或真实GUI压力测试。
+- [x] 每Emulation instance只保留一份显式retry的ReenableLease；producer仅存Weak，重复请求合并。dispatcher/proxy转交同一个Rc，backend attempt/活动恢复后端及Enabled/Disabled/BackendFailed衍生反馈共享它，Service处理/drop后释放自己的owner。
+- [x] 初始启动无retry owner但只有一次有限状态批次。显式attempt失败后直到最后反馈消费/drop前不回收；回收后可提交新显式retry。活动后端的reenable仍忽略，没有新增自动重试；原cleanup未完成拒绝创建替代的保护保留。
+
+### 验证与边界
+
+- 1万次请求合为1条；实际proxy转交后producer不能另排请求，dequeue仍保留名额，最后drop可再次提交。实际worker失败矩阵为初始+1显式两条失败；反馈取出并持有时仍不能排新attempt，最后drop后新retry成功到达并产生有owner的反馈。
+- 实际Dummy do_emulation健康attempt：Enabled消费后活动backend仍占名额；Terminate/cleanup结束后待处理Disabled仍占，最后drop后可再次请求。隔离Dummy Service处理三类状态通知后最后owner释放，状态/错误反馈仍保留。没有等同真实平台故障恢复。
+- 工作区all-features root192通过/3忽略，其他组件全部通过；严格Clippy/fmt/diff通过，隔离Service1条通过。上一轮10a284f Rust37435374624 completed/success，Windows build/check/clippy/test全成功，确认第82轮helper cfg修正；Nix37435374765检查时in_progress，未称完成。本轮新HEAD仍需CI。
+- [ ] 本轮约束emulation retry及其终态批次，不是所有backend反馈源。Capture reenabling、Release请求、其他lifecycle和独立native cleanup任务/失败metadata仍需审计。反馈未完成期间重复retry按同一attempt合并，只有原attempt及反馈最后owner释放后新的显式调用才启动新attempt。
+- [ ] 真实双机1000次往返、原生故障释放/恢复、完整p95/p99与8h RSS尚缺验收，不认定90分。未部署已安装服务。
+
+日志：reenable-budget-baseline.log、reenable-budget-fixed.log、reenable-budget-workspace.log、reenable-budget-clippy.log、reenable-budget-isolated-service.log。

@@ -573,16 +573,19 @@ impl Service {
             } => {
                 self.notify_frontend(FrontendEvent::Error(format!("Incoming input from {addr} is stalled; its connection was closed. Retry after the input backend recovers.")));
             }
-            EmulationEvent::BackendFailed(error) => {
+            EmulationEvent::BackendFailed {
+                error,
+                retry: _retry,
+            } => {
                 self.notify_frontend(FrontendEvent::Error(format!(
                     "Input emulation failed: {error}"
                 )));
             }
-            EmulationEvent::EmulationDisabled => {
+            EmulationEvent::EmulationDisabled { retry: _retry } => {
                 self.emulation_status = Status::Disabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::EmulationEnabled => {
+            EmulationEvent::EmulationEnabled { retry: _retry } => {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
@@ -1947,6 +1950,19 @@ mod tests {
             service.handle_emulation_event(EmulationEvent::InputCleanupFailed { addr: old_addr, input: Some(report_input) }).await;
             assert_eq!(report_budget.available(), (1, 1));
             assert_eq!(service.pending_frontend_events.iter().filter(|event| matches!(event, FrontendEvent::Error(_))).count(), 3);
+            service.pending_frontend_events.clear();
+            let previous_status = service.emulation_status;
+            let retry = std::rc::Rc::new(crate::emulation::ReenableLease);
+            let retry_weak = std::rc::Rc::downgrade(&retry);
+            service.handle_emulation_event(EmulationEvent::EmulationEnabled { retry: Some(retry.clone()) }).await;
+            assert!(retry_weak.upgrade().is_some());
+            service.handle_emulation_event(EmulationEvent::EmulationDisabled { retry: Some(retry.clone()) }).await;
+            assert!(retry_weak.upgrade().is_some());
+            service.handle_emulation_event(EmulationEvent::BackendFailed { error: "retry feedback fixture".into(), retry: Some(retry) }).await;
+            assert!(retry_weak.upgrade().is_none());
+            assert!(matches!(service.emulation_status, Status::Disabled));
+            assert!(service.pending_frontend_events.iter().any(|event| matches!(event, FrontendEvent::Error(message) if message.contains("retry feedback fixture"))));
+            service.emulation_status = previous_status;
             service.pending_frontend_events.clear();
             assert!(!service.incoming_conns.contains(&old_addr));
             service.config.flush().await.unwrap();
