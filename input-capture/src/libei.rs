@@ -641,6 +641,60 @@ async fn cancel_sibling_on_completion(
     result
 }
 
+fn capture_session_handle(
+    session: &Session<InputCapture>,
+) -> Result<ashpd::zvariant::OwnedObjectPath, CaptureError> {
+    // Session exposes its object path through Serialize, but its path() is private.
+    let context = ashpd::zvariant::serialized::Context::new_dbus(ashpd::zvariant::LE, 0);
+    let data = ashpd::zvariant::to_bytes(context, session).map_err(|error| {
+        io::Error::other(format!("could not serialize capture session: {error}"))
+    })?;
+    let (handle, _) = data
+        .deserialize::<ashpd::zvariant::OwnedObjectPath>()
+        .map_err(|error| {
+            io::Error::other(format!("could not read capture session handle: {error}"))
+        })?;
+    Ok(handle)
+}
+
+fn activation_position(
+    activated: &Activated,
+    expected_session: &str,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> Result<Option<Position>, CaptureError> {
+    if activated.session_handle().as_str() != expected_session {
+        log::debug!(
+            "ignoring activation for another capture session: {}",
+            activated.session_handle()
+        );
+        return Ok(None);
+    }
+    let barrier_id = match activated.barrier_id() {
+        Some(ActivatedBarrier::Barrier(id)) => id,
+        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(
+            barriers,
+            activated
+                .cursor_position()
+                .expect("no cursor position reported by compositor"),
+        )?,
+    };
+    let pos = match routes.get(&barrier_id) {
+        Some(pos) => *pos,
+        None => {
+            log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
+            let id = find_corresponding_client(
+                barriers,
+                activated
+                    .cursor_position()
+                    .expect("no cursor position reported by compositor"),
+            )?;
+            *routes.get(&id).expect("invalid barrier id")
+        }
+    };
+    Ok(Some(pos))
+}
+
 async fn do_capture_session(
     input_capture: &InputCapture,
     session: &mut Session<InputCapture>,
@@ -650,6 +704,7 @@ async fn do_capture_session(
     notify_release: &Notify,
     cancel_session: CancellationToken,
 ) -> Result<(), CaptureError> {
+    let session_handle = capture_session_handle(session)?;
     // current client
     let current_pos = Rc::new(Cell::new(None));
 
@@ -693,23 +748,8 @@ async fn do_capture_session(
                     let activated = activated.ok_or(CaptureError::ActivationClosed)?;
                     log::debug!("activated: {activated:?}");
 
-                    // get barrier id from activation
-                    let barrier_id = match activated.barrier_id() {
-                        Some(ActivatedBarrier::Barrier(id)) => id,
-                        // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"))?,
-                    };
-
-                    // find client corresponding to barrier
-                    let pos = match pos_for_barrier_id.get(&barrier_id) {
-                        Some(id) => *id,
-                        None => {
-                            log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                            let id = find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"))?;
-                            let pos = *pos_for_barrier_id.get(&id).expect("invalid barrier id");
-                            pos
-                        },
-                    };
+                    let Some(pos) = activation_position(&activated, session_handle.as_str(),
+                        &barriers, &pos_for_barrier_id)? else { continue; };
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
@@ -1112,6 +1152,55 @@ mod tests {
             barriers.iter().map(|b| b.barrier_id).collect::<Vec<_>>(),
             vec![first.barrier_id, last.barrier_id]
         );
+    }
+
+    fn activation_fixture(path: &str, id: Option<u32>, cursor: Option<(f32, f32)>) -> Activated {
+        use ashpd::zvariant::{LE, ObjectPath, Value, serialized::Context};
+        let path = ObjectPath::try_from(path).unwrap();
+        let mut options = HashMap::<&str, Value<'_>>::new();
+        if let Some(id) = id {
+            options.insert("barrier_id", Value::from(id));
+        }
+        if let Some(cursor) = cursor {
+            options.insert("cursor_position", Value::from(cursor));
+        }
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &(path, options)).unwrap();
+        data.deserialize::<Activated>().unwrap().0
+    }
+
+    #[test]
+    fn foreign_activation_with_reused_barrier_id_is_ignored() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/old", Some(1), Some((0., 50.)));
+        assert_eq!(
+            activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn foreign_activation_does_not_enter_current_geometry_fallback() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/other", None, None);
+        assert_eq!(
+            activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn current_activation_retains_explicit_and_geometry_routing() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        for id in [Some(1), Some(99), None] {
+            let activation = activation_fixture("/session/current", id, Some((0., 50.)));
+            assert_eq!(
+                activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+                Some(Position::Left)
+            );
+        }
     }
 
     struct ReadyZoneBurst {

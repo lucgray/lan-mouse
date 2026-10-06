@@ -1354,3 +1354,19 @@ capture error before enabling the session. Existing session completion and clean
 handle that failure. Partial acceptance currently has a log warning rather than
 a separate per-edge frontend status. Native rejection/reconfiguration and actual
 physical pointer recovery still need platform validation.
+
+
+### Libei activation session identity
+
+Activated signals are checked against the current session's object path before
+barrier lookup, cursor fallback or Begin emission. Signals from another session
+are ignored even if their barrier ID matches a current one. They cannot select a
+current edge or fail cursor fallback because their metadata is absent.
+
+The expected path is cached once per capture session using ashpd Session's public
+Serialize implementation, which serializes its object path. The library's path()
+accessor is private; a typed zvariant object-path round trip avoids parsing Debug
+output. Serialization errors return CaptureError through existing cleanup. The
+activation check itself compares borrowed path strings without another marshal.
+Zone-change session filtering and current-session cursor metadata/release behavior
+remain separate validation items. Real portal session churn needs platform tests.

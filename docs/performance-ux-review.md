@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
 | R111 | libei fallback屏障几何匹配已实现 | 有限线段/f64平方距离，保留小数及端点精度；退化点/空集合/非法坐标处理；原生多屏与缺失metadata待验 |
 | R110 | libei更新突发协作让出已实现 | 每32条更新yield，包含首条；ready控制及同线程取消先于256条排空，原计时/快照保留；native时延未实测 |
@@ -2241,3 +2242,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] partial acceptance目前只log warning，GUI逐边可用状态仍需评估；activation session身份/缺失cursor metadata与layer-shell错误路径继续审。原生故障恢复、千次双机往返、完整p95≤20ms/p99≤50ms及8h RSS验收仍缺证据，不认定90分。
 
 日志：libei-rejected-barriers-baseline.log、libei-rejected-barriers-fixed.log、libei-rejected-barriers-workspace.log、libei-rejected-barriers-clippy.log。
+
+
+## 第九十八轮：libei激活信号的会话归属
+
+### R113 / P1
+
+- 本地锁定ashpd0.13.9 receive_activated只调用Proxy.signal("Activated")；Proxy按名称订阅/解码，不以session参数过滤。Activated.session_handle公开会话路径，但原调用完全忽略，按barrier ID或坐标路由并发布Begin。
+- activation_position提取原选择逻辑后两条基线失败：另一会话带相同barrier ID被选到当前Left；另一会话缺少cursor/ID进入fallback并panic。当前会话路由回归同时通过。数据通过公开zvariant编码/ashpd Activated解码构造，不是任意手写替代结构。
+- [x] 在任何barrier/cursor读取前比较当前session路径，其他会话Ok(None)；调用方continue在current_pos修改与Begin前，避免错误切屏或不相关metadata导致当前捕获失败。
+- [x] ashpd Session.path为private，但公开Serialize将其序列化为ObjectPath；每条会话初始化时用typed zvariant round trip取OwnedObjectPath并缓存。没有Debug字符串解析、依赖新增或逐输入marshal；编码/解码异常转CaptureError经原完成/清理链。
+
+### 验证与其他信号范围
+
+- 两条失败回归修复后通过；一条当前会话正例覆盖有效ID、未知99回退及无ID几何路径，均保持Left。Foreign缺metadata不再访问expect。
+- libei模块36条通过；工作区all-features root201通过/3忽略、input-capture99通过/1忽略及其他组件通过；严格Clippy/fmt/diff通过。测试实例化真实Decoded Activated，未创建实际Session/D-Bus/EIS；Session路径布局依据当前依赖的Serialize/Type源码，真实portal初始化仍需验证。未部署本机。
+- 8bf829f Rust37449412165、Nix37449412230 queued；c2217ac两workflow cancelled。本轮HEAD仍需CI。
+- [ ] zones_changed及其他portal信号的会话范围继续审；当前会话缺cursor metadata仍有expect、release及layer-shell错误路径待处理。千次真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS验收缺少证据，不认定90分。
+
+日志：libei-session-identity-baseline.log、libei-session-identity-fixed.log、libei-session-identity-workspace.log、libei-session-identity-clippy.log。
