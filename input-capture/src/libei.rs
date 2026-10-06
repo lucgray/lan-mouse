@@ -548,8 +548,10 @@ async fn do_capture(
                 &active_clients,
                 &mut next_barrier_id,
                 &notify_release,
-                (cancel_session.clone(), cancel_update.clone()),
+                cancel_session.clone(),
             );
+            let capture_session =
+                cancel_sibling_on_completion(capture_session, cancel_update.clone());
 
             let (capture_result, ()) = tokio::join!(capture_session, handle_session_update_request);
             log::debug!("capture session + session_update task done!");
@@ -579,6 +581,33 @@ async fn do_capture(
     }
 }
 
+async fn run_ei_handler(
+    handler: impl std::future::Future<Output = Result<(), CaptureError>>,
+    cancel_session: CancellationToken,
+    cancel_ei_handler: CancellationToken,
+) -> Result<(), CaptureError> {
+    tokio::select! {
+        biased;
+        // A requested session teardown is not an unexpected EIS failure.
+        _ = cancel_ei_handler.cancelled() => Ok(()),
+        result = handler => {
+            log::debug!("libei exited: {result:?} cancelling session task");
+            cancel_session.cancel();
+            result
+        }
+    }
+}
+
+async fn cancel_sibling_on_completion(
+    branch: impl std::future::Future<Output = Result<(), CaptureError>>,
+    cancel_sibling: CancellationToken,
+) -> Result<(), CaptureError> {
+    let result = branch.await;
+    // Errors must also wake the sibling waiting in the join.
+    cancel_sibling.cancel();
+    result
+}
+
 async fn do_capture_session(
     input_capture: &InputCapture,
     session: &mut Session<InputCapture>,
@@ -586,9 +615,8 @@ async fn do_capture_session(
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
     notify_release: &Notify,
-    cancel: (CancellationToken, CancellationToken),
+    cancel_session: CancellationToken,
 ) -> Result<(), CaptureError> {
-    let (cancel_session, cancel_update) = cancel;
     // current client
     let current_pos = Rc::new(Cell::new(None));
 
@@ -609,25 +637,18 @@ async fn do_capture_session(
     let cancel_ei_handler = CancellationToken::new();
     let event_chan = event_tx.clone();
     let pos = current_pos.clone();
-    let cancel_session_clone = cancel_session.clone();
     let release_session_clone = release_session.clone();
-    let cancel_ei_handler_clone = cancel_ei_handler.clone();
-    let ei_task = async move {
-        tokio::select! {
-            r = libei_event_handler(
-                ei_event_stream,
-                context,
-                event_chan,
-                release_session_clone,
-                pos,
-            ) => {
-                log::debug!("libei exited: {r:?} cancelling session task");
-                cancel_session_clone.cancel();
-            }
-            _ = cancel_ei_handler_clone.cancelled() => {},
-        }
-        Ok::<(), CaptureError>(())
-    };
+    let ei_task = run_ei_handler(
+        libei_event_handler(
+            ei_event_stream,
+            context,
+            event_chan,
+            release_session_clone,
+            pos,
+        ),
+        cancel_session.clone(),
+        cancel_ei_handler.clone(),
+    );
 
     let capture_session_task = async {
         // receiver for activation tokens
@@ -700,15 +721,12 @@ async fn do_capture_session(
                 break;
             }
         }
-        // cancel libei task
-        log::debug!("session exited: killing libei task");
-        cancel_ei_handler.cancel();
         Ok::<(), CaptureError>(())
     };
 
+    let capture_session_task =
+        cancel_sibling_on_completion(capture_session_task, cancel_ei_handler);
     let (a, b) = tokio::join!(ei_task, capture_session_task);
-
-    cancel_update.cancel();
 
     log::debug!("both session and ei task finished!");
     a?;
@@ -895,6 +913,133 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_setup_failure_cancels_waiting_update_branch() {
+        let cancel_update = CancellationToken::new();
+        let joined = async {
+            tokio::join!(
+                cancel_sibling_on_completion(
+                    async { Err(CaptureError::Io(io::Error::other("setup failed"))) },
+                    cancel_update.clone(),
+                ),
+                cancel_update.cancelled(),
+            )
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_millis(100), joined)
+            .await
+            .expect("failed setup left update sibling pending");
+        assert!(
+            matches!(result, Err(CaptureError::Io(error)) if error.to_string() == "setup failed")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ei_handler_failure_reaches_session_owner() {
+        let cancel_session = CancellationToken::new();
+        let result = run_ei_handler(
+            async { Err(CaptureError::EndOfStream) },
+            cancel_session.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(cancel_session.is_cancelled());
+        assert!(matches!(result, Err(CaptureError::EndOfStream)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_session_failure_cancels_waiting_ei_sibling() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let joined = async {
+            tokio::join!(
+                run_ei_handler(std::future::pending(), cancel_session, cancel_ei.clone()),
+                cancel_sibling_on_completion(
+                    async { Err(CaptureError::ActivationClosed) },
+                    cancel_ei
+                ),
+            )
+        };
+        let (ei_result, session_result) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), joined)
+                .await
+                .expect("failed session left EI sibling pending");
+        assert!(ei_result.is_ok());
+        assert!(matches!(
+            session_result,
+            Err(CaptureError::ActivationClosed)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ei_failure_waits_for_session_cleanup_before_returning() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let (cleanup_finished, cleanup_wait) = tokio::sync::oneshot::channel();
+        let (cleanup_started, mut started_wait) = tokio::sync::oneshot::channel();
+        let session = async {
+            cancel_session.cancelled().await;
+            cleanup_started.send(()).unwrap();
+            cleanup_wait.await.unwrap();
+            Ok(())
+        };
+        let joined = async {
+            tokio::join!(
+                run_ei_handler(
+                    async { Err(CaptureError::Disconnected("test".into())) },
+                    cancel_session.clone(),
+                    cancel_ei.clone()
+                ),
+                cancel_sibling_on_completion(session, cancel_ei.clone()),
+            )
+        };
+        tokio::pin!(joined);
+        assert!(joined.as_mut().now_or_never().is_none());
+        assert!(started_wait.try_recv().is_ok());
+        assert!(!cancel_ei.is_cancelled());
+        cleanup_finished.send(()).unwrap();
+        let (ei_result, session_result) = joined.await;
+        assert!(matches!(ei_result, Err(CaptureError::Disconnected(reason)) if reason == "test"));
+        assert!(session_result.is_ok());
+        assert!(cancel_ei.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_ei_teardown_has_priority_over_ready_stream_error() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        cancel_ei.cancel();
+        let handler_polled = Cell::new(false);
+        let result = run_ei_handler(
+            async {
+                handler_polled.set(true);
+                Err(CaptureError::EndOfStream)
+            },
+            cancel_session.clone(),
+            cancel_ei,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(!handler_polled.get());
+        assert!(!cancel_session.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_session_exit_cancels_ei_without_failure() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let (ei_result, session_result) = tokio::join!(
+            run_ei_handler(
+                std::future::pending(),
+                cancel_session.clone(),
+                cancel_ei.clone()
+            ),
+            cancel_sibling_on_completion(async { Ok(()) }, cancel_ei),
+        );
+        assert!(ei_result.is_ok());
+        assert!(session_result.is_ok());
+        assert!(!cancel_session.is_cancelled());
+    }
 
     #[test]
     fn client_update_burst_retains_only_four_positions() {

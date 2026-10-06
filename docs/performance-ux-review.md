@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R108 | libei分支错误及联合等待退出已实现 | EIS错误不转成功；activation及初始化错误取消对应等待分支；主动退出优先，仍等待分支和原清理；真实portal故障待验 |
 | R107 | libei设备批次状态合并已实现 | 合并窗口仅保留至多四边目标状态，删除/重建顺序保持；50ms和会话重建不变，真实portal/RSS仍待验 |
 | R106 | libei任务完成/错误读取已实现 | panic/cancel JoinError转CaptureError，已结束未join结果不丢，消费后fused；取消等待保留原handle；真实portal恢复未验收 |
 | R105 | 不可路由突发的轮询让出已实现 | 每poll最多跳过32条后自唤醒/Pending，控制ready可先运行，按键跟踪及后续有效事件保留；native阻塞/完整时延未实测 |
@@ -2138,3 +2139,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] native信号/通知关闭、设备事件批次及同步dispatch仍需继续审查。原生恢复、千次双机往返、完整p95≤20ms/p99≤50ms和8h RSS验收仍缺少证据，不认定90分。
 
 日志：libei-client-batch-baseline.log、libei-client-batch-fixed.log、libei-client-batch-workspace.log、libei-client-batch-clippy.log、libei-client-batch-isolated-service.log。
+
+
+## 第九十三轮：libei会话错误丢失与join等待挂起
+
+### R108 / P1
+
+- EIS handler返回EndOfStream/Disconnected/Io等错误后，原ei_task只记录并cancel_session，最终无条件Ok。外层可能把实际EIS故障当成功，进入重新创建而没有故障反馈。
+- activation分支仅在正常走到底部时cancel_ei_handler；receive_activated或activated.next错误提前返回后，join仍等没有取消的EIS分支。更外层connect_to_eis/update_barriers/enable提前失败时，也没走到cancel_update，join会等待更新分支。
+- 使用生产future wrapper提取旧完成语义并复现：EIS EndOfStream转成功、Disconnected经慢session清理后仍转成功，两个错误退出join在100ms测试期限内未完成。4条回归基线失败，其他8条匹配测试通过；期限仅用于回归检测，未加到native路径。
+- [x] EIS非主动退出保留原CaptureError。activation分支成功/失败都唤醒EIS等待；整条do_capture_session成功/失败都唤醒外层update等待，覆盖初始化阶段的早退。
+- [x] 两层仍用join等待全部分支，再走原disable/close；没有try_join提前丢掉另一条清理future。oneshot模型证明EIS已报错且session cleanup开始后，清理未放行时join仍pending，放行后返回原Disconnected。
+- [x] EIS主动取消分支biased优先；与ready EndOfStream同时发生时返回正常退出且不poll错误handler，避免正常GNOME会话重建/退出新增误报。成功session结束仍取消EIS并成功完成。
+
+### 验证及剩余范围
+
+- libei模块12条通过，包含本轮6条新增回归和此前6条。工作区all-features root201通过/3忽略、input-capture75通过/1忽略，其他组件通过；严格Clippy/fmt/diff通过；隔离Dummy Service慢清理进度/终态错误反馈1条通过。
+- 测试使用真实Tokio future/取消/联合等待及受控oneshot，不实例化EIS/ashpd portal。原生调用若自身不返回或同步阻塞，completion wrapper不能强制结束它；未证明物理指针恢复，也没有部署本机服务。
+- cc94e54 Rust37446352277 in_progress、Nix37446352307 queued；d3ccdc6两workflow cancelled。本轮HEAD仍需CI，不把部分结果写成完整矩阵通过。
+- [ ] zones_changed/notify关闭、其他native signal闭合与设备读dispatch仍需审。真实原生故障恢复、千次往返、完整p95≤20ms/p99≤50ms和8h RSS验收缺少证据，不认定90分。
+
+日志：libei-session-exit-baseline.log、libei-session-exit-fixed.log、libei-session-exit-workspace.log、libei-session-exit-clippy.log、libei-session-exit-isolated-service.log。

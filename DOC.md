@@ -1280,3 +1280,18 @@ session keeps its original clients until it closes; session cancellation, portal
 restart behavior and the debounce duration are unchanged. This limits retained
 client state and removes the later history replay, but does not bound notification
 processing time, portal operations or total process memory.
+
+
+### Libei session branch failures
+
+Unexpected EIS stream errors now reach the capture owner with their original
+CaptureError instead of being logged and converted to success. When the portal
+activation branch finishes, including an early error, it cancels the waiting EIS
+branch. At the outer session boundary, completion also cancels the waiting update
+branch, covering failures during EIS connection, barrier setup and portal enable.
+Both joins still await their branches before existing disable/close handling.
+
+Requested EIS teardown takes priority over a simultaneously ready stream error,
+so a normal session restart is not reported as an unexpected failure. This does
+not add a native timeout or prove that a hung portal operation will finish; those
+operations remain owned and must return before their completion can be reported.
