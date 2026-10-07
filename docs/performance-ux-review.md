@@ -39,6 +39,7 @@
 | R128 | layer-shell释放/terminate清理已实现 | 无focus仍take/destroy捕获资源，terminate停流/清窗口队列并flush；模型回归通过，compositor响应待验 |
 | R129 | layer-shell窗口退役清理已实现 | 删除目标focus先release再drop，保留无关focus；重建清旧路由/队列，单pass retain；原生热插拔待验 |
 | R130 | layer-shell旧回调源隔离已实现 | Leave核对surface再take focus，相对运动核对当前proxy，pointer核对当前源；真实client ID复用回归通过，native时序待验 |
+| R131 | layer-shell seat设备所有权/失能清理已实现 | 重复caps复用/保存keyboard，丢能力take+release，active loss一次故障并fuse；idle可重建，真实热插拔/远端松键待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2593,3 +2594,24 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] seat Capabilities变化反复创建pointer/keyboard、缺能力时未清理，且get_keyboard返回值未保存到state；键盘旧源隔离、Enter替换不同focus时的资源所属、Closed处理继续审。原生千次切换/热插拔恢复、完整p95/p99与8h RSS仍未验收，不认定90分。
 
 日志：layer-shell-source-baseline.log、layer-shell-source-fixed.log、layer-shell-source-workspace.log、layer-shell-source-clippy.log。
+
+
+## 第一百一十六轮：layer-shell重复seat通知、键盘无所有者与能力丢失未清理
+
+### R131 / P1
+
+- 原Capabilities每次release/recreate pointer；get_keyboard返回值丢弃且state.keyboard始终无新owner；缺能力分支不release已有设备。三条真实client proxy基线失败：32次相同caps改变pointer身份；新keyboard无owner；pointer能力缺失保持旧proxy。
+- 原能力变化没有故障通知，持有的修饰键/按键可能留到其他释放触发。再提取旧“没有loss error”路径，两条基线失败：active keyboard loss仍保留排队keydown；queued Begin但无focus时两种能力丢失也未报错。测试不证明历史事故由该缺陷触发。
+- [x] update_seat_devices/update_seat_device仅empty slot创建并保存、有slot但缺能力时take+release；相同caps不重建。terminate在ungrab后释放pointer/keyboard，重复terminate不再次release同一slot；connection/globals保留到Drop。
+- [x] PendingCaptureEvents推广为failed + pending_failure，统一保留第一个错误并清queued、拒后续输入，原256限额行为保持。active focus或queued input时丢失已有能力，queue_seat_capability_loss报LayerShellSeatCapabilityLost（标明pointer/keyboard），State先ungrab再update设备；poll原fused helper只报一次，恢复需用户重新开启capture。空闲且无queued的能力丢失可自动创建新对象，增加能力/不变通知不误报。
+- [x] keyboard_capture_event验证当前keyboard来源再映射Key/Modifiers；旧proxy/无current/无focus忽略。accepted time/key/state/modifier字段映射保持原行为，无健康事件分配路径变化。新错误为内部CaptureError，无LAN序列化变更。
+
+### 验证与剩余验收
+
+- 十条新增回归通过：三条所有权基线、两条loss基线；idle loss/regain本地proxy is_alive与来源更换；active pointer loss/error融合并要求新queue；保留已有overload首错；旧keyboard Key/Modifiers拒绝而current clone映射正确；active增加keyboard不报错且原Begin保留。
+- 前三条对象操作使用真实wayland-client proxy和回调计数；其余验证生产helper/队列/stream gate，未实例化真实State/compositor/设备。由代码核对错误走既有capture cleanup，src/capture.rs清pending modifiers/take pressed keys；不是远端键盘恢复的实机证明。
+- layer-shell42通过，workspace/all-features input-capture204通过/1忽略、root201通过/3忽略及其他组件通过；包含fatal_release/fatal_capture已有回归，strict Clippy/fmt/diff通过。隔离Service忽略用例本轮未单独运行。
+- 上一HEAD 3045be8 Rust37579309831 queued、Nix37579309788 in_progress；本轮HEAD需CI。没有本机部署或改服务/桌面配置。
+- [ ] 普通release保留旧queued输入、Enter替换focus时资源归属、Closed处理、滚轮frame状态、post-terminate控制与dispatch预算继续审。真实seat热插拔/远端按键恢复、千次双机切换、完整p95≤20ms/p99≤50ms和8h RSS仍未验收，不认定90分。
+
+日志：layer-shell-seat-baseline.log（先三条所有权失败，再两条loss失败）、layer-shell-seat-fixed.log、layer-shell-seat-workspace.log、layer-shell-seat-clippy.log。

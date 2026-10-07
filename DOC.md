@@ -1662,5 +1662,31 @@ including a controlled wl_display.delete_id frame to verify rejection of an old
 pointer after its numerical ID is reused. Typed motion events are passed through
 the production mapping helper. No real compositor receives these fixtures, and
 these tests do not validate physical pointer recovery or native event timing.
-Seat capability ownership, keyboard-source isolation and layer-surface Closed
-handling still require review.
+Layer-surface Closed handling and focus replacement still require review.
+
+
+### Layer-shell seat capability ownership and loss
+
+Seat capability updates now create a pointer or keyboard only when its slot is
+empty, store both returned proxies, and release/take a slot when that capability
+is absent. Repeated unchanged capability notices retain the same objects.
+Termination releases these seat-device proxies after ungrabbing capture. The
+connection and global protocol objects remain owned until backend drop.
+
+When capture has a focus or queued input, loss of an owned pointer/keyboard
+capability first clears queued events and records one contextual capture error,
+then ungrabs before releasing device proxies. The stream reports the failure once
+and stops; re-enable capture when the capability is available. The first failure
+is preserved, including queue overload, and further input is not accepted. This
+feeds the existing capture failure/owned cleanup path; physical peer key recovery
+has not been verified. Idle capability loss without focus or pending input can
+release and recreate devices without disabling the backend. Capability additions
+and unchanged notifications do not fail healthy capture.
+
+Keyboard callbacks now validate the current keyboard source before mapping Key
+or Modifiers, preserving the previous field mapping for accepted events. Ten
+regressions cover stored ownership, duplicate notices, release once, idle loss and
+regain, active/queued loss, fused failure, first-failure preservation, source
+isolation and healthy additions. Private native client proxies validate local
+identity and destruction; no real seat hotplug, compositor ACK or remote key
+restoration is claimed.

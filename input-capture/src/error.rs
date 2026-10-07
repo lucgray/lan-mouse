@@ -25,6 +25,10 @@ use core_graphics::base::CGError;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
+    #[error(
+        "Wayland seat lost {lost} capability; capture disabled. Re-enable capture when input is available."
+    )]
+    LayerShellSeatCapabilityLost { lost: &'static str },
     #[error("Layer-shell input queue overloaded; capture disabled. Re-enable capture to resume.")]
     LayerShellQueueOverloaded,
     #[error("X11 input queue overloaded; capture disabled. Re-enable capture to resume.")]

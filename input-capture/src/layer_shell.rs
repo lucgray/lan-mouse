@@ -117,29 +117,35 @@ const MAX_LAYER_SHELL_EVENTS: usize = 256;
 #[derive(Default)]
 struct PendingCaptureEvents {
     events: VecDeque<(Position, CaptureEvent)>,
-    overloaded: bool,
-    report_overload: bool,
+    failed: bool,
+    pending_failure: Option<CaptureError>,
 }
 
 impl PendingCaptureEvents {
     fn push_back(&mut self, event: (Position, CaptureEvent)) -> bool {
-        if self.overloaded {
+        if self.failed {
             return false;
         }
         if self.events.len() == MAX_LAYER_SHELL_EVENTS {
-            self.overloaded = true;
-            self.report_overload = true;
-            self.events.clear();
-            return true;
+            return self.fail(CaptureError::LayerShellQueueOverloaded);
         }
         self.events.push_back(event);
         false
     }
 
+    fn fail(&mut self, error: CaptureError) -> bool {
+        if self.failed {
+            return false;
+        }
+        self.failed = true;
+        self.pending_failure = Some(error);
+        self.events.clear();
+        true
+    }
+
     fn pop_front(&mut self) -> Option<Result<(Position, CaptureEvent), CaptureError>> {
-        if self.report_overload {
-            self.report_overload = false;
-            return Some(Err(CaptureError::LayerShellQueueOverloaded));
+        if let Some(error) = self.pending_failure.take() {
+            return Some(Err(error));
         }
         self.events.pop_front().map(Ok)
     }
@@ -470,7 +476,7 @@ impl State {
         serial: u32,
         qh: &QueueHandle<State>,
     ) {
-        if self.pending_events.overloaded {
+        if self.pending_events.failed {
             return;
         }
         let window = self.focused.as_ref().unwrap();
@@ -633,6 +639,65 @@ fn retire_capture_windows<W>(
     // Removing windows does not recover a previously overloaded backend.
 }
 
+fn update_seat_devices<P, K>(
+    pointer: &mut Option<P>,
+    keyboard: &mut Option<K>,
+    capabilities: wl_seat::Capability,
+    create_pointer: impl FnOnce() -> P,
+    create_keyboard: impl FnOnce() -> K,
+    release_pointer: impl FnOnce(P),
+    release_keyboard: impl FnOnce(K),
+) {
+    update_seat_device(
+        pointer,
+        capabilities.contains(wl_seat::Capability::Pointer),
+        create_pointer,
+        release_pointer,
+    );
+    update_seat_device(
+        keyboard,
+        capabilities.contains(wl_seat::Capability::Keyboard),
+        create_keyboard,
+        release_keyboard,
+    );
+}
+
+fn update_seat_device<T>(
+    device: &mut Option<T>,
+    available: bool,
+    create: impl FnOnce() -> T,
+    release: impl FnOnce(T),
+) {
+    if available {
+        if device.is_none() {
+            *device = Some(create());
+        }
+    } else if let Some(device) = device.take() {
+        release(device);
+    }
+}
+
+fn queue_seat_capability_loss(
+    pending: &mut PendingCaptureEvents,
+    capabilities: wl_seat::Capability,
+    has_pointer: bool,
+    has_keyboard: bool,
+    capturing: bool,
+) -> bool {
+    if !capturing && pending.events.is_empty() {
+        return false;
+    }
+    let pointer_lost = has_pointer && !capabilities.contains(wl_seat::Capability::Pointer);
+    let keyboard_lost = has_keyboard && !capabilities.contains(wl_seat::Capability::Keyboard);
+    let lost = match (pointer_lost, keyboard_lost) {
+        (true, true) => "pointer and keyboard",
+        (true, false) => "pointer",
+        (false, true) => "keyboard",
+        (false, false) => return false,
+    };
+    pending.fail(CaptureError::LayerShellSeatCapabilityLost { lost })
+}
+
 fn capture_source_matches<I: PartialEq>(current: Option<&I>, source: &I) -> bool {
     current.is_some_and(|current| current == source)
 }
@@ -647,6 +712,40 @@ fn take_focus_on_leave<S: PartialEq, F>(
     } else {
         None
     }
+}
+
+fn keyboard_capture_event(
+    current: Option<&WlKeyboard>,
+    source: &WlKeyboard,
+    event: wl_keyboard::Event,
+    position: Option<Position>,
+) -> Option<(Position, CaptureEvent)> {
+    if !capture_source_matches(current, source) {
+        return None;
+    }
+    let event = match event {
+        wl_keyboard::Event::Key {
+            time, key, state, ..
+        } => KeyboardEvent::Key {
+            time,
+            key,
+            state: u32::from(state) as u8,
+        },
+        wl_keyboard::Event::Modifiers {
+            mods_depressed,
+            mods_latched,
+            mods_locked,
+            group,
+            ..
+        } => KeyboardEvent::Modifiers {
+            depressed: mods_depressed,
+            latched: mods_latched,
+            locked: mods_locked,
+            group,
+        },
+        _ => return None,
+    };
+    Some((position?, CaptureEvent::Input(Event::Keyboard(event))))
 }
 
 fn relative_motion_event(
@@ -805,10 +904,19 @@ impl Capture for LayerShellInputCapture {
         let inner = self.inner.get_mut();
         Ok(terminate_capture(&mut self.terminated, || {
             inner.state.ungrab();
+            update_seat_devices(
+                &mut inner.state.pointer,
+                &mut inner.state.keyboard,
+                wl_seat::Capability::empty(),
+                || unreachable!("no pointer capability"),
+                || unreachable!("no keyboard capability"),
+                |pointer| pointer.release(),
+                |keyboard| keyboard.release(),
+            );
             inner.state.active_windows.clear();
             inner.state.active_positions.clear();
             inner.state.pending_events.events.clear();
-            inner.state.pending_events.report_overload = false;
+            inner.state.pending_events.pending_failure = None;
             inner.state.read_guard.take();
             inner.flush_events()
         })?)
@@ -885,18 +993,24 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            if capabilities.contains(wl_seat::Capability::Pointer) {
-                if let Some(p) = state.pointer.take() {
-                    p.release();
-                }
-                state.pointer.replace(seat.get_pointer(qh, ()));
+            if queue_seat_capability_loss(
+                &mut state.pending_events,
+                capabilities,
+                state.pointer.is_some(),
+                state.keyboard.is_some(),
+                state.focused.is_some(),
+            ) {
+                state.ungrab();
             }
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
-                if let Some(k) = state.keyboard.take() {
-                    k.release();
-                }
-                seat.get_keyboard(qh, ());
-            }
+            update_seat_devices(
+                &mut state.pointer,
+                &mut state.keyboard,
+                capabilities,
+                || seat.get_pointer(qh, ()),
+                || seat.get_keyboard(qh, ()),
+                |pointer| pointer.release(),
+                |keyboard| keyboard.release(),
+            );
         }
     }
 }
@@ -1023,51 +1137,19 @@ impl Dispatch<WlPointer, ()> for State {
 impl Dispatch<WlKeyboard, ()> for State {
     fn event(
         app: &mut Self,
-        _: &WlKeyboard,
+        keyboard: &WlKeyboard,
         event: wl_keyboard::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let focused_position = app.focused.as_ref().map(|window| window.pos);
-        match event {
-            wl_keyboard::Event::Key {
-                serial: _,
-                time,
-                key,
-                state,
-            } => {
-                if let Some(pos) = focused_position {
-                    app.queue_capture_event((
-                        pos,
-                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                            time,
-                            key,
-                            state: u32::from(state) as u8,
-                        })),
-                    ));
-                }
-            }
-            wl_keyboard::Event::Modifiers {
-                serial: _,
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-            } => {
-                if let Some(pos) = focused_position {
-                    app.queue_capture_event((
-                        pos,
-                        CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                            depressed: mods_depressed,
-                            latched: mods_latched,
-                            locked: mods_locked,
-                            group,
-                        })),
-                    ));
-                }
-            }
-            _ => (),
+        if let Some(event) = keyboard_capture_event(
+            app.keyboard.as_ref(),
+            keyboard,
+            event,
+            app.focused.as_ref().map(|window| window.pos),
+        ) {
+            app.queue_capture_event(event);
         }
     }
 }
@@ -1243,6 +1325,7 @@ mod tests {
     delegate_noop!(ProxyFixtureState: ignore WlSurface);
     delegate_noop!(ProxyFixtureState: ignore wl_seat::WlSeat);
     delegate_noop!(ProxyFixtureState: ignore WlPointer);
+    delegate_noop!(ProxyFixtureState: ignore WlKeyboard);
     delegate_noop!(ProxyFixtureState: ZwpRelativePointerManagerV1);
     delegate_noop!(ProxyFixtureState: ignore ZwpRelativePointerV1);
 
@@ -1443,6 +1526,346 @@ mod tests {
     }
 
     #[test]
+    fn seat_duplicate_capabilities_preserve_owned_devices() {
+        let fixture = NativeProxyFixture::new();
+        let mut pointer = Some(fixture.pointers[0].clone());
+        let mut keyboard = Some(fixture.seat.get_keyboard(&fixture.qh, ()));
+        let old_pointer = pointer.clone();
+        let old_keyboard = keyboard.clone();
+        for _ in 0..32 {
+            update_seat_devices(
+                &mut pointer,
+                &mut keyboard,
+                wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard,
+                || fixture.seat.get_pointer(&fixture.qh, ()),
+                || fixture.seat.get_keyboard(&fixture.qh, ()),
+                |pointer| pointer.release(),
+                |keyboard| keyboard.release(),
+            );
+        }
+        assert_eq!(pointer, old_pointer, "duplicate notice replaced pointer");
+        assert_eq!(keyboard, old_keyboard, "duplicate notice replaced keyboard");
+    }
+
+    #[test]
+    fn seat_keyboard_creation_is_owned_until_capability_loss() {
+        let fixture = NativeProxyFixture::new();
+        let mut pointer: Option<WlPointer> = None;
+        let mut keyboard: Option<WlKeyboard> = None;
+        let created = std::cell::Cell::new(0);
+        let released = std::cell::Cell::new(0);
+        for capability in [wl_seat::Capability::Keyboard, wl_seat::Capability::Keyboard] {
+            update_seat_devices(
+                &mut pointer,
+                &mut keyboard,
+                capability,
+                || panic!("pointer capability unavailable"),
+                || {
+                    created.set(created.get() + 1);
+                    fixture.seat.get_keyboard(&fixture.qh, ())
+                },
+                |_| panic!("no pointer"),
+                |keyboard| {
+                    released.set(released.get() + 1);
+                    keyboard.release();
+                },
+            );
+            assert!(keyboard.is_some(), "created keyboard has no owner");
+        }
+        assert_eq!(created.get(), 1);
+        update_seat_devices(
+            &mut pointer,
+            &mut keyboard,
+            wl_seat::Capability::empty(),
+            || panic!("no capability"),
+            || panic!("no capability"),
+            |_| panic!("no pointer"),
+            |keyboard| {
+                released.set(released.get() + 1);
+                keyboard.release();
+            },
+        );
+        assert!(keyboard.is_none());
+        assert_eq!(released.get(), 1);
+    }
+
+    #[test]
+    fn seat_pointer_capability_loss_releases_owned_pointer_once() {
+        let fixture = NativeProxyFixture::new();
+        let mut pointer = Some(fixture.pointers[0].clone());
+        let mut keyboard: Option<WlKeyboard> = None;
+        let released = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            update_seat_devices(
+                &mut pointer,
+                &mut keyboard,
+                wl_seat::Capability::empty(),
+                || panic!("no capability"),
+                || panic!("no capability"),
+                |pointer| {
+                    released.set(released.get() + 1);
+                    pointer.release();
+                },
+                |_| panic!("no keyboard"),
+            );
+        }
+        assert!(pointer.is_none(), "lost pointer capability kept old proxy");
+        assert_eq!(released.get(), 1);
+    }
+
+    #[test]
+    fn seat_active_loss_reports_failure_before_queued_key_and_latches() {
+        let mut pending = PendingCaptureEvents::default();
+        pending.push_back((
+            Position::Left,
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 1,
+                key: 29,
+                state: 1,
+            })),
+        ));
+        assert!(queue_seat_capability_loss(
+            &mut pending,
+            wl_seat::Capability::Pointer,
+            true,
+            true,
+            true
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Err(CaptureError::LayerShellSeatCapabilityLost {
+                lost: "keyboard"
+            }))
+        ));
+        assert!(pending.failed && pending.pop_front().is_none());
+        assert!(!pending.push_back((Position::Left, CaptureEvent::Begin(0.5))));
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn seat_queued_capture_loss_reports_failure_without_focus() {
+        let mut pending = PendingCaptureEvents::default();
+        pending.push_back((Position::Left, CaptureEvent::Begin(0.25)));
+        assert!(queue_seat_capability_loss(
+            &mut pending,
+            wl_seat::Capability::empty(),
+            true,
+            true,
+            false
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Err(CaptureError::LayerShellSeatCapabilityLost {
+                lost: "pointer and keyboard"
+            }))
+        ));
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn seat_idle_loss_and_regain_keep_backend_usable() {
+        use wayland_client::Proxy;
+        let fixture = NativeProxyFixture::new();
+        let old_pointer = fixture.pointers[0].clone();
+        let old_keyboard = fixture.seat.get_keyboard(&fixture.qh, ());
+        let mut pointer = Some(old_pointer.clone());
+        let mut keyboard = Some(old_keyboard.clone());
+        let mut pending = PendingCaptureEvents::default();
+        assert!(!queue_seat_capability_loss(
+            &mut pending,
+            wl_seat::Capability::empty(),
+            true,
+            true,
+            false
+        ));
+        update_seat_devices(
+            &mut pointer,
+            &mut keyboard,
+            wl_seat::Capability::empty(),
+            || panic!("unavailable"),
+            || panic!("unavailable"),
+            |pointer| pointer.release(),
+            |keyboard| keyboard.release(),
+        );
+        assert!(pointer.is_none() && keyboard.is_none());
+        assert!(!old_pointer.is_alive() && !old_keyboard.is_alive());
+        assert!(!pending.failed && pending.pop_front().is_none());
+        update_seat_devices(
+            &mut pointer,
+            &mut keyboard,
+            wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard,
+            || fixture.seat.get_pointer(&fixture.qh, ()),
+            || fixture.seat.get_keyboard(&fixture.qh, ()),
+            |pointer| pointer.release(),
+            |keyboard| keyboard.release(),
+        );
+        assert!(pointer.as_ref().unwrap().is_alive() && keyboard.as_ref().unwrap().is_alive());
+        assert!(!capture_source_matches(pointer.as_ref(), &old_pointer));
+        assert!(!capture_source_matches(keyboard.as_ref(), &old_keyboard));
+        assert!(!pending.push_back((Position::Right, CaptureEvent::Begin(0.75))));
+        assert!(pending.pop_front().unwrap().is_ok());
+    }
+
+    #[test]
+    fn seat_active_pointer_loss_is_fused_and_requires_new_queue() {
+        let mut pending = PendingCaptureEvents::default();
+        assert!(queue_seat_capability_loss(
+            &mut pending,
+            wl_seat::Capability::Keyboard,
+            true,
+            true,
+            true
+        ));
+        let mut terminal = false;
+        let result = poll_capture_stream(&mut terminal, || Poll::Ready(pending.pop_front()));
+        assert!(matches!(
+            result,
+            Poll::Ready(Some(Err(CaptureError::LayerShellSeatCapabilityLost {
+                lost: "pointer"
+            })))
+        ));
+        assert!(terminal);
+        assert!(!queue_seat_capability_loss(
+            &mut pending,
+            wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard,
+            true,
+            true,
+            true
+        ));
+        assert!(matches!(
+            poll_capture_stream::<()>(&mut terminal, || panic!("failed backend polled")),
+            Poll::Ready(None)
+        ));
+        assert!(!pending.push_back((Position::Right, CaptureEvent::Begin(0.75))));
+        assert!(pending.pop_front().is_none());
+        let mut replacement = PendingCaptureEvents::default();
+        replacement.push_back((Position::Right, CaptureEvent::Begin(0.75)));
+        assert!(replacement.pop_front().unwrap().is_ok());
+    }
+
+    #[test]
+    fn seat_loss_preserves_first_overload_failure() {
+        let mut pending = PendingCaptureEvents::default();
+        for _ in 0..=MAX_LAYER_SHELL_EVENTS {
+            pending.push_back((Position::Left, CaptureEvent::Begin(0.5)));
+        }
+        assert!(!queue_seat_capability_loss(
+            &mut pending,
+            wl_seat::Capability::empty(),
+            true,
+            true,
+            true
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Err(CaptureError::LayerShellQueueOverloaded))
+        ));
+        assert!(pending.pop_front().is_none());
+        assert!(pending.failed);
+    }
+
+    fn native_key(state: wl_keyboard::KeyState) -> wl_keyboard::Event {
+        wl_keyboard::Event::Key {
+            serial: 1,
+            time: 42,
+            key: 29,
+            state: WEnum::Value(state),
+        }
+    }
+
+    #[test]
+    fn seat_keyboard_events_accept_only_current_key_and_modifier_source() {
+        let fixture = NativeProxyFixture::new();
+        let retired = fixture.seat.get_keyboard(&fixture.qh, ());
+        let current = fixture.seat.get_keyboard(&fixture.qh, ());
+        for state in [
+            wl_keyboard::KeyState::Pressed,
+            wl_keyboard::KeyState::Released,
+        ] {
+            assert!(
+                keyboard_capture_event(
+                    Some(&current),
+                    &retired,
+                    native_key(state),
+                    Some(Position::Right)
+                )
+                .is_none()
+            );
+            let (pos, event) = keyboard_capture_event(
+                Some(&current),
+                &current.clone(),
+                native_key(state),
+                Some(Position::Right),
+            )
+            .unwrap();
+            assert_eq!(pos, Position::Right);
+            assert!(
+                matches!(event, CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { time: 42, key: 29, state: actual })) if actual == state as u8)
+            );
+        }
+        let modifiers = || wl_keyboard::Event::Modifiers {
+            serial: 1,
+            mods_depressed: 4,
+            mods_latched: 8,
+            mods_locked: 16,
+            group: 2,
+        };
+        assert!(
+            keyboard_capture_event(Some(&current), &retired, modifiers(), Some(Position::Right))
+                .is_none()
+        );
+        let (pos, event) =
+            keyboard_capture_event(Some(&current), &current, modifiers(), Some(Position::Right))
+                .unwrap();
+        assert_eq!(pos, Position::Right);
+        assert!(matches!(
+            event,
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 4,
+                latched: 8,
+                locked: 16,
+                group: 2
+            }))
+        ));
+        assert!(
+            keyboard_capture_event(
+                None,
+                &current,
+                native_key(wl_keyboard::KeyState::Pressed),
+                Some(Position::Right)
+            )
+            .is_none()
+        );
+        assert!(
+            keyboard_capture_event(
+                Some(&current),
+                &current,
+                native_key(wl_keyboard::KeyState::Pressed),
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn seat_capability_addition_does_not_fail_active_capture() {
+        let mut pending = PendingCaptureEvents::default();
+        pending.push_back((Position::Right, CaptureEvent::Begin(0.75)));
+        let caps = wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard;
+        assert!(!queue_seat_capability_loss(
+            &mut pending,
+            caps,
+            true,
+            false,
+            true
+        ));
+        assert!(
+            matches!(pending.pop_front(), Some(Ok((Position::Right, CaptureEvent::Begin(t)))) if t == 0.75)
+        );
+        assert!(!pending.failed);
+    }
+
+    #[test]
     fn wayland_closed_socket_read_is_reported() {
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         let connection = Connection::from_socket(client).unwrap();
@@ -1490,7 +1913,7 @@ mod tests {
                 "native event queue grew without a limit"
             );
         }
-        assert!(queue.overloaded);
+        assert!(queue.failed);
     }
 
     #[test]
@@ -1525,7 +1948,7 @@ mod tests {
                 }))
             )));
         }
-        assert!(!queue.overloaded);
+        assert!(!queue.failed);
         for time in 0..MAX_LAYER_SHELL_EVENTS as u32 {
             assert_eq!(
                 queue.pop_front().unwrap().unwrap(),
@@ -1567,7 +1990,7 @@ mod tests {
         assert!(queue.events.is_empty());
         let mut replacement = PendingCaptureEvents::default();
         assert!(!replacement.push_back((Position::Right, CaptureEvent::Begin(0.5))));
-        assert!(!replacement.overloaded);
+        assert!(!replacement.failed);
         assert!(matches!(replacement.pop_front(), Some(Ok(_))));
     }
 
@@ -1761,7 +2184,7 @@ mod tests {
             pending.pop_front(),
             Some(Err(CaptureError::LayerShellQueueOverloaded))
         ));
-        assert!(pending.overloaded);
+        assert!(pending.failed);
         assert!(!pending.push_back((Position::Right, CaptureEvent::Begin(0.5))));
         assert!(pending.pop_front().is_none());
     }
