@@ -37,6 +37,7 @@
 | R126 | layer-shell运行错误传播已实现 | read/dispatch/flush失败返回CaptureError，stream错误一次后结束；真实socket读断连/映射/fusion通过 |
 | R127 | layer-shell应用事件队列已限额 | 每backend256，过载清积压/一次ungrab请求/明确错误并fuse；正常FIFO及替代queue回归通过 |
 | R128 | layer-shell释放/terminate清理已实现 | 无focus仍take/destroy捕获资源，terminate停流/清窗口队列并flush；模型回归通过，compositor响应待验 |
+| R129 | layer-shell窗口退役清理已实现 | 删除目标focus先release再drop，保留无关focus；重建清旧路由/队列，单pass retain；原生热插拔待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2552,3 +2553,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 删除窗口时focus/捕获资源处理、普通release已有queued事件、post-terminate控制调用与dispatch预算继续审。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
 
 日志：layer-shell-cleanup-baseline.log、layer-shell-cleanup-fixed.log、layer-shell-cleanup-workspace.log、layer-shell-cleanup-clippy.log。
+
+
+## 第一百一十四轮：layer-shell删除/重建窗口遗留捕获与误清焦点
+
+### R129 / P1
+
+- delete_client循环remove任意匹配窗口后focused=None，不核对focus归属且不ungrab；update_windows直接clear旧窗口，focus可继续持有旧surface。提取旧生产语义的三条基线均失败：删除Left清Right焦点；被删除窗口drop前没有release；重建保留旧focus且不清queued。
+- [x] delete与output rebuild统一调用retire_capture_windows。目标focus先take并release，或无focus时清残余捕获；无关live focus及其捕获保留。再retain删除窗口，比原反复position/remove只需一遍窗口保留扫描；尚无实测CPU降幅。
+- [x] pending仅清被删除Position的事件，其他Position保持FIFO；output rebuild清全部旧events，然后按active_positions创建新窗口。overloaded/report_overload不重置，不能用热插拔掩盖已失败backend。
+- [x] ungrab_resources借用focus调用surface release，保持拥有的focus到捕获资源destroy完成再drop；防止旧surface仅由focus持有时过早销毁。native请求函数复用release_layer_capture，没有LAN协议变动。
+
+### 验证与剩余范围
+
+- 八条新增回归通过：三条失败基线；删路由只过滤自身queued/FIFO；focus已不在windows仍释放；无focus残余资源重复退役只take一次；重建不吞过载错误；sole focus的真实Rc/Weak证明capture cleanup时仍存活、之后drop。测试覆盖生产helper的状态与回调次序，不构造原生Wayland State/proxies，不证明compositor收到请求。
+- layer-shell26通过；workspace/all-features input-capture188通过/1忽略，root201通过/3忽略及其余组件通过；strict workspace/all-targets/all-features Clippy、fmt/diff通过。
+- 上一HEAD 1e54a43的Rust37578233943 in_progress、Nix37578233966 queued；本轮HEAD仍需CI。没有部署或改动本机桌面配置。
+- [ ] 旧surface迟到Leave/Closed callback与新focus的隔离、普通release已queued输入、post-terminate控制调用及dispatch预算继续审。双机千次往返/热插拔恢复、完整p95≤20ms/p99≤50ms与8h RSS仍缺实机验收，不认定90分。
+
+日志：layer-shell-retirement-baseline.log、layer-shell-retirement-fixed.log、layer-shell-retirement-workspace.log、layer-shell-retirement-clippy.log。

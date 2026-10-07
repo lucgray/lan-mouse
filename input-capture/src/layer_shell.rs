@@ -406,11 +406,7 @@ impl LayerShellInputCapture {
     fn delete_client(&mut self, pos: Position) {
         let inner = self.inner.get_mut();
         inner.state.active_positions.remove(&pos);
-        // remove all windows corresponding to this client
-        while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
-            inner.state.active_windows.remove(i);
-            inner.state.focused = None;
-        }
+        inner.state.retire_windows(Some(pos));
     }
 }
 
@@ -523,24 +519,28 @@ impl State {
     }
 
     fn ungrab(&mut self) {
-        ungrab_resources(
+        release_layer_capture(
             self.focused.take(),
-            |window| {
-                window
-                    .layer_surface
-                    .set_keyboard_interactivity(KeyboardInteractivity::None);
-                window.surface.commit();
-            },
-            || {
-                if let Some(pointer_lock) = self.pointer_lock.take() {
-                    pointer_lock.destroy();
-                }
-                if let Some(rel_pointer) = self.rel_pointer.take() {
-                    rel_pointer.destroy();
-                }
-                if let Some(shortcut_inhibitor) = self.shortcut_inhibitor.take() {
-                    shortcut_inhibitor.destroy();
-                }
+            &mut self.pointer_lock,
+            &mut self.rel_pointer,
+            &mut self.shortcut_inhibitor,
+        );
+    }
+
+    fn retire_windows(&mut self, position: Option<Position>) {
+        retire_capture_windows(
+            &mut self.active_windows,
+            &mut self.focused,
+            &mut self.pending_events,
+            position,
+            |window| window.pos,
+            |focus| {
+                release_layer_capture(
+                    focus,
+                    &mut self.pointer_lock,
+                    &mut self.rel_pointer,
+                    &mut self.shortcut_inhibitor,
+                );
             },
         );
     }
@@ -575,7 +575,7 @@ impl State {
             log::info!(" * {output}");
         }
 
-        self.active_windows.clear();
+        self.retire_windows(None);
 
         let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
         for pos in active_positions {
@@ -584,12 +584,63 @@ impl State {
     }
 }
 
+fn release_layer_capture(
+    focused: Option<Arc<Window>>,
+    pointer_lock: &mut Option<ZwpLockedPointerV1>,
+    rel_pointer: &mut Option<ZwpRelativePointerV1>,
+    shortcut_inhibitor: &mut Option<ZwpKeyboardShortcutsInhibitorV1>,
+) {
+    ungrab_resources(
+        focused,
+        |window| {
+            window
+                .layer_surface
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            window.surface.commit();
+        },
+        || {
+            if let Some(pointer_lock) = pointer_lock.take() {
+                pointer_lock.destroy();
+            }
+            if let Some(rel_pointer) = rel_pointer.take() {
+                rel_pointer.destroy();
+            }
+            if let Some(shortcut_inhibitor) = shortcut_inhibitor.take() {
+                shortcut_inhibitor.destroy();
+            }
+        },
+    );
+}
+
+fn retire_capture_windows<W>(
+    windows: &mut Vec<W>,
+    focused: &mut Option<W>,
+    pending: &mut PendingCaptureEvents,
+    position: Option<Position>,
+    window_position: impl Fn(&W) -> Position,
+    release: impl FnOnce(Option<W>),
+) {
+    let removes = |window: &W| position.is_none_or(|pos| window_position(window) == pos);
+    // Release while the surface still lives. Missing focus may leave orphaned
+    // native capture resources; an unrelated live focus must remain untouched.
+    if focused.as_ref().is_none_or(&removes) {
+        release(focused.take());
+    }
+    windows.retain(|window| !removes(window));
+    pending
+        .events
+        .retain(|(pos, _)| position.is_some_and(|removed| *pos != removed));
+    // Removing windows does not recover a previously overloaded backend.
+}
+
 fn ungrab_resources<F>(
     focused: Option<F>,
-    release_focus: impl FnOnce(F),
+    release_focus: impl FnOnce(&F),
     release_resources: impl FnOnce(),
 ) {
-    if let Some(focused) = focused {
+    // A retired focus can be the last surface owner. Keep it alive until all
+    // capture objects referencing the surface have been destroyed.
+    if let Some(focused) = focused.as_ref() {
         release_focus(focused);
     }
     release_resources();
@@ -1278,6 +1329,199 @@ mod tests {
     }
 
     #[test]
+    fn layer_retire_unrelated_client_preserves_focus_and_capture() {
+        let mut windows = vec![Position::Left, Position::Right, Position::Left];
+        let mut focus = Some(Position::Right);
+        let mut pending = PendingCaptureEvents::default();
+        retire_capture_windows(
+            &mut windows,
+            &mut focus,
+            &mut pending,
+            Some(Position::Left),
+            |position| *position,
+            |_| panic!("unrelated live capture must remain active"),
+        );
+        assert_eq!(focus, Some(Position::Right));
+        assert_eq!(windows, vec![Position::Right]);
+    }
+
+    #[test]
+    fn layer_retire_focused_client_releases_before_window_drop() {
+        use std::{cell::RefCell, rc::Rc};
+        struct TestWindow(Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push("window destroyed");
+            }
+        }
+        let history = Rc::new(RefCell::new(Vec::new()));
+        let window = Rc::new(TestWindow(history.clone()));
+        let weak = Rc::downgrade(&window);
+        let mut windows = vec![window.clone()];
+        let mut focus = Some(window);
+        let mut pending = PendingCaptureEvents::default();
+        retire_capture_windows(
+            &mut windows,
+            &mut focus,
+            &mut pending,
+            Some(Position::Left),
+            |_| Position::Left,
+            |focus| {
+                assert!(focus.is_some());
+                assert!(weak.upgrade().is_some(), "surface destroyed before release");
+                history.borrow_mut().push("capture released");
+            },
+        );
+        assert!(focus.is_none() && windows.is_empty());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            *history.borrow(),
+            vec!["capture released", "window destroyed"]
+        );
+    }
+
+    #[test]
+    fn layer_retire_output_rebuild_clears_focus_and_old_events() {
+        let mut windows = vec![Position::Left, Position::Right];
+        let mut focus = Some(Position::Left);
+        let mut pending = PendingCaptureEvents::default();
+        pending.push_back((Position::Left, CaptureEvent::Begin(0.25)));
+        pending.push_back((Position::Right, CaptureEvent::Begin(0.75)));
+        let mut released = false;
+        retire_capture_windows(
+            &mut windows,
+            &mut focus,
+            &mut pending,
+            None,
+            |position| *position,
+            |focus| {
+                assert_eq!(focus, Some(Position::Left));
+                released = true;
+            },
+        );
+        assert!(released && focus.is_none() && windows.is_empty());
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn layer_retire_deleted_route_discards_only_its_queued_events() {
+        let mut windows = vec![Position::Left, Position::Right];
+        let mut focus = Some(Position::Right);
+        let mut pending = PendingCaptureEvents::default();
+        for (position, t) in [
+            (Position::Right, 0.1),
+            (Position::Left, 0.2),
+            (Position::Right, 0.3),
+            (Position::Left, 0.4),
+        ] {
+            pending.push_back((position, CaptureEvent::Begin(t)));
+        }
+        retire_capture_windows(
+            &mut windows,
+            &mut focus,
+            &mut pending,
+            Some(Position::Left),
+            |position| *position,
+            |_| panic!("unrelated focus"),
+        );
+        for t in [0.1, 0.3] {
+            let (pos, event) = pending.pop_front().unwrap().unwrap();
+            assert_eq!(pos, Position::Right);
+            assert!(matches!(event, CaptureEvent::Begin(actual) if actual == t));
+        }
+        assert!(pending.pop_front().is_none());
+        assert_eq!(focus, Some(Position::Right));
+    }
+
+    #[test]
+    fn layer_retire_stale_focus_not_in_window_list_still_releases() {
+        let mut windows = vec![Position::Right];
+        let mut focus = Some(Position::Left);
+        let mut pending = PendingCaptureEvents::default();
+        let mut released = None;
+        retire_capture_windows(
+            &mut windows,
+            &mut focus,
+            &mut pending,
+            Some(Position::Left),
+            |position| *position,
+            |focus| released = focus,
+        );
+        assert_eq!(released, Some(Position::Left));
+        assert!(focus.is_none());
+        assert_eq!(windows, vec![Position::Right]);
+    }
+
+    #[test]
+    fn layer_retire_missing_focus_cleans_orphans_without_double_release() {
+        let mut windows = vec![Position::Left];
+        let mut focus = None;
+        let mut pending = PendingCaptureEvents::default();
+        let mut resource = Some(7);
+        let mut released = Vec::new();
+        for _ in 0..2 {
+            retire_capture_windows(
+                &mut windows,
+                &mut focus,
+                &mut pending,
+                Some(Position::Left),
+                |position| *position,
+                |focus| {
+                    assert!(focus.is_none());
+                    if let Some(resource) = resource.take() {
+                        released.push(resource);
+                    }
+                },
+            );
+        }
+        assert_eq!(released, vec![7]);
+        assert!(windows.is_empty());
+    }
+
+    #[test]
+    fn layer_retire_rebuild_does_not_hide_queue_overload() {
+        let mut windows = vec![Position::Left];
+        let mut focus = None;
+        let mut pending = PendingCaptureEvents::default();
+        for _ in 0..=MAX_LAYER_SHELL_EVENTS {
+            pending.push_back((Position::Left, CaptureEvent::Begin(0.5)));
+        }
+        retire_capture_windows(
+            &mut windows,
+            &mut focus,
+            &mut pending,
+            None,
+            |position| *position,
+            |_| {},
+        );
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Err(CaptureError::LayerShellQueueOverloaded))
+        ));
+        assert!(pending.overloaded);
+        assert!(!pending.push_back((Position::Right, CaptureEvent::Begin(0.5))));
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn layer_ungrab_sole_focus_lives_through_capture_resource_release() {
+        use std::rc::Rc;
+        let focus = Rc::new(7);
+        let weak = Rc::downgrade(&focus);
+        ungrab_resources(
+            Some(focus),
+            |focus| assert_eq!(**focus, 7),
+            || {
+                assert!(
+                    weak.upgrade().is_some(),
+                    "surface dropped before native resource release"
+                )
+            },
+        );
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn layer_ungrab_without_focus_still_releases_all_resources() {
         let mut resources = [Some(1), Some(2), Some(3)];
         ungrab_resources(
@@ -1314,7 +1558,7 @@ mod tests {
         ungrab_resources(
             Some(7),
             |focus| {
-                assert_eq!(focus, 7);
+                assert_eq!(*focus, 7);
                 order.borrow_mut().push("focus");
             },
             || order.borrow_mut().push("resources"),

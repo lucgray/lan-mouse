@@ -1621,4 +1621,25 @@ events, drops the read guard, then flushes protocol requests. Flush errors propa
 while the stream remains terminal; resources already taken are not restored.
 The connection/global objects remain owned until backend drop. Controlled callback
 models validate cleanup order and state, not actual compositor unlock or receipt
-of destroy requests. Window deletion and already-queued input still require audit.
+of destroy requests. Already-queued input during ordinary release still requires audit.
+
+
+### Layer-shell window retirement
+
+Deleting a position now releases capture only when that position owns the focus,
+or when focus is absent and orphaned capture resources may remain. Removing an
+unrelated position preserves live focus and capture. Capture is released before
+retired windows are dropped; the focused surface stays owned through destruction
+of the capture objects even if it is the last reference to an old window.
+
+Window retirement removes queued events for the deleted position while preserving
+other positions' FIFO order. Output configuration rebuilds retire all old windows,
+focus and queued input before recreating windows for active positions. Retirement
+does not reset the queue's overload state or suppress its pending failure report.
+The removal pass uses Vec::retain instead of repeated searches and removals.
+
+Eight controlled regressions cover focus isolation, release/drop ownership order,
+rebuild cleanup, queued-route filtering, stale focus, orphan cleanup, overload
+preservation and last-owner lifetime. These exercise production helpers and real
+Rc drop/Weak observations, not native compositor proxies. Physical unlock and
+output hotplug behavior still require platform verification.
