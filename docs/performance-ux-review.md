@@ -36,6 +36,7 @@
 | R125 | libei token原子替换已实现 | 同目录私有临时文件/write+sync后persist，失败保留旧路径/清临时，symlink目标不改；实机rotation待验 |
 | R126 | layer-shell运行错误传播已实现 | read/dispatch/flush失败返回CaptureError，stream错误一次后结束；真实socket读断连/映射/fusion通过 |
 | R127 | layer-shell应用事件队列已限额 | 每backend256，过载清积压/一次ungrab请求/明确错误并fuse；正常FIFO及替代queue回归通过 |
+| R128 | layer-shell释放/terminate清理已实现 | 无focus仍take/destroy捕获资源，terminate停流/清窗口队列并flush；模型回归通过，compositor响应待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2533,3 +2534,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 256阈值需真实高频负载验证；Wayland内部队列、单次dispatch时间/prepare_read预算和整体RSS未被本限额证明有界。normal terminate/窗口临时文件及原生恢复继续审；千次双机往返、完整p95≤20ms/p99≤50ms与8h RSS仍未验收，不认定90分。
 
 日志：layer-shell-queue-baseline.log、layer-shell-queue-fixed.log、layer-shell-queue-workspace.log、layer-shell-queue-clippy.log。
+
+
+## 第一百一十三轮：layer-shell无焦点时跳过释放与terminate空操作
+
+### R128 / P1
+
+- State.ungrab以focused=None直接return，pointer_lock/rel_pointer/shortcut_inhibitor可被跳过；正常terminate原来只Ok。提取旧生产回调语义后两条基线失败：无focus资源保持Some；terminate不置terminal且不运行cleanup。
+- [x] ungrab先take focused阻止后续callback沿旧focus路由；surface键盘释放只在有window时执行，但三个捕获资源总take并destroy。资源Option已取走，重复调用不再次destroy同一handle。
+- [x] terminate_capture先标stream terminal，总运行cleanup，不能因前一fatal poll已置terminal而跳过。native closure执行ungrab、清active windows/positions及pending、取消read guard，最后flush；flush错误传播但逻辑终止保持。
+
+### 验证与native生命周期范围
+
+- 6条新增回归通过：两条失败基线；focus release先于其他资源；两次无focuscleanup三份资源各take一次；flush BrokenPipe保留且queued清空/之后不poll；已failed flag仍执行cleanup。模型调用生产helper与受控Option/回调，不实例化真实State globals/native proxies。
+- layer-shell18通过；工作区all-features input-capture180通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。没有实际compositor destroy/flush ACK/物理键鼠释放证明，没有本机部署。
+- 51f2d82 Rust37577431554 queued、Nix37577431561 in_progress，本轮HEAD需CI。连接/globals仍由backend持有到Drop，不将清捕获对象视为所有原生资源已释放；无LAN协议变化。
+- [ ] 删除窗口时focus/捕获资源处理、普通release已有queued事件、post-terminate控制调用与dispatch预算继续审。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
+
+日志：layer-shell-cleanup-baseline.log、layer-shell-cleanup-fixed.log、layer-shell-cleanup-workspace.log、layer-shell-cleanup-clippy.log。

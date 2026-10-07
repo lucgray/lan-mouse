@@ -523,35 +523,26 @@ impl State {
     }
 
     fn ungrab(&mut self) {
-        // get focused client
-        let window = match self.focused.as_ref() {
-            Some(focused) => focused,
-            None => return,
-        };
-
-        // ungrab surface
-        window
-            .layer_surface
-            .set_keyboard_interactivity(KeyboardInteractivity::None);
-        window.surface.commit();
-
-        // destroy pointer lock
-        if let Some(pointer_lock) = &self.pointer_lock {
-            pointer_lock.destroy();
-            self.pointer_lock = None;
-        }
-
-        // destroy relative input
-        if let Some(rel_pointer) = &self.rel_pointer {
-            rel_pointer.destroy();
-            self.rel_pointer = None;
-        }
-
-        // destroy shortcut inhibitor
-        if let Some(shortcut_inhibitor) = &self.shortcut_inhibitor {
-            shortcut_inhibitor.destroy();
-            self.shortcut_inhibitor = None;
-        }
+        ungrab_resources(
+            self.focused.take(),
+            |window| {
+                window
+                    .layer_surface
+                    .set_keyboard_interactivity(KeyboardInteractivity::None);
+                window.surface.commit();
+            },
+            || {
+                if let Some(pointer_lock) = self.pointer_lock.take() {
+                    pointer_lock.destroy();
+                }
+                if let Some(rel_pointer) = self.rel_pointer.take() {
+                    rel_pointer.destroy();
+                }
+                if let Some(shortcut_inhibitor) = self.shortcut_inhibitor.take() {
+                    shortcut_inhibitor.destroy();
+                }
+            },
+        );
     }
 
     fn add_client(&mut self, pos: Position) {
@@ -591,6 +582,26 @@ impl State {
             self.add_client(pos);
         }
     }
+}
+
+fn ungrab_resources<F>(
+    focused: Option<F>,
+    release_focus: impl FnOnce(F),
+    release_resources: impl FnOnce(),
+) {
+    if let Some(focused) = focused {
+        release_focus(focused);
+    }
+    release_resources();
+}
+
+fn terminate_capture(
+    terminated: &mut bool,
+    cleanup: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    // A previously failed stream still needs resource cleanup; do not skip it.
+    *terminated = true;
+    cleanup()
 }
 
 fn wayland_io_error(error: WaylandError) -> io::Error {
@@ -696,7 +707,16 @@ impl Capture for LayerShellInputCapture {
     }
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
-        Ok(())
+        let inner = self.inner.get_mut();
+        Ok(terminate_capture(&mut self.terminated, || {
+            inner.state.ungrab();
+            inner.state.active_windows.clear();
+            inner.state.active_positions.clear();
+            inner.state.pending_events.events.clear();
+            inner.state.pending_events.report_overload = false;
+            inner.state.read_guard.take();
+            inner.flush_events()
+        })?)
     }
 }
 
@@ -1255,6 +1275,106 @@ mod tests {
             )),
             Poll::Ready(None)
         ));
+    }
+
+    #[test]
+    fn layer_ungrab_without_focus_still_releases_all_resources() {
+        let mut resources = [Some(1), Some(2), Some(3)];
+        ungrab_resources(
+            None::<()>,
+            |_| panic!("no focused surface exists"),
+            || {
+                for resource in &mut resources {
+                    resource.take();
+                }
+            },
+        );
+        assert!(
+            resources.iter().all(Option::is_none),
+            "missing focus skipped capture resource cleanup"
+        );
+    }
+
+    #[test]
+    fn layer_terminate_marks_stream_and_runs_cleanup() {
+        let mut terminated = false;
+        let mut queued = vec![1, 2, 3];
+        terminate_capture(&mut terminated, || {
+            queued.clear();
+            Ok(())
+        })
+        .unwrap();
+        assert!(terminated, "terminate left the stream pollable");
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn layer_ungrab_focus_release_precedes_other_resources() {
+        let order = std::cell::RefCell::new(Vec::new());
+        ungrab_resources(
+            Some(7),
+            |focus| {
+                assert_eq!(focus, 7);
+                order.borrow_mut().push("focus");
+            },
+            || order.borrow_mut().push("resources"),
+        );
+        assert_eq!(*order.borrow(), vec!["focus", "resources"]);
+    }
+
+    #[test]
+    fn layer_ungrab_repeated_cleanup_takes_each_resource_once() {
+        let mut resources = [Some(1), Some(2), Some(3)];
+        let mut destroyed = Vec::new();
+        for _ in 0..2 {
+            ungrab_resources(
+                None::<()>,
+                |_| unreachable!(),
+                || {
+                    for resource in &mut resources {
+                        if let Some(id) = resource.take() {
+                            destroyed.push(id);
+                        }
+                    }
+                },
+            );
+        }
+        assert_eq!(destroyed, vec![1, 2, 3]);
+        assert!(resources.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn layer_terminate_flush_failure_preserves_error_and_terminal_state() {
+        let mut terminated = false;
+        let mut queued = vec![1, 2, 3];
+        let error = terminate_capture(&mut terminated, || {
+            queued.clear();
+            Err(io::Error::new(
+                ErrorKind::BrokenPipe,
+                "controlled flush failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+        assert!(terminated && queued.is_empty());
+        assert!(matches!(
+            poll_capture_stream::<()>(&mut terminated, || panic!(
+                "cleanup failure must not resume polling"
+            )),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn layer_terminate_already_failed_stream_still_cleans_resources() {
+        let mut terminated = true;
+        let mut cleaned = false;
+        terminate_capture(&mut terminated, || {
+            cleaned = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(cleaned && terminated);
     }
 
     fn protocol_failure() -> WaylandError {

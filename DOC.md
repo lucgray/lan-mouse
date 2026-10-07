@@ -1584,8 +1584,8 @@ polling or draining queued events. This allows the capture pipeline's existing
 error cleanup and frontend reporting to run. Tests exercise an actual Wayland
 client connection over a local socket whose peer closes, error mappings and the
 production terminal-poll helper. They do not create layer surfaces, acquire an
-actual compositor pointer lock or prove physical pointer restoration. Other
-callback panics, queue limits and normal terminate cleanup remain separate items.
+actual compositor pointer lock or prove physical pointer restoration. Other callback panics and queue/dispatch limits remain separate items;
+normal terminate cleanup is described below.
 
 
 ### Layer-shell event-queue overload
@@ -1605,3 +1605,20 @@ before mutating capture state. Controlled queue tests validate limits and routin
 not compositor unlock or actual throughput. The 256-event threshold still needs
 platform load validation; Wayland's own queues and dispatch time are not bounded
 by this application queue limit.
+
+
+### Layer-shell release and termination ownership
+
+ungrab takes and clears the focused window before submitting release requests.
+Pointer lock, relative pointer and shortcut inhibitor are taken and destroyed even
+when no focused window remains. Surface keyboard-interactivity release is only
+conditional on having that surface. Taking each resource makes subsequent release
+calls independent of stale focus and avoids destroying the same handle twice.
+
+terminate marks the stream terminal before cleanup, including when the stream was
+already marked failed. It ungrabs, clears active windows/positions and pending
+events, drops the read guard, then flushes protocol requests. Flush errors propagate
+while the stream remains terminal; resources already taken are not restored.
+The connection/global objects remain owned until backend drop. Controlled callback
+models validate cleanup order and state, not actual compositor unlock or receipt
+of destroy requests. Window deletion and already-queued input still require audit.
