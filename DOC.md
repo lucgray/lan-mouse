@@ -1568,3 +1568,21 @@ The portal session remains started and logs a save error. A previous token may
 already have been consumed, so preserving its file does not guarantee future
 consent-free startup. Parent-directory synchronization and power-loss durability
 are not established here; real portal token rotation remains unverified.
+
+
+### Layer-shell runtime error propagation
+
+Layer-shell socket reads and event dispatch now return fatal IO/protocol errors
+rather than logging and continuing or panicking. Flush protocol errors likewise
+return errors, including through create/destroy/release. prepare_read propagates
+failed dispatch immediately; a missing read guard reports an error. Existing read
+WouldBlock handling and nonfatal flush WouldBlock handling in stream polling stay
+unchanged.
+
+The capture stream returns a fatal error once, then becomes terminal and stops
+polling or draining queued events. This allows the capture pipeline's existing
+error cleanup and frontend reporting to run. Tests exercise an actual Wayland
+client connection over a local socket whose peer closes, error mappings and the
+production terminal-poll helper. They do not create layer surfaces, acquire an
+actual compositor pointer lock or prove physical pointer restoration. Other
+callback panics, queue limits and normal terminate cleanup remain separate items.

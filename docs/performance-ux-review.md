@@ -34,6 +34,7 @@
 | R123 | libei区域通知会话过滤已实现 | 仅当前session启动重建，ignored计入32条让出预算，当前/旧/idle/边界回归通过 |
 | R124 | libei token IO移出事件线程 | spawn_blocking承接读写，慢操作期间async控制可运行；文件语义/权限回归通过，真实延迟待测 |
 | R125 | libei token原子替换已实现 | 同目录私有临时文件/write+sync后persist，失败保留旧路径/清临时，symlink目标不改；实机rotation待验 |
+| R126 | layer-shell运行错误传播已实现 | read/dispatch/flush失败返回CaptureError，stream错误一次后结束；真实socket读断连/映射/fusion通过 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2494,3 +2495,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] token一次性，保存失败后保留的旧值可能已消费，不保证下次免授权；父目录fsync/断电durability及parent路径竞争未闭环。真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
 
 日志：libei-token-atomic-baseline.log、libei-token-atomic-fixed.log、libei-token-atomic-workspace.log、libei-token-atomic-clippy.log。
+
+
+## 第一百一十一轮：layer-shell断连错误被忽略与协议panic
+
+### R126 / P1
+
+- 原Inner.read对Io错误仅log；dispatch_pending后Io错误也仅log，协议/BadMessage直接panic；prepare_read继续dispatch且无错误传播。三条生产映射helper基线失败：本地真实Wayland Connection/ReadEventsGuard在peer socket关闭后返回BrokenPipe，但helper转成功；dispatch Io也转成功；flush protocol panic。
+- [x] read/dispatch/flush统一返回io::Result，保留Io kind、protocol/BadMessage提供上下文错误；prepare_read dispatch失败立即?，read guard缺失不用unwrap。poll通过CaptureError向上返回，control flush错误也通过既有接口传播。
+- [x] LayerShellInputCapture保存terminal标记；生产poll_capture_stream在Some(Err)/None后fuse，之后不再读native或交付queued事件。正常Pending/事件不标终止。read WouldBlock仍允许dispatch，stream flush WouldBlock仍非fatal。
+
+### 原生读取与回归范围
+
+- 7条新增测试通过：3条失败基线；read/dispatch protocol映射；正常read/dispatch/flush及read WouldBlock、flush WouldBlock kind；fatal错误一次后不再调用poll closure；Pending/健康事件保持。真实读取测试只建立本地Unix pair并用实际Wayland library读断连，没有初始化compositor globals/LayerShell窗口/锁鼠。
+- 工作区all-features input-capture169通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。终止poll模型使用生产helper，没有由真实LayerShellInputCapture实例完成物理释放。
+- c276e78 Rust37576525020 queued、Nix37576525137 in_progress；本轮HEAD需CI，没有本机部署。成功路径没有新增任务/堆分配或LAN协议变更。
+- [ ] pending事件队列上限、prepare_read连续dispatch预算、窗口文件/尺寸处理及normal terminate资源释放继续审。其他callbacks仍可能panic；千次双机往返、原生恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
+
+日志：layer-shell-errors-baseline.log、layer-shell-errors-fixed.log、layer-shell-errors-workspace.log、layer-shell-errors-clippy.log。

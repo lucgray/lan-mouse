@@ -141,7 +141,10 @@ impl AsRawFd for Inner {
     }
 }
 
-pub struct LayerShellInputCapture(AsyncFd<Inner>);
+pub struct LayerShellInputCapture {
+    inner: AsyncFd<Inner>,
+    terminated: bool,
+}
 
 struct Window {
     buffer: wl_buffer::WlBuffer,
@@ -357,15 +360,18 @@ impl LayerShellInputCapture {
 
         let inner = AsyncFd::new(Inner { queue, state })?;
 
-        Ok(LayerShellInputCapture(inner))
+        Ok(LayerShellInputCapture {
+            inner,
+            terminated: false,
+        })
     }
 
     fn add_client(&mut self, pos: Position) {
-        self.0.get_mut().state.add_client(pos);
+        self.inner.get_mut().state.add_client(pos);
     }
 
     fn delete_client(&mut self, pos: Position) {
-        let inner = self.0.get_mut();
+        let inner = self.inner.get_mut();
         inner.state.active_positions.remove(&pos);
         // remove all windows corresponding to this client
         while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
@@ -545,18 +551,57 @@ impl State {
     }
 }
 
-impl Inner {
-    fn read(&mut self) {
-        match self.state.read_guard.take().unwrap().read() {
-            Ok(_) => {}
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(WaylandError::Io(e)) => {
-                log::error!("error reading from wayland socket: {e}");
-            }
-            Err(WaylandError::Protocol(e)) => {
-                panic!("wayland protocol violation: {e}")
-            }
+fn wayland_io_error(error: WaylandError) -> io::Error {
+    match error {
+        WaylandError::Io(error) => error,
+        WaylandError::Protocol(error) => {
+            io::Error::other(format!("Wayland protocol violation: {error}"))
         }
+    }
+}
+
+fn read_wayland_result(result: Result<usize, WaylandError>) -> io::Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(wayland_io_error(error)),
+    }
+}
+
+fn dispatch_wayland_result(result: Result<usize, DispatchError>) -> io::Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(DispatchError::Backend(error)) => Err(wayland_io_error(error)),
+        Err(error) => Err(io::Error::other(format!("Wayland dispatch error: {error}"))),
+    }
+}
+
+fn flush_wayland_result(result: Result<(), WaylandError>) -> io::Result<()> {
+    result.map_err(wayland_io_error)
+}
+
+fn poll_capture_stream<T>(
+    terminated: &mut bool,
+    poll: impl FnOnce() -> Poll<Option<Result<T, CaptureError>>>,
+) -> Poll<Option<Result<T, CaptureError>>> {
+    if *terminated {
+        return Poll::Ready(None);
+    }
+    let result = poll();
+    if matches!(result, Poll::Ready(Some(Err(_))) | Poll::Ready(None)) {
+        *terminated = true;
+    }
+    result
+}
+
+impl Inner {
+    fn read(&mut self) -> io::Result<()> {
+        let guard = self
+            .state
+            .read_guard
+            .take()
+            .ok_or_else(|| io::Error::other("Wayland read guard is missing"))?;
+        read_wayland_result(guard.read())
     }
 
     fn prepare_read(&mut self) -> io::Result<()> {
@@ -565,44 +610,17 @@ impl Inner {
                 self.state.read_guard = Some(guard);
                 break Ok(());
             } else {
-                self.dispatch_events();
+                self.dispatch_events()?;
             }
         }
     }
 
-    fn dispatch_events(&mut self) {
-        match self.queue.dispatch_pending(&mut self.state) {
-            Ok(_) => {}
-            Err(DispatchError::Backend(WaylandError::Io(e))) => {
-                log::error!("Wayland Error: {e}");
-            }
-            Err(DispatchError::Backend(e)) => {
-                panic!("backend error: {e}");
-            }
-            Err(DispatchError::BadMessage {
-                sender_id,
-                interface,
-                opcode,
-            }) => {
-                panic!("bad message {sender_id}, {interface} , {opcode}");
-            }
-        }
+    fn dispatch_events(&mut self) -> io::Result<()> {
+        dispatch_wayland_result(self.queue.dispatch_pending(&mut self.state))
     }
 
     fn flush_events(&mut self) -> io::Result<()> {
-        // flush outgoing events
-        match self.queue.flush() {
-            Ok(_) => (),
-            Err(e) => match e {
-                WaylandError::Io(e) => {
-                    return Err(e);
-                }
-                WaylandError::Protocol(e) => {
-                    panic!("wayland protocol violation: {e}")
-                }
-            },
-        }
-        Ok(())
+        flush_wayland_result(self.queue.flush())
     }
 }
 
@@ -610,13 +628,13 @@ impl Inner {
 impl Capture for LayerShellInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.add_client(pos);
-        let inner = self.0.get_mut();
+        let inner = self.inner.get_mut();
         Ok(inner.flush_events()?)
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.delete_client(pos);
-        let inner = self.0.get_mut();
+        let inner = self.inner.get_mut();
         Ok(inner.flush_events()?)
     }
 
@@ -626,7 +644,7 @@ impl Capture for LayerShellInputCapture {
 
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
-        let inner = self.0.get_mut();
+        let inner = self.inner.get_mut();
         inner.state.ungrab();
         Ok(inner.flush_events()?)
     }
@@ -643,46 +661,56 @@ impl Capture for LayerShellInputCapture {
 impl Stream for LayerShellInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some(event) = self.0.get_mut().state.pending_events.pop_front() {
-            return Poll::Ready(Some(Ok(event)));
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        poll_capture_stream(&mut this.terminated, || {
+            poll_wayland_capture(&mut this.inner, cx)
+        })
+    }
+}
+
+fn poll_wayland_capture(
+    backend: &mut AsyncFd<Inner>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<(Position, CaptureEvent), CaptureError>>> {
+    if let Some(event) = backend.get_mut().state.pending_events.pop_front() {
+        return Poll::Ready(Some(Ok(event)));
+    }
+
+    loop {
+        let mut guard = ready!(backend.poll_read_ready_mut(cx))?;
+
+        {
+            let inner = guard.get_inner_mut();
+
+            // read events
+            inner.read()?;
+
+            // dispatch the events
+            inner.dispatch_events()?;
+
+            // flush outgoing events
+            if let Err(e) = inner.flush_events() {
+                if e.kind() != ErrorKind::WouldBlock {
+                    return Poll::Ready(Some(Err(e.into())));
+                }
+            }
+
+            // prepare for the next read
+            match inner.prepare_read() {
+                Ok(_) => {}
+                Err(e) => return Poll::Ready(Some(Err(e.into()))),
+            }
         }
 
-        loop {
-            let mut guard = ready!(self.0.poll_read_ready_mut(cx))?;
+        // clear read readiness for tokio read guard
+        // guard.clear_ready_matching(Ready::READABLE);
+        guard.clear_ready();
 
-            {
-                let inner = guard.get_inner_mut();
-
-                // read events
-                inner.read();
-
-                // dispatch the events
-                inner.dispatch_events();
-
-                // flush outgoing events
-                if let Err(e) = inner.flush_events() {
-                    if e.kind() != ErrorKind::WouldBlock {
-                        return Poll::Ready(Some(Err(e.into())));
-                    }
-                }
-
-                // prepare for the next read
-                match inner.prepare_read() {
-                    Ok(_) => {}
-                    Err(e) => return Poll::Ready(Some(Err(e.into()))),
-                }
-            }
-
-            // clear read readiness for tokio read guard
-            // guard.clear_ready_matching(Ready::READABLE);
-            guard.clear_ready();
-
-            // if an event has been queued during dispatch_events() we return it
-            match guard.get_inner_mut().state.pending_events.pop_front() {
-                Some(event) => return Poll::Ready(Some(Ok(event))),
-                None => continue,
-            }
+        // if an event has been queued during dispatch_events() we return it
+        match guard.get_inner_mut().state.pending_events.pop_front() {
+            Some(event) => return Poll::Ready(Some(Ok(event))),
+            None => continue,
         }
     }
 }
@@ -1028,3 +1056,123 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wayland_closed_socket_read_is_reported() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(client).unwrap();
+        let guard = connection.prepare_read().unwrap();
+        drop(server);
+        let result = guard.read();
+        assert!(
+            result.is_err(),
+            "closed socket should produce native read failure"
+        );
+        assert!(read_wayland_result(result).is_err());
+    }
+
+    #[test]
+    fn wayland_dispatch_io_error_is_reported() {
+        let result = dispatch_wayland_result(Err(DispatchError::Backend(WaylandError::Io(
+            io::Error::new(ErrorKind::BrokenPipe, "controlled disconnection"),
+        ))));
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn wayland_flush_protocol_error_is_reported_without_panic() {
+        let protocol = wayland_client::backend::protocol::ProtocolError {
+            code: 1,
+            object_id: 1,
+            object_interface: "wl_display".into(),
+            message: "controlled protocol failure".into(),
+        };
+        let result = flush_wayland_result(Err(WaylandError::Protocol(protocol)));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("controlled protocol failure")
+        );
+    }
+    fn protocol_failure() -> WaylandError {
+        WaylandError::Protocol(wayland_client::backend::protocol::ProtocolError {
+            code: 1,
+            object_id: 1,
+            object_interface: "wl_display".into(),
+            message: "controlled protocol failure".into(),
+        })
+    }
+
+    #[test]
+    fn wayland_read_and_dispatch_protocol_errors_are_reported() {
+        assert!(
+            read_wayland_result(Err(protocol_failure()))
+                .unwrap_err()
+                .to_string()
+                .contains("controlled protocol failure")
+        );
+        assert!(dispatch_wayland_result(Err(DispatchError::Backend(protocol_failure()))).is_err());
+    }
+
+    #[test]
+    fn wayland_success_and_read_would_block_keep_existing_behavior() {
+        assert!(read_wayland_result(Ok(3)).is_ok());
+        assert!(dispatch_wayland_result(Ok(3)).is_ok());
+        assert!(flush_wayland_result(Ok(())).is_ok());
+        assert!(
+            read_wayland_result(Err(WaylandError::Io(io::Error::from(
+                ErrorKind::WouldBlock
+            ))))
+            .is_ok()
+        );
+        assert_eq!(
+            flush_wayland_result(Err(WaylandError::Io(io::Error::from(
+                ErrorKind::WouldBlock
+            ))))
+            .unwrap_err()
+            .kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn wayland_stream_reports_fatal_error_once_and_stops_polling() {
+        let mut terminated = false;
+        let error = read_wayland_result(Err(WaylandError::Io(io::Error::from(
+            ErrorKind::BrokenPipe,
+        ))))
+        .unwrap_err();
+        let result =
+            poll_capture_stream::<()>(&mut terminated, || Poll::Ready(Some(Err(error.into()))));
+        assert!(
+            matches!(result, Poll::Ready(Some(Err(CaptureError::Io(ref error)))) if error.kind() == ErrorKind::BrokenPipe)
+        );
+        assert!(terminated);
+        assert!(matches!(
+            poll_capture_stream::<()>(&mut terminated, || panic!(
+                "terminal backend must not read again"
+            )),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[test]
+    fn wayland_stream_pending_and_healthy_events_are_not_terminal() {
+        let mut terminated = false;
+        assert!(matches!(
+            poll_capture_stream::<()>(&mut terminated, || Poll::Pending),
+            Poll::Pending
+        ));
+        assert!(!terminated);
+        assert!(matches!(
+            poll_capture_stream(&mut terminated, || Poll::Ready(Some(Ok(7)))),
+            Poll::Ready(Some(Ok(7)))
+        ));
+        assert!(!terminated);
+    }
+}
