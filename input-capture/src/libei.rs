@@ -267,9 +267,9 @@ fn select_barriers(
             .iter()
             .map(|r| {
                 let id = *next_barrier_id;
-                *next_barrier_id = next_barrier_id
-                    .checked_add(1)
-                    .expect("barrier id out of range");
+                *next_barrier_id = next_barrier_id.checked_add(1).ok_or_else(|| {
+                    io::Error::other("libei barrier ID exhausted; re-enable capture")
+                })?;
                 pos_for_barrier.insert(id, *pos);
                 ICBarrier::for_region(id, r, *pos)
             })
@@ -2335,6 +2335,78 @@ mod tests {
             matches!(send_route_event(&sender, &route, CaptureEvent::Begin(0.5)).await,
             Err(CaptureError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe)
         );
+    }
+
+    fn zones_fixture(regions: Vec<(u32, u32, i32, i32)>) -> Zones {
+        use ashpd::zvariant::{LE, Value, serialized::Context};
+        let options = HashMap::from([
+            ("zones", Value::from(regions)),
+            ("zone_set", Value::from(1u32)),
+        ]);
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn barrier_id_exhaustion_returns_error_without_wrapping() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20)]);
+        let mut next = NonZeroU32::new(u32::MAX).unwrap();
+        assert!(select_barriers(&zones, &[Position::Left], &mut next).is_err());
+        assert_eq!(next.get(), u32::MAX);
+    }
+
+    #[test]
+    fn barrier_id_exhaustion_during_multiple_regions_returns_error() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20), (100, 80, 200, -20)]);
+        let mut next = NonZeroU32::new(u32::MAX - 1).unwrap();
+        assert!(select_barriers(&zones, &[Position::Left], &mut next).is_err());
+        assert_eq!(next.get(), u32::MAX);
+    }
+
+    #[test]
+    fn barrier_id_selection_preserves_routes_and_sequential_order() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20), (100, 80, 200, -20)]);
+        let mut next = NonZeroU32::new(1).unwrap();
+        let (barriers, routes) =
+            select_barriers(&zones, &[Position::Left, Position::Top], &mut next).unwrap();
+        assert_eq!(next.get(), 5);
+        assert_eq!(
+            barriers
+                .iter()
+                .map(|b| b.barrier_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            barriers.iter().map(|b| b.position).collect::<Vec<_>>(),
+            vec![
+                (10, -20, 10, 59),
+                (200, -20, 200, 59),
+                (10, -20, 109, -20),
+                (200, -20, 299, -20),
+            ]
+        );
+        for (id, expected) in [
+            (1, Position::Left),
+            (2, Position::Left),
+            (3, Position::Top),
+            (4, Position::Top),
+        ] {
+            assert_eq!(routes.get(&NonZeroU32::new(id).unwrap()), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn barrier_id_no_requests_do_not_consume_exhausted_counter() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20)]);
+        let mut next = NonZeroU32::new(u32::MAX).unwrap();
+        let (barriers, routes) = select_barriers(&zones, &[], &mut next).unwrap();
+        assert!(barriers.is_empty() && routes.is_empty());
+        assert_eq!(next.get(), u32::MAX);
+        let empty = zones_fixture(vec![]);
+        let (barriers, routes) = select_barriers(&empty, &[Position::Left], &mut next).unwrap();
+        assert!(barriers.is_empty() && routes.is_empty());
+        assert_eq!(next.get(), u32::MAX);
     }
 
     struct ReadyZoneBurst {

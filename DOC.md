@@ -1483,8 +1483,7 @@ The barrier factory and selection return CaptureError; update_barriers propagate
 invalid geometry before SetPointerBarriers/Enable. Existing session cleanup then
 handles setup failure. No input-frame work or serialized protocol fields change.
 Tests decode actual ashpd Region/Zones data but do not establish that a live
-compositor has supplied malformed regions. Barrier ID exhaustion is a separate
-remaining validation item.
+compositor has supplied malformed regions. Barrier ID exhaustion is handled as described below.
 
 
 ### Libei activation-scoped input routing
@@ -1502,3 +1501,17 @@ a reference-counted route snapshot across send waits; route/token allocations
 occur per activation rather than per input event. Cancellation does not withdraw
 events already accepted into downstream queues. Native portal restoration and
 physical cross-device behavior remain validation items.
+
+
+### Libei barrier ID exhaustion
+
+The capture task uses monotonically increasing nonzero barrier IDs. If the next
+ID cannot be advanced, selection returns a contextual capture error instead of
+panicking. It does not wrap or reset IDs within a running backend, which could
+make a late activation refer to a newer barrier. The error propagates before
+SetPointerBarriers/Enable through existing session cleanup. Re-enabling capture
+creates a new backend/session.
+
+Normal client/region order and sequential IDs are unchanged. Empty requests do
+not consume IDs. Boundary tests start near u32::MAX; they do not establish that
+an installed instance has exhausted its counter or caused a physical failure.

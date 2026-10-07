@@ -30,6 +30,7 @@
 | R119 | libei进入位置比例已实现 | 使用activation坐标/所属region计算Begin(t)，四向/多屏/越界/回退通过，双机定位待验 |
 | R120 | libei区域坐标校验已实现 | i64计算/u32完整尺寸，空区域/不可表示端点返回错误，合法大尺寸及setup传播回归通过 |
 | R121 | libei激活路由生命周期已实现 | Begin入队后发布，释放取消旧快照/等待发送，精确guard身份避免清新路由；native恢复待验 |
+| R122 | libei屏障ID耗尽错误已实现 | checked_add失败返回错误，不panic/回绕；顺序/路由/空请求保持，native边界待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2418,3 +2419,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 已经进入下游队列/网络的事件不由路由取消撤回；EIS/native释放、真实双机往返和故障恢复仍需验证。ZonesChanged归属、ID耗尽、native等待继续审。完整p95≤20ms/p99≤50ms及8h RSS缺验收证据，不认定90分；没有本机部署。
 
 日志：libei-route-release-baseline.log、libei-route-release-fixed.log、libei-route-release-workspace.log、libei-route-release-clippy.log。
+
+
+## 第一百零七轮：libei屏障ID耗尽不再panic
+
+### R122 / P2
+
+- select_barriers递增NonZeroU32时仍expect，计数器耗尽会panic并跳过普通Result清理。两条基线失败分别从u32::MAX开始、从MAX-1为两区域分配时中途panic。这是构造边界状态，不证明历史实机故障或真实耗尽频率。
+- [x] checked_add(None)映射上下文Io CaptureError，保留耗尽counter不回绕/重置，防止迟到activation ID误指新屏障。select/update已有Result链在SetPointerBarriers/Enable前传播，沿既有session清理。
+- [x] 不改变正常client/region遍历顺序与ID路由；空client/region请求不分配ID。不存在逐输入处理或协议变化。
+
+### 验证与性能范围
+
+- 2条失败基线通过；补2条实际ashpd Zones解码测试：两个region/两条edge产生ID1..4、next5且四线段/routes一致；空client或region在MAX counter保持空且不消耗。
+- libei85通过；工作区all-features input-capture148通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。没有真实portal耗尽/物理恢复验证，没有本机部署。
+- 81b2bd0 Rust37575191156 queued、Nix37575191146 in_progress；本轮HEAD仍需CI。
+- [ ] ZonesChanged会话归属、native等待及其他panic路径继续审；千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
+
+日志：libei-barrier-id-baseline.log、libei-barrier-id-fixed.log、libei-barrier-id-workspace.log、libei-barrier-id-clippy.log。
