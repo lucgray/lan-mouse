@@ -182,15 +182,35 @@ impl CaptureTaskCompletion {
 }
 
 /// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
-    let (x, y) = (r.x_offset(), r.y_offset());
-    let (w, h) = (r.width() as i32, r.height() as i32);
-    match pos {
-        Position::Left => (x, y, x, y + h - 1),
-        Position::Right => (x + w, y, x + w, y + h - 1),
-        Position::Top => (x, y, x + w - 1, y),
-        Position::Bottom => (x, y + h, x + w - 1, y + h),
+fn pos_to_barrier(r: &Region, pos: Position) -> Result<(i32, i32, i32, i32), CaptureError> {
+    if r.width() == 0 || r.height() == 0 {
+        return Err(io::Error::other("libei region has empty dimensions").into());
     }
+    let (x, y) = (i64::from(r.x_offset()), i64::from(r.y_offset()));
+    let (w, h) = (i64::from(r.width()), i64::from(r.height()));
+    let coordinate = |value| {
+        i32::try_from(value).map_err(|_| {
+            CaptureError::from(io::Error::other(
+                "libei region endpoint exceeds i32 coordinates",
+            ))
+        })
+    };
+    // Validate the owning region as well as the selected boundary. A valid left
+    // barrier must not carry out-of-range bounds for later release/entry math.
+    let (last_x, last_y) = (coordinate(x + w - 1)?, coordinate(y + h - 1)?);
+    let (origin_x, origin_y) = (r.x_offset(), r.y_offset());
+    Ok(match pos {
+        Position::Left => (origin_x, origin_y, origin_x, last_y),
+        Position::Right => {
+            let right = coordinate(x + w)?;
+            (right, origin_y, right, last_y)
+        }
+        Position::Top => (origin_x, origin_y, last_x, origin_y),
+        Position::Bottom => {
+            let bottom = coordinate(y + h)?;
+            (origin_x, bottom, last_x, bottom)
+        }
+    })
 }
 
 /// Ashpd does not expose fields
@@ -210,18 +230,20 @@ impl ICBarrier {
         }
     }
 
-    fn for_region(barrier_id: BarrierID, region: &Region, pos: Position) -> Self {
-        let mut barrier = Self::new(barrier_id, pos_to_barrier(region, pos));
-        if region.width() > 0 && region.height() > 0 {
-            let (x, y) = (f64::from(region.x_offset()), f64::from(region.y_offset()));
-            barrier.zone_bounds = Some((
-                x,
-                y,
-                x + f64::from(region.width()) - 1.,
-                y + f64::from(region.height()) - 1.,
-            ));
-        }
-        barrier
+    fn for_region(
+        barrier_id: BarrierID,
+        region: &Region,
+        pos: Position,
+    ) -> Result<Self, CaptureError> {
+        let mut barrier = Self::new(barrier_id, pos_to_barrier(region, pos)?);
+        let (x, y) = (f64::from(region.x_offset()), f64::from(region.y_offset()));
+        barrier.zone_bounds = Some((
+            x,
+            y,
+            x + f64::from(region.width()) - 1.,
+            y + f64::from(region.height()) - 1.,
+        ));
+        Ok(barrier)
     }
 }
 
@@ -235,7 +257,7 @@ fn select_barriers(
     zones: &Zones,
     clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-) -> (Vec<ICBarrier>, HashMap<BarrierID, Position>) {
+) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), CaptureError> {
     let mut pos_for_barrier = HashMap::new();
     let mut barriers: Vec<ICBarrier> = vec![];
 
@@ -251,10 +273,10 @@ fn select_barriers(
                 pos_for_barrier.insert(id, *pos);
                 ICBarrier::for_region(id, r, *pos)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         barriers.append(&mut client_barriers);
     }
-    (barriers, pos_for_barrier)
+    Ok((barriers, pos_for_barrier))
 }
 
 fn accepted_barriers(
@@ -293,7 +315,7 @@ async fn update_barriers(
         .response()?;
     log::debug!("zones: {zones:?}");
 
-    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
+    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id)?;
     log::debug!("barriers: {barriers:?}");
     log::debug!("client for barrier id: {id_map:?}");
 
@@ -1497,7 +1519,7 @@ mod tests {
         };
         let region = region_fixture(100, 100, x, y);
         let id = NonZeroU32::new(1).unwrap();
-        let barrier = ICBarrier::for_region(id, &region, pos);
+        let barrier = ICBarrier::for_region(id, &region, pos).unwrap();
         let options =
             activation_release_options(activated, pos, &[barrier], &HashMap::from([(id, pos)]));
         let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
@@ -1551,7 +1573,7 @@ mod tests {
 
     fn assert_overshoot_release(edge: Position, cursor: (f32, f32), expected: (f64, f64)) {
         let region = region_fixture(100, 80, 10, -20);
-        let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+        let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
         assert_eq!(
             release_cursor_position(Some(cursor), edge, Some(barrier)),
             Some(expected)
@@ -1596,7 +1618,8 @@ mod tests {
             Position::Top,
             Position::Bottom,
         ] {
-            let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+            let barrier =
+                ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
             assert_eq!(
                 release_cursor_position(Some((-100., 200.)), edge, Some(barrier)),
                 Some((10., -20.))
@@ -1611,12 +1634,14 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             &region_fixture(100, 80, 10, -20),
             Position::Left,
-        );
+        )
+        .unwrap();
         let second = ICBarrier::for_region(
             NonZeroU32::new(2).unwrap(),
             &region_fixture(100, 80, 400, -20),
             Position::Left,
-        );
+        )
+        .unwrap();
         let routes = HashMap::from([
             (first.barrier_id, Position::Left),
             (second.barrier_id, Position::Left),
@@ -1651,14 +1676,13 @@ mod tests {
             release_cursor_position(cursor, Position::Left, Some(barrier(1, (0, 0, 0, 100)))),
             None
         );
-        let empty = ICBarrier::for_region(
-            NonZeroU32::new(1).unwrap(),
-            &region_fixture(0, 0, 0, 0),
-            Position::Left,
-        );
-        assert_eq!(
-            release_cursor_position(cursor, Position::Left, Some(empty)),
-            None
+        assert!(
+            ICBarrier::for_region(
+                NonZeroU32::new(1).unwrap(),
+                &region_fixture(0, 0, 0, 0),
+                Position::Left
+            )
+            .is_err()
         );
     }
 
@@ -1856,7 +1880,8 @@ mod tests {
             (Position::Top, (-175., -80.)),
             (Position::Bottom, (-175., 200.)),
         ] {
-            let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+            let barrier =
+                ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
             let activation = activation_fixture("/session/current", Some(1), Some(cursor));
             assert_eq!(
                 activation_edge_position(
@@ -1879,7 +1904,8 @@ mod tests {
             (Position::Top, (-50., -80.), (200., -80.)),
             (Position::Bottom, (-50., 200.), (200., 200.)),
         ] {
-            let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+            let barrier =
+                ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
             let routes = HashMap::from([(barrier.barrier_id, edge)]);
             for (cursor, expected) in [(low, 0.), (high, 1.)] {
                 let activation = activation_fixture("/session/current", Some(1), Some(cursor));
@@ -1897,12 +1923,14 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             &region_fixture(100, 100, 0, 0),
             Position::Left,
-        );
+        )
+        .unwrap();
         let second = ICBarrier::for_region(
             NonZeroU32::new(2).unwrap(),
             &region_fixture(100, 200, 0, 100),
             Position::Left,
-        );
+        )
+        .unwrap();
         let routes = HashMap::from([
             (first.barrier_id, Position::Left),
             (second.barrier_id, Position::Left),
@@ -1927,7 +1955,8 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             &region_fixture(100, 100, 0, 0),
             edge,
-        );
+        )
+        .unwrap();
         let routes = HashMap::from([(barrier.barrier_id, edge)]);
         for cursor in [None, Some((f32::NAN, 25.)), Some((0., f32::INFINITY))] {
             let activation = activation_fixture("/session/current", Some(1), cursor);
@@ -1955,7 +1984,8 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             &region_fixture(100, 80, -20, 10),
             edge,
-        );
+        )
+        .unwrap();
         let activation = activation_fixture("/session/current", Some(1), Some((5.5, -50.)));
         assert_eq!(
             activation_edge_position(
@@ -1975,7 +2005,8 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             &region_fixture(1, 1, 10, -20),
             edge,
-        );
+        )
+        .unwrap();
         let routes = HashMap::from([(barrier.barrier_id, edge)]);
         for (cursor, expected) in [((10., -20.), 0.), ((10., -19.), 1.)] {
             let activation = activation_fixture("/session/current", Some(1), Some(cursor));
@@ -1993,7 +2024,8 @@ mod tests {
             NonZeroU32::new(1).unwrap(),
             &region_fixture(100, 80, 10, -20),
             edge,
-        );
+        )
+        .unwrap();
         let activation = activation_fixture("/session/current", Some(1), Some((-50., 0.)));
         let t = activation_edge_position(
             &activation,
@@ -2010,6 +2042,84 @@ mod tests {
         assert_eq!(
             receiver.recv().await.unwrap(),
             (edge, CaptureEvent::Begin(0.25))
+        );
+    }
+
+    #[test]
+    fn barrier_region_rejects_empty_dimensions() {
+        for (width, height) in [(0, 80), (100, 0), (0, 0)] {
+            for edge in [
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ] {
+                assert!(pos_to_barrier(&region_fixture(width, height, 10, -20), edge).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn barrier_region_rejects_unrepresentable_endpoints() {
+        let region = region_fixture(2, 2, i32::MAX, i32::MAX);
+        for edge in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            assert!(pos_to_barrier(&region, edge).is_err());
+        }
+    }
+
+    #[test]
+    fn barrier_region_preserves_large_unsigned_extent() {
+        let region = region_fixture(u32::MAX, 2, i32::MIN, 0);
+        assert_eq!(
+            pos_to_barrier(&region, Position::Top).unwrap(),
+            (i32::MIN, 0, i32::MAX - 1, 0)
+        );
+        assert_eq!(
+            pos_to_barrier(&region, Position::Right).unwrap(),
+            (i32::MAX, 0, i32::MAX, 1)
+        );
+    }
+
+    #[test]
+    fn barrier_region_preserves_normal_edges_and_limit_coordinates() {
+        let region = region_fixture(100, 80, 10, -20);
+        for (edge, expected) in [
+            (Position::Left, (10, -20, 10, 59)),
+            (Position::Right, (110, -20, 110, 59)),
+            (Position::Top, (10, -20, 109, -20)),
+            (Position::Bottom, (10, 60, 109, 60)),
+        ] {
+            assert_eq!(pos_to_barrier(&region, edge).unwrap(), expected);
+        }
+        let corner = region_fixture(1, 1, i32::MAX, i32::MAX);
+        assert_eq!(
+            pos_to_barrier(&corner, Position::Left).unwrap(),
+            (i32::MAX, i32::MAX, i32::MAX, i32::MAX)
+        );
+        assert!(pos_to_barrier(&corner, Position::Right).is_err());
+        assert!(pos_to_barrier(&corner, Position::Bottom).is_err());
+    }
+
+    #[test]
+    fn barrier_region_validation_reaches_factory_and_selection() {
+        use ashpd::zvariant::{LE, Value, serialized::Context};
+        let invalid = region_fixture(0, 80, 10, -20);
+        assert!(
+            ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &invalid, Position::Left).is_err()
+        );
+        let options = HashMap::from([
+            ("zones", Value::from(vec![(0u32, 80u32, 10i32, -20i32)])),
+            ("zone_set", Value::from(1u32)),
+        ]);
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+        let (zones, _) = data.deserialize::<Zones>().unwrap();
+        assert!(
+            select_barriers(&zones, &[Position::Left], &mut NonZeroU32::new(1).unwrap()).is_err()
         );
     }
 

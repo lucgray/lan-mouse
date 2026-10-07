@@ -28,6 +28,7 @@
 | R117 | libei未使用初始会话清理已实现 | 正常/错误退出显式await Close，已消耗会话不重复关闭；真实portal释放、panic及挂起关闭待验 |
 | R118 | libei事件通道错误/Begin取消已实现 | 关闭通道报BrokenPipe而非panic，满通道Begin可取消；联合等待模型回归通过，native清理待验 |
 | R119 | libei进入位置比例已实现 | 使用activation坐标/所属region计算Begin(t)，四向/多屏/越界/回退通过，双机定位待验 |
+| R120 | libei区域坐标校验已实现 | i64计算/u32完整尺寸，空区域/不可表示端点返回错误，合法大尺寸及setup传播回归通过 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2379,3 +2380,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] release后current_pos及迟到输入、ZonesChanged身份、native调用挂起继续审。接收端不支持warp时仍不能保证落点。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms和8h RSS未验收，不认定90分；没有本机部署。
 
 日志：libei-enter-position-baseline.log、libei-enter-position-fixed.log、libei-enter-position-workspace.log、libei-enter-position-clippy.log。
+
+
+## 第一百零五轮：libei区域尺寸与端点整数溢出
+
+### R120 / P1
+
+- pos_to_barrier将u32 width/height直接as i32并在i32加减；空区域生成错误线段，超出坐标范围在debug panic，合法大尺寸也可能因窄化/中间运算失败。真实ashpd Region解码fixture的3条基线失败：空区域未报错，i32::MAX附近端点panic，u32::MAX宽度+负offset合法区域仍panic。
+- [x] 以i64计算完整u32 extent，非零检查；先校验所属region last-pixel坐标，再校验所选right/bottom边界，统一try_from到i32。维持原left/top与right/bottom exclusive边界规则；可表示的大尺寸不一概拒绝。
+- [x] ICBarrier::for_region、select_barriers均返回Result，update_barriers传播错误，在SetPointerBarriers/Enable前结束setup并沿既有会话清理路径处理。valid factory总保存合法bounds；无逐输入处理或协议字段改动。
+
+### 验证和实际输入范围
+
+- 3条失败基线通过；补2条正常四边及i32极限单像素边界，factory/真实ashpd Zones解码进入select_barriers的错误传播。此前空region省略建议测试改为factory直接拒绝；缺geometry回退测试保留。
+- libei75通过；工作区all-features input-capture138通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。受控异常数据能证明运算缺陷，不能证明此前实机故障由异常region导致；没有native compositor调用或部署。
+- aad4b9b Rust37574538353 queued、Nix37574538344 in_progress；本轮HEAD仍需CI。
+- [ ] barrier ID checked_add仍expect，ZonesChanged身份、release后current_pos、native等待继续审。千次真实双机往返、原生恢复、完整p95≤20ms/p99≤50ms及8h RSS缺证据，不认定90分。
+
+日志：libei-region-arithmetic-baseline.log、libei-region-arithmetic-fixed.log、libei-region-arithmetic-workspace.log、libei-region-arithmetic-clippy.log。

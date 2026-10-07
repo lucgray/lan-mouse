@@ -1418,8 +1418,8 @@ Without usable cursor or region geometry, Release omits its optional position
 suggestion and keeps the activation ID. The compositor can ignore the suggestion;
 unit coverage of serialized options does not prove physical pointer recovery.
 No LAN protocol fields change. Geometry metadata is stored during configuration;
-projection occurs on release rather than each input frame. Native malformed-region
-arithmetic and actual multi-machine switching remain separate validation items.
+projection occurs on release rather than each input frame. Region arithmetic is checked as described below. Actual multi-machine switching
+remains a separate validation item.
 
 
 ### Libei unused first-session cleanup
@@ -1468,3 +1468,20 @@ activation validation still rejects explicitly nonfinite coordinates before Begi
 The computed value flows through the existing cancellation-aware Begin send with
 no protocol change. Receiver backends that cannot warp retain their existing
 behavior; actual peer placement remains a platform validation item.
+
+
+### Libei region coordinate validation
+
+Region-to-barrier conversion rejects zero width/height and validates the owning
+region's last-pixel coordinates and selected boundary against the portal's i32
+coordinate range. Arithmetic uses i64 for the complete u32 dimension, avoiding
+narrowing casts and intermediate i32 overflow. Large unsigned extents remain
+accepted when their translated region and selected edge are representable.
+Right/bottom retain their existing exclusive-edge placement.
+
+The barrier factory and selection return CaptureError; update_barriers propagates
+invalid geometry before SetPointerBarriers/Enable. Existing session cleanup then
+handles setup failure. No input-frame work or serialized protocol fields change.
+Tests decode actual ashpd Region/Zones data but do not establish that a live
+compositor has supplied malformed regions. Barrier ID exhaustion is a separate
+remaining validation item.
