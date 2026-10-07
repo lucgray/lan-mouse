@@ -1381,10 +1381,9 @@ activations are still ignored before metadata validation.
 
 Release always builds options carrying the received activation ID. When cursor
 coordinates are missing or nonfinite, it omits the optional position suggestion
-and still requests portal release. Finite coordinates retain the existing one-pixel
-inward suggestion. This follows the portal's optional Release cursor_position
-contract; the compositor controls the final pointer position. Native release and
-overshoot behavior remain for validation.
+and still requests portal release. Finite coordinates use the owning region
+projection and inward suggestion described below. This follows the portal's optional Release cursor_position
+contract; the compositor controls the final pointer position. Native release placement remains for validation.
 
 Specification: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.InputCapture.html#org-freedesktop-portal-inputcapture-release
 
@@ -1403,3 +1402,21 @@ its async work or cleanup is pending. Canceling a join wait preserves that owner
 and the original result. This changes resource lifetime safety, not native cleanup
 timeouts: a stuck operation can still retain its resource, and actual portal
 session closure/physical input restoration need validation.
+
+
+### Libei release position after edge overshoot
+
+Each accepted barrier retains its owning region bounds as internal metadata.
+Release uses the reported barrier ID when it matches the selected route; unknown
+or absent IDs choose the nearest barrier within that route. The finite cursor is
+projected onto the barrier segment, moved one pixel inward, and clamped to the
+owning region. This handles fast edge overshoot, corners, negative region offsets
+and one-pixel zones. Axis-aligned projection preserves an in-range coordinate
+without interpolation roundoff.
+
+Without usable cursor or region geometry, Release omits its optional position
+suggestion and keeps the activation ID. The compositor can ignore the suggestion;
+unit coverage of serialized options does not prove physical pointer recovery.
+No LAN protocol fields change. Geometry metadata is stored during configuration;
+projection occurs on release rather than each input frame. Native malformed-region
+arithmetic and actual multi-machine switching remain separate validation items.

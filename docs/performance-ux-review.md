@@ -24,6 +24,7 @@
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
 | R115 | libei后台portal所有权已实现 | Arc task owner替代裸指针/unsafe，Drop detach及取消join等待期间资源存活；真实portal关闭/总资源仍待验 |
+| R116 | libei释放越界位置已修复 | 按所属region投影、内收并clamp；四边/角落/单像素/多屏回归通过，真实compositor定位待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2301,3 +2302,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 挂起的native调用仍可长期持有portal，task/resource总量、空闲first session关闭及panic/通道关闭路径仍需审。RC/Arc资源析构不证明D-Bus Session关闭或物理指针恢复。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms与8h RSS缺验收证据；第100轮不等于90分，没有本机部署。
 
 日志：libei-task-owner-baseline.log、libei-task-owner-fixed.log、libei-task-owner-workspace.log、libei-task-owner-clippy.log。
+
+
+## 第一百零一轮：libei释放时快速移动越过边缘
+
+### R116 / P1
+
+- 旧release位置只将Activated cursor向内偏移1px。四条生产helper基线失败：Left -50仍建议-49、Right 200仍199、Top -80仍-79、Bottom 200仍199，均在测试region之外。已确认代码缺陷；没有将其认定为此前物理卡住的唯一原因。
+- [x] ICBarrier保留所属region bounds作为内部metadata，portal Barrier序列化仍只发送ID/线段。Release优先使用与route一致的已知ID；未知/缺失ID只在当前route内选最近线段。
+- [x] 释放坐标投影到有限线段，按进入边缘内收1px，再clamp到region内；轴对齐路径保留原切向坐标，避免插值误差。角落、负偏移与单像素region不再建议屏幕外位置。
+- [x] 缺少cursor/geometry/bounds时省略可选建议，activation ID仍保留。配置时保存metadata，release时查询计算；没有逐帧新增工作或LAN协议变更。
+
+### 验证与范围
+
+- 4条越界基线修复后通过；新增4条覆盖四角、1×1区域、已知ID选择较远所属屏幕/未知ID最近回退，以及缺geometry/空region省略建议。多屏测试用真实ashpd Activated/ReleaseOptions的zvariant编码与解码，验证activation ID=7。
+- libei模块53通过；工作区all-features input-capture116通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy、fmt与diff检查通过。未创建实际portal/compositor，未部署本机；cursor_position是建议，物理恢复仍待验证。
+- [ ] pos_to_barrier中的异常region整数算术、ZonesChanged身份、空闲session关闭等仍需独立审查。千次真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。本轮提交HEAD需CI验证。
+
+日志：libei-release-overshoot-baseline.log、libei-release-overshoot-fixed.log、libei-release-overshoot-workspace.log、libei-release-overshoot-clippy.log。

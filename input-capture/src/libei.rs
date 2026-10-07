@@ -198,6 +198,7 @@ fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
 struct ICBarrier {
     barrier_id: BarrierID,
     position: (i32, i32, i32, i32),
+    zone_bounds: Option<(f64, f64, f64, f64)>,
 }
 
 impl ICBarrier {
@@ -205,7 +206,22 @@ impl ICBarrier {
         Self {
             barrier_id,
             position,
+            zone_bounds: None,
         }
+    }
+
+    fn for_region(barrier_id: BarrierID, region: &Region, pos: Position) -> Self {
+        let mut barrier = Self::new(barrier_id, pos_to_barrier(region, pos));
+        if region.width() > 0 && region.height() > 0 {
+            let (x, y) = (f64::from(region.x_offset()), f64::from(region.y_offset()));
+            barrier.zone_bounds = Some((
+                x,
+                y,
+                x + f64::from(region.width()) - 1.,
+                y + f64::from(region.height()) - 1.,
+            ));
+        }
+        barrier
     }
 }
 
@@ -232,9 +248,8 @@ fn select_barriers(
                 *next_barrier_id = next_barrier_id
                     .checked_add(1)
                     .expect("barrier id out of range");
-                let position = pos_to_barrier(r, *pos);
                 pos_for_barrier.insert(id, *pos);
-                ICBarrier::new(id, position)
+                ICBarrier::for_region(id, r, *pos)
             })
             .collect();
         barriers.append(&mut client_barriers);
@@ -782,7 +797,7 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    release_capture(input_capture, session, activated, pos, &barriers, &pos_for_barrier_id).await?;
 
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
@@ -821,9 +836,12 @@ async fn do_capture_session(
 fn release_cursor_position(
     cursor: Option<(f32, f32)>,
     current_pos: Position,
+    barrier: Option<ICBarrier>,
 ) -> Option<(f64, f64)> {
     let (x, y) = cursor.filter(|(x, y)| x.is_finite() && y.is_finite())?;
-    log::debug!("client entered @ ({x}, {y})");
+    let barrier = barrier?;
+    let (min_x, min_y, max_x, max_y) = barrier.zone_bounds?;
+    let (x, y) = closest_point_on_segment(barrier.position, (x, y));
     let (dx, dy) = match current_pos {
         // offset cursor position to not enter again immediately
         Position::Left => (1., 0.),
@@ -831,15 +849,48 @@ fn release_cursor_position(
         Position::Top => (0., 1.),
         Position::Bottom => (0., -1.),
     };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
-    Some(cursor_position)
+    // Keep corner overshoot and one-pixel zones inside the owning region.
+    Some(((x + dx).clamp(min_x, max_x), (y + dy).clamp(min_y, max_y)))
 }
 
-fn activation_release_options(activated: &Activated, pos: Position) -> ReleaseOptions {
+fn release_barrier(
+    activated: &Activated,
+    pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> Option<ICBarrier> {
+    if let Some(ActivatedBarrier::Barrier(id)) = activated.barrier_id() {
+        if routes.get(&id) == Some(&pos) {
+            return barriers
+                .iter()
+                .find(|barrier| barrier.barrier_id == id)
+                .copied();
+        }
+    }
+    let cursor = activated
+        .cursor_position()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())?;
+    barriers
+        .iter()
+        .filter(|b| routes.get(&b.barrier_id) == Some(&pos))
+        .map(|b| (b, distance_to_segment_squared(b.position, cursor)))
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(b, _)| *b)
+}
+
+fn activation_release_options(
+    activated: &Activated,
+    pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> ReleaseOptions {
     ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
-        .set_cursor_position(release_cursor_position(activated.cursor_position(), pos))
+        .set_cursor_position(release_cursor_position(
+            activated.cursor_position(),
+            pos,
+            release_barrier(activated, pos, barriers, routes),
+        ))
 }
 
 async fn release_capture(
@@ -847,11 +898,13 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
     }
-    let release_options = activation_release_options(&activated, current_pos);
+    let release_options = activation_release_options(&activated, current_pos, barriers, routes);
     input_capture.release(session, release_options).await?;
     Ok(())
 }
@@ -877,10 +930,23 @@ fn find_corresponding_client(
 }
 
 fn distance_to_segment_squared(segment: (i32, i32, i32, i32), pos: (f32, f32)) -> f64 {
+    let (nearest_x, nearest_y) = closest_point_on_segment(segment, pos);
+    let (offset_x, offset_y) = (f64::from(pos.0) - nearest_x, f64::from(pos.1) - nearest_y);
+    offset_x * offset_x + offset_y * offset_y
+}
+
+fn closest_point_on_segment(segment: (i32, i32, i32, i32), pos: (f32, f32)) -> (f64, f64) {
     // Preserve integer endpoint precision and avoid f32 overflow for finite cursors.
     let (x1, y1, x2, y2) = segment;
     let (x1, y1, x2, y2) = (f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2));
     let (x, y) = (f64::from(pos.0), f64::from(pos.1));
+    // Portal barriers are axis aligned; preserve an in-range cursor exactly.
+    if x1 == x2 {
+        return (x1, y.clamp(y1.min(y2), y1.max(y2)));
+    }
+    if y1 == y2 {
+        return (x.clamp(x1.min(x2), x1.max(x2)), y1);
+    }
     let (dx, dy) = (x2 - x1, y2 - y1);
     let length_squared = dx * dx + dy * dy;
     let projection = if length_squared == 0. {
@@ -888,8 +954,7 @@ fn distance_to_segment_squared(segment: (i32, i32, i32, i32), pos: (f32, f32)) -
     } else {
         (((x - x1) * dx + (y - y1) * dy) / length_squared).clamp(0., 1.)
     };
-    let (offset_x, offset_y) = (x - (x1 + projection * dx), y - (y1 + projection * dy));
-    offset_x * offset_x + offset_y * offset_y
+    (x1 + projection * dx, y1 + projection * dy)
 }
 
 async fn handle_ei_event(
@@ -1326,7 +1391,7 @@ mod tests {
     #[test]
     fn release_without_usable_cursor_omits_suggestion() {
         for cursor in [None, Some((f32::NAN, 0.)), Some((0., f32::INFINITY))] {
-            assert_eq!(release_cursor_position(cursor, Position::Left), None);
+            assert_eq!(release_cursor_position(cursor, Position::Left, None), None);
         }
     }
 
@@ -1346,7 +1411,17 @@ mod tests {
         pos: Position,
     ) -> HashMap<String, ashpd::zvariant::OwnedValue> {
         use ashpd::zvariant::{LE, serialized::Context};
-        let options = activation_release_options(activated, pos);
+        let (x, y) = match pos {
+            Position::Left => (10, 0),
+            Position::Right => (-90, 0),
+            Position::Top => (0, 20),
+            Position::Bottom => (0, -80),
+        };
+        let region = region_fixture(100, 100, x, y);
+        let id = NonZeroU32::new(1).unwrap();
+        let barrier = ICBarrier::for_region(id, &region, pos);
+        let options =
+            activation_release_options(activated, pos, &[barrier], &HashMap::from([(id, pos)]));
         let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
         data.deserialize().unwrap().0
     }
@@ -1386,6 +1461,126 @@ mod tests {
         assert!(
             activation_position(&activation, "/session/current", &[barrier], &HashMap::new())
                 .is_err()
+        );
+    }
+
+    fn region_fixture(width: u32, height: u32, x: i32, y: i32) -> Region {
+        use ashpd::zvariant::{LE, serialized::Context};
+        let data =
+            ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &(width, height, x, y)).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    fn assert_overshoot_release(edge: Position, cursor: (f32, f32), expected: (f64, f64)) {
+        let region = region_fixture(100, 80, 10, -20);
+        let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+        assert_eq!(
+            release_cursor_position(Some(cursor), edge, Some(barrier)),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn release_overshoot_left_projects_into_zone() {
+        assert_overshoot_release(Position::Left, (-50., 10.), (11., 10.));
+    }
+    #[test]
+    fn release_overshoot_right_projects_into_zone() {
+        assert_overshoot_release(Position::Right, (200., 10.), (109., 10.));
+    }
+    #[test]
+    fn release_overshoot_top_projects_into_zone() {
+        assert_overshoot_release(Position::Top, (50., -80.), (50., -19.));
+    }
+    #[test]
+    fn release_overshoot_bottom_projects_into_zone() {
+        assert_overshoot_release(Position::Bottom, (50., 200.), (50., 59.));
+    }
+
+    #[test]
+    fn release_corner_overshoot_stays_inside_region() {
+        for (edge, cursor, expected) in [
+            (Position::Left, (-50., 500.), (11., 59.)),
+            (Position::Right, (200., -100.), (109., -20.)),
+            (Position::Top, (-50., -80.), (10., -19.)),
+            (Position::Bottom, (200., 200.), (109., 59.)),
+        ] {
+            assert_overshoot_release(edge, cursor, expected);
+        }
+    }
+
+    #[test]
+    fn release_one_pixel_region_stays_inside_region() {
+        let region = region_fixture(1, 1, 10, -20);
+        for edge in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+            assert_eq!(
+                release_cursor_position(Some((-100., 200.)), edge, Some(barrier)),
+                Some((10., -20.))
+            );
+        }
+    }
+
+    #[test]
+    fn release_uses_reported_region_and_falls_back_within_route() {
+        use ashpd::zvariant::{LE, serialized::Context};
+        let first = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 80, 10, -20),
+            Position::Left,
+        );
+        let second = ICBarrier::for_region(
+            NonZeroU32::new(2).unwrap(),
+            &region_fixture(100, 80, 400, -20),
+            Position::Left,
+        );
+        let routes = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (second.barrier_id, Position::Left),
+        ]);
+        for (id, expected) in [
+            (Some(2), (401., 10.)),
+            (Some(99), (11., 10.)),
+            (None, (11., 10.)),
+        ] {
+            let activation = activation_fixture("/session/current", id, Some((-50., 10.)));
+            let options =
+                activation_release_options(&activation, Position::Left, &[first, second], &routes);
+            let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+            let (options, _) = data
+                .deserialize::<HashMap<String, ashpd::zvariant::OwnedValue>>()
+                .unwrap();
+            assert_eq!(
+                options["cursor_position"]
+                    .downcast_ref::<(f64, f64)>()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(options["activation_id"].downcast_ref::<u32>().unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn release_without_region_geometry_omits_suggestion() {
+        let cursor = Some((10., 20.));
+        assert_eq!(release_cursor_position(cursor, Position::Left, None), None);
+        assert_eq!(
+            release_cursor_position(cursor, Position::Left, Some(barrier(1, (0, 0, 0, 100)))),
+            None
+        );
+        let empty = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(0, 0, 0, 0),
+            Position::Left,
+        );
+        assert_eq!(
+            release_cursor_position(cursor, Position::Left, Some(empty)),
+            None
         );
     }
 
