@@ -116,7 +116,7 @@ impl CaptureClientUpdates {
 
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
-    input_capture: Pin<Box<InputCapture>>,
+    input_capture: Arc<InputCapture>,
     capture_task: CaptureTaskCompletion,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
@@ -131,6 +131,23 @@ struct CaptureTaskCompletion {
 }
 
 impl CaptureTaskCompletion {
+    fn spawn_owned<T: 'static, F, Fut>(owner: Arc<T>, run: F) -> Self
+    where
+        F: FnOnce(Arc<T>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<(), CaptureError>> + 'static,
+    {
+        let handle = tokio::task::spawn_local(async move {
+            // Retain the resource even if the frontend/JoinHandle is dropped.
+            let result = run(owner.clone()).await;
+            drop(owner);
+            result
+        });
+        Self {
+            handle,
+            joined: false,
+        }
+    }
+
     fn result(
         result: Result<Result<(), CaptureError>, tokio::task::JoinError>,
     ) -> Result<(), CaptureError> {
@@ -430,10 +447,8 @@ impl LibeiInputCapture {
     pub async fn new(
         window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
     ) -> std::result::Result<Self, LibeiCaptureCreationError> {
-        let input_capture = Box::pin(InputCapture::new().await?);
-        let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
-        let first_session =
-            Some(create_session(unsafe { &*input_capture_ptr }, window_identifier.clone()).await?);
+        let input_capture = Arc::new(InputCapture::new().await?);
+        let first_session = Some(create_session(&input_capture, window_identifier.clone()).await?);
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
@@ -441,24 +456,25 @@ impl LibeiInputCapture {
 
         let cancellation_token = CancellationToken::new();
 
-        let capture = do_capture(
-            input_capture_ptr,
-            notify_rx,
-            notify_release.clone(),
-            first_session,
-            event_tx,
-            cancellation_token.clone(),
-            window_identifier,
-        );
-        let capture_task = tokio::task::spawn_local(capture);
+        let task_cancel = cancellation_token.clone();
+        let task_release = notify_release.clone();
+        let capture_task =
+            CaptureTaskCompletion::spawn_owned(input_capture.clone(), move |input_capture| {
+                do_capture(
+                    input_capture,
+                    notify_rx,
+                    task_release,
+                    first_session,
+                    event_tx,
+                    task_cancel,
+                    window_identifier,
+                )
+            });
 
         let producer = Self {
             input_capture,
             event_rx,
-            capture_task: CaptureTaskCompletion {
-                handle: capture_task,
-                joined: false,
-            },
+            capture_task,
             notify_capture,
             notify_release,
             cancellation_token,
@@ -470,7 +486,7 @@ impl LibeiInputCapture {
 }
 
 async fn do_capture(
-    input_capture: *const InputCapture,
+    input_capture: Arc<InputCapture>,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
@@ -480,8 +496,7 @@ async fn do_capture(
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
 
-    /* safety: libei_task does not outlive Self */
-    let input_capture = unsafe { &*input_capture };
+    let input_capture = input_capture.as_ref();
     let mut active_clients: Vec<Position> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
@@ -998,6 +1013,86 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+
+    struct TaskResourceProbe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for TaskResourceProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_capture_task_keeps_resource_until_cleanup_finishes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let resource = Arc::new(TaskResourceProbe(drops.clone()));
+                let weak = Arc::downgrade(&resource);
+                let task_weak = weak.clone();
+                let cancel = CancellationToken::new();
+                let task_cancel = cancel.clone();
+                let (started, started_wait) = tokio::sync::oneshot::channel();
+                let (release_cleanup, cleanup_wait) = tokio::sync::oneshot::channel();
+                let (observed, observed_wait) = tokio::sync::oneshot::channel();
+                let task = CaptureTaskCompletion::spawn_owned(
+                    resource.clone(),
+                    move |_resource| async move {
+                        task_cancel.cancelled().await;
+                        started.send(()).unwrap();
+                        cleanup_wait.await.unwrap();
+                        // Observe ownership without ever dereferencing a potentially freed pointer.
+                        observed.send(task_weak.upgrade().is_some()).unwrap();
+                        Ok(())
+                    },
+                );
+                drop(resource);
+                cancel.cancel();
+                drop(task); // JoinHandle drop detaches the task, as frontend Drop does.
+                started_wait.await.unwrap();
+                let alive_during_cleanup = weak.upgrade().is_some();
+                let drops_during_cleanup = drops.load(std::sync::atomic::Ordering::SeqCst);
+                release_cleanup.send(()).unwrap();
+                let alive_at_cleanup_end = observed_wait.await.unwrap();
+                tokio::task::yield_now().await;
+                assert!(
+                    alive_during_cleanup,
+                    "frontend freed resource while cleanup was waiting"
+                );
+                assert_eq!(drops_during_cleanup, 0);
+                assert!(alive_at_cleanup_end);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_owned_join_wait_keeps_resource_and_task_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let resource = Arc::new(TaskResourceProbe(drops.clone()));
+                let weak = Arc::downgrade(&resource);
+                let (release_cleanup, cleanup_wait) = tokio::sync::oneshot::channel();
+                let mut task = CaptureTaskCompletion::spawn_owned(
+                    resource.clone(),
+                    move |_resource| async move {
+                        cleanup_wait.await.unwrap();
+                        Err(CaptureError::EndOfStream)
+                    },
+                );
+                drop(resource);
+                assert!(task.join().now_or_never().is_none());
+                assert!(weak.upgrade().is_some());
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+                release_cleanup.send(()).unwrap();
+                assert!(matches!(task.join().await, Err(CaptureError::EndOfStream)));
+                assert!(weak.upgrade().is_none());
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(task.join().await.is_ok());
+            })
+            .await;
+    }
 
     fn barrier(id: u32, position: (i32, i32, i32, i32)) -> ICBarrier {
         ICBarrier::new(NonZeroU32::new(id).unwrap(), position)

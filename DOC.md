@@ -1387,3 +1387,19 @@ contract; the compositor controls the final pointer position. Native release and
 overshoot behavior remain for validation.
 
 Specification: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.InputCapture.html#org-freedesktop-portal-inputcapture-release
+
+
+### Libei task resource ownership
+
+The frontend and capture task share the InputCapture portal through Arc. Task
+startup retains a strong owner until its capture future finishes, and do_capture
+receives an owned Arc rather than a raw pointer. No portal pointer is cast or
+dereferenced through unsafe. Arc keeps the existing Send capture interface while
+the event task still runs on its LocalSet.
+
+Dropping the frontend requests cancellation; dropping its JoinHandle detaches the
+task rather than terminating it synchronously. The task retains the portal while
+its async work or cleanup is pending. Canceling a join wait preserves that owner
+and the original result. This changes resource lifetime safety, not native cleanup
+timeouts: a stuck operation can still retain its resource, and actual portal
+session closure/physical input restoration need validation.

@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R115 | libei后台portal所有权已实现 | Arc task owner替代裸指针/unsafe，Drop detach及取消join等待期间资源存活；真实portal关闭/总资源仍待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2281,3 +2282,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 未实例化实际portal.release，不证明省略建议后的具体物理指针位置。千次真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms和8h RSS验收缺失，不认定90分；没有本机部署。
 
 日志：libei-cursor-metadata-baseline.log、libei-cursor-metadata-fixed.log、libei-cursor-metadata-workspace.log、libei-cursor-metadata-clippy.log。
+
+
+## 第一百轮：libei后台任务的portal裸指针生命周期
+
+### R115 / P1
+
+- Self持Pin<Box<InputCapture>>，do_capture只持*const并unsafe借用；安全说明假设task不比Self长寿。但Self::Drop仅cancel token，随后drop JoinHandle会detach，而非join等待；后台disable/close等await仍可继续。该假设不成立，可产生释放后的借用/访问。
+- 在生产CaptureTaskCompletion提取旧spawn语义（传指针但不保留owner）后，真实LocalSet/oneshot模型基线失败：frontend owner和JoinHandle丢弃后，cleanup尚未放行，Weak已失效，resource提前Drop。模型只观察Weak/析构计数，不解引用潜在悬空指针，不运行UB或真实portal。
+- [x] frontend改Arc<InputCapture>；spawn_owned在任务内持有强owner到capture future完成，do_capture接收owned Arc后安全借用；构造也直接安全borrow。libei.rs已无*const、input_capture_ptr或unsafe dereference。
+- [x] Arc保持Capture async_trait所需Send接口；spawn_local/LocalSet不变。共享同一portal，不复制native资源，仅初始化时引用计数操作。Drop仍请求取消，terminate仍await原task/result；没有abort替代native清理或新超时。
+
+### 生命周期验证及剩余清理
+
+- 失败基线通过：detach后慢cleanup期间resource仍alive/析构0次，放行后任务末尾仍可观察owner；完成后Weak失效且析构恰好1次。第二条取消join等待后owner保留，放行原任务返回原EndOfStream，释放一次，后续join安全成功。
+- libei模块45条通过；工作区all-features root201通过/3忽略、input-capture108通过/1忽略及其他组件通过；严格Clippy/fmt/diff通过。测试对象是生产spawn wrapper里的受控资源，未创建真实ashpd InputCapture/native Session，也未复现实际use-after-free崩溃。
+- c92c6f6 Rust37571957074 queued、Nix37571957011 in_progress；此前9f2305d两个完整workflow已success（见第99轮）。本轮HEAD仍需CI，不把旧通过视为本轮通过。
+- [ ] 挂起的native调用仍可长期持有portal，task/resource总量、空闲first session关闭及panic/通道关闭路径仍需审。RC/Arc资源析构不证明D-Bus Session关闭或物理指针恢复。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms与8h RSS缺验收证据；第100轮不等于90分，没有本机部署。
+
+日志：libei-task-owner-baseline.log、libei-task-owner-fixed.log、libei-task-owner-workspace.log、libei-task-owner-clippy.log。
