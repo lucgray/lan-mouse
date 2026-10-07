@@ -803,10 +803,9 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx
-                        .send((pos, CaptureEvent::Begin(0.5)))
-                        .await
-                        .expect("no channel");
+                    if !send_activation_event(event_tx, pos, &cancel_session).await? {
+                        break;
+                    }
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
@@ -982,6 +981,35 @@ fn closest_point_on_segment(segment: (i32, i32, i32, i32), pos: (f32, f32)) -> (
     (x1 + projection * dx, y1 + projection * dy)
 }
 
+async fn send_capture_event(
+    sender: &Sender<(Position, CaptureEvent)>,
+    pos: Position,
+    event: CaptureEvent,
+) -> Result<(), CaptureError> {
+    sender.send((pos, event)).await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "libei capture event receiver closed",
+        )
+        .into()
+    })
+}
+
+async fn send_activation_event(
+    sender: &Sender<(Position, CaptureEvent)>,
+    pos: Position,
+    cancel_session: &CancellationToken,
+) -> Result<bool, CaptureError> {
+    tokio::select! {
+        biased;
+        _ = cancel_session.cancelled() => Ok(false),
+        result = send_capture_event(sender, pos, CaptureEvent::Begin(0.5)) => {
+            result?;
+            Ok(true)
+        }
+    }
+}
+
 async fn handle_ei_event(
     ei_event: EiEvent,
     current_client: Option<Position>,
@@ -1022,10 +1050,7 @@ async fn handle_ei_event(
         _ => {
             if let Some(pos) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    event_tx
-                        .send((pos, CaptureEvent::Input(event)))
-                        .await
-                        .expect("no channel");
+                    send_capture_event(event_tx, pos, CaptureEvent::Input(event)).await?;
                 }
             }
         }
@@ -1674,6 +1699,124 @@ mod tests {
         release.send(()).unwrap();
         assert!(matches!(finish.await, Err(CaptureError::EndOfStream)));
         assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_closed_begin_reports_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert!(
+            send_activation_event(&sender, Position::Left, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_closed_input_reports_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let input = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 0,
+            dx: 1.,
+            dy: 2.,
+        }));
+        assert!(
+            send_capture_event(&sender, Position::Left, input)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_full_begin_is_interruptible() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_capture_event(&sender, Position::Right, CaptureEvent::Begin(0.25))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut send = Box::pin(send_activation_event(&sender, Position::Left, &cancel));
+        assert!((&mut send).now_or_never().is_none());
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), send).await;
+        assert!(
+            matches!(result, Ok(Ok(false))),
+            "shutdown must interrupt full Begin channel: {result:?}"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.25))
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_requested_shutdown_precedes_ready_begin() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            !send_activation_event(&sender, Position::Left, &cancel)
+                .await
+                .unwrap()
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_healthy_begin_and_input_keep_order() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert!(
+            send_activation_event(&sender, Position::Left, &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let input = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 1,
+            dx: 2.,
+            dy: 3.,
+        }));
+        send_capture_event(&sender, Position::Left, input.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Left, CaptureEvent::Begin(0.5))
+        );
+        assert_eq!(receiver.recv().await.unwrap(), (Position::Left, input));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_error_wakes_session_cleanup_without_panic() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let cleaned = Cell::new(false);
+        let handler = run_ei_handler(
+            send_capture_event(&sender, Position::Left, CaptureEvent::Begin(0.5)),
+            cancel_session.clone(),
+            cancel_ei.clone(),
+        );
+        let session = cancel_sibling_on_completion(
+            async {
+                cancel_session.cancelled().await;
+                cleaned.set(true);
+                Ok(())
+            },
+            cancel_ei,
+        );
+        let (handler, session) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                tokio::join!(handler, session)
+            })
+            .await
+            .expect("send failure must wake joined session cleanup");
+        assert!(
+            matches!(handler, Err(CaptureError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(session.is_ok());
+        assert!(cleaned.get());
     }
 
     struct ReadyZoneBurst {

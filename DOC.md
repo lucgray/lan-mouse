@@ -1436,3 +1436,18 @@ The finalizer retains the session while Close is pending. There is no new timeou
 or abort; a stalled native Close can still delay completion. Controlled finalizer
 tests do not establish real portal resource release, and panic/runtime shutdown
 remain outside this normal/error return cleanup path.
+
+
+### Libei event-channel shutdown
+
+Begin and input sends report a contextual BrokenPipe capture error when the
+frontend receiver closes rather than panicking. The existing session/EIS error
+and sibling-cancellation paths can then finish before active-session disable and
+Close. Begin delivery also races session cancellation, with requested shutdown
+preferred when both are ready. A full one-event channel no longer prevents that
+activation branch from observing cancellation; canceled Begin is not queued.
+
+Normal Begin/input ordering and the channel capacity stay unchanged. EIS input
+sends retain the outer run_ei_handler cancellation path. These changes do not add
+per-event tasks or allocations on successful sends. Controlled channel/join tests
+verify propagation and cooperation, not native compositor disable/Close success.

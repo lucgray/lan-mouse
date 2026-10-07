@@ -26,6 +26,7 @@
 | R115 | libei后台portal所有权已实现 | Arc task owner替代裸指针/unsafe，Drop detach及取消join等待期间资源存活；真实portal关闭/总资源仍待验 |
 | R116 | libei释放越界位置已修复 | 按所属region投影、内收并clamp；四边/角落/单像素/多屏回归通过，真实compositor定位待验 |
 | R117 | libei未使用初始会话清理已实现 | 正常/错误退出显式await Close，已消耗会话不重复关闭；真实portal释放、panic及挂起关闭待验 |
+| R118 | libei事件通道错误/Begin取消已实现 | 关闭通道报BrokenPipe而非panic，满通道Begin可取消；联合等待模型回归通过，native清理待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2339,3 +2340,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] panic、runtime退出及永久pending Close仍未由此finalizer解决；真实portal资源释放、千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms与8h RSS未验收，不认定90分。没有本机部署。
 
 日志：libei-idle-session-baseline.log、libei-idle-session-fixed.log、libei-idle-session-workspace.log、libei-idle-session-clippy.log。
+
+
+## 第一百零三轮：libei事件通道关闭与Begin等待取消
+
+### R118 / P1
+
+- 两处send(...).await.expect("no channel")在receiver关闭时panic，绕过普通Result的sibling取消和后续disable/close；Begin send位于activation分支中，满通道时无法进入后面的cancel_session选择，update分支虽已取消session，join仍可等待它。
+- 提取原生产send语义后4条基线失败：关闭Begin/input通道panic，满Begin取消后100ms内仍pending，已请求取消时仍发送Begin。测试使用实际Tokio有界mpsc，未实例化portal。
+- [x] send_capture_event将接收端关闭映射为带上下文的Io(BrokenPipe)，Begin/input均传播Result；保留run_ei_handler和cancel_sibling_on_completion链，使错误能唤醒对应分支而不panic。
+- [x] send_activation_event biased选择cancel_session优先；返回false时主activation循环break走原清理。满通道send future被取消，不排入迟到Begin；正常send成功仍返回true。EIS输入沿原外层取消选择。
+
+### 验证与范围
+
+- 4条失败基线通过，另2条验证健康Begin/input FIFO以及实际生产send/run_ei_handler/sibling helper联合等待：BrokenPipe保留、会话分支被唤醒并完成受控cleanup，不panic/不挂住。后者是通道/异步helper模型，不执行真实disable/Close。
+- libei63通过；工作区all-features input-capture126通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。通道容量仍1，无每事件新任务、正常路径新分配或协议改动。
+- a6e5986 Rust37574005305 queued，Nix37574005419 in_progress；本轮HEAD仍需CI。
+- [ ] 原生Close挂起、非send路径panic、ZonesChanged归属及物理后端恢复继续审。千次双机往返、完整p95≤20ms/p99≤50ms和8h RSS未验收，不认定90分，没有本机部署。
+
+日志：libei-event-channel-baseline.log、libei-event-channel-fixed.log、libei-event-channel-workspace.log、libei-event-channel-clippy.log。
