@@ -25,6 +25,8 @@ use core_graphics::base::CGError;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
+    #[error("Layer-shell input queue overloaded; capture disabled. Re-enable capture to resume.")]
+    LayerShellQueueOverloaded,
     #[error("X11 input queue overloaded; capture disabled. Re-enable capture to resume.")]
     X11QueueOverloaded,
     #[error("Windows input queue overloaded; capture released. Re-enable capture to resume.")]

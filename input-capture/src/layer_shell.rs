@@ -112,6 +112,39 @@ struct OutputInfo {
     size: (i32, i32),
 }
 
+const MAX_LAYER_SHELL_EVENTS: usize = 256;
+
+#[derive(Default)]
+struct PendingCaptureEvents {
+    events: VecDeque<(Position, CaptureEvent)>,
+    overloaded: bool,
+    report_overload: bool,
+}
+
+impl PendingCaptureEvents {
+    fn push_back(&mut self, event: (Position, CaptureEvent)) -> bool {
+        if self.overloaded {
+            return false;
+        }
+        if self.events.len() == MAX_LAYER_SHELL_EVENTS {
+            self.overloaded = true;
+            self.report_overload = true;
+            self.events.clear();
+            return true;
+        }
+        self.events.push_back(event);
+        false
+    }
+
+    fn pop_front(&mut self) -> Option<Result<(Position, CaptureEvent), CaptureError>> {
+        if self.report_overload {
+            self.report_overload = false;
+            return Some(Err(CaptureError::LayerShellQueueOverloaded));
+        }
+        self.events.pop_front().map(Ok)
+    }
+}
+
 struct State {
     active_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
@@ -125,7 +158,7 @@ struct State {
     globals: Globals,
     read_guard: Option<ReadEventsGuard>,
     qh: QueueHandle<Self>,
-    pending_events: VecDeque<(Position, CaptureEvent)>,
+    pending_events: PendingCaptureEvents,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
 }
@@ -335,7 +368,7 @@ impl LayerShellInputCapture {
             focused: None,
             qh,
             read_guard: None,
-            pending_events: VecDeque::new(),
+            pending_events: PendingCaptureEvents::default(),
             outputs: vec![],
             scroll_discrete_pending: false,
         };
@@ -382,6 +415,12 @@ impl LayerShellInputCapture {
 }
 
 impl State {
+    fn queue_capture_event(&mut self, event: (Position, CaptureEvent)) {
+        if self.pending_events.push_back(event) {
+            self.ungrab();
+        }
+    }
+
     fn update_output_info(&mut self, name: u32) {
         let output = self
             .outputs
@@ -435,6 +474,9 @@ impl State {
         serial: u32,
         qh: &QueueHandle<State>,
     ) {
+        if self.pending_events.overloaded {
+            return;
+        }
         let window = self.focused.as_ref().unwrap();
 
         // hide the cursor
@@ -674,7 +716,7 @@ fn poll_wayland_capture(
     cx: &mut Context<'_>,
 ) -> Poll<Option<Result<(Position, CaptureEvent), CaptureError>>> {
     if let Some(event) = backend.get_mut().state.pending_events.pop_front() {
-        return Poll::Ready(Some(Ok(event)));
+        return Poll::Ready(Some(event));
     }
 
     loop {
@@ -709,7 +751,7 @@ fn poll_wayland_capture(
 
         // if an event has been queued during dispatch_events() we return it
         match guard.get_inner_mut().state.pending_events.pop_front() {
-            Some(event) => return Poll::Ready(Some(Ok(event))),
+            Some(event) => return Poll::Ready(Some(event)),
             None => continue,
         }
     }
@@ -775,8 +817,7 @@ impl Dispatch<WlPointer, ()> for State {
                     .find(|w| w.surface == surface)
                     .map(|w| w.pos)
                     .unwrap();
-                app.pending_events
-                    .push_back((pos, CaptureEvent::Begin(0.5)));
+                app.queue_capture_event((pos, CaptureEvent::Begin(0.5)));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -797,9 +838,11 @@ impl Dispatch<WlPointer, ()> for State {
                 button,
                 state,
             } => {
-                let window = app.focused.as_ref().unwrap();
-                app.pending_events.push_back((
-                    window.pos,
+                let Some(pos) = app.focused.as_ref().map(|window| window.pos) else {
+                    return;
+                };
+                app.queue_capture_event((
+                    pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
                         time,
                         button,
@@ -808,15 +851,17 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
-                let window = app.focused.as_ref().unwrap();
+                let Some(pos) = app.focused.as_ref().map(|window| window.pos) else {
+                    return;
+                };
                 if app.scroll_discrete_pending {
                     // each axisvalue120 event is coupled with
                     // a corresponding axis event, which needs to
                     // be ignored to not duplicate the scrolling
                     app.scroll_discrete_pending = false;
                 } else {
-                    app.pending_events.push_back((
-                        window.pos,
+                    app.queue_capture_event((
+                        pos,
                         CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                             time,
                             axis: u32::from(axis) as u8,
@@ -826,10 +871,12 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                let window = app.focused.as_ref().unwrap();
+                let Some(pos) = app.focused.as_ref().map(|window| window.pos) else {
+                    return;
+                };
                 app.scroll_discrete_pending = true;
-                app.pending_events.push_back((
-                    window.pos,
+                app.queue_capture_event((
+                    pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
                         axis: u32::from(axis) as u8,
                         value: value120,
@@ -855,7 +902,7 @@ impl Dispatch<WlKeyboard, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let window = &app.focused;
+        let focused_position = app.focused.as_ref().map(|window| window.pos);
         match event {
             wl_keyboard::Event::Key {
                 serial: _,
@@ -863,9 +910,9 @@ impl Dispatch<WlKeyboard, ()> for State {
                 key,
                 state,
             } => {
-                if let Some(window) = window {
-                    app.pending_events.push_back((
-                        window.pos,
+                if let Some(pos) = focused_position {
+                    app.queue_capture_event((
+                        pos,
                         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                             time,
                             key,
@@ -881,9 +928,9 @@ impl Dispatch<WlKeyboard, ()> for State {
                 mods_locked,
                 group,
             } => {
-                if let Some(window) = window {
-                    app.pending_events.push_back((
-                        window.pos,
+                if let Some(pos) = focused_position {
+                    app.queue_capture_event((
+                        pos,
                         CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
                             depressed: mods_depressed,
                             latched: mods_latched,
@@ -915,10 +962,10 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
             ..
         } = event
         {
-            if let Some(window) = &app.focused {
+            if let Some(pos) = app.focused.as_ref().map(|window| window.pos) {
                 let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
-                app.pending_events.push_back((
-                    window.pos,
+                app.queue_capture_event((
+                    pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })),
                 ));
             }
@@ -1099,6 +1146,117 @@ mod tests {
                 .contains("controlled protocol failure")
         );
     }
+    #[test]
+    fn layer_queue_burst_never_retains_more_than_capacity() {
+        let mut queue = PendingCaptureEvents::default();
+        for _ in 0..8000 {
+            queue.push_back((Position::Left, CaptureEvent::Begin(0.5)));
+            assert!(
+                queue.events.len() <= MAX_LAYER_SHELL_EVENTS,
+                "native event queue grew without a limit"
+            );
+        }
+        assert!(queue.overloaded);
+    }
+
+    #[test]
+    fn layer_queue_overflow_reports_failure_before_old_input() {
+        let mut queue = PendingCaptureEvents::default();
+        for _ in 0..MAX_LAYER_SHELL_EVENTS {
+            queue.push_back((Position::Left, CaptureEvent::Begin(0.5)));
+        }
+        let release = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+            time: 1,
+            key: 30,
+            state: 0,
+        }));
+        assert!(queue.push_back((Position::Left, release)));
+        assert!(matches!(
+            queue.pop_front(),
+            Some(Err(CaptureError::LayerShellQueueOverloaded))
+        ));
+        assert!(queue.pop_front().is_none());
+    }
+
+    #[test]
+    fn layer_queue_healthy_fifo_reuses_capacity_without_failure() {
+        let mut queue = PendingCaptureEvents::default();
+        for time in 0..MAX_LAYER_SHELL_EVENTS as u32 {
+            assert!(!queue.push_back((
+                Position::Left,
+                CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    time,
+                    key: 30,
+                    state: (time % 2) as u8
+                }))
+            )));
+        }
+        assert!(!queue.overloaded);
+        for time in 0..MAX_LAYER_SHELL_EVENTS as u32 {
+            assert_eq!(
+                queue.pop_front().unwrap().unwrap(),
+                (
+                    Position::Left,
+                    CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                        time,
+                        key: 30,
+                        state: (time % 2) as u8
+                    }))
+                )
+            );
+        }
+        assert!(queue.pop_front().is_none());
+        assert!(!queue.push_back((Position::Right, CaptureEvent::Begin(0.75))));
+        assert_eq!(
+            queue.pop_front().unwrap().unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.75))
+        );
+    }
+
+    #[test]
+    fn layer_queue_overload_trips_once_and_requires_new_queue() {
+        let mut queue = PendingCaptureEvents::default();
+        let mut releases = 0;
+        for _ in 0..8000 {
+            if queue.push_back((Position::Left, CaptureEvent::Begin(0.5))) {
+                releases += 1;
+            }
+        }
+        assert_eq!(releases, 1);
+        assert!(queue.events.is_empty());
+        assert!(matches!(
+            queue.pop_front(),
+            Some(Err(CaptureError::LayerShellQueueOverloaded))
+        ));
+        assert!(queue.pop_front().is_none());
+        assert!(!queue.push_back((Position::Left, CaptureEvent::Begin(0.5))));
+        assert!(queue.events.is_empty());
+        let mut replacement = PendingCaptureEvents::default();
+        assert!(!replacement.push_back((Position::Right, CaptureEvent::Begin(0.5))));
+        assert!(!replacement.overloaded);
+        assert!(matches!(replacement.pop_front(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn layer_queue_overload_terminates_stream_before_old_events() {
+        let mut queue = PendingCaptureEvents::default();
+        for _ in 0..=MAX_LAYER_SHELL_EVENTS {
+            queue.push_back((Position::Left, CaptureEvent::Begin(0.5)));
+        }
+        let mut terminated = false;
+        assert!(matches!(
+            poll_capture_stream(&mut terminated, || Poll::Ready(queue.pop_front())),
+            Poll::Ready(Some(Err(CaptureError::LayerShellQueueOverloaded)))
+        ));
+        assert!(terminated);
+        assert!(matches!(
+            poll_capture_stream::<()>(&mut terminated, || panic!(
+                "overloaded native backend must not be polled"
+            )),
+            Poll::Ready(None)
+        ));
+    }
+
     fn protocol_failure() -> WaylandError {
         WaylandError::Protocol(wayland_client::backend::protocol::ProtocolError {
             code: 1,

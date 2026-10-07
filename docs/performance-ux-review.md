@@ -35,6 +35,7 @@
 | R124 | libei token IO移出事件线程 | spawn_blocking承接读写，慢操作期间async控制可运行；文件语义/权限回归通过，真实延迟待测 |
 | R125 | libei token原子替换已实现 | 同目录私有临时文件/write+sync后persist，失败保留旧路径/清临时，symlink目标不改；实机rotation待验 |
 | R126 | layer-shell运行错误传播已实现 | read/dispatch/flush失败返回CaptureError，stream错误一次后结束；真实socket读断连/映射/fusion通过 |
+| R127 | layer-shell应用事件队列已限额 | 每backend256，过载清积压/一次ungrab请求/明确错误并fuse；正常FIFO及替代queue回归通过 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2513,3 +2514,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] pending事件队列上限、prepare_read连续dispatch预算、窗口文件/尺寸处理及normal terminate资源释放继续审。其他callbacks仍可能panic；千次双机往返、原生恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
 
 日志：layer-shell-errors-baseline.log、layer-shell-errors-fixed.log、layer-shell-errors-workspace.log、layer-shell-errors-clippy.log。
+
+
+## 第一百一十二轮：layer-shell原生分发后事件积压无上限
+
+### R127 / P1
+
+- State.pending_events原VecDeque无限push，native一次dispatch可产生大量pointer/keyboard事件；外层逐poll消费不限制单batch积压。两条提取生产队列基线失败：超过256仍增长、按键release超过容量仍排队而无过载决策。
+- [x] PendingCaptureEvents每backend最多256条，所有7处Begin/输入enqueue统一State.queue_capture_event。第257条置sticky overload、清旧积压并标记一次错误；拒绝后续enqueue，避免继续传递不完整按键状态。
+- [x] 首次trip返回true触发State.ungrab请求；State.grab检查overload避免同批新Enter重抓。pop先返回LayerShellQueueOverloaded，上一轮terminal poll helper停止该stream。错误提示re-enable，新的backend fresh queue；不自动reset复用旧捕获。
+- [x] callbacks先复制focused Position再可变enqueue；pointer无focus时忽略，避免原unwrap panic。键盘/相对运动无focus原本就忽略，保持该语义。
+
+### 有界范围和真实释放限制
+
+- 5条新增回归通过：8000事件不超256；过载错误先于旧Begin/键盘release，清积压；满额正常key FIFO/弹出后容量复用；8000条仅一次trip且sticky/替代queue独立；过载经生产terminal helper一次错误后不再poll。
+- layer-shell模块12通过；工作区all-features input-capture174通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。队列/terminal是生产helper模型，trip计数不证明native State.ungrab成功或物理光标恢复。
+- f85944a Rust37576996951、Nix37576996964 queued；本轮HEAD需CI。没有LAN序列化变化或每事件新任务，没有本机部署。
+- [ ] 256阈值需真实高频负载验证；Wayland内部队列、单次dispatch时间/prepare_read预算和整体RSS未被本限额证明有界。normal terminate/窗口临时文件及原生恢复继续审；千次双机往返、完整p95≤20ms/p99≤50ms与8h RSS仍未验收，不认定90分。
+
+日志：layer-shell-queue-baseline.log、layer-shell-queue-fixed.log、layer-shell-queue-workspace.log、layer-shell-queue-clippy.log。

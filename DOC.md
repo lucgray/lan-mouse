@@ -1586,3 +1586,22 @@ client connection over a local socket whose peer closes, error mappings and the
 production terminal-poll helper. They do not create layer surfaces, acquire an
 actual compositor pointer lock or prove physical pointer restoration. Other
 callback panics, queue limits and normal terminate cleanup remain separate items.
+
+
+### Layer-shell event-queue overload
+
+Each layer-shell backend retains at most 256 routed capture events. Begin,
+pointer, scroll, keyboard and modifier callbacks share the bounded queue. If a
+new event exceeds the limit, the queue discards its stale backlog and reports
+LayerShellQueueOverloaded instead of silently dropping a transition and continuing.
+The first overload requests State::ungrab; later callbacks cannot re-grab while
+the queue is overloaded. The terminal stream/error pipeline then handles cleanup
+and reports that capture must be re-enabled.
+
+Healthy FIFO and freed capacity are preserved. A fresh backend starts with a fresh
+queue; the overloaded backend does not reset itself. Pointer callbacks without a
+focused window return rather than unwrap it, and callback positions are copied
+before mutating capture state. Controlled queue tests validate limits and routing,
+not compositor unlock or actual throughput. The 256-event threshold still needs
+platform load validation; Wayland's own queues and dispatch time are not bounded
+by this application queue limit.
