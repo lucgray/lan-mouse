@@ -17,7 +17,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{CleanupTarget, LanMouseConnection};
 use crate::remap::KeyRemap;
 use crate::scroll::ScrollInvert;
 
@@ -25,17 +25,32 @@ pub(crate) struct Capture {
     cancellation_token: CancellationToken,
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
+    reenable_pending: RefCell<std::rc::Weak<CaptureRetryLease>>,
+    release_pending: RefCell<std::rc::Weak<CaptureReleaseLease>>,
+    settings_pending: RefCell<std::rc::Weak<RefCell<Option<CaptureSettings>>>>,
     event_rx: Receiver<ICaptureEvent>,
 }
+
+/// Shared lifetime of one explicit retry, including its status feedback.
+/// The source stores only a Weak reference so consumption can reopen admission.
+#[derive(Debug)]
+pub(crate) struct CaptureRetryLease;
+
+#[derive(Debug)]
+struct CaptureReleaseLease;
 
 pub(crate) enum ICaptureEvent {
     /// a client was entered, at the given normalized cross-axis
     /// position along the edge it was entered at
     CaptureBegin(CaptureHandle, f64),
     /// capture disabled
-    CaptureDisabled,
-    /// capture disabled
-    CaptureEnabled,
+    CaptureDisabled(Option<Rc<CaptureRetryLease>>),
+    /// A backend failed and capture was disabled until explicitly re-enabled.
+    CaptureFailed(String, Option<Rc<CaptureRetryLease>>),
+    /// Cleanup is still owned by this attempt; capture cannot resume yet.
+    CaptureCleanupPending(String, Option<Rc<CaptureRetryLease>>),
+    /// capture enabled
+    CaptureEnabled(Option<Rc<CaptureRetryLease>>),
     /// A (new) client was entered.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
     /// event is only triggered when the capture was
@@ -50,8 +65,6 @@ pub(crate) enum ICaptureEvent {
     /// remote `Leave`, explicit `Release` request, send
     /// failure, or destroy of the active capture).
     ClientLeft(u64),
-    /// clipboard data received from remote
-    ClipboardReceived(input_event::ClipboardEvent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,23 +80,24 @@ pub(crate) enum CaptureType {
 #[derive(Clone, Debug)]
 enum CaptureRequest {
     /// capture must release the mouse
-    Release,
+    Release(Rc<CaptureReleaseLease>),
     /// add a capture client
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
-    Reenable,
-    /// set release bind
-    SetReleaseBind(Vec<scancode::Linux>),
-    /// set the mouse-jail bind
-    SetJailBind(Vec<scancode::Linux>),
-    /// set the binds that enter a client without an edge crossing
-    SetEnterBinds(HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>),
-    /// set the keys rewritten on their way to other devices
-    SetRemap(Box<KeyRemap>),
-    /// set the scroll axes inverted on their way to other devices
-    SetScrollInvert(ScrollInvert),
+    Reenable(Rc<CaptureRetryLease>),
+    /// Latest settings in a continuous group; None means already consumed.
+    Settings(Rc<RefCell<Option<CaptureSettings>>>),
+}
+
+#[derive(Debug, Default)]
+struct CaptureSettings {
+    release_bind: Option<Vec<scancode::Linux>>,
+    jail_bind: Option<Vec<scancode::Linux>>,
+    enter_binds: Option<HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>>,
+    remap: Option<Box<KeyRemap>>,
+    scroll_invert: Option<ScrollInvert>,
 }
 
 impl Capture {
@@ -102,6 +116,7 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
+            retry: None,
             active_client: None,
             backend,
             cancellation_token: cancellation_token.clone(),
@@ -123,6 +138,9 @@ impl Capture {
         };
         let task = spawn_local(capture_task.run());
         Self {
+            reenable_pending: Default::default(),
+            release_pending: Default::default(),
+            settings_pending: Default::default(),
             cancellation_token,
             request_tx,
             task,
@@ -131,8 +149,15 @@ impl Capture {
     }
 
     pub(crate) fn reenable(&self) {
+        if self.reenable_pending.borrow().strong_count() != 0 {
+            return;
+        }
+        self.separate_release_requests();
+        self.separate_settings_updates();
+        let retry = Rc::new(CaptureRetryLease);
+        *self.reenable_pending.borrow_mut() = Rc::downgrade(&retry);
         self.request_tx
-            .send(CaptureRequest::Reenable)
+            .send(CaptureRequest::Reenable(retry))
             .expect("channel closed");
     }
 
@@ -150,6 +175,8 @@ impl Capture {
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
     ) {
+        self.separate_release_requests();
+        self.separate_settings_updates();
         let pos = to_capture_pos(pos);
         self.request_tx
             .send(CaptureRequest::Create(handle, pos, capture_type))
@@ -157,14 +184,28 @@ impl Capture {
     }
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
+        self.separate_release_requests();
+        self.separate_settings_updates();
         self.request_tx
             .send(CaptureRequest::Destroy(handle))
             .expect("channel closed");
     }
 
+    // A configuration/lifecycle command separates release groups. Retain its
+    // FIFO boundary rather than swallowing a release submitted after it.
+    fn separate_release_requests(&self) {
+        *self.release_pending.borrow_mut() = std::rc::Weak::new();
+    }
+
     pub(crate) fn release(&self) {
+        if self.release_pending.borrow().strong_count() != 0 {
+            return;
+        }
+        self.separate_settings_updates();
+        let release = Rc::new(CaptureReleaseLease);
+        *self.release_pending.borrow_mut() = Rc::downgrade(&release);
         self.request_tx
-            .send(CaptureRequest::Release)
+            .send(CaptureRequest::Release(release))
             .expect("channel closed");
     }
 
@@ -172,33 +213,51 @@ impl Capture {
         self.event_rx.recv().await.expect("channel closed")
     }
 
+    fn separate_settings_updates(&self) {
+        *self.settings_pending.borrow_mut() = std::rc::Weak::new();
+    }
+
+    fn update_settings(&self, edit: impl FnOnce(&mut CaptureSettings)) -> bool {
+        self.separate_release_requests();
+        if let Some(marker) = self.settings_pending.borrow().upgrade() {
+            if let Some(settings) = marker.borrow_mut().as_mut() {
+                edit(settings);
+                return true;
+            }
+        }
+        let mut settings = CaptureSettings::default();
+        edit(&mut settings);
+        let marker = Rc::new(RefCell::new(Some(settings)));
+        *self.settings_pending.borrow_mut() = Rc::downgrade(&marker);
+        self.request_tx
+            .send(CaptureRequest::Settings(marker))
+            .is_ok()
+    }
+
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
-        let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+        let _ = self.update_settings(|settings| settings.release_bind = Some(bind));
     }
 
     pub(crate) fn set_jail_bind(&mut self, bind: Vec<scancode::Linux>) {
-        self.request_tx
-            .send(CaptureRequest::SetJailBind(bind))
-            .expect("channel closed");
+        assert!(
+            self.update_settings(|settings| settings.jail_bind = Some(bind)),
+            "channel closed"
+        );
     }
 
     pub(crate) fn set_enter_binds(
         &mut self,
         binds: HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>,
     ) {
-        let _ = self.request_tx.send(CaptureRequest::SetEnterBinds(binds));
+        let _ = self.update_settings(|settings| settings.enter_binds = Some(binds));
     }
 
     pub(crate) fn set_remap(&mut self, remap: KeyRemap) {
-        let _ = self
-            .request_tx
-            .send(CaptureRequest::SetRemap(Box::new(remap)));
+        let _ = self.update_settings(|settings| settings.remap = Some(Box::new(remap)));
     }
 
     pub(crate) fn set_scroll_invert(&mut self, scroll_invert: ScrollInvert) {
-        let _ = self
-            .request_tx
-            .send(CaptureRequest::SetScrollInvert(scroll_invert));
+        let _ = self.update_settings(|settings| settings.scroll_invert = Some(scroll_invert));
     }
 }
 
@@ -220,6 +279,7 @@ macro_rules! debounce {
 }
 
 struct CaptureTask {
+    retry: Option<Rc<CaptureRetryLease>>,
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
@@ -250,6 +310,13 @@ struct CaptureTask {
     pending_modifiers: Option<KeyboardEvent>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseMode {
+    NotifyPeer,
+    Silent,
+    AbortPeer,
+}
+
 impl CaptureTask {
     fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
         self.captures.push((handle, pos, capture_type));
@@ -265,27 +332,11 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
-    }
-
     fn capture_enter_binds(&self) -> HashMap<Position, Vec<scancode::Linux>> {
         self.enter_binds
             .iter()
             .map(|(&pos, bind)| (to_capture_pos(pos), bind.clone()))
             .collect()
-    }
-
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
-        self.captures
-            .iter()
-            .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
     }
 
     async fn create_backend_capture(
@@ -303,26 +354,18 @@ impl CaptureTask {
     async fn run(mut self) {
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
-            if let Err(e) = self.do_capture().await {
-                log::warn!("input capture exited: {e}");
-            }
+            let result = self.do_capture().await;
+            report_capture_exit(&self.event_tx, &result, self.retry.take());
             loop {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Reenable => break,
+                        CaptureRequest::Reenable(retry) => { self.retry = Some(retry); break; },
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
-                            self.release_bind.borrow_mut().clone_from(&bind);
-                        }
-                        CaptureRequest::SetJailBind(bind) => {
-                            *self.jail_bind.borrow_mut() = bind;
-                        }
-                        CaptureRequest::SetEnterBinds(binds) => self.enter_binds = binds,
-                        CaptureRequest::SetRemap(remap) => self.remap = *remap,
-                        CaptureRequest::SetScrollInvert(scroll_invert) => {
-                            self.scroll_invert = scroll_invert
+                        CaptureRequest::Release(_release) => { /* nothing to do */ }
+                        CaptureRequest::Settings(marker) => {
+                            let settings = marker.borrow_mut().take();
+                            if let Some(settings) = settings { self.install_settings(settings); }
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -345,23 +388,54 @@ impl CaptureTask {
 
         let _capture_guard = DropGuard::new(
             self.event_tx.clone(),
-            ICaptureEvent::CaptureEnabled,
-            ICaptureEvent::CaptureDisabled,
+            ICaptureEvent::CaptureEnabled(self.retry.clone()),
+            ICaptureEvent::CaptureDisabled(self.retry.clone()),
         );
 
         /* create barriers for active clients */
         let r = self.create_captures(&mut capture).await;
         if let Err(e) = r {
-            capture.terminate().await?;
-            return Err(e.into());
+            return await_capture_termination(
+                &self.event_tx,
+                self.retry.clone(),
+                Err(e.into()),
+                capture.terminate(),
+            )
+            .await;
         }
 
-        let r = self.do_capture_session(&mut capture).await;
+        let result = self.do_capture_session(&mut capture).await;
+        self.finish_capture_session(&mut capture, result).await
+    }
 
-        // FIXME replace with async drop when stabilized
-        capture.terminate().await?;
-
-        r
+    async fn finish_capture_session(
+        &mut self,
+        capture: &mut InputCapture,
+        r: Result<(), InputCaptureError>,
+    ) -> Result<(), InputCaptureError> {
+        let event_tx = self.event_tx.clone();
+        let reason = r
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "backend termination has not completed".into());
+        await_capture_cleanup(&event_tx, self.retry.clone(), &reason, async {
+            let mut result = r;
+            if result.is_err() {
+                // AbortPeer cancels the saved transport before native release.
+                let release = self
+                    .release_capture_with(capture, ReleaseMode::AbortPeer, None)
+                    .await;
+                if let Err(error) = &release {
+                    log::warn!("failed to release capture after backend error: {error}");
+                }
+                result = capture_result_after_cleanup(result, release, "native release");
+                self.remap.reset_session();
+            }
+            // Retain one owner/progress timer across release and termination.
+            capture_result_after_termination(result, capture.terminate().await)
+        })
+        .await
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -379,24 +453,23 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        let disconnected = self.conn.disconnect_signal();
         loop {
+            // Drain closure notices before another input can reconnect this target.
+            for handle in self.conn.take_disconnected() {
+                self.handle_disconnected(capture, handle).await?;
+            }
             tokio::select! {
+                _ = disconnected.notified() => {},
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
-                    None => return Ok(()),
+                    None => return self.capture_stream_ended(),
                 },
-                (handle, event) = self.conn.recv() => {
-                    // clipboard events are accepted from any client
-                    if let ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event)) = &event {
-                        self.event_tx.send(ICaptureEvent::ClipboardReceived(clipboard_event.clone())).expect("channel closed");
+                received = self.conn.recv() => {
+                    let crate::connect::ReceivedEvent { handle, event, .. } = received;
+                    if self.active_client != Some(handle) {
+                        // Late Ack/Leave cannot change an idle or different capture.
                         continue;
-                    }
-                    if let Some(active) = self.active_client {
-                        if handle != active {
-                            // we only care about events coming from the client we are currently connected to
-                            // only `Ack` and `Leave` are relevant
-                            continue
-                        }
                     }
 
                     match event {
@@ -405,10 +478,7 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             if let Some(mods) = self.pending_modifiers.take() {
-                                let _ = self
-                                    .conn
-                                    .send(ProtoEvent::Input(Event::Keyboard(mods)), handle)
-                                    .await;
+                                self.forward_input(capture, ProtoEvent::Input(Event::Keyboard(mods)), handle).await?;
                             }
                         }
                         // client disconnected
@@ -420,8 +490,8 @@ impl CaptureTask {
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture, None).await?,
+                    CaptureRequest::Reenable(_retry) => { /* already active */ },
+                    CaptureRequest::Release(release) => self.release_requested(capture, release).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         Self::create_backend_capture(capture, h, p, t).await?;
@@ -440,25 +510,28 @@ impl CaptureTask {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
-                    CaptureRequest::SetReleaseBind(bind) => {
-                        self.release_bind.borrow_mut().clone_from(&bind);
-                    }
-                    CaptureRequest::SetJailBind(bind) => {
-                        *self.jail_bind.borrow_mut() = bind;
-                    }
-                    CaptureRequest::SetEnterBinds(binds) => {
-                        self.enter_binds = binds;
-                        capture.set_enter_binds(self.capture_enter_binds());
-                    }
-                    CaptureRequest::SetRemap(remap) => self.remap = *remap,
-                    CaptureRequest::SetScrollInvert(scroll_invert) => {
-                        self.scroll_invert = scroll_invert
+                    CaptureRequest::Settings(marker) => {
+                        // Detach a fixed snapshot before awaiting remap cleanup.
+                        // Later edits must enqueue their own notification.
+                        let settings = marker.borrow_mut().take();
+                        if let Some(settings) = settings { self.apply_live_settings(capture, settings).await?; }
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
         Ok(())
+    }
+
+    fn capture_stream_ended(&self) -> Result<(), InputCaptureError> {
+        if self.cancellation_token.is_cancelled() {
+            return Ok(());
+        }
+        Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "input capture stream closed unexpectedly",
+        ))
+        .into())
     }
 
     /// Toggle the "mouse jail" whenever the jail bind is engaged, i.e. all
@@ -491,14 +564,21 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+        // Destroy can retire an already-expanded event. Ignore it before
+        // release/jail/peer state changes, and resolve both routing fields once.
+        let Some(&(_, pos, capture_type)) = self.captures.iter().find(|(h, ..)| *h == handle)
+        else {
+            return Ok(());
+        };
 
-        if capture.keys_pressed(&self.release_bind.borrow()) {
+        let release_engaged = {
+            let bind = self.release_bind.borrow();
+            !bind.is_empty() && capture.keys_pressed(&bind)
+        };
+        if release_engaged {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture, None).await;
         }
-
-        let capture_type = self.get_type(handle);
-        let pos = self.get_pos(handle);
 
         // arm/disarm the mouse jail whenever the jail bind is engaged (see
         // update_jail_from_bind).
@@ -527,6 +607,12 @@ impl CaptureTask {
             return Ok(());
         }
 
+        // Input buffered before release or routed for another handle must not
+        // re-enter a peer without a fresh Begin for that target.
+        if matches!(event, CaptureEvent::Input(_)) && self.active_client != Some(handle) {
+            return Ok(());
+        }
+
         // mouse jail active: confine this machine's input to the local screen,
         // do not transfer it across an edge to a peer
         if self.jail.get() {
@@ -542,7 +628,7 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let events: Vec<ProtoEvent> = match event {
             CaptureEvent::Begin(t) => {
@@ -570,20 +656,113 @@ impl CaptureTask {
         };
 
         for event in events {
-            if let Err(e) = self.conn.send(event, handle).await {
-                const DUR: Duration = Duration::from_millis(500);
-                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-                // Funnel through release_capture so the leave_hook
-                // fires and active_client is cleared (without this the
-                // active_client field would stay stale until the next
-                // Begin from a different handle). The send just failed, so
-                // skip the key-up/Leave messages: they fail the same way and
-                // each logs a warning on every edge crossing.
-                self.release_capture_with(capture, false, None).await?;
+            if !self.forward_input(capture, event, handle).await? {
                 break;
             }
         }
         Ok(())
+    }
+
+    async fn forward_input(
+        &mut self,
+        capture: &mut InputCapture,
+        event: ProtoEvent,
+        handle: CaptureHandle,
+    ) -> Result<bool, CaptureError> {
+        let result = tokio::select! {
+            _ = self.cancellation_token.cancelled() => Err(crate::connect::LanMouseConnectionError::NotConnected),
+            result = self.conn.send(event, handle) => result,
+        };
+        if let Err(error) = result {
+            const DUR: Duration = Duration::from_millis(500);
+            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {error}"));
+            self.release_capture_with(capture, ReleaseMode::Silent, None)
+                .await?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn handle_disconnected(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        if self.active_client == Some(handle) {
+            log::info!("releasing capture: client {handle} transport disconnected");
+            self.remap.reset_session();
+            self.state = State::WaitingForAck;
+            self.release_capture_with(capture, ReleaseMode::Silent, None)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn install_settings(&mut self, settings: CaptureSettings) {
+        if let Some(bind) = settings.release_bind {
+            *self.release_bind.borrow_mut() = bind;
+        }
+        if let Some(bind) = settings.jail_bind {
+            *self.jail_bind.borrow_mut() = bind;
+        }
+        if let Some(binds) = settings.enter_binds {
+            self.enter_binds = binds;
+        }
+        if let Some(remap) = settings.remap {
+            self.remap = *remap;
+        }
+        if let Some(invert) = settings.scroll_invert {
+            self.scroll_invert = invert;
+        }
+    }
+
+    async fn apply_live_settings(
+        &mut self,
+        capture: &mut InputCapture,
+        mut settings: CaptureSettings,
+    ) -> Result<(), CaptureError> {
+        let result = if let Some(remap) = settings.remap.take() {
+            self.update_remap(capture, *remap).await
+        } else {
+            Ok(())
+        };
+        let enter_binds_changed = settings.enter_binds.is_some();
+        self.install_settings(settings);
+        if enter_binds_changed {
+            capture.set_enter_binds(self.capture_enter_binds());
+        }
+        result
+    }
+
+    async fn update_remap(
+        &mut self,
+        capture: &mut InputCapture,
+        remap: KeyRemap,
+    ) -> Result<(), CaptureError> {
+        if self.remap.same_rules(&remap) {
+            // A reload must not erase a held chord's resolved target.
+            return Ok(());
+        }
+        let release = if self.active_client.is_some() {
+            // Send releases with the rules that produced the original downs.
+            self.release_capture(capture, None).await
+        } else {
+            Ok(())
+        };
+        // Retain the new desired rules even if native release fails. The caller
+        // propagates that failure into the existing owned cleanup path.
+        self.remap = remap;
+        release
+    }
+
+    async fn release_requested(
+        &mut self,
+        capture: &mut InputCapture,
+        _release: Rc<CaptureReleaseLease>,
+    ) -> Result<(), CaptureError> {
+        // Keep admission through native restoration and peer cleanup. The
+        // session loop cannot start another capture while this await is active.
+        self.release_capture(capture, None).await
     }
 
     async fn release_capture(
@@ -591,7 +770,8 @@ impl CaptureTask {
         capture: &mut InputCapture,
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
-        self.release_capture_with(capture, true, warp_to).await
+        self.release_capture_with(capture, ReleaseMode::NotifyPeer, warp_to)
+            .await
     }
 
     /// releases the capture, optionally warping the cursor to a
@@ -602,83 +782,176 @@ impl CaptureTask {
     async fn release_capture_with(
         &mut self,
         capture: &mut InputCapture,
-        notify_peer: bool,
+        mode: ReleaseMode,
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
         self.pending_modifiers = None;
-        // If we have an active client, notify them we're leaving
-        if let Some(handle) = self.active_client.take() {
-            // Surface the leave to the service layer so it can fire
-            // the per-client leave_hook. Sent before the network
-            // teardown below so we never race against the peer
-            // disappearing.
-            self.event_tx
-                .send(ICaptureEvent::ClientLeft(handle))
-                .expect("channel closed");
-            if !notify_peer {
-                capture.take_pressed_keys();
-                return match warp_to {
-                    Some(t) => capture.release_to(t).await,
-                    None => capture.release().await,
-                };
-            }
-            // Synthesize key-up events for every key still held in the
-            // capture's pressed_keys set BEFORE sending Leave. Without
-            // this, pressing the release-bind chord (typically all four
-            // modifiers) leaves the peer with phantom held modifiers:
-            // the down events were forwarded while capture was active,
-            // but the matching up events arrive after the local tap
-            // flips to passthrough and never reach the peer. The peer
-            // then runs every subsequent keystroke through those held
-            // mods until its watchdog times out (1+ s) or our Leave
-            // arrives — and Leave can be lost over UDP/DTLS.
-            for key in capture.take_pressed_keys() {
-                // `pressed_keys` holds the *physical* keys, so these
-                // have to go through the same remap the down events
-                // did — otherwise the peer is released from a key it
-                // was never pressed with and keeps holding the one it
-                // actually got. A key still `pending` on an unresolved
-                // chord never had a down event sent for it at all —
-                // `release_key` reports `None` for those, and no
-                // key-up should be synthesized either.
-                let Some(target) = self.remap.release_key(key) else {
-                    continue;
-                };
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+        self.state = State::WaitingForAck;
+        let active = self.active_client.take();
+        let abort = active.and_then(|handle| {
+            self.conn
+                .capture_revision(handle)
+                .map(|revision| (handle, revision))
+        });
+        let cleanup = active.and_then(|handle| self.conn.prepare_cleanup(handle));
+        let mut events = Vec::new();
+        for key in capture.take_pressed_keys() {
+            if let Some(target) = self.remap.release_key(key) {
+                events.push(ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: target as u32,
                     state: 0,
-                }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
-                    log::warn!("failed to send key-up to client {handle}: {e}");
-                }
+                })));
             }
-            // Reset the modifier mask too. The peer's input-emulation
-            // layer keeps a separate XKB-style modifier state that's
-            // updated by KeyboardEvent::Modifiers, distinct from the
-            // pressed_keys set drained above. Without this, an
-            // already-locked CapsLock would survive the release.
-            let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
-                depressed: 0,
-                latched: 0,
-                locked: 0,
-                group: 0,
-            }));
-            if let Err(e) = self.conn.send(mods_zero, handle).await {
-                log::warn!("failed to reset modifiers on client {handle}: {e}");
+        }
+        self.remap.reset_session();
+        if let Some(handle) = active {
+            self.event_tx
+                .send(ICaptureEvent::ClientLeft(handle))
+                .expect("channel closed");
+        }
+        // Normal release restores the pointer before peer cleanup. Fatal capture
+        // errors cancel the original transport first; neither path reconnects it.
+        let release = async {
+            match warp_to {
+                Some(t) => capture.release_to(t).await,
+                None => capture.release().await,
             }
+        };
+        release_native_capture(
+            &self.conn,
+            abort,
+            cleanup.as_ref(),
+            mode == ReleaseMode::AbortPeer,
+            release,
+        )
+        .await?;
+        if let Some(cleanup) = cleanup.filter(|_| mode == ReleaseMode::NotifyPeer) {
+            events.push(ProtoEvent::Input(Event::Keyboard(
+                KeyboardEvent::Modifiers {
+                    depressed: 0,
+                    latched: 0,
+                    locked: 0,
+                    group: 0,
+                },
+            )));
+            events.push(ProtoEvent::Leave(0, 0.5));
+            tokio::select! {
+                _ = self.cancellation_token.cancelled() => {},
+                result = self.conn.send_cleanup(cleanup, events) => if let Err(error) = result {
+                    log::warn!("capture release network cleanup failed: {error}");
+                },
+            }
+        }
+        Ok(())
+    }
+}
 
-            log::info!("sending Leave event to client {handle}");
-            // the peer doesn't act on this `t` — it's *our* Leave,
-            // stopping capture towards them, not a hand-back to us
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0, 0.5), handle).await {
-                log::warn!("failed to send Leave to client {handle}: {e}");
-            }
+async fn release_native_capture<F>(
+    conn: &LanMouseConnection,
+    active: Option<(CaptureHandle, u64)>,
+    cleanup: Option<&CleanupTarget>,
+    abort_before_release: bool,
+    release: F,
+) -> Result<(), CaptureError>
+where
+    F: std::future::Future<Output = Result<(), CaptureError>>,
+{
+    let abort = || {
+        if let Some((handle, revision)) = active {
+            conn.abort_capture(handle, revision, cleanup);
+        } else if let Some(cleanup) = cleanup {
+            conn.abort_cleanup(cleanup);
         }
-        match warp_to {
-            Some(t) => capture.release_to(t).await,
-            None => capture.release().await,
+    };
+    if abort_before_release {
+        abort();
+    }
+    let result = release.await;
+    // The original generation was already canceled on the fatal path. A late
+    // release error must not re-resolve the handle or close a replacement.
+    if result.is_err() && !abort_before_release {
+        abort();
+    }
+    result
+}
+
+async fn await_capture_cleanup<F>(
+    event_tx: &Sender<ICaptureEvent>,
+    retry: Option<Rc<CaptureRetryLease>>,
+    reason: &str,
+    cleanup: F,
+) -> Result<(), InputCaptureError>
+where
+    F: std::future::Future<Output = Result<(), InputCaptureError>>,
+{
+    tokio::pin!(cleanup);
+    tokio::select! {
+        biased;
+        result = &mut cleanup => result,
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {
+            log::warn!("input capture cleanup is still pending: {reason}");
+            event_tx.send(ICaptureEvent::CaptureCleanupPending(reason.into(), retry)).expect("channel closed");
+            // Feedback does not cancel cleanup or allow a replacement owner.
+            // Continue polling this same chain, with no second progress timer.
+            cleanup.await
         }
+    }
+}
+
+async fn await_capture_termination<F>(
+    event_tx: &Sender<ICaptureEvent>,
+    retry: Option<Rc<CaptureRetryLease>>,
+    result: Result<(), InputCaptureError>,
+    termination: F,
+) -> Result<(), InputCaptureError>
+where
+    F: std::future::Future<Output = Result<(), CaptureError>>,
+{
+    let reason = result
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "backend termination has not completed".into());
+    await_capture_cleanup(event_tx, retry, &reason, async {
+        capture_result_after_termination(result, termination.await)
+    })
+    .await
+}
+
+fn capture_result_after_termination(
+    result: Result<(), InputCaptureError>,
+    termination: Result<(), CaptureError>,
+) -> Result<(), InputCaptureError> {
+    capture_result_after_cleanup(result, termination, "backend termination")
+}
+
+fn capture_result_after_cleanup(
+    result: Result<(), InputCaptureError>,
+    cleanup: Result<(), CaptureError>,
+    stage: &str,
+) -> Result<(), InputCaptureError> {
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => Err(CaptureError::Io(std::io::Error::other(format!(
+            "{error}; {stage} also failed: {cleanup}"
+        )))
+        .into()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn report_capture_exit(
+    event_tx: &Sender<ICaptureEvent>,
+    result: &Result<(), InputCaptureError>,
+    retry: Option<Rc<CaptureRetryLease>>,
+) {
+    if let Err(error) = result {
+        log::warn!("input capture exited: {error}");
+        event_tx
+            .send(ICaptureEvent::CaptureFailed(error.to_string(), retry))
+            .expect("channel closed");
     }
 }
 
@@ -747,6 +1020,1228 @@ impl<T> Drop for DropGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_handle_event_preserves_current_capture_without_panicking() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let conn = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients,
+                );
+                let sender = conn.sender();
+                let transport = Arc::new(RefusedConnection {
+                    succeed_send: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        transport.clone(),
+                    )
+                    .await;
+                let (event_tx, mut events) = channel();
+                let (_requests, request_rx) = channel();
+                let mut task = CaptureTask {
+                    retry: None,
+                    active_client: Some(handle),
+                    backend: Some(input_capture::Backend::Dummy),
+                    cancellation_token: CancellationToken::new(),
+                    captures: vec![(handle, Position::Left, CaptureType::Default)],
+                    conn,
+                    event_tx,
+                    request_rx,
+                    release_bind: Default::default(),
+                    enter_binds: Default::default(),
+                    remap: Default::default(),
+                    scroll_invert: Default::default(),
+                    state: State::Sending,
+                    jail: Cell::new(false),
+                    jail_bind: Default::default(),
+                    jail_bind_prev_engaged: Cell::new(false),
+                    window_identifier: Default::default(),
+                    enter_t: 0.5,
+                    pending_modifiers: None,
+                };
+                let mut capture =
+                    InputCapture::new(Some(input_capture::Backend::Dummy), Default::default())
+                        .await
+                        .unwrap();
+                for event in [
+                    CaptureEvent::Begin(0.75),
+                    CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+                        time: 0,
+                        dx: 1.0,
+                        dy: 2.0,
+                    })),
+                ] {
+                    task.handle_capture_event(&mut capture, (handle + 1, event))
+                        .await
+                        .unwrap();
+                    assert_eq!(task.active_client, Some(handle));
+                    assert!(matches!(task.state, State::Sending));
+                    assert!(transport.sent.lock().unwrap().is_empty());
+                    assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
+                }
+                capture.terminate().await.unwrap();
+                sender.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn continuous_capture_settings_keep_one_latest_snapshot() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (request_tx, mut requests) = channel();
+                let (_events, event_rx) = channel();
+                let mut source = Capture {
+                    cancellation_token: CancellationToken::new(),
+                    reenable_pending: Default::default(),
+                    release_pending: Default::default(),
+                    settings_pending: Default::default(),
+                    request_tx,
+                    event_rx,
+                    task: spawn_local(async {}),
+                };
+                for edit in 0..10_000 {
+                    let latest = edit % 2 != 0;
+                    source.set_release_bind(vec![if latest {
+                        scancode::Linux::KeyB
+                    } else {
+                        scancode::Linux::KeyA
+                    }]);
+                    source.set_jail_bind(vec![if latest {
+                        scancode::Linux::KeyD
+                    } else {
+                        scancode::Linux::KeyC
+                    }]);
+                    source.set_enter_binds(HashMap::from([(
+                        lan_mouse_ipc::Position::Left,
+                        vec![if latest {
+                            scancode::Linux::KeyF
+                        } else {
+                            scancode::Linux::KeyE
+                        }],
+                    )]));
+                    source.set_remap(KeyRemap::new(
+                        HashMap::from([(
+                            scancode::Linux::KeyA,
+                            if latest {
+                                scancode::Linux::KeyC
+                            } else {
+                                scancode::Linux::KeyB
+                            },
+                        )]),
+                        vec![],
+                    ));
+                    source.set_scroll_invert(ScrollInvert::new(latest, !latest));
+                }
+                let CaptureRequest::Settings(marker) = requests.recv().await.unwrap() else {
+                    panic!()
+                };
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                // Dequeued but not taken: source edits still merge into this snapshot.
+                source.set_release_bind(vec![scancode::Linux::KeyZ]);
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                let settings = marker.borrow_mut().take().unwrap();
+                assert_eq!(settings.release_bind, Some(vec![scancode::Linux::KeyZ]));
+                assert_eq!(settings.jail_bind, Some(vec![scancode::Linux::KeyD]));
+                assert_eq!(
+                    settings
+                        .enter_binds
+                        .as_ref()
+                        .unwrap()
+                        .get(&lan_mouse_ipc::Position::Left),
+                    Some(&vec![scancode::Linux::KeyF])
+                );
+                assert!(settings.remap.as_ref().unwrap().same_rules(&KeyRemap::new(
+                    HashMap::from([(scancode::Linux::KeyA, scancode::Linux::KeyC)]),
+                    vec![]
+                )));
+                assert_eq!(settings.scroll_invert, Some(ScrollInvert::new(true, false)));
+                // A live handler may hold the empty marker while awaiting native
+                // cleanup. The new edit needs a fresh notification, not a write
+                // into that consumed marker.
+                source.set_release_bind(vec![scancode::Linux::KeyY]);
+                let CaptureRequest::Settings(next) = requests.recv().await.unwrap() else {
+                    panic!()
+                };
+                assert!(!Rc::ptr_eq(&marker, &next));
+                assert!(marker.borrow().is_none());
+                assert_eq!(
+                    next.borrow().as_ref().unwrap().release_bind,
+                    Some(vec![scancode::Linux::KeyY])
+                );
+                assert_eq!(settings.release_bind, Some(vec![scancode::Linux::KeyZ]));
+                drop(next);
+                for boundary in 0..4 {
+                    source.set_release_bind(vec![scancode::Linux::KeyA]);
+                    match boundary {
+                        0 => source.release(),
+                        1 => source.create(1, lan_mouse_ipc::Position::Left, CaptureType::Default),
+                        2 => source.destroy(1),
+                        3 => source.reenable(),
+                        _ => unreachable!(),
+                    }
+                    source.set_release_bind(vec![scancode::Linux::KeyB]);
+                    let CaptureRequest::Settings(first) = requests.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    let control = requests.recv().await.unwrap();
+                    assert!(matches!(
+                        (&control, boundary),
+                        (CaptureRequest::Release(..), 0)
+                            | (CaptureRequest::Create(..), 1)
+                            | (CaptureRequest::Destroy(..), 2)
+                            | (CaptureRequest::Reenable(..), 3)
+                    ));
+                    let CaptureRequest::Settings(last) = requests.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    assert!(!Rc::ptr_eq(&first, &last));
+                    assert_eq!(
+                        first.borrow().as_ref().unwrap().release_bind,
+                        Some(vec![scancode::Linux::KeyA])
+                    );
+                    assert_eq!(
+                        last.borrow().as_ref().unwrap().release_bind,
+                        Some(vec![scancode::Linux::KeyB])
+                    );
+                    assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn settings_during_remap_cleanup_keep_a_fresh_notification() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients);
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { stall_send: true, ..Default::default() });
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let (request_tx, mut requests) = channel(); let (_events, event_rx) = channel();
+            let mut source = Capture {
+                cancellation_token: CancellationToken::new(), reenable_pending: Default::default(),
+                release_pending: Default::default(), settings_pending: Default::default(),
+                request_tx, event_rx, task: spawn_local(async {}),
+            };
+            source.set_release_bind(vec![scancode::Linux::KeyA]);
+            source.set_remap(Default::default());
+            let CaptureRequest::Settings(marker) = requests.recv().await.unwrap() else { panic!() };
+            let snapshot = marker.borrow_mut().take().unwrap();
+            let (event_tx, _events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None, active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: KeyRemap::new(HashMap::from([(scancode::Linux::KeyA, scancode::Linux::KeyB)]), vec![]),
+                scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            let next;
+            {
+                let apply = task.apply_live_settings(&mut capture, snapshot);
+                tokio::pin!(apply);
+                let edit = async {
+                    while transport.sent.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+                    source.set_release_bind(vec![scancode::Linux::KeyC]);
+                    source.set_scroll_invert(ScrollInvert::new(true, true));
+                    let CaptureRequest::Settings(next) = requests.recv().await.unwrap() else { panic!() };
+                    assert!(!Rc::ptr_eq(&marker, &next));
+                    assert!(marker.borrow().is_none());
+                    assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                    next
+                };
+                tokio::pin!(edit);
+                next = tokio::select! { _ = &mut apply => panic!("peer cleanup must remain pending"), next = &mut edit => next };
+                tokio::time::advance(Duration::from_millis(100)).await;
+                apply.await.unwrap();
+            }
+            assert_eq!(*task.release_bind.borrow(), vec![scancode::Linux::KeyA]);
+            let settings = next.borrow_mut().take().unwrap();
+            task.apply_live_settings(&mut capture, settings).await.unwrap();
+            assert_eq!(*task.release_bind.borrow(), vec![scancode::Linux::KeyC]);
+            assert_eq!(task.scroll_invert, ScrollInvert::new(true, true));
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reapplying_remap_rules_preserves_active_chord() {
+        for (chord, pending) in [(true, false), (true, true), (false, false)] {
+            check_remap_update(false, chord, pending).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn changing_remap_rules_releases_old_capture_before_switching() {
+        for chord in [false, true] {
+            check_remap_update(true, chord, false).await;
+        }
+    }
+
+    async fn check_remap_update(changed: bool, chord: bool, pending: bool) {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients);
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { succeed_send: true, ..Default::default() });
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let rules = || if chord {
+                KeyRemap::new(Default::default(), vec![crate::remap::ChordRemap {
+                    modifier: scancode::Linux::KeyLeftMeta, trigger: scancode::Linux::KeyTab,
+                    to: scancode::Linux::KeyLeftAlt,
+                }])
+            } else {
+                KeyRemap::new(HashMap::from([(scancode::Linux::KeyLeftMeta, scancode::Linux::KeyLeftCtrl)]), vec![])
+            };
+            let (event_tx, mut events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None, active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: rules(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let key = |key, state| Event::Keyboard(KeyboardEvent::Key { time: 0, key: key as u32, state });
+            let mut downs = task.remap.apply(key(scancode::Linux::KeyLeftMeta, 1));
+            if chord {
+                assert!(downs.is_empty());
+                if !pending {
+                    downs = task.remap.apply(key(scancode::Linux::KeyTab, 1));
+                    assert!(downs.iter().any(|event| *event == key(scancode::Linux::KeyLeftAlt, 1)));
+                }
+            } else {
+                assert_eq!(downs, vec![key(scancode::Linux::KeyLeftCtrl, 1)]);
+            }
+            for event in downs { task.conn.send(ProtoEvent::Input(event), handle).await.unwrap(); }
+            let sent_before = transport.sent.lock().unwrap().len();
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            task.apply_live_settings(&mut capture, CaptureSettings {
+                release_bind: Some(vec![scancode::Linux::KeyA]), jail_bind: Some(vec![scancode::Linux::KeyB]),
+                enter_binds: Some(HashMap::from([(lan_mouse_ipc::Position::Left, vec![scancode::Linux::KeyC])])),
+                remap: Some(Box::new(if changed { Default::default() } else { rules() })),
+                scroll_invert: Some(ScrollInvert::new(true, false)),
+            }).await.unwrap();
+            assert_eq!(*task.release_bind.borrow(), vec![scancode::Linux::KeyA]);
+            assert_eq!(*task.jail_bind.borrow(), vec![scancode::Linux::KeyB]);
+            assert_eq!(task.enter_binds.get(&lan_mouse_ipc::Position::Left), Some(&vec![scancode::Linux::KeyC]));
+            assert_eq!(task.scroll_invert, ScrollInvert::new(true, false));
+            if changed {
+                assert!(task.active_client.is_none(), "old capture must be released before new rules become active");
+                assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+                let frames: Vec<_> = transport.sent.lock().unwrap().iter().map(|bytes| lan_mouse_proto::decode_event_frame(bytes).unwrap()).collect();
+                assert!(matches!(frames.last(), Some(ProtoEvent::Leave(..))));
+                assert!(task.remap.is_empty());
+            } else {
+                assert_eq!(task.active_client, Some(handle));
+                let expected = if pending { None } else if chord { Some(scancode::Linux::KeyLeftAlt) } else { Some(scancode::Linux::KeyLeftCtrl) };
+                assert_eq!(task.remap.release_key(scancode::Linux::KeyLeftMeta), expected, "same rules must preserve held override or pending chord");
+                assert_eq!(transport.sent.lock().unwrap().len(), sent_before);
+                assert!(futures::FutureExt::now_or_never(events.recv()).is_none());
+            }
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_release_flood_keeps_one_request() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (request_tx, mut requests) = channel();
+                let (_events, event_rx) = channel();
+                let mut capture = Capture {
+                    cancellation_token: CancellationToken::new(),
+                    reenable_pending: Default::default(),
+                    release_pending: Default::default(),
+                    settings_pending: Default::default(),
+                    request_tx,
+                    event_rx,
+                    task: spawn_local(async {}),
+                };
+                for _ in 0..10_000 {
+                    capture.release();
+                }
+                let request = requests.recv().await.unwrap();
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                capture.release();
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                drop(request);
+                capture.release();
+                assert!(matches!(
+                    requests.recv().await.unwrap(),
+                    CaptureRequest::Release(_)
+                ));
+                for boundary in 0..8 {
+                    capture.release();
+                    match boundary {
+                        0 => capture.create(1, lan_mouse_ipc::Position::Left, CaptureType::Default),
+                        1 => capture.destroy(1),
+                        2 => capture.reenable(),
+                        3 => capture.set_release_bind(vec![]),
+                        4 => capture.set_jail_bind(vec![]),
+                        5 => capture.set_enter_binds(Default::default()),
+                        6 => capture.set_remap(Default::default()),
+                        7 => capture.set_scroll_invert(Default::default()),
+                        _ => unreachable!(),
+                    }
+                    capture.release();
+                    capture.release();
+                    let CaptureRequest::Release(first) = requests.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    let barrier = requests.recv().await.unwrap();
+                    assert!(matches!(
+                        (&barrier, boundary),
+                        (CaptureRequest::Create(..), 0)
+                            | (CaptureRequest::Destroy(..), 1)
+                            | (CaptureRequest::Reenable(..), 2)
+                            | (CaptureRequest::Settings(..), 3..=7)
+                    ));
+                    let CaptureRequest::Release(last) = requests.recv().await.unwrap() else {
+                        panic!()
+                    };
+                    assert!(!Rc::ptr_eq(&first, &last));
+                    assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_release_request_retains_admission_through_peer_cleanup() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients);
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { stall_send: true, ..Default::default() });
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let (request_tx, mut requests) = channel();
+            let (_events, event_rx) = channel();
+            let source = Capture {
+                cancellation_token: CancellationToken::new(), reenable_pending: Default::default(),
+                release_pending: Default::default(), settings_pending: Default::default(), request_tx, event_rx, task: spawn_local(async {}),
+            };
+            source.release();
+            let CaptureRequest::Release(release) = requests.recv().await.unwrap() else { panic!() };
+            let pending = Rc::downgrade(&release);
+            let (event_tx, mut events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None, active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            let cancellation = task.cancellation_token.clone();
+            {
+                let work = task.release_requested(&mut capture, release);
+                tokio::pin!(work);
+                let control = async {
+                    while transport.sent.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+                    assert!(pending.upgrade().is_some(), "peer cleanup still owns admission");
+                    for _ in 0..10_000 { source.release(); }
+                    assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                    cancellation.cancel();
+                };
+                tokio::pin!(control);
+                tokio::select! {
+                    _ = &mut work => panic!("cleanup must wait for control"),
+                    _ = &mut control => { work.await.unwrap(); },
+                }
+            }
+            assert!(pending.upgrade().is_none());
+            assert!(task.active_client.is_none());
+            // Delayed hook feedback must not suppress a release for a new session.
+            source.release();
+            assert!(matches!(requests.recv().await.unwrap(), CaptureRequest::Release(_)));
+            assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_reenable_flood_keeps_one_request() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (request_tx, mut requests) = channel();
+                let (_events, event_rx) = channel();
+                let capture = Capture {
+                    cancellation_token: CancellationToken::new(),
+                    reenable_pending: Default::default(),
+                    release_pending: Default::default(),
+                    settings_pending: Default::default(),
+                    request_tx,
+                    event_rx,
+                    task: spawn_local(async {}),
+                };
+                for _ in 0..10_000 {
+                    capture.reenable();
+                }
+                let request = requests.recv().await.unwrap();
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                capture.reenable();
+                assert!(
+                    futures::FutureExt::now_or_never(requests.recv()).is_none(),
+                    "dequeued request still owns the attempt"
+                );
+                drop(request);
+                capture.reenable();
+                assert!(matches!(
+                    requests.recv().await.unwrap(),
+                    CaptureRequest::Reenable(_)
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_retry_status_and_active_backend_keep_attempt_reserved() {
+        use crate::client::ClientManager;
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), ClientManager::default());
+            let sender = conn.sender();
+            let source_conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), ClientManager::default());
+            let source_sender = source_conn.sender();
+            let mut source = Capture::new(Some(input_capture::Backend::Dummy), source_conn, vec![], vec![], Default::default(), Default::default(), Default::default(), Default::default());
+            let (tx, mut requests) = channel();
+            let original = std::mem::replace(&mut source.request_tx, tx);
+            source.reenable();
+            let CaptureRequest::Reenable(retry) = requests.recv().await.unwrap() else { panic!() };
+            let (event_tx, mut events) = channel();
+            let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: Some(retry), active_client: None, backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: Default::default(), scroll_invert: Default::default(), state: Default::default(),
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let cancellation = task.cancellation_token.clone();
+            {
+                let run = task.do_capture();
+                tokio::pin!(run);
+                let enabled = tokio::select! { _ = &mut run => panic!("backend must stay active"), e = events.recv() => e.unwrap() };
+                assert!(matches!(enabled, ICaptureEvent::CaptureEnabled(Some(_))));
+                drop(enabled);
+                source.reenable();
+                assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+                cancellation.cancel();
+                assert!(run.await.is_ok());
+            }
+            report_capture_exit(&task.event_tx, &Ok(()), task.retry.take());
+            source.reenable();
+            assert!(futures::FutureExt::now_or_never(requests.recv()).is_none(), "queued Disabled retains the completed attempt");
+            let disabled = events.recv().await.unwrap();
+            assert!(matches!(disabled, ICaptureEvent::CaptureDisabled(Some(_))));
+            source.reenable();
+            assert!(futures::FutureExt::now_or_never(requests.recv()).is_none());
+            drop(disabled);
+            source.reenable();
+            let CaptureRequest::Reenable(retry) = requests.recv().await.unwrap() else { panic!() };
+            let error = Err(CaptureError::ActivationClosed.into());
+            report_capture_exit(&task.event_tx, &error, Some(retry));
+            let failed = events.recv().await.unwrap();
+            assert!(matches!(failed, ICaptureEvent::CaptureFailed(_, Some(_))));
+            source.reenable();
+            assert!(futures::FutureExt::now_or_never(requests.recv()).is_none(), "held failure retains admission");
+            drop(failed);
+            source.reenable();
+            assert!(matches!(requests.recv().await.unwrap(), CaptureRequest::Reenable(_)));
+            source.request_tx = original;
+            source.terminate().await;
+            source_sender.terminate().await;
+            sender.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_and_termination_share_one_progress_timer_and_keep_all_errors() {
+        struct Owner<'a>(&'a Cell<bool>);
+        impl Drop for Owner<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let (tx, mut events) = channel();
+        let (release_done, release_wait) = tokio::sync::oneshot::channel();
+        let (terminate_done, terminate_wait) = tokio::sync::oneshot::channel();
+        let (terminate_started, started_wait) = tokio::sync::oneshot::channel();
+        let dropped = Cell::new(false);
+        let owner = Owner(&dropped);
+        let retry = Rc::new(CaptureRetryLease);
+        let pending = Rc::downgrade(&retry);
+        let wait = await_capture_cleanup(
+            &tx,
+            Some(retry),
+            "activation stream closed unexpectedly",
+            async {
+                let _owner = owner;
+                let primary = Err(CaptureError::ActivationClosed.into());
+                release_wait.await.unwrap();
+                let result = capture_result_after_cleanup(
+                    primary,
+                    Err(CaptureError::Io(std::io::Error::other("release failure"))),
+                    "native release",
+                );
+                terminate_started.send(()).unwrap();
+                terminate_wait.await.unwrap();
+                capture_result_after_termination(
+                    result,
+                    Err(CaptureError::Io(std::io::Error::other(
+                        "termination failure",
+                    ))),
+                )
+            },
+        );
+        tokio::pin!(wait);
+        let notice = tokio::time::timeout(Duration::from_millis(650), async {
+            tokio::select! {
+                _ = &mut wait => panic!("release must remain pending"),
+                event = events.recv() => event.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&notice, ICaptureEvent::CaptureCleanupPending(reason, _retry) if reason.contains("activation stream"))
+        );
+        assert!(!dropped.get());
+        release_done.send(()).unwrap();
+        tokio::select! {
+            _ = &mut wait => panic!("termination must remain pending"),
+            started = started_wait => started.unwrap(),
+        }
+        tokio::select! {
+            _ = &mut wait => panic!("termination must remain pending"),
+            _ = events.recv() => panic!("second stage must not repeat progress"),
+            _ = tokio::time::sleep(Duration::from_millis(350)) => {},
+        }
+        assert!(!dropped.get());
+        terminate_done.send(()).unwrap();
+        let result = wait.await;
+        assert!(dropped.get());
+        assert!(
+            pending.upgrade().is_some(),
+            "held progress feedback retains the retry after cleanup"
+        );
+        drop(notice);
+        assert!(pending.upgrade().is_none());
+        let message = result.as_ref().unwrap_err().to_string();
+        assert!(message.contains("activation stream"));
+        assert!(message.contains("native release also failed"));
+        assert!(message.contains("release failure"));
+        assert!(message.contains("backend termination also failed"));
+        assert!(message.contains("termination failure"));
+        report_capture_exit(&tx, &result, None);
+        assert!(
+            matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureFailed(message, _retry) if message.contains("release failure"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_release_cancels_original_before_wait_and_preserves_late_replacement() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for native_error in [false, true] {
+                    let clients = ClientManager::default();
+                    let handle = clients.add_client();
+                    clients.activate_client(handle);
+                    let other = clients.add_client();
+                    clients.activate_client(other);
+                    let token = clients.target_token(handle).unwrap();
+                    let other_token = clients.target_token(other).unwrap();
+                    let conn = LanMouseConnection::new(
+                        Certificate::generate_self_signed(vec![]).unwrap(),
+                        clients.clone(),
+                    );
+                    let sender = conn.sender();
+                    let old = Arc::new(RefusedConnection::default());
+                    let healthy = Arc::new(RefusedConnection::default());
+                    sender
+                        .install_test_connection(
+                            handle,
+                            "127.0.0.1:2".parse().unwrap(),
+                            old.clone(),
+                        )
+                        .await;
+                    sender
+                        .install_test_connection(
+                            other,
+                            "127.0.0.1:3".parse().unwrap(),
+                            healthy.clone(),
+                        )
+                        .await;
+                    let revision = conn.capture_revision(handle).unwrap();
+                    let cleanup = conn.prepare_cleanup(handle).unwrap();
+                    let (done, receiver) = tokio::sync::oneshot::channel();
+                    let started = Cell::new(false);
+                    let release = release_native_capture(
+                        &conn,
+                        Some((handle, revision)),
+                        Some(&cleanup),
+                        true,
+                        async {
+                            assert!(token.is_cancelled()); // cancellation precedes native future's first poll.
+                            assert!(clients.active_addr(handle).is_none());
+                            started.set(true);
+                            receiver.await.unwrap();
+                            if native_error {
+                                Err(CaptureError::Io(std::io::Error::other(
+                                    "native release failed",
+                                )))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    );
+                    tokio::pin!(release);
+                    tokio::select! {
+                        _ = &mut release => panic!("native release must still be pending"),
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                    }
+                    assert!(started.get());
+                    assert!(token.is_cancelled());
+                    assert!(old.closed.load(std::sync::atomic::Ordering::SeqCst));
+                    assert!(!other_token.is_cancelled());
+                    assert!(!healthy.closed.load(std::sync::atomic::Ordering::SeqCst));
+                    let replacement = Arc::new(RefusedConnection::default());
+                    sender
+                        .install_test_connection(
+                            handle,
+                            "127.0.0.1:2".parse().unwrap(),
+                            replacement.clone(),
+                        )
+                        .await;
+                    let fresh = clients.target_token(handle).unwrap();
+                    done.send(()).unwrap();
+                    assert_eq!(release.await.is_err(), native_error);
+                    assert!(!fresh.is_cancelled());
+                    assert!(clients.active_addr(handle).is_some());
+                    assert!(!replacement.closed.load(std::sync::atomic::Ordering::SeqCst));
+                    assert!(old.sent.lock().unwrap().is_empty());
+                    sender.terminate().await;
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_capture_cleanup_reports_progress_and_retains_owner_until_completion() {
+        struct CleanupGuard<'a>(&'a Cell<bool>);
+        impl Drop for CleanupGuard<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        for primary_error in [false, true] {
+            for cleanup_error in [false, true] {
+                let (tx, mut events) = channel();
+                let (done, receiver) = tokio::sync::oneshot::channel();
+                let finished = Cell::new(false);
+                let dropped = Cell::new(false);
+                let guard = CleanupGuard(&dropped);
+                let wait = async {
+                    let result = if primary_error {
+                        Err(CaptureError::ActivationClosed.into())
+                    } else {
+                        Ok(())
+                    };
+                    let result = await_capture_termination(&tx, None, result, async move {
+                        let _guard = guard;
+                        receiver.await.unwrap();
+                        if cleanup_error {
+                            Err(CaptureError::Io(std::io::Error::other("cleanup failed")))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await;
+                    finished.set(true);
+                    report_capture_exit(&tx, &result, None);
+                };
+                tokio::pin!(wait);
+                let notice = tokio::time::timeout(Duration::from_millis(650), async {
+                    tokio::select! {
+                        _ = &mut wait => panic!("cleanup must remain pending"),
+                        event = events.recv() => event.unwrap(),
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    matches!(notice, ICaptureEvent::CaptureCleanupPending(reason, _retry) if
+                    reason.contains(if primary_error { "activation stream" } else { "termination has not completed" }))
+                );
+                assert!(!finished.get());
+                assert!(!dropped.get()); // no cancel/drop/replacement of pending cleanup.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), events.recv())
+                        .await
+                        .is_err()
+                );
+                done.send(()).unwrap();
+                wait.await;
+                assert!(finished.get());
+                assert!(dropped.get());
+                if primary_error || cleanup_error {
+                    let event = events.recv().await.unwrap();
+                    assert!(
+                        matches!(event, ICaptureEvent::CaptureFailed(message, _retry) if
+                        (!primary_error || message.contains("activation stream")) &&
+                        (!cleanup_error || message.contains("cleanup failed")))
+                    );
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), events.recv())
+                        .await
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_capture_cleanup_emits_no_pending_notice() {
+        let (tx, mut events) = channel();
+        let result = await_capture_termination(
+            &tx,
+            None,
+            Err(CaptureError::ActivationClosed.into()),
+            async { Ok(()) },
+        )
+        .await;
+        report_capture_exit(&tx, &result, None);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ICaptureEvent::CaptureFailed(_, _retry)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_exit_preserves_primary_and_cleanup_failures() {
+        let result = Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "barrier creation failed",
+        ))
+        .into());
+        let termination = Err(CaptureError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "worker cleanup timed out",
+        )));
+        let result = capture_result_after_termination(result, termination).unwrap_err();
+        assert!(result.to_string().contains("worker cleanup timed out"));
+        assert!(result.to_string().contains("barrier creation failed"));
+        for (failed, cleanup_failed) in [(false, false), (true, false), (false, true)] {
+            let result = if failed {
+                Err(CaptureError::ActivationClosed.into())
+            } else {
+                Ok(())
+            };
+            let cleanup = if cleanup_failed {
+                Err(CaptureError::EndOfStream)
+            } else {
+                Ok(())
+            };
+            let result = capture_result_after_termination(result, cleanup);
+            match (failed, cleanup_failed) {
+                (false, false) => assert!(result.is_ok()),
+                (true, false) => assert!(matches!(
+                    result,
+                    Err(InputCaptureError::Capture(CaptureError::ActivationClosed))
+                )),
+                (false, true) => assert!(matches!(
+                    result,
+                    Err(InputCaptureError::Capture(CaptureError::EndOfStream))
+                )),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_capture_exit_error_notifies_once_and_success_is_quiet() {
+        let (tx, mut events) = channel();
+        for result in [
+            Err::<(), InputCaptureError>(
+                input_capture::CaptureCreationError::NoAvailableBackend.into(),
+            ),
+            Err(CaptureError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "barrier creation failed",
+            ))
+            .into()),
+            Err(CaptureError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "capture EOF",
+            ))
+            .into()),
+            Err(CaptureError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker cleanup timed out",
+            ))
+            .into()),
+        ] {
+            let expected = result.as_ref().unwrap_err().to_string();
+            report_capture_exit(&tx, &result, None);
+            assert!(
+                matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureFailed(message, _retry) if message == expected)
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), events.recv())
+                    .await
+                    .is_err()
+            );
+        }
+        report_capture_exit(&tx, &Ok(()), None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_eof_cleans_active_session_and_reports_idle_failure() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+            for active in [false, true] {
+            let clients = ClientManager::default(); let handle = clients.add_client(); clients.activate_client(handle);
+            let token = clients.target_token(handle).unwrap();
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients.clone());
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection::default());
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            let (event_tx, mut events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None,
+                active_client: active.then_some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: KeyRemap::new(Default::default(), vec![crate::remap::ChordRemap {
+                    modifier: scancode::Linux::KeyLeftMeta, trigger: scancode::Linux::KeyTab, to: scancode::Linux::KeyLeftAlt,
+                }]),
+                scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5,
+                pending_modifiers: Some(KeyboardEvent::Modifiers { depressed: 64, latched: 0, locked: 0, group: 0 }),
+            };
+            assert!(task.remap.apply(Event::Keyboard(KeyboardEvent::Key { time: 0, key: scancode::Linux::KeyLeftMeta as u32, state: 1 })).is_empty());
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            let result = task.capture_stream_ended();
+            let result = task.finish_capture_session(&mut capture, result).await;
+            report_capture_exit(&task.event_tx, &result, None);
+            assert!(matches!(result, Err(InputCaptureError::Capture(CaptureError::Io(error))) if error.kind() == std::io::ErrorKind::UnexpectedEof));
+            assert!(task.active_client.is_none());
+            assert!(task.pending_modifiers.is_none());
+            assert_eq!(task.state, State::WaitingForAck);
+            assert_eq!(token.is_cancelled(), active);
+            assert_eq!(clients.active_addr(handle).is_none(), active);
+            assert_eq!(task.remap.release_key(scancode::Linux::KeyLeftMeta), Some(scancode::Linux::KeyLeftMeta));
+            assert!(transport.sent.lock().unwrap().is_empty());
+            if active {
+                assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+            }
+            assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureFailed(message, _retry) if message.contains("stream closed unexpectedly")));
+            assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+            // EOF during requested shutdown remains successful; service shutdown owns connection cleanup.
+            task.cancellation_token.cancel();
+            assert!(task.capture_stream_ended().is_ok());
+            sender.terminate().await;
+            }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fatal_capture_abort_preserves_replacement_and_never_waits_for_close() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let conn = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = conn.sender();
+                let old = Arc::new(RefusedConnection::default());
+                sender
+                    .install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), old.clone())
+                    .await;
+                let revision = conn.capture_revision(handle).unwrap();
+                let cleanup = conn.prepare_cleanup(handle).unwrap();
+                // A replacement may arrive while native release is awaited.
+                clients.invalidate_target(handle);
+                let replacement = Arc::new(RefusedConnection::default());
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        replacement.clone(),
+                    )
+                    .await;
+                let fresh = clients.target_token(handle).unwrap();
+                conn.abort_capture(handle, revision, Some(&cleanup));
+                assert!(!fresh.is_cancelled());
+                assert!(!replacement.closed.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(clients.active_addr(handle).is_some());
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    while !old.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                // Current-session fatal abort also returns without waiting for close.
+                let stalled = Arc::new(RefusedConnection {
+                    stall_close: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        stalled.clone(),
+                    )
+                    .await;
+                let revision = conn.capture_revision(handle).unwrap();
+                let cleanup = conn.prepare_cleanup(handle).unwrap();
+                let token = clients.target_token(handle).unwrap();
+                tokio::time::timeout(Duration::from_millis(50), async {
+                    conn.abort_capture(handle, revision, Some(&cleanup));
+                })
+                .await
+                .unwrap();
+                assert!(token.is_cancelled());
+                assert!(clients.active_addr(handle).is_none());
+                sender.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_release_error_aborts_pinned_peer_after_active_handle_is_taken() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client(); clients.activate_client(handle);
+            let other = clients.add_client(); clients.activate_client(other);
+            let other_token = clients.target_token(other).unwrap();
+            let old_token = clients.target_token(handle).unwrap();
+            let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients.clone());
+            let sender = conn.sender();
+            let transport = Arc::new(RefusedConnection { stall_close: true, ..Default::default() });
+            let healthy = Arc::new(RefusedConnection::default());
+            sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+            sender.install_test_connection(other, "127.0.0.1:3".parse().unwrap(), healthy.clone()).await;
+            let (event_tx, _events) = channel(); let (_requests, request_rx) = channel();
+            let mut task = CaptureTask {
+                retry: None,
+                active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: CancellationToken::new(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5, pending_modifiers: None,
+            };
+            let active = task.active_client.take();
+            let abort = active.and_then(|h| task.conn.capture_revision(h).map(|revision| (h, revision)));
+            let cleanup = active.and_then(|h| task.conn.prepare_cleanup(h));
+            let result = tokio::time::timeout(Duration::from_millis(50), release_native_capture(&task.conn, abort, cleanup.as_ref(), false, std::future::ready(
+                Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "native release failed").into())))).await.unwrap();
+            assert!(matches!(result, Err(CaptureError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+            assert!(task.active_client.is_none());
+            assert!(old_token.is_cancelled());
+            assert!(clients.active_addr(handle).is_none());
+            assert!(!other_token.is_cancelled());
+            assert!(clients.active_addr(other).is_some());
+            assert!(!healthy.closed.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(transport.sent.lock().unwrap().is_empty()); // failure sends no stale cleanup input.
+            sender.terminate().await;
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_input_releases_on_deadline_and_shutdown_cancels_without_waiting() {
+        use crate::{client::ClientManager, connect::tests::RefusedConnection};
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            for shutdown in [false, true] {
+                let clients = ClientManager::default(); let handle = clients.add_client(); clients.activate_client(handle);
+                let conn = LanMouseConnection::new(Certificate::generate_self_signed(vec![]).unwrap(), clients.clone());
+                let sender = conn.sender();
+                let transport = Arc::new(RefusedConnection { stall_send: true, stall_close: true, ..Default::default() });
+                sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), transport.clone()).await;
+                let (event_tx, mut events) = channel(); let (requests, request_rx) = channel();
+                let token = CancellationToken::new();
+                let mut task = CaptureTask {
+                    retry: None,
+                    active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                    cancellation_token: token.clone(), captures: vec![(handle, Position::Left, CaptureType::Default)], conn,
+                    event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                    remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                    jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                    window_identifier: Default::default(), enter_t: 0.5,
+                    pending_modifiers: Some(KeyboardEvent::Modifiers { depressed: 64, latched: 0, locked: 0, group: 0 }),
+                };
+                let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+                capture.create(handle, Position::Left).await.unwrap();
+                tokio::time::timeout(Duration::from_millis(700), async {
+                    let session = task.do_capture_session(&mut capture); tokio::pin!(session);
+                    let control = async {
+                        while transport.sent.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+                        if shutdown { token.cancel(); }
+                        else {
+                            requests.send(CaptureRequest::Release(Rc::new(CaptureReleaseLease))).unwrap();
+                            loop { if matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle) { break; } }
+                            // Dummy keeps emitting input after release. Those old
+                            // events cannot send Enter or reconnect the failed peer.
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                            token.cancel();
+                        }
+                    };
+                    tokio::pin!(control);
+                    tokio::select! {
+                        result = &mut session => { assert!(shutdown); result.unwrap(); },
+                        _ = &mut control => { session.await.unwrap(); },
+                    }
+                }).await.unwrap();
+                assert!(task.active_client.is_none()); assert!(task.pending_modifiers.is_none());
+                assert_eq!(task.state, State::WaitingForAck);
+                assert_eq!(transport.sent.lock().unwrap().len(), 1); // no key-up reconnect/extra sends after failure.
+                assert!(matches!(lan_mouse_proto::decode_event_frame(&transport.sent.lock().unwrap()[0]).unwrap(), ProtoEvent::Enter(..))); // actual input path, not empty-bind cleanup.
+                if shutdown {
+                    assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::CaptureBegin(..)));
+                    assert!(matches!(events.recv().await.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle));
+                }
+                assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+                let healthy = Arc::new(RefusedConnection { succeed_send: true, ..Default::default() });
+                sender.install_test_connection(handle, "127.0.0.1:2".parse().unwrap(), healthy.clone()).await;
+                task.active_client = Some(handle);
+                task.cancellation_token = CancellationToken::new();
+                task.release_capture(&mut capture, Some(0.25)).await.unwrap();
+                let packets: Vec<_> = healthy.sent.lock().unwrap().iter().map(|bytes| lan_mouse_proto::decode_event_frame(bytes).unwrap()).collect();
+                assert_eq!(packets.len(), 2);
+                assert!(matches!(packets[0], ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers { depressed: 0, latched: 0, locked: 0, group: 0 }))));
+                assert!(matches!(packets[1], ProtoEvent::Leave(..)));
+                assert!(task.active_client.is_none());
+                capture.terminate().await.unwrap(); sender.terminate().await;
+            }
+        }).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_dtls_close_releases_idle_capture_without_input_or_leave() {
+        use crate::{
+            client::ClientManager,
+            crypto,
+            listen::{LanMouseListener, ListenEvent},
+        };
+        use std::sync::RwLock;
+        use webrtc_dtls::crypto::Certificate;
+        tokio::task::LocalSet::new().run_until(async {
+            let clients = ClientManager::default();
+            let handle = clients.add_client();
+            let cert = Certificate::generate_self_signed(vec![]).unwrap();
+            let keys = Arc::new(RwLock::new(HashMap::from([
+                (crypto::certificate_fingerprint(&cert), "fixture".into())
+            ])));
+            let mut peer = LanMouseListener::new(0, Certificate::generate_self_signed(vec![]).unwrap(), keys).await.unwrap();
+            clients.set_fix_ips(handle, vec!["127.0.0.1".parse().unwrap()]);
+            clients.set_port(handle, peer.port());
+            clients.activate_client(handle);
+            let conn = LanMouseConnection::new(cert, clients.clone());
+            let sender = conn.sender();
+            assert!(sender.send(ProtoEvent::Ping, handle).await.is_err());
+            let transport = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Some(ListenEvent::Accept { conn, .. }) = peer.next().await { break conn; }
+                }
+            }).await.unwrap();
+            sender.clipboard_ready_signal().notified().await;
+            let (event_tx, mut events) = channel();
+            let (_requests, request_rx) = channel();
+            let cancellation_token = CancellationToken::new();
+            let mut task = CaptureTask {
+                retry: None,
+                active_client: Some(handle), backend: Some(input_capture::Backend::Dummy),
+                cancellation_token: cancellation_token.clone(), captures: vec![], conn,
+                event_tx, request_rx, release_bind: Default::default(), enter_binds: Default::default(),
+                remap: Default::default(), scroll_invert: Default::default(), state: State::Sending,
+                jail: Cell::new(false), jail_bind: Default::default(), jail_bind_prev_engaged: Cell::new(false),
+                window_identifier: Default::default(), enter_t: 0.5,
+                pending_modifiers: Some(KeyboardEvent::Modifiers { depressed: 64, latched: 0, locked: 0, group: 0 }),
+            };
+            let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy), Default::default()).await.unwrap();
+            // No backend barriers: no input events can drive a failed send/release.
+            // Terminate the peer without ever sending Leave or Ack.
+            transport.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let session = task.do_capture_session(&mut capture);
+                tokio::pin!(session);
+                tokio::select! {
+                    result = &mut session => panic!("capture exited unexpectedly: {result:?}"),
+                    event = events.recv() => assert!(matches!(event.unwrap(), ICaptureEvent::ClientLeft(h) if h == handle)),
+                }
+                cancellation_token.cancel();
+                session.await.unwrap();
+            }).await.unwrap();
+            assert!(task.active_client.is_none());
+            assert!(task.pending_modifiers.is_none());
+            assert_eq!(task.state, State::WaitingForAck);
+            assert!(clients.active_addr(handle).is_none());
+            assert!(tokio::time::timeout(Duration::from_millis(10), events.recv()).await.is_err());
+            capture.terminate().await.unwrap();
+            sender.terminate().await;
+            peer.terminate().await;
+        }).await;
+    }
 
     #[test]
     fn jail_bind_toggles_only_on_fresh_engagement() {

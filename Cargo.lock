@@ -2030,6 +2030,7 @@ dependencies = [
 name = "lan-mouse"
 version = "0.11.0"
 dependencies = [
+ "async-trait",
  "clap",
  "env_logger",
  "futures",
@@ -2051,6 +2052,7 @@ dependencies = [
  "sha2",
  "shadow-rs",
  "slab",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -2080,6 +2082,7 @@ name = "lan-mouse-gtk"
 version = "0.3.0"
 dependencies = [
  "async-channel",
+ "futures",
  "gdk4-wayland",
  "glib-build-tools",
  "gtk4",
@@ -2090,6 +2093,8 @@ dependencies = [
  "libadwaita",
  "log",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tray-icon",
 ]
 
@@ -4035,8 +4040,6 @@ dependencies = [
 [[package]]
 name = "webrtc-dtls"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ccbe4d9049390ab52695c3646c1395c877e16c15fb05d3bda8eee0c7351711c"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4073,8 +4076,6 @@ dependencies = [
 [[package]]
 name = "webrtc-util"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64bfb10dbe6d762f80169ae07cf252bafa1f764b9594d140008a0231c0cdce58"
 dependencies = [
  "async-trait",
  "bitflags 1.3.2",

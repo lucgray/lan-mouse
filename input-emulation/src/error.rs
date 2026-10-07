@@ -20,6 +20,8 @@ use wayland_client::{
 
 #[derive(Debug, Error)]
 pub enum EmulationError {
+    #[error("invalid input event: {0}")]
+    InvalidInput(#[from] input_event::error::InvalidInputEvent),
     #[error("event stream closed")]
     EndOfStream,
     #[cfg(libei)]

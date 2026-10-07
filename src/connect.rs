@@ -4,12 +4,12 @@ use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
+    cell::{Cell, RefCell},
+    collections::HashMap,
     io,
     net::SocketAddr,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 use thiserror::Error;
@@ -18,6 +18,7 @@ use tokio::{
     sync::Mutex,
     task::{JoinSet, spawn_local},
 };
+use tokio_util::sync::CancellationToken;
 use webrtc_dtls::{
     config::{Config, ExtendedMasterSecretType},
     conn::DTLSConn,
@@ -39,7 +40,13 @@ pub(crate) enum LanMouseConnectionError {
     TargetEmulationDisabled,
     #[error("Connection timed out")]
     Timeout,
+    #[error("incomplete input send: {sent} of {expected} bytes")]
+    Incomplete { sent: usize, expected: usize },
+    #[error("clipboard send is busy; copy again")]
+    ClipboardBusy,
 }
+
+const INPUT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -104,30 +111,123 @@ async fn connect_any(
 }
 
 #[derive(Clone)]
+pub(crate) struct CleanupTarget {
+    target: Target,
+    addr: SocketAddr,
+    conn: Connection,
+}
+
+type Connection = Arc<dyn Conn + Send + Sync>;
+type Connections = Mutex<HashMap<ClientHandle, (SocketAddr, Connection)>>;
+type PeerIdentities = HashMap<ClientHandle, (Weak<dyn Conn + Send + Sync>, String)>;
+type ClosedTargets = HashMap<ClientHandle, (u64, Weak<dyn Conn + Send + Sync>)>;
+
+#[derive(Clone, Default)]
+struct ClosedConnections {
+    pending: Rc<RefCell<ClosedTargets>>,
+    ready: Rc<tokio::sync::Notify>,
+}
+
+impl ClosedConnections {
+    fn publish(&self, clients: &ClientManager, handle: ClientHandle, conn: &Connection) {
+        let mut pending = self.pending.borrow_mut();
+        // One notice per configured target; deleting targets cannot grow this map.
+        pending.retain(|handle, _| clients.target_revision(*handle).is_some());
+        if let Some(revision) = clients.target_revision(handle) {
+            pending.insert(handle, (revision, Arc::downgrade(conn)));
+            self.ready.notify_one();
+        }
+    }
+}
+
+type Attempts = Mutex<HashMap<ClientHandle, (u64, Rc<()>)>>;
+
+async fn close_connection(conn: &Connection) {
+    match tokio::time::timeout(Duration::from_secs(1), conn.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::debug!("connection cleanup failed: {error}"),
+        Err(_) => log::warn!("connection cleanup exceeded one second"),
+    }
+}
+
+#[derive(Clone)]
+struct Target {
+    handle: ClientHandle,
+    revision: u64,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
 pub(crate) struct LanMouseConnectionSender {
     cert: Certificate,
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    conns: Rc<Connections>,
+    connecting: Rc<Attempts>,
+    recv_tx: ReceiveChannels,
+    peer_identities: Rc<RefCell<PeerIdentities>>,
+    clipboard_ready: Arc<tokio::sync::Notify>,
+    closed: ClosedConnections,
+}
+
+#[derive(Clone)]
+struct ReceiveChannels {
+    events: Sender<ReceivedEvent>,
+    clipboard: tokio::sync::watch::Sender<Option<ReceivedEvent>>,
+    clipboard_enabled: Arc<std::sync::atomic::AtomicBool>,
+    closed: ClosedConnections,
+}
+
+impl ReceiveChannels {
+    fn publish(&self, received: ReceivedEvent) {
+        if matches!(
+            received.event,
+            ProtoEvent::Input(input_event::Event::Clipboard(_))
+        ) {
+            if self
+                .clipboard_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.clipboard.send_replace(Some(received));
+            }
+        } else {
+            self.events.send(received).expect("channel closed");
+        }
+    }
+}
+
+pub(crate) struct ReceivedEvent {
+    pub handle: ClientHandle,
+    pub revision: u64,
+    pub addr: SocketAddr,
+    pub conn: Connection,
+    pub event: ProtoEvent,
 }
 
 pub(crate) struct LanMouseConnection {
     sender: LanMouseConnectionSender,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<ReceivedEvent>,
 }
 
 impl LanMouseConnection {
     pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
-        let (recv_tx, recv_rx) = channel();
+        let (events, recv_rx) = channel();
+        let (clipboard, _) = tokio::sync::watch::channel(None);
+        let closed = ClosedConnections::default();
+        let recv_tx = ReceiveChannels {
+            events,
+            clipboard,
+            clipboard_enabled: Default::default(),
+            closed: closed.clone(),
+        };
         let sender = LanMouseConnectionSender {
             cert,
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
             recv_tx,
-            ping_response: Default::default(),
+            peer_identities: Default::default(),
+            clipboard_ready: Default::default(),
+            closed,
         };
         Self { sender, recv_rx }
     }
@@ -136,8 +236,202 @@ impl LanMouseConnection {
         self.sender.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+    pub(crate) async fn recv(&mut self) -> ReceivedEvent {
+        loop {
+            let event = self.recv_rx.recv().await.expect("channel closed");
+            // Allow the final already-accepted Leave from a closed current session;
+            // a target revision or replacement identity still rejects old controls.
+            if self
+                .sender
+                .client_manager
+                .target_is_current(event.handle, event.revision)
+                && self
+                    .sender
+                    .clipboard_peer(event.handle, &event.conn)
+                    .is_some()
+                && (self.sender.client_manager.active_addr(event.handle) == Some(event.addr)
+                    || matches!(event.event, ProtoEvent::Leave(..)))
+            {
+                return event;
+            }
+        }
+    }
+
+    pub(crate) fn disconnect_signal(&self) -> Rc<tokio::sync::Notify> {
+        self.sender.closed.ready.clone()
+    }
+
+    pub(crate) fn take_disconnected(&self) -> Vec<ClientHandle> {
+        let pending = std::mem::take(&mut *self.sender.closed.pending.borrow_mut());
+        let identities = self.sender.peer_identities.borrow();
+        pending
+            .into_iter()
+            .filter_map(|(handle, (revision, conn))| {
+                (self
+                    .sender
+                    .client_manager
+                    .target_is_current(handle, revision)
+                    && match identities.get(&handle) {
+                        Some((current, _)) => current.ptr_eq(&conn),
+                        // Another handshake may have pruned dead Weak identities.
+                        // Without a replacement transport the close is still valid.
+                        None => self.sender.client_manager.active_addr(handle).is_none(),
+                    })
+                .then_some(handle)
+            })
+            .collect()
+    }
+
+    /// Abort the capture generation saved before awaiting native cleanup.
+    pub(crate) fn abort_capture(
+        &self,
+        handle: ClientHandle,
+        revision: u64,
+        cleanup: Option<&CleanupTarget>,
+    ) {
+        if let Some(cleanup) = cleanup {
+            self.abort_cleanup(cleanup);
+        } else {
+            self.abort_capture_at_revision(handle, revision);
+        }
+    }
+
+    pub(crate) fn capture_revision(&self, handle: ClientHandle) -> Option<u64> {
+        self.sender.client_manager.target_revision(handle)
+    }
+
+    pub(crate) fn abort_capture_at_revision(&self, handle: ClientHandle, revision: u64) {
+        if let Ok(current) = self.sender.conns.try_lock() {
+            if self.sender.client_manager.target_revision(handle) != Some(revision) {
+                return;
+            }
+            let connection = current.get(&handle).cloned();
+            self.sender.client_manager.invalidate_target(handle);
+            drop(current);
+            if let Some((addr, conn)) = connection {
+                self.sender.queue_disconnect(handle, addr, conn);
+            }
+        } else {
+            let sender = self.sender.clone();
+            spawn_local(async move {
+                let current = sender.conns.lock().await;
+                if sender.client_manager.target_revision(handle) != Some(revision) {
+                    return;
+                }
+                let connection = current.get(&handle).cloned();
+                sender.client_manager.invalidate_target(handle);
+                drop(current);
+                if let Some((addr, conn)) = connection {
+                    disconnect(
+                        &sender.client_manager,
+                        handle,
+                        addr,
+                        &conn,
+                        &sender.conns,
+                        &sender.closed,
+                    )
+                    .await;
+                }
+            });
+        }
+    }
+
+    /// Abort only the transport captured before a native release started.
+    pub(crate) fn abort_cleanup(&self, cleanup: &CleanupTarget) {
+        if let Ok(current) = self.sender.conns.try_lock() {
+            if current
+                .get(&cleanup.target.handle)
+                .is_some_and(|(_, conn)| Arc::ptr_eq(conn, &cleanup.conn))
+                && self
+                    .sender
+                    .client_manager
+                    .target_is_current(cleanup.target.handle, cleanup.target.revision)
+            {
+                self.sender
+                    .client_manager
+                    .invalidate_target(cleanup.target.handle);
+            }
+            drop(current);
+            self.sender
+                .queue_disconnect(cleanup.target.handle, cleanup.addr, cleanup.conn.clone());
+        } else {
+            let sender = self.sender.clone();
+            let cleanup = cleanup.clone();
+            spawn_local(async move {
+                let current = sender.conns.lock().await;
+                if current
+                    .get(&cleanup.target.handle)
+                    .is_some_and(|(_, conn)| Arc::ptr_eq(conn, &cleanup.conn))
+                    && sender
+                        .client_manager
+                        .target_is_current(cleanup.target.handle, cleanup.target.revision)
+                {
+                    sender
+                        .client_manager
+                        .invalidate_target(cleanup.target.handle);
+                }
+                drop(current);
+                disconnect(
+                    &sender.client_manager,
+                    cleanup.target.handle,
+                    cleanup.addr,
+                    &cleanup.conn,
+                    &sender.conns,
+                    &sender.closed,
+                )
+                .await;
+            });
+        }
+    }
+
+    pub(crate) fn prepare_cleanup(&self, handle: ClientHandle) -> Option<CleanupTarget> {
+        let target = self.sender.target(handle)?;
+        let addr = self.sender.client_manager.active_addr(handle)?;
+        let table = self.sender.conns.try_lock().ok()?;
+        let (_, conn) = table.get(&handle).filter(|(current, _)| *current == addr)?;
+        Some(CleanupTarget {
+            target,
+            addr,
+            conn: conn.clone(),
+        })
+    }
+
+    pub(crate) async fn send_cleanup(
+        &self,
+        cleanup: CleanupTarget,
+        events: Vec<ProtoEvent>,
+    ) -> Result<(), LanMouseConnectionError> {
+        let deadline = tokio::time::Instant::now() + INPUT_SEND_TIMEOUT;
+        for event in events {
+            if !self
+                .sender
+                .client_manager
+                .target_is_current(cleanup.target.handle, cleanup.target.revision)
+                || !self.sender.conns.try_lock().ok().is_some_and(|table| {
+                    table
+                        .get(&cleanup.target.handle)
+                        .is_some_and(|(_, conn)| Arc::ptr_eq(conn, &cleanup.conn))
+                })
+            {
+                return Err(LanMouseConnectionError::NotConnected);
+            }
+            let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+            let result = tokio::select! {
+                _ = cleanup.target.cancellation.cancelled() => Err(LanMouseConnectionError::NotConnected),
+                result = tokio::time::timeout_at(deadline, cleanup.conn.send(&bytes[..len])) => match result {
+                    Ok(Ok(sent)) if sent == len => Ok(()),
+                    Ok(Ok(sent)) => Err(LanMouseConnectionError::Incomplete { sent, expected: len }),
+                    Ok(Err(error)) => Err(error.into()),
+                    Err(_) => Err(LanMouseConnectionError::Timeout),
+                }
+            };
+            if let Err(error) = result {
+                self.sender
+                    .queue_disconnect(cleanup.target.handle, cleanup.addr, cleanup.conn);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn send(
@@ -149,183 +443,458 @@ impl LanMouseConnection {
     }
 }
 
+impl Drop for LanMouseConnection {
+    fn drop(&mut self) {
+        self.sender.client_manager.cancel_targets();
+    }
+}
+
 impl LanMouseConnectionSender {
+    pub(crate) fn clipboard_events(&self) -> tokio::sync::watch::Receiver<Option<ReceivedEvent>> {
+        self.recv_tx.clipboard.subscribe()
+    }
+
+    pub(crate) fn set_clipboard_receiving(&self, enabled: bool) {
+        self.recv_tx
+            .clipboard_enabled
+            .store(enabled, std::sync::atomic::Ordering::Release);
+        if !enabled {
+            self.recv_tx.clipboard.send_replace(None);
+        }
+    }
+
+    pub(crate) fn take_received_clipboard(&self) -> Option<ReceivedEvent> {
+        let mut event = None;
+        // The sole Service consumer has already observed the change. Take the
+        // payload without another notification or retaining a closed-session Arc.
+        self.recv_tx.clipboard.send_if_modified(|pending| {
+            event = pending.take();
+            false
+        });
+        event
+    }
+
+    pub(crate) fn clipboard_ready_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.clipboard_ready.clone()
+    }
+
+    pub(crate) fn clipboard_peer(&self, handle: ClientHandle, conn: &Connection) -> Option<String> {
+        self.peer_identities
+            .borrow()
+            .get(&handle)
+            .filter(|(identity, _)| {
+                identity
+                    .upgrade()
+                    .is_some_and(|current| Arc::ptr_eq(&current, conn))
+            })
+            .map(|(_, peer)| peer.clone())
+    }
+
+    pub(crate) fn clipboard_known_peers(&self) -> std::collections::HashSet<String> {
+        let identities = self.peer_identities.borrow();
+        self.client_manager
+            .active_clients()
+            .into_iter()
+            .filter_map(|handle| {
+                self.target(handle)?;
+                self.client_manager.active_addr(handle)?;
+                identities
+                    .get(&handle)
+                    .filter(|(conn, _)| conn.strong_count() != 0)
+                    .map(|(_, peer)| peer.clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn clipboard_current(
+        &self,
+        handle: ClientHandle,
+    ) -> Result<(Connection, String), LanMouseConnectionError> {
+        let target = self
+            .target(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let addr = self
+            .client_manager
+            .active_addr(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let table = self
+            .conns
+            .try_lock()
+            .map_err(|_| LanMouseConnectionError::ClipboardBusy)?;
+        let (_, conn) = table
+            .get(&target.handle)
+            .filter(|(current, _)| *current == addr)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let peer = self
+            .clipboard_peer(handle, conn)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        Ok((conn.clone(), peer))
+    }
+
+    pub(crate) fn clipboard_session_is_current(
+        &self,
+        handle: ClientHandle,
+        revision: u64,
+        addr: SocketAddr,
+        conn: &Connection,
+    ) -> bool {
+        self.client_manager.target_is_current(handle, revision)
+            && self.client_manager.active_addr(handle) == Some(addr)
+            && self.clipboard_peer(handle, conn).is_some()
+    }
+
+    fn target(&self, handle: ClientHandle) -> Option<Target> {
+        let revision = self.client_manager.target_revision(handle)?;
+        let cancellation = self.client_manager.target_token(handle)?;
+        self.client_manager
+            .target_is_current(handle, revision)
+            .then_some(Target {
+                handle,
+                revision,
+                cancellation,
+            })
+    }
+
+    pub(crate) async fn terminate(&self) {
+        self.client_manager.cancel_targets();
+        let connections: Vec<_> = self
+            .conns
+            .lock()
+            .await
+            .drain()
+            .map(|(_, (_, conn))| conn)
+            .collect();
+        for conn in connections {
+            close_connection(&conn).await;
+        }
+    }
+
+    fn queue_disconnect(&self, handle: ClientHandle, addr: SocketAddr, conn: Connection) {
+        if let Ok(mut current) = self.conns.try_lock() {
+            if current
+                .get(&handle)
+                .is_some_and(|(_, old)| Arc::ptr_eq(old, &conn))
+            {
+                current.remove(&handle);
+                self.closed.publish(&self.client_manager, handle, &conn);
+                if self.client_manager.active_addr(handle) == Some(addr) {
+                    self.client_manager.set_active_addr(handle, None);
+                    self.client_manager.set_peer_commit(handle, None);
+                    self.client_manager.set_alive(handle, false);
+                }
+            }
+            drop(current);
+            // Only transport close is detached; current-session state is already
+            // invalidated before the failed send returns to capture.
+            tokio::spawn(async move {
+                close_connection(&conn).await;
+            });
+        } else {
+            let sender = self.clone();
+            spawn_local(async move {
+                disconnect(
+                    &sender.client_manager,
+                    handle,
+                    addr,
+                    &conn,
+                    &sender.conns,
+                    &sender.closed,
+                )
+                .await;
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_test_connection(
+        &self,
+        handle: ClientHandle,
+        addr: SocketAddr,
+        conn: Connection,
+    ) {
+        self.client_manager.set_active_addr(handle, Some(addr));
+        self.client_manager.set_alive(handle, true);
+        self.peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&conn), "fixture".into()));
+        self.conns.lock().await.insert(handle, (addr, conn));
+    }
+
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let event_str = format!("{event}");
+        let target = self
+            .target(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let deadline = tokio::time::Instant::now() + INPUT_SEND_TIMEOUT;
+        log::trace!("sending {event} to client {handle}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
             let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
+                let conns = tokio::select! {
+                    _ = target.cancellation.cancelled() => return Err(LanMouseConnectionError::NotConnected),
+                    result = tokio::time::timeout_at(deadline, self.conns.lock()) => match result {
+                        Ok(table) => table,
+                        Err(_) => {
+                            let conn = self.peer_identities.borrow().get(&handle).and_then(|(conn, _)| conn.upgrade());
+                            if let Some(conn) = conn { self.queue_disconnect(handle, addr, conn); }
+                            return Err(LanMouseConnectionError::Timeout);
+                        }
+                    },
+                };
+                conns
+                    .get(&handle)
+                    .filter(|(a, _)| *a == addr)
+                    .map(|(_, c)| c.clone())
             };
             if let Some(conn) = conn {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
+                let result = tokio::select! {
+                    _ = target.cancellation.cancelled() => Err(LanMouseConnectionError::NotConnected),
+                    result = tokio::time::timeout_at(deadline, conn.send(buf)) => match result {
+                        Ok(Ok(sent)) if sent == len => Ok(()),
+                        Ok(Ok(sent)) => Err(LanMouseConnectionError::Incomplete { sent, expected: len }),
+                        Ok(Err(error)) => Err(error.into()),
+                        Err(_) => Err(LanMouseConnectionError::Timeout),
+                    },
+                };
+                if let Err(error) = result {
+                    log::warn!("client {handle} input send failed: {error}");
+                    self.queue_disconnect(handle, addr, conn);
+                    return Err(error);
                 }
-                log::trace!("{event_str} >->->->->- {addr}");
                 return Ok(());
             }
         }
 
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
+        let mut connecting = tokio::select! {
+            _ = target.cancellation.cancelled() => return Err(LanMouseConnectionError::NotConnected),
+            result = tokio::time::timeout_at(deadline, self.connecting.lock()) => result.map_err(|_| LanMouseConnectionError::Timeout)?,
+        };
+        if !self
+            .client_manager
+            .target_is_current(handle, target.revision)
+        {
+            return Err(LanMouseConnectionError::NotConnected);
+        }
+        if !connecting
+            .get(&handle)
+            .is_some_and(|(revision, _)| *revision == target.revision)
+        {
+            let marker = Rc::new(());
+            connecting.insert(handle, (target.revision, marker.clone()));
+            let sender = self.clone();
+            spawn_local(async move {
+                let result = tokio::select! {
+                    _ = target.cancellation.cancelled() => Err(LanMouseConnectionError::NotConnected),
+                    result = connect_to_handle(&sender, target.clone()) => result,
+                };
+                let mut attempts = sender.connecting.lock().await;
+                finish_attempt(&mut attempts, handle, &marker);
+                if let Err(error) = result {
+                    log::debug!("client {handle} connection attempt ended: {error}");
+                }
+            });
         }
         Err(LanMouseConnectionError::NotConnected)
     }
 
-    /// Send clipboard event with variable-length encoding
-    pub(crate) async fn send_clipboard(
+    /// Capture the exact target without waiting in the service input loop.
+    pub(crate) fn prepare_clipboard(
         &self,
-        event: ProtoEvent,
+        event: input_event::ClipboardEvent,
         handle: ClientHandle,
-    ) -> Result<(), LanMouseConnectionError> {
-        use lan_mouse_proto::encode_clipboard_event;
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<crate::clipboard_network::ClipboardRequest, LanMouseConnectionError> {
+        let target = self
+            .target(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let addr = self
+            .client_manager
+            .active_addr(handle)
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        let table = self
+            .conns
+            .try_lock()
+            .map_err(|_| LanMouseConnectionError::ClipboardBusy)?;
+        let conn = table
+            .get(&handle)
+            .filter(|(a, _)| *a == addr)
+            .map(|(_, conn)| conn.clone())
+            .ok_or(LanMouseConnectionError::NotConnected)?;
+        Ok(crate::clipboard_network::ClipboardRequest {
+            addr,
+            conn: Some(conn),
+            event,
+            generation,
+            cancellation,
+            session_cancellation: Some(target.cancellation),
+            outgoing: Some((handle, target.revision)),
+        })
+    }
 
-        let buf = encode_clipboard_event(&event).map_err(|e| {
-            log::error!("Failed to encode clipboard event: {}", e);
-            LanMouseConnectionError::NotConnected
-        })?;
-
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
-            };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
-                }
-                match conn.send(&buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send clipboard: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
-                }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
-            }
+    pub(crate) fn clipboard_send_failed(
+        &self,
+        handle: ClientHandle,
+        revision: u64,
+        addr: SocketAddr,
+        conn: Connection,
+    ) {
+        if !self.client_manager.target_is_current(handle, revision) {
+            return;
         }
+        let sender = self.clone();
+        spawn_local(async move {
+            disconnect(
+                &sender.client_manager,
+                handle,
+                addr,
+                &conn,
+                &sender.conns,
+                &sender.closed,
+            )
+            .await;
+        });
+    }
+}
 
-        // Not connected yet - clipboard will sync when connection is established
-        log::debug!(
-            "Client {} not connected, clipboard will sync when connection is established",
-            handle
-        );
-        Ok(())
+fn finish_attempt(
+    attempts: &mut HashMap<ClientHandle, (u64, Rc<()>)>,
+    handle: ClientHandle,
+    marker: &Rc<()>,
+) {
+    if attempts
+        .get(&handle)
+        .is_some_and(|(_, current)| Rc::ptr_eq(current, marker))
+    {
+        attempts.remove(&handle);
     }
 }
 
 async fn connect_to_handle(
-    client_manager: ClientManager,
-    cert: Certificate,
-    handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    sender: &LanMouseConnectionSender,
+    target: Target,
 ) -> Result<(), LanMouseConnectionError> {
-    log::info!("client {handle} connecting ...");
-    // sending did not work, figure out active conn.
-    if let Some(addrs) = client_manager.get_ips(handle) {
-        let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let addrs = addrs
-            .into_iter()
-            .map(|a| SocketAddr::new(a, port))
-            .collect::<Vec<_>>();
-        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
-        let (conn, addr) = match res {
-            Ok(c) => c,
-            Err(e) => {
-                connecting.lock().await.remove(&handle);
-                return Err(e);
-            }
-        };
-        log::info!("client ({handle}) connected @ {addr}");
-        client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
+    let Target {
+        handle, revision, ..
+    } = target.clone();
+    let client_manager = &sender.client_manager;
+    let addrs = client_manager
+        .get_ips(handle)
+        .ok_or(LanMouseConnectionError::NotConnected)?;
+    let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
+    let addrs: Vec<_> = addrs
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    let (conn, addr) = connect_any(&addrs, sender.cert.clone()).await?;
+    let peer = conn
+        .as_any()
+        .downcast_ref::<DTLSConn>()
+        .expect("DTLS connection")
+        .connection_state()
+        .await
+        .peer_certificates;
+    let Some(peer) = peer.first() else {
+        close_connection(&conn).await;
+        return Err(LanMouseConnectionError::NotConnected);
+    };
+    let fingerprint = crate::crypto::generate_fingerprint(peer);
+    let mut current = sender.conns.lock().await;
+    if !client_manager.target_is_current(handle, revision) {
+        drop(current);
+        close_connection(&conn).await;
+        return Err(LanMouseConnectionError::NotConnected);
+    }
+    client_manager.set_active_addr(handle, Some(addr));
+    let previous = current.insert(handle, (addr, conn.clone()));
+    sender
+        .peer_identities
+        .borrow_mut()
+        .retain(|_, (conn, _)| conn.strong_count() != 0);
+    sender
+        .peer_identities
+        .borrow_mut()
+        .insert(handle, (Arc::downgrade(&conn), fingerprint));
+    drop(current);
 
-        // Best-effort version handshake. Send our commit hash once
-        // immediately after the DTLS handshake; the listen side
-        // mirrors a Hello back so the receive loop can populate
-        // `peer_commit`. Old peers will silently skip this event
-        // per the forward-compat handler in [`receive_loop`].
-        let (buf, len) = ProtoEvent::Hello {
-            commit: local_commit(),
+    // Install cancellation-aware consumers before any post-publication await.
+    // A cancellation during Hello/old-session cleanup must not orphan this conn.
+    let ping_response = Rc::new(Cell::new(false));
+    spawn_local(receive_loop(
+        client_manager.clone(),
+        target.clone(),
+        addr,
+        conn.clone(),
+        sender.conns.clone(),
+        sender.recv_tx.clone(),
+        ping_response.clone(),
+    ));
+    let ping_conn = conn.clone();
+    let heartbeat_sender = sender.clone();
+    let cancellation = target.cancellation.clone();
+    spawn_local(async move {
+        tokio::select! {
+            _ = cancellation.cancelled() => {},
+            _ = ping_pong(addr, ping_conn.clone(), ping_response) => {},
         }
-        .into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("hello send to {addr} failed: {e}");
-        }
-
-        // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
-
-        // receiver
-        spawn_local(receive_loop(
-            client_manager,
+        disconnect(
+            &heartbeat_sender.client_manager,
             handle,
             addr,
-            conn,
-            conns,
-            tx,
-            ping_response.clone(),
-        ));
-        return Ok(());
+            &ping_conn,
+            &heartbeat_sender.conns,
+            &heartbeat_sender.closed,
+        )
+        .await;
+    });
+    // Coalesced wake; Service rechecks the current Arc and target revision.
+    sender.clipboard_ready.notify_one();
+    let (buf, len) = ProtoEvent::Hello {
+        commit: local_commit(),
     }
-    connecting.lock().await.remove(&handle);
-    Err(LanMouseConnectionError::NotConnected)
+    .into();
+    match tokio::time::timeout(Duration::from_secs(1), conn.send(&buf[..len])).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => log::debug!("hello send to {addr} failed: {error}"),
+        Err(_) => log::debug!("hello send to {addr} timed out"),
+    }
+    if let Some((_, old)) = previous {
+        close_connection(&old).await;
+    }
+    Ok(())
 }
 
 async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    ping_response: Rc<Cell<bool>>,
 ) {
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
 
         // send 4 pings, at least one must be answered
         for _ in 0..4 {
-            if let Err(e) = conn.send(&buf[..len]).await {
-                log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
+            match tokio::time::timeout(Duration::from_secs(1), conn.send(&buf[..len])).await {
+                Ok(Ok(n)) if n == len => {}
+                result => {
+                    log::warn!("{addr}: heartbeat send failed or timed out: {result:?}");
+                    return;
+                }
             }
             log::trace!("PING >->->->->- {addr}");
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        if !ping_response.borrow_mut().remove(&addr) {
+        if !ping_response.replace(false) {
             log::warn!("{addr} did not respond, closing connection");
-            let _ = conn.close().await;
             return;
         }
     }
@@ -333,46 +902,47 @@ async fn ping_pong(
 
 async fn receive_loop(
     client_manager: ClientManager,
-    handle: ClientHandle,
+    target: Target,
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    conns: Rc<Connections>,
+    tx: ReceiveChannels,
+    ping_response: Rc<Cell<bool>>,
 ) {
-    use lan_mouse_proto::{EventType, MAX_CLIPBOARD_SIZE, decode_clipboard_event};
+    let Target {
+        handle,
+        revision,
+        cancellation,
+    } = target;
+    use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_event_frame};
 
     // Buffer needs to be large enough for clipboard data.
     // Use Vec instead of array for large buffers to avoid stack overflow.
     let mut buf = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
-    while let Ok(n) = conn.recv(&mut buf).await {
+    loop {
+        let received = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = conn.recv(&mut buf) => result,
+        };
+        let Ok(n) = received else {
+            break;
+        };
         if n == 0 {
             break;
         }
-        // Clipboard events use variable-length encoding
-        let event = if buf[0] == EventType::ClipboardText as u8 {
-            match decode_clipboard_event(&buf[..n]) {
-                Ok(event) => event,
-                Err(e) => {
-                    log::warn!("Failed to decode clipboard from {addr}: {e:?}");
-                    continue;
-                }
-            }
-        } else {
-            // Pad with zeros if message is smaller than MAX_EVENT_SIZE
-            let mut fixed_buf = [0u8; MAX_EVENT_SIZE];
-            let copy_len = n.min(MAX_EVENT_SIZE);
-            fixed_buf[..copy_len].copy_from_slice(&buf[..copy_len]);
-            match fixed_buf.try_into() {
-                Ok(event) => event,
-                // Skip undecodable datagrams without dropping the
-                // connection. Each DTLS recv is one framed message, so
-                // skipping is safe and keeps us forward-compatible with
-                // peers that send event types we don't yet know about.
-                Err(e) => {
-                    log::debug!("ignoring undecodable event from {addr}: {e}");
-                    continue;
-                }
+        let current = conns.lock().await;
+        let ours = current
+            .get(&handle)
+            .is_some_and(|(_, c)| Arc::ptr_eq(c, &conn));
+        drop(current);
+        if !ours || !client_manager.target_is_current(handle, revision) {
+            break;
+        }
+        let event = match decode_event_frame(&buf[..n]) {
+            Ok(event) => event,
+            Err(e) => {
+                log::debug!("ignoring undecodable event from {addr}: {e}");
+                continue;
             }
         };
 
@@ -381,36 +951,946 @@ async fn receive_loop(
             ProtoEvent::Pong(b) => {
                 client_manager.set_active_addr(handle, Some(addr));
                 client_manager.set_alive(handle, b);
-                ping_response.borrow_mut().insert(addr);
+                ping_response.set(true);
             }
             ProtoEvent::Hello { commit } => {
                 client_manager.set_peer_commit(handle, Some(commit));
             }
-            event => tx.send((handle, event)).expect("channel closed"),
+            event => {
+                let received = ReceivedEvent {
+                    handle,
+                    revision,
+                    addr,
+                    conn: conn.clone(),
+                    event,
+                };
+                tx.publish(received);
+            }
         }
     }
 
-    log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    log::debug!("client {handle} receive task ended @ {addr}");
+    disconnect(&client_manager, handle, addr, &conn, &conns, &tx.closed).await;
 }
 
 async fn disconnect(
     client_manager: &ClientManager,
     handle: ClientHandle,
     addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    conn: &Connection,
+    conns: &Connections,
+    closed: &ClosedConnections,
 ) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    client_manager.set_peer_commit(handle, None);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
-    log::info!("active connections: {active:?}");
+    let mut current = conns.lock().await;
+    if current
+        .get(&handle)
+        .is_some_and(|(_, c)| Arc::ptr_eq(c, conn))
+    {
+        current.remove(&handle);
+        // Publish before awaiting transport close; capture must not wait for I/O.
+        closed.publish(client_manager, handle, conn);
+        if client_manager.active_addr(handle) == Some(addr) {
+            client_manager.set_active_addr(handle, None);
+            client_manager.set_peer_commit(handle, None);
+            client_manager.set_alive(handle, false);
+        }
+    }
+    drop(current);
+    close_connection(conn).await;
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[derive(Default)]
+    pub(crate) struct RefusedConnection {
+        pub(crate) closed: std::sync::atomic::AtomicBool,
+        pub(crate) short_send: bool,
+        pub(crate) stall_send: bool,
+        pub(crate) stall_close: bool,
+        pub(crate) succeed_send: bool,
+        pub(crate) sent: std::sync::Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Conn for RefusedConnection {
+        async fn connect(&self, _: SocketAddr) -> webrtc_util::Result<()> {
+            Ok(())
+        }
+        async fn recv(&self, _: &mut [u8]) -> webrtc_util::Result<usize> {
+            std::future::pending().await
+        }
+        async fn recv_from(&self, _: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+            unreachable!()
+        }
+        async fn send(&self, bytes: &[u8]) -> webrtc_util::Result<usize> {
+            self.sent.lock().unwrap().push(bytes.to_vec());
+            if self.stall_send {
+                return std::future::pending().await;
+            }
+            if self.short_send {
+                Ok(0)
+            } else if self.succeed_send {
+                Ok(bytes.len())
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test refusal").into())
+            }
+        }
+        async fn send_to(&self, _: &[u8], _: SocketAddr) -> webrtc_util::Result<usize> {
+            unreachable!()
+        }
+        fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            Some("127.0.0.1:2".parse().unwrap())
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.stall_close {
+                return std::future::pending().await;
+            }
+            Ok(())
+        }
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_receiver_is_latest_only_independent_of_capture_and_disable_discards_it() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let mut connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let conn: Connection = Arc::new(RefusedConnection::default());
+        let replaced: Connection = Arc::new(RefusedConnection::default());
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let revision = clients.target_revision(handle).unwrap();
+        clients.set_active_addr(handle, Some(addr));
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, conn.clone()));
+        sender
+            .peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&conn), "peer".into()));
+        let event = |conn: &Connection, event| ReceivedEvent {
+            handle,
+            revision,
+            addr,
+            conn: conn.clone(),
+            event,
+        };
+        let mut notices = sender.clipboard_events();
+        sender.set_clipboard_receiving(true);
+        for index in 0..1000 {
+            sender.recv_tx.publish(event(
+                &conn,
+                ProtoEvent::Input(input_event::Event::Clipboard(
+                    input_event::ClipboardEvent::Text(format!("latest-{index}")),
+                )),
+            ));
+        }
+        notices.changed().await.unwrap();
+        assert!(
+            matches!(sender.take_received_clipboard().unwrap().event, ProtoEvent::Input(input_event::Event::Clipboard(input_event::ClipboardEvent::Text(value))) if value == "latest-999")
+        );
+        assert!(sender.take_received_clipboard().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), connection.recv_rx.recv())
+                .await
+                .is_err()
+        ); // capture never needs to poll these updates.
+        sender.recv_tx.publish(event(
+            &conn,
+            ProtoEvent::Input(input_event::Event::Clipboard(
+                input_event::ClipboardEvent::Text("discard on disable".into()),
+            )),
+        ));
+        sender.set_clipboard_receiving(false);
+        sender.recv_tx.publish(event(
+            &conn,
+            ProtoEvent::Input(input_event::Event::Clipboard(
+                input_event::ClipboardEvent::Text("disabled receipt".into()),
+            )),
+        ));
+        assert!(sender.take_received_clipboard().is_none());
+        sender.set_clipboard_receiving(true);
+        assert!(sender.take_received_clipboard().is_none());
+        sender
+            .recv_tx
+            .publish(event(&replaced, ProtoEvent::Leave(0, 0.5)));
+        sender.recv_tx.publish(event(&conn, ProtoEvent::Ack(0)));
+        assert!(matches!(connection.recv().await.event, ProtoEvent::Ack(0))); // old queued control cannot affect a replacement.
+        clients.set_active_addr(handle, None);
+        sender.recv_tx.publish(event(&conn, ProtoEvent::Ack(0)));
+        sender
+            .recv_tx
+            .publish(event(&conn, ProtoEvent::Leave(0, 0.5)));
+        assert!(matches!(
+            connection.recv().await.event,
+            ProtoEvent::Leave(..)
+        )); // the final current Leave remains usable after EOF.
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, false);
+        assert!(
+            sender
+                .prepare_clipboard(
+                    input_event::ClipboardEvent::Text("input disabled".into()),
+                    handle,
+                    1,
+                    CancellationToken::new()
+                )
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepared_clipboard_failures_cleanup_only_the_captured_target() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let other = clients.add_client();
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let other_addr = "127.0.0.1:3".parse().unwrap();
+                clients.set_active_addr(other, Some(other_addr));
+                let connection = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = connection.sender();
+                let other_conn = Arc::new(RefusedConnection::default());
+                sender
+                    .conns
+                    .lock()
+                    .await
+                    .insert(other, (other_addr, other_conn.clone()));
+                for short_send in [false, true] {
+                    clients.set_active_addr(handle, Some(addr));
+                    clients.set_alive(handle, true);
+                    let conn = Arc::new(RefusedConnection {
+                        short_send,
+                        ..Default::default()
+                    });
+                    sender
+                        .conns
+                        .lock()
+                        .await
+                        .insert(handle, (addr, conn.clone()));
+                    let request = sender
+                        .prepare_clipboard(
+                            input_event::ClipboardEvent::Text("test".into()),
+                            handle,
+                            7,
+                            CancellationToken::new(),
+                        )
+                        .unwrap();
+                    let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+                    jobs.submit(request)
+                        .unwrap_or_else(|_| panic!("queue rejected fixture"));
+                    let completed = jobs.completed().await;
+                    if short_send {
+                        assert!(matches!(
+                            completed.result,
+                            Err(crate::listen::ClipboardSendError::Incomplete { sent: 0, .. })
+                        ));
+                    } else {
+                        assert!(matches!(
+                            completed.result,
+                            Err(crate::listen::ClipboardSendError::Transport(_))
+                        ));
+                    }
+                    let (completed_handle, revision) = completed.outgoing.unwrap();
+                    assert_eq!(completed_handle, handle);
+                    sender.clipboard_send_failed(
+                        handle,
+                        revision,
+                        completed.addr,
+                        completed.conn.unwrap(),
+                    );
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while !conn.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert!(clients.active_addr(handle).is_none());
+                    assert_eq!(clients.active_addr(other), Some(other_addr));
+                    assert!(!other_conn.closed.load(std::sync::atomic::Ordering::SeqCst));
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_preparation_never_waits_for_table_and_target_changes_cancel_job() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let addr = "127.0.0.1:2".parse().unwrap();
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let conn: Connection = Arc::new(RefusedConnection::default());
+        let mut table = sender.conns.lock().await;
+        table.insert(handle, (addr, conn.clone()));
+        assert!(matches!(
+            sender.prepare_clipboard(
+                input_event::ClipboardEvent::Text("test".into()),
+                handle,
+                1,
+                CancellationToken::new()
+            ),
+            Err(LanMouseConnectionError::ClipboardBusy)
+        ));
+        drop(table);
+        let request = sender
+            .prepare_clipboard(
+                input_event::ClipboardEvent::Text("test".into()),
+                handle,
+                1,
+                CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(request.conn.as_ref().unwrap(), &conn));
+        let (_, revision) = request.outgoing.unwrap();
+        clients.set_port(handle, 4444);
+        assert!(!clients.target_is_current(handle, revision));
+        assert!(
+            request
+                .session_cancellation
+                .as_ref()
+                .unwrap()
+                .is_cancelled()
+        );
+        let mut jobs = crate::clipboard_network::ClipboardJobs::default();
+        jobs.submit(request)
+            .unwrap_or_else(|_| panic!("queue rejected fixture"));
+        assert!(matches!(
+            jobs.completed().await.result,
+            Err(crate::listen::ClipboardSendError::Canceled)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_input_sends_return_errors_and_offline_clipboard_preparation_fails() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, Arc::new(RefusedConnection::default())));
+        assert!(sender.send(ProtoEvent::Ping, handle).await.is_err());
+        assert!(clients.active_addr(handle).is_none());
+        assert!(
+            sender
+                .prepare_clipboard(
+                    input_event::ClipboardEvent::Text("offline".into()),
+                    handle,
+                    0,
+                    CancellationToken::new()
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abort_capture_cancels_session_without_affecting_other_target() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let other = clients.add_client();
+        clients.activate_client(handle);
+        clients.activate_client(other);
+        let old_token = clients.target_token(handle).unwrap();
+        let other_token = clients.target_token(other).unwrap();
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let own = Arc::new(RefusedConnection::default());
+        let peer = Arc::new(RefusedConnection::default());
+        let addr = "127.0.0.1:2".parse().unwrap();
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        connection.sender.conns.lock().await.extend([
+            (handle, (addr, own.clone() as Connection)),
+            (other, (addr, peer.clone() as Connection)),
+        ]);
+        connection.abort_capture(
+            handle,
+            connection.capture_revision(handle).unwrap(),
+            connection.prepare_cleanup(handle).as_ref(),
+        );
+        assert!(old_token.is_cancelled());
+        assert!(!clients.target_token(handle).unwrap().is_cancelled());
+        assert!(!other_token.is_cancelled());
+        assert!(clients.active_addr(handle).is_none());
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !own.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!peer.closed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!connection.sender.conns.lock().await.contains_key(&handle));
+        assert!(connection.sender.conns.lock().await.contains_key(&other));
+        connection.abort_capture(
+            handle,
+            connection.capture_revision(handle).unwrap(),
+            connection.prepare_cleanup(handle).as_ref(),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_release_abort_preserves_replacement_even_with_contended_table() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                for change_revision in [false, true] {
+                    for contended in [false, true] {
+                        let clients = ClientManager::default();
+                        let handle = clients.add_client();
+                        clients.activate_client(handle);
+                        let other = clients.add_client();
+                        clients.activate_client(other);
+                        let connection = LanMouseConnection::new(
+                            Certificate::generate_self_signed(vec![]).unwrap(),
+                            clients.clone(),
+                        );
+                        let sender = connection.sender();
+                        let old = Arc::new(RefusedConnection::default());
+                        let replacement = Arc::new(RefusedConnection::default());
+                        let healthy = Arc::new(RefusedConnection::default());
+                        let addr = "127.0.0.1:2".parse().unwrap();
+                        sender
+                            .install_test_connection(handle, addr, old.clone())
+                            .await;
+                        sender
+                            .install_test_connection(
+                                other,
+                                "127.0.0.1:3".parse().unwrap(),
+                                healthy.clone(),
+                            )
+                            .await;
+                        let cleanup = connection.prepare_cleanup(handle).unwrap();
+                        if change_revision {
+                            clients.invalidate_target(handle);
+                        }
+                        sender
+                            .install_test_connection(handle, addr, replacement.clone())
+                            .await;
+                        let fresh_token = clients.target_token(handle).unwrap();
+                        let other_token = clients.target_token(other).unwrap();
+                        let held = if contended {
+                            Some(sender.conns.lock().await)
+                        } else {
+                            None
+                        };
+                        connection.abort_cleanup(&cleanup);
+                        assert!(!fresh_token.is_cancelled());
+                        drop(held);
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            while !old.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        assert!(!replacement.closed.load(std::sync::atomic::Ordering::SeqCst));
+                        assert!(!healthy.closed.load(std::sync::atomic::Ordering::SeqCst));
+                        assert!(!fresh_token.is_cancelled());
+                        assert!(!other_token.is_cancelled());
+                        assert_eq!(clients.active_addr(handle), Some(addr));
+                        assert!(clients.alive(handle));
+                        let current = sender.conns.lock().await;
+                        let replacement_conn: Connection = replacement.clone();
+                        assert!(Arc::ptr_eq(&current[&handle].1, &replacement_conn));
+                        drop(current);
+                        sender.terminate().await;
+                    }
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_release_without_transport_snapshot_checks_original_revision() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let connection = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = connection.sender();
+                let original = connection.capture_revision(handle).unwrap();
+                clients.invalidate_target(handle);
+                let current = Arc::new(RefusedConnection {
+                    stall_close: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(
+                        handle,
+                        "127.0.0.1:2".parse().unwrap(),
+                        current.clone(),
+                    )
+                    .await;
+                let fresh_token = clients.target_token(handle).unwrap();
+                let held = sender.conns.lock().await;
+                connection.abort_capture_at_revision(handle, original);
+                drop(held);
+                tokio::task::yield_now().await;
+                assert!(!fresh_token.is_cancelled());
+                assert!(!current.closed.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(clients.active_addr(handle).is_some());
+                connection.abort_capture_at_revision(
+                    handle,
+                    connection.capture_revision(handle).unwrap(),
+                );
+                assert!(fresh_token.is_cancelled());
+                assert!(clients.active_addr(handle).is_none());
+                assert!(sender.conns.lock().await.get(&handle).is_none());
+                sender.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_connection_table_wait_is_bounded_and_cleans_after_contention() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let connection = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = connection.sender();
+                let addr = "127.0.0.1:2".parse().unwrap();
+                let transport = Arc::new(RefusedConnection {
+                    succeed_send: true,
+                    ..Default::default()
+                });
+                sender
+                    .install_test_connection(handle, addr, transport.clone())
+                    .await;
+                let guard = sender.conns.lock().await;
+                assert!(matches!(
+                    tokio::time::timeout(
+                        Duration::from_millis(400),
+                        sender.send(ProtoEvent::Ping, handle)
+                    )
+                    .await
+                    .unwrap(),
+                    Err(LanMouseConnectionError::Timeout)
+                ));
+                assert!(transport.sent.lock().unwrap().is_empty());
+                drop(guard);
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    while clients.active_addr(handle).is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(connection.take_disconnected(), vec![handle]);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_deadline_short_send_cleanup_budget_and_replacement_are_safe() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        for (stall, short) in [(true, false), (false, true)] {
+            let conn = Arc::new(RefusedConnection {
+                stall_send: stall,
+                stall_close: true,
+                short_send: short,
+                ..Default::default()
+            });
+            sender
+                .install_test_connection(handle, addr, conn.clone())
+                .await;
+            let result = tokio::time::timeout(
+                Duration::from_millis(400),
+                sender.send(ProtoEvent::Ack(0), handle),
+            )
+            .await
+            .unwrap();
+            if stall {
+                assert!(matches!(result, Err(LanMouseConnectionError::Timeout)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(LanMouseConnectionError::Incomplete { .. })
+                ));
+            }
+            assert!(clients.active_addr(handle).is_none());
+            assert_eq!(connection.take_disconnected(), vec![handle]);
+        }
+        let stalled = Arc::new(RefusedConnection {
+            stall_send: true,
+            ..Default::default()
+        });
+        sender
+            .install_test_connection(handle, addr, stalled.clone())
+            .await;
+        let cleanup = connection.prepare_cleanup(handle).unwrap();
+        let events = vec![ProtoEvent::Ack(0); 100];
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(400),
+                connection.send_cleanup(cleanup, events)
+            )
+            .await
+            .unwrap(),
+            Err(LanMouseConnectionError::Timeout)
+        ));
+        assert_eq!(stalled.sent.lock().unwrap().len(), 1);
+        let old = Arc::new(RefusedConnection {
+            succeed_send: true,
+            ..Default::default()
+        });
+        sender
+            .install_test_connection(handle, addr, old.clone())
+            .await;
+        let cleanup = connection.prepare_cleanup(handle).unwrap();
+        let replacement = Arc::new(RefusedConnection {
+            succeed_send: true,
+            ..Default::default()
+        });
+        sender
+            .install_test_connection(handle, addr, replacement.clone())
+            .await;
+        assert!(
+            connection
+                .send_cleanup(cleanup, vec![ProtoEvent::Leave(0, 0.5)])
+                .await
+                .is_err()
+        );
+        assert!(old.sent.lock().unwrap().is_empty());
+        assert!(replacement.sent.lock().unwrap().is_empty());
+        assert_eq!(clients.active_addr(handle), Some(addr));
+        let cleanup = connection.prepare_cleanup(handle).unwrap();
+        let events = vec![
+            ProtoEvent::Ack(0),
+            ProtoEvent::Pong(true),
+            ProtoEvent::Leave(0, 0.5),
+        ];
+        connection
+            .send_cleanup(cleanup, events.clone())
+            .await
+            .unwrap();
+        let received: Vec<_> = replacement
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|bytes| lan_mouse_proto::decode_event_frame(bytes).unwrap())
+            .collect();
+        assert_eq!(received.len(), events.len());
+        for (actual, expected) in received.iter().zip(events) {
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_notice_precedes_stalled_transport_cleanup_and_heartbeat_send_is_bounded() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let conn: Connection = Arc::new(RefusedConnection {
+            stall_close: true,
+            ..Default::default()
+        });
+        sender
+            .peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&conn), "peer".into()));
+        clients.set_active_addr(handle, Some(addr));
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, conn.clone()));
+        let close = disconnect(&clients, handle, addr, &conn, &sender.conns, &sender.closed);
+        tokio::pin!(close);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut close)
+                .await
+                .is_err()
+        );
+        assert_eq!(connection.take_disconnected(), vec![handle]);
+        assert!(clients.active_addr(handle).is_none());
+        assert!(sender.conns.try_lock().is_ok());
+        close.await; // transport cleanup itself has the existing one-second bound.
+        let stalled: Connection = Arc::new(RefusedConnection {
+            stall_send: true,
+            ..Default::default()
+        });
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            ping_pong(addr, stalled, Rc::new(Cell::new(false))),
+        )
+        .await
+        .unwrap();
+        let short: Connection = Arc::new(RefusedConnection {
+            short_send: true,
+            ..Default::default()
+        });
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            ping_pong(addr, short, Rc::new(Cell::new(false))),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_notices_coalesce_filter_replacement_revision_and_do_not_keep_sessions_alive() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        clients.activate_client(handle);
+        let connection = LanMouseConnection::new(
+            Certificate::generate_self_signed(vec![]).unwrap(),
+            clients.clone(),
+        );
+        let sender = connection.sender();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let old: Connection = Arc::new(RefusedConnection::default());
+        let new: Connection = Arc::new(RefusedConnection::default());
+        sender
+            .peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&old), "peer".into()));
+        for _ in 0..1000 {
+            sender.closed.publish(&clients, handle, &old);
+        }
+        assert_eq!(sender.closed.pending.borrow().len(), 1);
+        assert_eq!(connection.take_disconnected(), vec![handle]);
+        assert!(connection.take_disconnected().is_empty());
+        sender.closed.publish(&clients, handle, &old);
+        sender
+            .peer_identities
+            .borrow_mut()
+            .insert(handle, (Arc::downgrade(&new), "peer".into()));
+        assert!(connection.take_disconnected().is_empty());
+        sender.closed.publish(&clients, handle, &new);
+        clients.invalidate_target(handle);
+        assert!(connection.take_disconnected().is_empty());
+        clients.set_active_addr(handle, Some(addr));
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(handle, (addr, new.clone()));
+        // A stale close cannot publish a notice for the new current transport.
+        disconnect(&clients, handle, addr, &old, &sender.conns, &sender.closed).await;
+        assert!(connection.take_disconnected().is_empty());
+        disconnect(&clients, handle, addr, &new, &sender.conns, &sender.closed).await;
+        disconnect(&clients, handle, addr, &new, &sender.conns, &sender.closed).await;
+        let weak = Arc::downgrade(&new);
+        drop(new);
+        assert!(weak.upgrade().is_none());
+        // An unrelated handshake may prune this now-dead Weak metadata.
+        sender.peer_identities.borrow_mut().remove(&handle);
+        assert_eq!(connection.take_disconnected(), vec![handle]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_disconnect_preserves_replacement_and_other_device() {
+        let clients = ClientManager::default();
+        let handle = clients.add_client();
+        let other = clients.add_client();
+        let addr = "127.0.0.1:2".parse().unwrap();
+        let old: Connection = Arc::new(RefusedConnection::default());
+        let new: Connection = Arc::new(RefusedConnection::default());
+        let conns = Mutex::new(HashMap::from([
+            (handle, (addr, new.clone())),
+            (other, (addr, old.clone())),
+        ]));
+        clients.set_active_addr(handle, Some(addr));
+        clients.set_alive(handle, true);
+        disconnect(
+            &clients,
+            handle,
+            addr,
+            &old,
+            &conns,
+            &ClosedConnections::default(),
+        )
+        .await;
+        assert_eq!(clients.active_addr(handle), Some(addr));
+        assert!(clients.alive(handle));
+        assert_eq!(conns.lock().await.len(), 2);
+        disconnect(
+            &clients,
+            handle,
+            addr,
+            &new,
+            &conns,
+            &ClosedConnections::default(),
+        )
+        .await;
+        assert_eq!(clients.active_addr(handle), None);
+        assert!(!clients.alive(handle));
+        assert!(conns.lock().await.contains_key(&other));
+    }
+
+    #[test]
+    fn old_attempt_cleanup_preserves_replacement_even_at_same_revision() {
+        let old = Rc::new(());
+        let new = Rc::new(());
+        let mut attempts = HashMap::from([(1, (7, new.clone()))]);
+        finish_attempt(&mut attempts, 1, &old);
+        assert!(attempts.contains_key(&1));
+        finish_attempt(&mut attempts, 1, &new);
+        assert!(attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_target_starts_new_real_handshake_without_waiting_for_old_timeout() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let old_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let new_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.set_fix_ips(handle, vec!["127.0.0.1".parse().unwrap()]);
+                clients.set_port(handle, old_peer.local_addr().unwrap().port());
+                clients.activate_client(handle);
+                let owner = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = owner.sender();
+                let old_token = clients.target_token(handle).unwrap();
+                assert!(sender.send(ProtoEvent::Ping, handle).await.is_err());
+                let mut packet = [0u8; 2048];
+                tokio::time::timeout(Duration::from_secs(2), old_peer.recv_from(&mut packet))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                clients.set_port(handle, new_peer.local_addr().unwrap().port());
+                assert!(old_token.is_cancelled());
+                assert!(sender.send(ProtoEvent::Ping, handle).await.is_err());
+                tokio::time::timeout(Duration::from_secs(2), new_peer.recv_from(&mut packet))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                clients.remove_client(handle);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if sender.connecting.lock().await.is_empty() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(clients.active_addr(handle).is_none());
+                while old_peer.try_recv_from(&mut packet).is_ok() {}
+                // Neither loopback peer replies: no old DTLS handshake should keep
+                // retransmitting after the cancellation has unwound its tasks.
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(1300),
+                        old_peer.recv_from(&mut packet)
+                    )
+                    .await
+                    .is_err()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_idle_receiver_and_closes_its_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let clients = ClientManager::default();
+                let handle = clients.add_client();
+                clients.activate_client(handle);
+                let owner = LanMouseConnection::new(
+                    Certificate::generate_self_signed(vec![]).unwrap(),
+                    clients.clone(),
+                );
+                let sender = owner.sender();
+                let target = sender.target(handle).unwrap();
+                let mock = Arc::new(RefusedConnection::default());
+                let conn: Connection = mock.clone();
+                let addr = "127.0.0.1:2".parse().unwrap();
+                sender
+                    .conns
+                    .lock()
+                    .await
+                    .insert(handle, (addr, conn.clone()));
+                clients.set_active_addr(handle, Some(addr));
+                clients.set_alive(handle, true);
+                let task = spawn_local(receive_loop(
+                    clients.clone(),
+                    target,
+                    addr,
+                    conn,
+                    sender.conns.clone(),
+                    sender.recv_tx.clone(),
+                    Rc::new(Cell::new(false)),
+                ));
+                tokio::task::yield_now().await;
+                clients.set_port(handle, 1234);
+                tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(mock.closed.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(sender.conns.lock().await.is_empty());
+            })
+            .await;
+    }
 
     #[test]
     fn bind_addr_matches_target_family() {

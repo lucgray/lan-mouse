@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use evdev::{AttributeSet, KeyCode, RelativeAxisCode, uinput::VirtualDevice};
 use input_event::{KeyboardEvent, PointerEvent};
+use std::collections::HashMap;
+
+use crate::motion::quantize_motion;
 
 use crate::{Emulation, EmulationError, EmulationHandle, error::EvdevEmulationCreationError};
 
@@ -8,6 +11,7 @@ const WHEEL_SENSITIVITY: f64 = 3.0;
 
 pub(crate) struct EvdevEmulation {
     dev: VirtualDevice,
+    motion_remainders: HashMap<EmulationHandle, (f64, f64)>,
 }
 
 impl EvdevEmulation {
@@ -25,7 +29,10 @@ impl EvdevEmulation {
                 RelativeAxisCode::REL_HWHEEL_HI_RES,
             ]))?
             .build()?;
-        Ok(EvdevEmulation { dev })
+        Ok(EvdevEmulation {
+            dev,
+            motion_remainders: HashMap::new(),
+        })
     }
 }
 
@@ -34,15 +41,22 @@ impl Emulation for EvdevEmulation {
     async fn consume(
         &mut self,
         event: input_event::Event,
-        _: EmulationHandle,
+        handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         match event {
             input_event::Event::Pointer(p) => match p {
                 PointerEvent::Motion { time: _, dx, dy } => {
+                    let residual = self
+                        .motion_remainders
+                        .get(&handle)
+                        .copied()
+                        .unwrap_or_default();
+                    let ((x, y), remainder) = quantize_motion((dx, dy), residual);
                     self.dev.emit(&[
-                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_X, dx.round() as i32),
-                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_Y, dy.round() as i32),
+                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_X, x),
+                        *evdev::RelativeAxisEvent::new(RelativeAxisCode::REL_Y, y),
                     ])?;
+                    self.motion_remainders.insert(handle, remainder);
                 }
                 PointerEvent::Button {
                     time: _,
@@ -71,10 +85,7 @@ impl Emulation for EvdevEmulation {
                     )])?;
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    let (axis, value) = match axis {
-                        0 => (RelativeAxisCode::REL_WHEEL_HI_RES, -value),
-                        _ => (RelativeAxisCode::REL_HWHEEL_HI_RES, value),
-                    };
+                    let (axis, value) = discrete_scroll_event(axis, value);
                     self.dev
                         .emit(&[*evdev::RelativeAxisEvent::new(axis, value)])?;
                 }
@@ -97,8 +108,54 @@ impl Emulation for EvdevEmulation {
     }
 
     async fn create(&mut self, _: EmulationHandle) {}
-    async fn destroy(&mut self, _: EmulationHandle) {}
-    async fn terminate(&mut self) {}
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        self.motion_remainders.remove(&handle);
+    }
+    async fn terminate(&mut self) {
+        self.motion_remainders.clear();
+    }
+}
+
+fn discrete_scroll_event(axis: u8, value: i32) -> (RelativeAxisCode, i32) {
+    match axis {
+        0 => (RelativeAxisCode::REL_WHEEL_HI_RES, value.saturating_neg()),
+        _ => (RelativeAxisCode::REL_HWHEEL_HI_RES, value),
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    #[test]
+    fn discrete_scroll_conversion_preserves_axes_and_saturates_vertical_minimum() {
+        for value in [i32::MIN, -240, -120, -1, 0, 1, 120, 240, i32::MAX] {
+            for axis in [0, 1] {
+                let event =
+                    input_event::Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value });
+                assert!(event.validate_input().is_ok());
+                let (native_axis, native_value) = discrete_scroll_event(axis, value);
+                assert_eq!(
+                    native_axis,
+                    if axis == 0 {
+                        RelativeAxisCode::REL_WHEEL_HI_RES
+                    } else {
+                        RelativeAxisCode::REL_HWHEEL_HI_RES
+                    }
+                );
+                let expected = if axis == 0 {
+                    (-i64::from(value)).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+                } else {
+                    value
+                };
+                assert_eq!(native_value, expected);
+            }
+        }
+        assert_eq!(
+            discrete_scroll_event(0, 120),
+            (RelativeAxisCode::REL_WHEEL_HI_RES, -120)
+        );
+    }
 }
 
 const ALL_KEYS: [KeyCode; 549] = [
@@ -740,3 +797,61 @@ const ALL_KEYS: [KeyCode; 549] = [
     KeyCode::BTN_TRIGGER_HAPPY39,
     KeyCode::BTN_TRIGGER_HAPPY40,
 ];
+
+#[cfg(test)]
+mod motion_tests {
+    use super::quantize_motion;
+
+    #[test]
+    fn invalid_or_saturated_motion_does_not_poison_next_normal_motion() {
+        for dx in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            let (_, residual) = quantize_motion((dx, 0.4), (0.0, 0.0));
+            assert!(residual.0.is_finite() && residual.0.abs() <= 0.5);
+            let (next, residual) = quantize_motion((1.0, 0.4), residual);
+            assert_eq!(next, (1, 1));
+            assert!(residual.0.abs() <= 0.5 && residual.1.abs() <= 0.5);
+        }
+        for residual in [f64::NAN, f64::INFINITY, 10.0, -10.0] {
+            assert_eq!(
+                quantize_motion((1.0, -1.0), (residual, residual)),
+                ((1, -1), (0.0, 0.0))
+            );
+        }
+        assert_eq!(
+            quantize_motion((f64::NAN, 0.0), (0.4, 0.0)),
+            ((0, 0), (0.4, 0.0))
+        );
+        assert_eq!(
+            quantize_motion((f64::MAX, -f64::MAX), (0.0, 0.0)),
+            ((i32::MAX, i32::MIN), (0.0, 0.0))
+        );
+    }
+
+    #[test]
+    fn slow_motion_preserves_total_displacement_and_reversals() {
+        let mut residual = (0.0, 0.0);
+        let mut total = (0, 0);
+        for dx in [0.4; 100].into_iter().chain([-0.4; 100]) {
+            let (motion, next) = quantize_motion((dx, -dx), residual);
+            residual = next;
+            total.0 += motion.0;
+            total.1 += motion.1;
+            assert!(residual.0.abs() <= 0.5 && residual.1.abs() <= 0.5);
+        }
+        assert_eq!(total, (0, 0));
+        let mut residual = (0.0, 0.0);
+        let mut total = 0;
+        for _ in 0..100 {
+            let ((x, _), next) = quantize_motion((0.4, 0.0), residual);
+            total += x;
+            residual = next;
+        }
+        assert_eq!(total, 40);
+    }
+}

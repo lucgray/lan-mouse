@@ -4,7 +4,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use glib::subclass::InitializingObject;
 use gtk::{
-    Button, CompositeTemplate, Text,
+    Button, CompositeTemplate, Label, Text,
     glib::{self, subclass::Signal},
     template_callbacks,
 };
@@ -18,6 +18,8 @@ pub struct FingerprintWindow {
     pub fingerprint: TemplateChild<Text>,
     #[template_child]
     pub confirm_button: TemplateChild<Button>,
+    #[template_child]
+    pub validation_error: TemplateChild<Label>,
 }
 
 #[glib::object_subclass]
@@ -41,9 +43,26 @@ impl ObjectSubclass for FingerprintWindow {
 #[template_callbacks]
 impl FingerprintWindow {
     #[template_callback]
+    fn handle_fingerprint_changed(&self, _text: &Text) {
+        self.validation_error.set_visible(false);
+        self.fingerprint.remove_css_class("error");
+    }
+
+    #[template_callback]
     fn handle_confirm(&self, _button: Button) {
         let desc = self.description.text().as_str().trim().to_owned();
-        let fp = self.fingerprint.text().as_str().trim().to_owned();
+        let fp = match lan_mouse_ipc::normalize_fingerprint(self.fingerprint.text().as_str()) {
+            Ok(fp) => fp,
+            Err(error) => {
+                self.validation_error.set_label(&error.to_string());
+                self.validation_error.set_visible(true);
+                self.fingerprint.add_css_class("error");
+                self.fingerprint.grab_focus();
+                return;
+            }
+        };
+        self.fingerprint.set_text(&fp);
+        self.handle_fingerprint_changed(&self.fingerprint);
         self.obj().emit_by_name("confirm-clicked", &[&desc, &fp])
     }
 }

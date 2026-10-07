@@ -49,7 +49,7 @@ pub struct ChordRemap {
 }
 
 /// Resolution state of a chord-eligible modifier that's currently held.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChordEntry {
     trigger: scancode::Linux,
     to: scancode::Linux,
@@ -124,6 +124,18 @@ impl KeyRemap {
             active: HashMap::new(),
             raw_mask: (0, 0, 0, 0),
         }
+    }
+
+    /// Discard session state after transport failure without changing rules.
+    pub(crate) fn reset_session(&mut self) {
+        self.pending.clear();
+        self.active.clear();
+        self.raw_mask = (0, 0, 0, 0);
+    }
+
+    /// Compare configuration only; held-key/chord state belongs to the session.
+    pub(crate) fn same_rules(&self, other: &Self) -> bool {
+        self.keys == other.keys && self.chords == other.chords
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -361,6 +373,25 @@ mod test {
             locked: 0,
             group: 0,
         })
+    }
+
+    #[test]
+    fn failed_session_reset_preserves_rules_without_old_modifiers() {
+        for resolved in [false, true] {
+            let mut r = swap_with_chord();
+            r.apply(key_ev(KeyLeftMeta, 1));
+            r.apply(mods(1 << 6));
+            if resolved {
+                r.apply(key_ev(KeyTab, 1));
+            }
+            r.reset_session();
+            assert_eq!(r.apply(key_ev(KeyC, 1)), vec![key_ev(KeyC, 1)]);
+            assert!(r.apply(key_ev(KeyLeftMeta, 1)).is_empty());
+            assert_eq!(
+                r.apply(key_ev(KeyTab, 1)),
+                vec![key_ev(KeyLeftAlt, 1), mods(0), key_ev(KeyTab, 1)]
+            );
+        }
     }
 
     #[test]

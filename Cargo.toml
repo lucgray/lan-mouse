@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/webrtc-util", "vendor/webrtc-dtls"]
 members = [
     "input-capture",
     "input-emulation",
@@ -71,6 +72,7 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+tempfile = "3.27"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
@@ -88,6 +90,7 @@ windows = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
     "Win32_System_RemoteDesktop",
     "Win32_System_Environment",
     "Win32_System_Diagnostics_ToolHelp",
@@ -125,3 +128,11 @@ resources = ["target/menubar-template.png"]
 [package.metadata.bundle.osx]
 info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 
+
+[dev-dependencies]
+async-trait = "0.1.80"
+tokio = { version = "1.32.0", features = ["test-util"] }
+
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }
+webrtc-dtls = { path = "vendor/webrtc-dtls" }

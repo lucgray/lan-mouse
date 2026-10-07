@@ -1,4 +1,8 @@
-use std::cell::RefCell;
+use super::draft::Draft;
+use std::{
+    cell::{Cell, RefCell},
+    time::Duration,
+};
 
 use adw::subclass::prelude::*;
 use adw::{ActionRow, ComboRow, prelude::*};
@@ -6,7 +10,7 @@ use glib::{Binding, subclass::InitializingObject};
 use gtk::glib::subclass::Signal;
 use gtk::glib::{SignalHandlerId, clone};
 use gtk::{Button, CompositeTemplate, Entry, Switch, glib};
-use lan_mouse_ipc::Position;
+use lan_mouse_ipc::{DEFAULT_PORT, Position};
 use std::sync::OnceLock;
 
 use crate::client_object::ClientObject;
@@ -31,6 +35,11 @@ pub struct ClientRow {
     #[template_child]
     pub dns_loading_indicator: TemplateChild<gtk::Spinner>,
     pub bindings: RefCell<Vec<Binding>>,
+    hostname_draft: RefCell<Draft<String>>,
+    hostname_timeout: RefCell<Option<glib::SourceId>>,
+    port_draft: RefCell<Draft<u16>>,
+    port_invalid: Cell<bool>,
+    port_timeout: RefCell<Option<glib::SourceId>>,
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,
     position_change_handler: RefCell<Option<SignalHandlerId>>,
@@ -83,6 +92,30 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.port_change_handler.replace(Some(handler));
+        self.hostname.connect_activate(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| row.flush_hostname()
+        ));
+        self.port.connect_activate(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| row.flush_port()
+        ));
+        let hostname_focus = gtk::EventControllerFocus::new();
+        hostname_focus.connect_leave(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| row.flush_hostname()
+        ));
+        self.hostname.add_controller(hostname_focus);
+        let port_focus = gtk::EventControllerFocus::new();
+        port_focus.connect_leave(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| row.flush_port()
+        ));
+        self.port.add_controller(port_focus);
         let handler = self.position.connect_selected_notify(clone!(
             #[weak(rename_to = row)]
             self,
@@ -102,6 +135,10 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.set_state_handler.replace(Some(handler));
+    }
+
+    fn dispose(&self) {
+        self.cancel_pending_edits();
     }
 
     fn signals() -> &'static [glib::subclass::Signal] {
@@ -137,24 +174,128 @@ impl ClientRow {
 
     #[template_callback]
     fn handle_request_dns(&self, _: &Button) {
+        self.flush_hostname();
+        self.flush_port();
         self.obj().emit_by_name::<()>("request-dns", &[]);
     }
 
     #[template_callback]
     fn handle_client_delete(&self, _button: &Button) {
+        self.cancel_pending_edits();
         self.obj().emit_by_name::<()>("request-delete", &[]);
     }
 
     fn handle_port_changed(&self, port_entry: &Entry) {
-        if let Ok(port) = port_entry.text().parse::<u16>() {
-            self.obj()
-                .emit_by_name::<()>("request-port-change", &[&(port as u32)]);
+        if let Some(timeout) = self.port_timeout.borrow_mut().take() {
+            timeout.remove();
+        }
+        let text = port_entry.text();
+        let port = if text.is_empty() {
+            Ok(DEFAULT_PORT)
+        } else {
+            text.parse::<u16>()
+        };
+        match port {
+            Ok(port) => {
+                self.port_invalid.set(false);
+                port_entry.remove_css_class("error");
+                self.port_draft.borrow_mut().stage(port);
+                let timeout = glib::timeout_add_local_once(
+                    Duration::from_millis(400),
+                    clone!(
+                        #[weak(rename_to = row)]
+                        self,
+                        move || {
+                            row.port_timeout.borrow_mut().take();
+                            row.flush_port();
+                        }
+                    ),
+                );
+                self.port_timeout.replace(Some(timeout));
+            }
+            Err(_) => {
+                self.port_invalid.set(true);
+                self.port_draft.borrow_mut().clear();
+                port_entry.add_css_class("error");
+            }
         }
     }
 
     fn handle_hostname_changed(&self, hostname_entry: &Entry) {
-        self.obj()
-            .emit_by_name::<()>("request-hostname-change", &[&hostname_entry.text()]);
+        if let Some(timeout) = self.hostname_timeout.borrow_mut().take() {
+            timeout.remove();
+        }
+        self.hostname_draft
+            .borrow_mut()
+            .stage(hostname_entry.text().to_string());
+        let timeout = glib::timeout_add_local_once(
+            Duration::from_millis(400),
+            clone!(
+                #[weak(rename_to = row)]
+                self,
+                move || {
+                    row.hostname_timeout.borrow_mut().take();
+                    row.flush_hostname();
+                }
+            ),
+        );
+        self.hostname_timeout.replace(Some(timeout));
+    }
+
+    pub(super) fn flush_hostname(&self) {
+        if let Some(timeout) = self.hostname_timeout.borrow_mut().take() {
+            timeout.remove();
+        }
+        let confirmed = self
+            .client_object
+            .borrow()
+            .as_ref()
+            .map(|client| client.get_data().hostname.unwrap_or_default());
+        if let Some(confirmed) = confirmed {
+            let value = self.hostname_draft.borrow_mut().submit(&confirmed);
+            if let Some(value) = value {
+                self.obj()
+                    .emit_by_name::<()>("request-hostname-change", &[&value]);
+            }
+        }
+    }
+
+    pub(super) fn flush_port(&self) {
+        if let Some(timeout) = self.port_timeout.borrow_mut().take() {
+            timeout.remove();
+        }
+        let confirmed = self
+            .client_object
+            .borrow()
+            .as_ref()
+            .map(|client| client.get_data().port as u16);
+        if let Some(confirmed) = confirmed {
+            let value = self.port_draft.borrow_mut().submit(&confirmed);
+            if let Some(value) = value {
+                self.obj()
+                    .emit_by_name::<()>("request-port-change", &[&(value as u32)]);
+            }
+        }
+    }
+
+    pub(super) fn reject_edit_submission(&self, hostname: bool) {
+        if hostname {
+            self.hostname_draft.borrow_mut().reject_submission();
+        } else {
+            self.port_draft.borrow_mut().reject_submission();
+        }
+    }
+
+    pub(super) fn cancel_pending_edits(&self) {
+        if let Some(timeout) = self.hostname_timeout.borrow_mut().take() {
+            timeout.remove();
+        }
+        if let Some(timeout) = self.port_timeout.borrow_mut().take() {
+            timeout.remove();
+        }
+        self.hostname_draft.borrow_mut().clear();
+        self.port_draft.borrow_mut().clear();
+        self.port_invalid.set(false);
     }
 
     fn handle_position_changed(&self, position: &ComboRow) {
@@ -163,6 +304,13 @@ impl ClientRow {
     }
 
     pub(super) fn set_hostname(&self, hostname: Option<String>) {
+        if !self
+            .hostname_draft
+            .borrow_mut()
+            .accept(&hostname.clone().unwrap_or_default())
+        {
+            return;
+        }
         let position = self.hostname.position();
         let handler = self.hostname_change_handler.borrow();
         let handler = handler.as_ref().expect("signal handler");
@@ -177,6 +325,9 @@ impl ClientRow {
     }
 
     pub(super) fn set_port(&self, port: u16) {
+        if self.port_invalid.get() || !self.port_draft.borrow_mut().accept(&port) {
+            return;
+        }
         let position = self.port.position();
         let handler = self.port_change_handler.borrow();
         let handler = handler.as_ref().expect("signal handler");

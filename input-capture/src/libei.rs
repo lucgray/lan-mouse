@@ -3,7 +3,7 @@ use ashpd::{
         PersistMode, Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, StartOptions, Zones,
+            InputCapture, Region, ReleaseOptions, StartOptions, Zones, ZonesChanged,
         },
     },
     enumflags2::BitFlags,
@@ -16,16 +16,13 @@ use reis::{
     tokio::EiConvertEventStream,
 };
 use std::{
-    cell::Cell,
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, Write},
     num::NonZeroU32,
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        net::UnixStream,
-    },
-    path::PathBuf,
+    os::unix::{fs::PermissionsExt, net::UnixStream},
+    path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
     sync::{Arc, LazyLock, Mutex, Once},
@@ -81,10 +78,43 @@ enum LibeiNotifyEvent {
     Destroy(Position),
 }
 
+// Keep only the next desired state while the current session still uses its snapshot.
+struct CaptureClientUpdates {
+    clients: Vec<Position>,
+}
+
+impl CaptureClientUpdates {
+    fn new(clients: &[Position]) -> Self {
+        Self {
+            clients: clients.to_vec(),
+        }
+    }
+
+    fn record(&mut self, event: LibeiNotifyEvent) {
+        match event {
+            LibeiNotifyEvent::Create(pos) => {
+                if !self.clients.contains(&pos) {
+                    self.clients.push(pos);
+                }
+            }
+            LibeiNotifyEvent::Destroy(pos) => self.clients.retain(|p| *p != pos),
+        }
+    }
+
+    fn finish(self) -> Vec<Position> {
+        self.clients
+    }
+
+    #[cfg(test)]
+    fn retained_positions(&self) -> usize {
+        self.clients.len()
+    }
+}
+
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
-    input_capture: Pin<Box<InputCapture>>,
-    capture_task: JoinHandle<Result<(), CaptureError>>,
+    input_capture: Arc<InputCapture>,
+    capture_task: CaptureTaskCompletion,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
@@ -92,16 +122,92 @@ pub struct LibeiInputCapture {
     terminated: bool,
 }
 
-/// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
-    let (x, y) = (r.x_offset(), r.y_offset());
-    let (w, h) = (r.width() as i32, r.height() as i32);
-    match pos {
-        Position::Left => (x, y, x, y + h - 1),
-        Position::Right => (x + w, y, x + w, y + h - 1),
-        Position::Top => (x, y, x + w - 1, y),
-        Position::Bottom => (x, y + h, x + w - 1, y + h),
+struct CaptureTaskCompletion {
+    handle: JoinHandle<Result<(), CaptureError>>,
+    joined: bool,
+}
+
+impl CaptureTaskCompletion {
+    fn spawn_owned<T: 'static, F, Fut>(owner: Arc<T>, run: F) -> Self
+    where
+        F: FnOnce(Arc<T>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<(), CaptureError>> + 'static,
+    {
+        let handle = tokio::task::spawn_local(async move {
+            // Retain the resource even if the frontend/JoinHandle is dropped.
+            let result = run(owner.clone()).await;
+            drop(owner);
+            result
+        });
+        Self {
+            handle,
+            joined: false,
+        }
     }
+
+    fn result(
+        result: Result<Result<(), CaptureError>, tokio::task::JoinError>,
+    ) -> Result<(), CaptureError> {
+        result.unwrap_or_else(|error| {
+            Err(io::Error::other(format!("libei capture task failed: {error}")).into())
+        })
+    }
+
+    fn poll_result(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<(), CaptureError>>> {
+        if self.joined {
+            return Poll::Ready(None);
+        }
+        match self.handle.poll_unpin(cx) {
+            Poll::Ready(result) => {
+                self.joined = true;
+                Poll::Ready(Some(Self::result(result)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    async fn join(&mut self) -> Result<(), CaptureError> {
+        if self.joined {
+            return Ok(());
+        }
+        // is_finished does not mean the result was consumed. Await even an
+        // already-finished handle, and mark it joined only after completion.
+        let result = (&mut self.handle).await;
+        self.joined = true;
+        Self::result(result)
+    }
+}
+
+/// returns (start pos, end pos), inclusive
+fn pos_to_barrier(r: &Region, pos: Position) -> Result<(i32, i32, i32, i32), CaptureError> {
+    if r.width() == 0 || r.height() == 0 {
+        return Err(io::Error::other("libei region has empty dimensions").into());
+    }
+    let (x, y) = (i64::from(r.x_offset()), i64::from(r.y_offset()));
+    let (w, h) = (i64::from(r.width()), i64::from(r.height()));
+    let coordinate = |value| {
+        i32::try_from(value).map_err(|_| {
+            CaptureError::from(io::Error::other(
+                "libei region endpoint exceeds i32 coordinates",
+            ))
+        })
+    };
+    // Validate the owning region as well as the selected boundary. A valid left
+    // barrier must not carry out-of-range bounds for later release/entry math.
+    let (last_x, last_y) = (coordinate(x + w - 1)?, coordinate(y + h - 1)?);
+    let (origin_x, origin_y) = (r.x_offset(), r.y_offset());
+    Ok(match pos {
+        Position::Left => (origin_x, origin_y, origin_x, last_y),
+        Position::Right => {
+            let right = coordinate(x + w)?;
+            (right, origin_y, right, last_y)
+        }
+        Position::Top => (origin_x, origin_y, last_x, origin_y),
+        Position::Bottom => {
+            let bottom = coordinate(y + h)?;
+            (origin_x, bottom, last_x, bottom)
+        }
+    })
 }
 
 /// Ashpd does not expose fields
@@ -109,6 +215,7 @@ fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
 struct ICBarrier {
     barrier_id: BarrierID,
     position: (i32, i32, i32, i32),
+    zone_bounds: Option<(f64, f64, f64, f64)>,
 }
 
 impl ICBarrier {
@@ -116,7 +223,24 @@ impl ICBarrier {
         Self {
             barrier_id,
             position,
+            zone_bounds: None,
         }
+    }
+
+    fn for_region(
+        barrier_id: BarrierID,
+        region: &Region,
+        pos: Position,
+    ) -> Result<Self, CaptureError> {
+        let mut barrier = Self::new(barrier_id, pos_to_barrier(region, pos)?);
+        let (x, y) = (f64::from(region.x_offset()), f64::from(region.y_offset()));
+        barrier.zone_bounds = Some((
+            x,
+            y,
+            x + f64::from(region.width()) - 1.,
+            y + f64::from(region.height()) - 1.,
+        ));
+        Ok(barrier)
     }
 }
 
@@ -130,7 +254,7 @@ fn select_barriers(
     zones: &Zones,
     clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-) -> (Vec<ICBarrier>, HashMap<BarrierID, Position>) {
+) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), CaptureError> {
     let mut pos_for_barrier = HashMap::new();
     let mut barriers: Vec<ICBarrier> = vec![];
 
@@ -140,17 +264,40 @@ fn select_barriers(
             .iter()
             .map(|r| {
                 let id = *next_barrier_id;
-                *next_barrier_id = next_barrier_id
-                    .checked_add(1)
-                    .expect("barrier id out of range");
-                let position = pos_to_barrier(r, *pos);
+                *next_barrier_id = next_barrier_id.checked_add(1).ok_or_else(|| {
+                    io::Error::other("libei barrier ID exhausted; re-enable capture")
+                })?;
                 pos_for_barrier.insert(id, *pos);
-                ICBarrier::new(id, position)
+                ICBarrier::for_region(id, r, *pos)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         barriers.append(&mut client_barriers);
     }
-    (barriers, pos_for_barrier)
+    Ok((barriers, pos_for_barrier))
+}
+
+fn accepted_barriers(
+    mut barriers: Vec<ICBarrier>,
+    mut id_map: HashMap<BarrierID, Position>,
+    failed: &[BarrierID],
+) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), CaptureError> {
+    let requested = barriers.len();
+    if !failed.is_empty() {
+        let failed: HashSet<_> = failed.iter().copied().collect();
+        barriers.retain(|barrier| !failed.contains(&barrier.barrier_id));
+        id_map.retain(|id, _| !failed.contains(id));
+        log::warn!(
+            "portal rejected pointer barriers {failed:?}; {} of {requested} remain",
+            barriers.len()
+        );
+    }
+    if barriers.is_empty() {
+        return Err(io::Error::other(format!(
+            "portal accepted no pointer barriers ({requested} requested)"
+        ))
+        .into());
+    }
+    Ok((barriers, id_map))
 }
 
 async fn update_barriers(
@@ -158,14 +305,14 @@ async fn update_barriers(
     session: &Session<InputCapture>,
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
-) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), ashpd::Error> {
+) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), CaptureError> {
     let zones = input_capture
         .zones(session, Default::default())
         .await?
         .response()?;
     log::debug!("zones: {zones:?}");
 
-    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
+    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id)?;
     log::debug!("barriers: {barriers:?}");
     log::debug!("client for barrier id: {id_map:?}");
 
@@ -180,7 +327,7 @@ async fn update_barriers(
         .await?;
     let response = response.response()?;
     log::debug!("{response:?}");
-    Ok((barriers, id_map))
+    accepted_barriers(barriers, id_map, response.failed_barriers())
 }
 
 fn capabilities() -> BitFlags<Capabilities> {
@@ -201,37 +348,63 @@ fn get_token_file_path() -> PathBuf {
 }
 
 /// Read the InputCapture token from file
-fn read_token() -> Option<String> {
-    let token_path = get_token_file_path();
-    match fs::read_to_string(&token_path) {
-        // an interrupted write leaves the file empty, which is no token at all
+fn read_token_from(token_path: &Path) -> Option<String> {
+    match fs::read_to_string(token_path) {
+        // Empty legacy files contain no usable restore token.
         Ok(token) => Some(token.trim().to_string()).filter(|t| !t.is_empty()),
         Err(_) => None,
     }
 }
 
 /// Write the InputCapture token to file
-fn write_token(token: &str) -> io::Result<()> {
-    let token_path = get_token_file_path();
-    if let Some(parent) = token_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn write_token_to(token_path: &Path, token: &str) -> io::Result<()> {
+    write_token_with(token_path, token, |file, bytes| file.write_all(bytes))
+}
 
-    // the token lets its holder skip the consent dialog, so keep it private;
-    // mode() only applies on create, hence set_permissions for older files,
-    // and only best-effort: some filesystems refuse chmod, and the file is
-    // already truncated by then
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&token_path)?;
-    if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        log::warn!("could not restrict {}: {e}", token_path.display());
-    }
-    file.write_all(token.as_bytes())?;
+fn write_token_with(
+    token_path: &Path,
+    token: &str,
+    write: impl FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = token_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    // Prepare a private replacement without truncating or following the old path.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    write(temporary.as_file_mut(), token.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(token_path).map_err(|error| error.error)?;
     Ok(())
+}
+
+async fn run_token_io<T, F>(operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| io::Error::other(format!("InputCapture token worker failed: {error}")))?
+}
+
+async fn read_token() -> Option<String> {
+    match run_token_io(|| Ok(read_token_from(&get_token_file_path()))).await {
+        Ok(token) => token,
+        Err(error) => {
+            log::warn!("could not read InputCapture token: {error}");
+            None
+        }
+    }
+}
+
+async fn write_token(token: &str) -> io::Result<()> {
+    let token = token.to_owned();
+    run_token_io(move || write_token_to(&get_token_file_path(), &token)).await
 }
 
 async fn create_session(
@@ -247,7 +420,7 @@ async fn create_session(
             let options = StartOptions::default()
                 .set_capabilities(capabilities())
                 .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                .set_restore_token(read_token());
+                .set_restore_token(read_token().await);
             let response = match input_capture
                 .start(&session, ashpd_window_identifier.as_ref(), options)
                 .await
@@ -265,7 +438,7 @@ async fn create_session(
 
             // The restore token is only valid once, we need to re-save it each time
             if let Some(token_str) = response.restore_token() {
-                if let Err(e) = write_token(token_str) {
+                if let Err(e) = write_token(token_str).await {
                     log::warn!("failed to save InputCapture token: {e}");
                 }
             }
@@ -310,12 +483,74 @@ async fn connect_to_eis(
     Ok((context, conn, event_stream))
 }
 
+#[derive(Default)]
+struct CaptureRouting {
+    route: RefCell<Option<Rc<CaptureRoute>>>,
+}
+
+struct CaptureRoute {
+    pos: Position,
+    cancelled: CancellationToken,
+}
+
+struct CaptureRouteGuard {
+    routing: Rc<CaptureRouting>,
+    route: Rc<CaptureRoute>,
+}
+
+impl CaptureRouting {
+    fn snapshot(&self) -> Option<Rc<CaptureRoute>> {
+        self.route.borrow().clone()
+    }
+
+    fn activate(self: &Rc<Self>, pos: Position) -> CaptureRouteGuard {
+        let route = Rc::new(CaptureRoute {
+            pos,
+            cancelled: CancellationToken::new(),
+        });
+        if let Some(previous) = self.route.replace(Some(route.clone())) {
+            previous.cancelled.cancel();
+        }
+        CaptureRouteGuard {
+            routing: self.clone(),
+            route,
+        }
+    }
+}
+
+impl Drop for CaptureRouteGuard {
+    fn drop(&mut self) {
+        self.route.cancelled.cancel();
+        let is_current = self
+            .routing
+            .route
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, &self.route));
+        if is_current {
+            self.routing.route.borrow_mut().take();
+        }
+    }
+}
+
+async fn send_route_event(
+    sender: &Sender<(Position, CaptureEvent)>,
+    route: &CaptureRoute,
+    event: CaptureEvent,
+) -> Result<(), CaptureError> {
+    tokio::select! {
+        biased;
+        _ = route.cancelled.cancelled() => Ok(()),
+        result = send_capture_event(sender, route.pos, event) => result,
+    }
+}
+
 async fn libei_event_handler(
     mut ei_event_stream: EiConvertEventStream,
     context: ei::Context,
     event_tx: Sender<(Position, CaptureEvent)>,
     release_session: Arc<Notify>,
-    current_pos: Rc<Cell<Option<Position>>>,
+    current_pos: Rc<CaptureRouting>,
 ) -> Result<(), CaptureError> {
     loop {
         let ei_event = ei_event_stream
@@ -323,7 +558,7 @@ async fn libei_event_handler(
             .await
             .ok_or(CaptureError::EndOfStream)??;
         log::trace!("from ei: {ei_event:?}");
-        let client = current_pos.get();
+        let client = current_pos.snapshot();
         handle_ei_event(ei_event, client, &context, &event_tx, &release_session).await?;
     }
 }
@@ -334,10 +569,8 @@ impl LibeiInputCapture {
     pub async fn new(
         window_identifier: Arc<Mutex<Option<WindowIdentifier>>>,
     ) -> std::result::Result<Self, LibeiCaptureCreationError> {
-        let input_capture = Box::pin(InputCapture::new().await?);
-        let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
-        let first_session =
-            Some(create_session(unsafe { &*input_capture_ptr }, window_identifier.clone()).await?);
+        let input_capture = Arc::new(InputCapture::new().await?);
+        let first_session = Some(create_session(&input_capture, window_identifier.clone()).await?);
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
@@ -345,16 +578,20 @@ impl LibeiInputCapture {
 
         let cancellation_token = CancellationToken::new();
 
-        let capture = do_capture(
-            input_capture_ptr,
-            notify_rx,
-            notify_release.clone(),
-            first_session,
-            event_tx,
-            cancellation_token.clone(),
-            window_identifier,
-        );
-        let capture_task = tokio::task::spawn_local(capture);
+        let task_cancel = cancellation_token.clone();
+        let task_release = notify_release.clone();
+        let capture_task =
+            CaptureTaskCompletion::spawn_owned(input_capture.clone(), move |input_capture| {
+                do_capture(
+                    input_capture,
+                    notify_rx,
+                    task_release,
+                    first_session,
+                    event_tx,
+                    task_cancel,
+                    window_identifier,
+                )
+            });
 
         let producer = Self {
             input_capture,
@@ -371,7 +608,7 @@ impl LibeiInputCapture {
 }
 
 async fn do_capture(
-    input_capture: *const InputCapture,
+    input_capture: Arc<InputCapture>,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
@@ -381,136 +618,278 @@ async fn do_capture(
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
 
-    /* safety: libei_task does not outlive Self */
-    let input_capture = unsafe { &*input_capture };
+    let input_capture = input_capture.as_ref();
     let mut active_clients: Vec<Position> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
-    let mut zones_changed = input_capture.receive_zones_changed().await?;
+    let result = async {
+        let zone_session = Rc::new(RefCell::new(None::<ashpd::zvariant::OwnedObjectPath>));
+        let zone_identity = zone_session.clone();
+        let mut zones_changed = input_capture
+            .receive_zones_changed()
+            .await?
+            .map(move |change| {
+                zone_change_is_current(
+                    &change,
+                    zone_identity.borrow().as_ref().map(|path| path.as_str()),
+                )
+            });
 
-    loop {
-        // do capture session
-        let cancel_session = CancellationToken::new();
-        let cancel_update = CancellationToken::new();
+        loop {
+            // do capture session
+            let cancel_session = CancellationToken::new();
+            let cancel_update = CancellationToken::new();
 
-        let mut capture_events_occurred = Vec::new();
-        let mut zones_have_changed = false;
-
-        // kill session if clients need to be updated
-        let handle_session_update_request = async {
-            let mut do_debounce = false;
-            tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    log::debug!("cancelled");
-                }, /* exit requested */
-                _ = cancel_update.cancelled() => {
-                    log::debug!("update task cancelled");
-                }, /* session exited */
-                _ = zones_changed.next() => {
-                    log::debug!("zones changed!");
-                    zones_have_changed = true;
-                    do_debounce = true;
-                }, /* zones have changed */
-                e = capture_event.recv() => if let Some(e) = e { /* clients changed */
-                    log::debug!("capture event: {e:?}");
-                    capture_events_occurred.push(e);
-                    do_debounce = true;
-                },
-            }
-
-            if do_debounce {
-                let debounce_duration = std::time::Duration::from_millis(50);
-                let sleep = tokio::time::sleep(debounce_duration);
-                tokio::pin!(sleep);
-
-                loop {
-                    tokio::select! {
-                        _ = &mut sleep => {
-                            break;
-                        },
-                        _ = cancellation_token.cancelled() => {
-                            log::debug!("cancelled during debounce");
-                            break;
-                        },
-                        _ = cancel_update.cancelled() => {
-                            log::debug!("update task cancelled during debounce");
-                            break;
-                        },
-                        _ = zones_changed.next() => {
-                            log::debug!("zones changed (coalesced)!");
-                            zones_have_changed = true;
-                        },
-                        e = capture_event.recv() => if let Some(e) = e {
-                            log::debug!("capture event (coalesced): {e:?}");
-                            capture_events_occurred.push(e);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // kill session (might already be dead!)
-            log::debug!("=> cancelling session");
-            cancel_session.cancel();
-        };
-
-        if !active_clients.is_empty() {
-            // create session
-            let mut session = match session.take() {
-                Some(s) => s,
-                None => {
-                    create_session(input_capture, window_identifier.clone())
-                        .await?
-                        .0
-                }
-            };
-
-            let capture_session = do_capture_session(
-                input_capture,
-                &mut session,
-                &event_tx,
-                &active_clients,
-                &mut next_barrier_id,
-                &notify_release,
-                (cancel_session.clone(), cancel_update.clone()),
+            let mut client_updates = CaptureClientUpdates::new(&active_clients);
+            let handle_session_update_request = cancel_sibling_on_completion(
+                wait_session_updates(
+                    &mut zones_changed,
+                    &mut capture_event,
+                    &mut client_updates,
+                    &cancellation_token,
+                    &cancel_update,
+                ),
+                cancel_session.clone(),
             );
 
-            let (capture_result, ()) = tokio::join!(capture_session, handle_session_update_request);
-            log::debug!("capture session + session_update task done!");
-
-            // disable capture
-            log::debug!("disabling input capture");
-            if let Err(e) = input_capture.disable(&session, Default::default()).await {
-                log::warn!("input_capture.disable(&session) {e}");
-            }
-            if let Err(e) = session.close().await {
-                log::warn!("session.close(): {e}");
-            }
-
-            // propagate error from capture session
-            capture_result?;
-        } else {
-            handle_session_update_request.await;
-        }
-
-        // update clients if requested
-        for event in capture_events_occurred {
-            match event {
-                LibeiNotifyEvent::Create(p) => {
-                    if !active_clients.contains(&p) {
-                        active_clients.push(p);
+            if !active_clients.is_empty() {
+                // create session
+                let mut session = match session.take() {
+                    Some(s) => s,
+                    None => {
+                        create_session(input_capture, window_identifier.clone())
+                            .await?
+                            .0
                     }
-                }
-                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&pos| pos != p),
-            }
-        }
+                };
 
-        // break
-        if cancellation_token.is_cancelled() {
-            break Ok(());
+                let capture_session = async {
+                    let handle = capture_session_handle(&session)?;
+                    zone_session.replace(Some(handle.clone()));
+                    do_capture_session(
+                        input_capture,
+                        &mut session,
+                        &event_tx,
+                        &active_clients,
+                        &mut next_barrier_id,
+                        &notify_release,
+                        (cancel_session.clone(), handle),
+                    )
+                    .await
+                };
+                let capture_session =
+                    cancel_sibling_on_completion(capture_session, cancel_update.clone());
+
+                let (capture_result, update_result) =
+                    tokio::join!(capture_session, handle_session_update_request);
+                zone_session.replace(None);
+                log::debug!("capture session + session_update task done!");
+
+                // disable capture
+                log::debug!("disabling input capture");
+                if let Err(e) = input_capture.disable(&session, Default::default()).await {
+                    log::warn!("input_capture.disable(&session) {e}");
+                }
+                if let Err(e) = session.close().await {
+                    log::warn!("session.close(): {e}");
+                }
+
+                // propagate error from capture session
+                capture_result?;
+                update_result?;
+            } else {
+                handle_session_update_request.await?;
+            }
+
+            // update clients if requested
+            active_clients = client_updates.finish();
+
+            // break
+            if cancellation_token.is_cancelled() {
+                break Ok(());
+            }
         }
     }
+    .await;
+    finish_pending_session(result, session, |session| async move {
+        session.close().await.map_err(CaptureError::from)
+    })
+    .await
+}
+
+async fn finish_pending_session<S, F>(
+    result: Result<(), CaptureError>,
+    pending_session: Option<S>,
+    close: impl FnOnce(S) -> F,
+) -> Result<(), CaptureError>
+where
+    F: std::future::Future<Output = Result<(), CaptureError>>,
+{
+    if let Some(session) = pending_session {
+        // The first session can remain unused on idle shutdown or setup failure.
+        // Finish native cleanup before publishing the task's original result.
+        if let Err(error) = close(session).await {
+            log::warn!("unused capture session.close(): {error}");
+        }
+    }
+    result
+}
+
+enum SessionUpdate {
+    ZoneChanged,
+    Client(LibeiNotifyEvent),
+    Ignored,
+}
+
+fn zone_change_is_current(change: &ZonesChanged, expected: Option<&str>) -> bool {
+    expected.is_some_and(|path| change.session_handle().as_str() == path)
+}
+
+async fn next_session_update(
+    zones_changed: &mut (impl Stream<Item = bool> + Unpin),
+    capture_event: &mut Receiver<LibeiNotifyEvent>,
+) -> Result<SessionUpdate, CaptureError> {
+    // Keep the two data sources fair when either produces a burst.
+    tokio::select! {
+        change = zones_changed.next() => change
+            .map(|current| if current { SessionUpdate::ZoneChanged } else { SessionUpdate::Ignored })
+            .ok_or_else(|| io::Error::other("libei zones change stream closed").into()),
+        event = capture_event.recv() => event
+            .map(SessionUpdate::Client)
+            .ok_or_else(|| io::Error::other("libei client notification channel closed").into()),
+    }
+}
+
+const MAX_SESSION_UPDATES_PER_YIELD: usize = 32;
+
+async fn wait_session_updates(
+    zones_changed: &mut (impl Stream<Item = bool> + Unpin),
+    capture_event: &mut Receiver<LibeiNotifyEvent>,
+    client_updates: &mut CaptureClientUpdates,
+    cancellation_token: &CancellationToken,
+    cancel_update: &CancellationToken,
+) -> Result<(), CaptureError> {
+    let mut processed = 0;
+    let update = loop {
+        let update = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Ok(()),
+            _ = cancel_update.cancelled() => return Ok(()),
+            update = next_session_update(zones_changed, capture_event) => update?,
+        };
+        processed += 1;
+        if !matches!(update, SessionUpdate::Ignored) {
+            if processed == MAX_SESSION_UPDATES_PER_YIELD {
+                tokio::task::yield_now().await;
+                processed = 0;
+            }
+            break update;
+        }
+        if processed == MAX_SESSION_UPDATES_PER_YIELD {
+            tokio::task::yield_now().await;
+            processed = 0;
+        }
+    };
+    if let SessionUpdate::Client(event) = update {
+        client_updates.record(event);
+    }
+
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(50));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Ok(()),
+            _ = cancel_update.cancelled() => return Ok(()),
+            _ = &mut sleep => return Ok(()),
+            update = next_session_update(zones_changed, capture_event) => {
+                if let SessionUpdate::Client(event) = update? {
+                    client_updates.record(event);
+                }
+            },
+        }
+        processed += 1;
+        if processed == MAX_SESSION_UPDATES_PER_YIELD {
+            tokio::task::yield_now().await;
+            processed = 0;
+        }
+    }
+}
+
+async fn run_ei_handler(
+    handler: impl std::future::Future<Output = Result<(), CaptureError>>,
+    cancel_session: CancellationToken,
+    cancel_ei_handler: CancellationToken,
+) -> Result<(), CaptureError> {
+    tokio::select! {
+        biased;
+        // A requested session teardown is not an unexpected EIS failure.
+        _ = cancel_ei_handler.cancelled() => Ok(()),
+        result = handler => {
+            log::debug!("libei exited: {result:?} cancelling session task");
+            cancel_session.cancel();
+            result
+        }
+    }
+}
+
+async fn cancel_sibling_on_completion(
+    branch: impl std::future::Future<Output = Result<(), CaptureError>>,
+    cancel_sibling: CancellationToken,
+) -> Result<(), CaptureError> {
+    let result = branch.await;
+    // Errors must also wake the sibling waiting in the join.
+    cancel_sibling.cancel();
+    result
+}
+
+fn capture_session_handle(
+    session: &Session<InputCapture>,
+) -> Result<ashpd::zvariant::OwnedObjectPath, CaptureError> {
+    // Session exposes its object path through Serialize, but its path() is private.
+    let context = ashpd::zvariant::serialized::Context::new_dbus(ashpd::zvariant::LE, 0);
+    let data = ashpd::zvariant::to_bytes(context, session).map_err(|error| {
+        io::Error::other(format!("could not serialize capture session: {error}"))
+    })?;
+    let (handle, _) = data
+        .deserialize::<ashpd::zvariant::OwnedObjectPath>()
+        .map_err(|error| {
+            io::Error::other(format!("could not read capture session handle: {error}"))
+        })?;
+    Ok(handle)
+}
+
+fn activation_position(
+    activated: &Activated,
+    expected_session: &str,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> Result<Option<Position>, CaptureError> {
+    if activated.session_handle().as_str() != expected_session {
+        log::debug!(
+            "ignoring activation for another capture session: {}",
+            activated.session_handle()
+        );
+        return Ok(None);
+    }
+    let cursor = activated.cursor_position();
+    if cursor.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return Err(io::Error::other("libei activation has nonfinite cursor coordinates").into());
+    }
+    if let Some(ActivatedBarrier::Barrier(id)) = activated.barrier_id() {
+        if let Some(pos) = routes.get(&id) {
+            return Ok(Some(*pos));
+        }
+        log::warn!("INVALID BARRIER ID: Id {id} does not exist!");
+    }
+    let cursor = cursor.ok_or_else(|| {
+        io::Error::other("libei activation cannot locate a barrier without cursor coordinates")
+    })?;
+    let id = find_corresponding_client(barriers, cursor)?;
+    let pos = routes.get(&id).copied().ok_or_else(|| {
+        io::Error::other("libei activation barrier geometry has no position route")
+    })?;
+    Ok(Some(pos))
 }
 
 async fn do_capture_session(
@@ -520,11 +899,11 @@ async fn do_capture_session(
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
     notify_release: &Notify,
-    cancel: (CancellationToken, CancellationToken),
+    control: (CancellationToken, ashpd::zvariant::OwnedObjectPath),
 ) -> Result<(), CaptureError> {
-    let (cancel_session, cancel_update) = cancel;
+    let (cancel_session, session_handle) = control;
     // current client
-    let current_pos = Rc::new(Cell::new(None));
+    let current_pos = Rc::new(CaptureRouting::default());
 
     // connect to eis server
     let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
@@ -543,25 +922,18 @@ async fn do_capture_session(
     let cancel_ei_handler = CancellationToken::new();
     let event_chan = event_tx.clone();
     let pos = current_pos.clone();
-    let cancel_session_clone = cancel_session.clone();
     let release_session_clone = release_session.clone();
-    let cancel_ei_handler_clone = cancel_ei_handler.clone();
-    let ei_task = async move {
-        tokio::select! {
-            r = libei_event_handler(
-                ei_event_stream,
-                context,
-                event_chan,
-                release_session_clone,
-                pos,
-            ) => {
-                log::debug!("libei exited: {r:?} cancelling session task");
-                cancel_session_clone.cancel();
-            }
-            _ = cancel_ei_handler_clone.cancelled() => {},
-        }
-        Ok::<(), CaptureError>(())
-    };
+    let ei_task = run_ei_handler(
+        libei_event_handler(
+            ei_event_stream,
+            context,
+            event_chan,
+            release_session_clone,
+            pos,
+        ),
+        cancel_session.clone(),
+        cancel_ei_handler.clone(),
+    );
 
     let capture_session_task = async {
         // receiver for activation tokens
@@ -573,31 +945,16 @@ async fn do_capture_session(
                     let activated = activated.ok_or(CaptureError::ActivationClosed)?;
                     log::debug!("activated: {activated:?}");
 
-                    // get barrier id from activation
-                    let barrier_id = match activated.barrier_id() {
-                        Some(ActivatedBarrier::Barrier(id)) => id,
-                        // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor")),
-                    };
-
-                    // find client corresponding to barrier
-                    let pos = match pos_for_barrier_id.get(&barrier_id) {
-                        Some(id) => *id,
-                        None => {
-                            log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                            let id = find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"));
-                            let pos = *pos_for_barrier_id.get(&id).expect("invalid barrier id");
-                            pos
-                        },
-                    };
-                    current_pos.replace(Some(pos));
+                    let Some(pos) = activation_position(&activated, session_handle.as_str(),
+                        &barriers, &pos_for_barrier_id)? else { continue; };
 
                     // client entered => send event
-                    event_tx
-                        .send((pos, CaptureEvent::Begin(0.5)))
-                        .await
-                        .expect("no channel");
+                    let t = activation_edge_position(&activated, pos, &barriers, &pos_for_barrier_id);
+                    if !send_activation_event(event_tx, pos, t, &cancel_session).await? {
+                        break;
+                    }
 
+                    let active_route = current_pos.activate(pos);
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
                             log::debug!("release session requested");
@@ -612,7 +969,8 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    drop(active_route);
+                    release_capture(input_capture, session, activated, pos, &barriers, &pos_for_barrier_id).await?;
 
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
@@ -634,15 +992,12 @@ async fn do_capture_session(
                 break;
             }
         }
-        // cancel libei task
-        log::debug!("session exited: killing libei task");
-        cancel_ei_handler.cancel();
         Ok::<(), CaptureError>(())
     };
 
+    let capture_session_task =
+        cancel_sibling_on_completion(capture_session_task, cancel_ei_handler);
     let (a, b) = tokio::join!(ei_task, capture_session_task);
-
-    cancel_update.cancel();
 
     log::debug!("both session and ei task finished!");
     a?;
@@ -651,19 +1006,41 @@ async fn do_capture_session(
     Ok(())
 }
 
-async fn release_capture(
-    input_capture: &InputCapture,
-    session: &Session<InputCapture>,
-    activated: Activated,
-    current_pos: Position,
-) -> Result<(), CaptureError> {
-    if let Some(activation_id) = activated.activation_id() {
-        log::debug!("releasing input capture {activation_id}");
-    }
-    let (x, y) = activated
+fn activation_edge_position(
+    activated: &Activated,
+    pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> f64 {
+    let Some((x, y)) = activated
         .cursor_position()
-        .expect("compositor did not report cursor position!");
-    log::debug!("client entered @ ({x}, {y})");
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+    else {
+        return 0.5;
+    };
+    let Some((min_x, min_y, max_x, max_y)) =
+        release_barrier(activated, pos, barriers, routes).and_then(|barrier| barrier.zone_bounds)
+    else {
+        return 0.5;
+    };
+    // Bounds store the last pixel; normalize against the full logical extent,
+    // matching the exclusive screen bounds used by X11 and Windows capture.
+    let (coordinate, min, max) = match pos {
+        Position::Left | Position::Right => (f64::from(y), min_y, max_y),
+        Position::Top | Position::Bottom => (f64::from(x), min_x, max_x),
+    };
+    ((coordinate - min) / (max - min + 1.)).clamp(0., 1.)
+}
+
+fn release_cursor_position(
+    cursor: Option<(f32, f32)>,
+    current_pos: Position,
+    barrier: Option<ICBarrier>,
+) -> Option<(f64, f64)> {
+    let (x, y) = cursor.filter(|(x, y)| x.is_finite() && y.is_finite())?;
+    let barrier = barrier?;
+    let (min_x, min_y, max_x, max_y) = barrier.zone_bounds?;
+    let (x, y) = closest_point_on_segment(barrier.position, (x, y));
     let (dx, dy) = match current_pos {
         // offset cursor position to not enter again immediately
         Position::Left => (1., 0.),
@@ -671,46 +1048,147 @@ async fn release_capture(
         Position::Top => (0., 1.),
         Position::Bottom => (0., -1.),
     };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
-    let release_options = ReleaseOptions::default()
+    // Keep corner overshoot and one-pixel zones inside the owning region.
+    Some(((x + dx).clamp(min_x, max_x), (y + dy).clamp(min_y, max_y)))
+}
+
+fn release_barrier(
+    activated: &Activated,
+    pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> Option<ICBarrier> {
+    if let Some(ActivatedBarrier::Barrier(id)) = activated.barrier_id() {
+        if routes.get(&id) == Some(&pos) {
+            return barriers
+                .iter()
+                .find(|barrier| barrier.barrier_id == id)
+                .copied();
+        }
+    }
+    let cursor = activated
+        .cursor_position()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())?;
+    barriers
+        .iter()
+        .filter(|b| routes.get(&b.barrier_id) == Some(&pos))
+        .map(|b| (b, distance_to_segment_squared(b.position, cursor)))
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(b, _)| *b)
+}
+
+fn activation_release_options(
+    activated: &Activated,
+    pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> ReleaseOptions {
+    ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
-        .set_cursor_position(Some(cursor_position));
+        .set_cursor_position(release_cursor_position(
+            activated.cursor_position(),
+            pos,
+            release_barrier(activated, pos, barriers, routes),
+        ))
+}
+
+async fn release_capture(
+    input_capture: &InputCapture,
+    session: &Session<InputCapture>,
+    activated: Activated,
+    current_pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> Result<(), CaptureError> {
+    if let Some(activation_id) = activated.activation_id() {
+        log::debug!("releasing input capture {activation_id}");
+    }
+    let release_options = activation_release_options(&activated, current_pos, barriers, routes);
     input_capture.release(session, release_options).await?;
     Ok(())
 }
 
-fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> BarrierID {
+fn find_corresponding_client(
+    barriers: &[ICBarrier],
+    pos: (f32, f32),
+) -> Result<BarrierID, CaptureError> {
+    if !pos.0.is_finite() || !pos.1.is_finite() {
+        return Err(io::Error::other("libei activation has nonfinite cursor coordinates").into());
+    }
     barriers
         .iter()
-        .copied()
-        .min_by_key(|b| {
-            let (x1, y1, x2, y2) = b.position;
-            let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
-            distance_to_line(((x1, y1), (x2, y2)), pos) as i32
+        .map(|barrier| {
+            (
+                barrier.barrier_id,
+                distance_to_segment_squared(barrier.position, pos),
+            )
         })
-        .expect("could not find barrier corresponding to client")
-        .barrier_id
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(id, _)| id)
+        .ok_or_else(|| io::Error::other("libei activation has no matching barrier geometry").into())
 }
 
-fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
-    let ((x1, y1), (x2, y2)) = line;
-    let (x0, y0) = p;
-    /*
-     * we use the fact that for the triangle spanned by the line and p,
-     * the height of the triangle is the desired distance and can be calculated by
-     * h = 2A / b with b being the line_length and
-     */
-    let double_triangle_area = ((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1).abs();
-    let line_length = ((y2 - y1).powf(2.0) + (x2 - x1).powf(2.0)).sqrt();
-    let distance = double_triangle_area / line_length;
-    log::debug!("distance to line({line:?}, {p:?}) = {distance}");
-    distance
+fn distance_to_segment_squared(segment: (i32, i32, i32, i32), pos: (f32, f32)) -> f64 {
+    let (nearest_x, nearest_y) = closest_point_on_segment(segment, pos);
+    let (offset_x, offset_y) = (f64::from(pos.0) - nearest_x, f64::from(pos.1) - nearest_y);
+    offset_x * offset_x + offset_y * offset_y
+}
+
+fn closest_point_on_segment(segment: (i32, i32, i32, i32), pos: (f32, f32)) -> (f64, f64) {
+    // Preserve integer endpoint precision and avoid f32 overflow for finite cursors.
+    let (x1, y1, x2, y2) = segment;
+    let (x1, y1, x2, y2) = (f64::from(x1), f64::from(y1), f64::from(x2), f64::from(y2));
+    let (x, y) = (f64::from(pos.0), f64::from(pos.1));
+    // Portal barriers are axis aligned; preserve an in-range cursor exactly.
+    if x1 == x2 {
+        return (x1, y.clamp(y1.min(y2), y1.max(y2)));
+    }
+    if y1 == y2 {
+        return (x.clamp(x1.min(x2), x1.max(x2)), y1);
+    }
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let length_squared = dx * dx + dy * dy;
+    let projection = if length_squared == 0. {
+        0.
+    } else {
+        (((x - x1) * dx + (y - y1) * dy) / length_squared).clamp(0., 1.)
+    };
+    (x1 + projection * dx, y1 + projection * dy)
+}
+
+async fn send_capture_event(
+    sender: &Sender<(Position, CaptureEvent)>,
+    pos: Position,
+    event: CaptureEvent,
+) -> Result<(), CaptureError> {
+    sender.send((pos, event)).await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "libei capture event receiver closed",
+        )
+        .into()
+    })
+}
+
+async fn send_activation_event(
+    sender: &Sender<(Position, CaptureEvent)>,
+    pos: Position,
+    t: f64,
+    cancel_session: &CancellationToken,
+) -> Result<bool, CaptureError> {
+    tokio::select! {
+        biased;
+        _ = cancel_session.cancelled() => Ok(false),
+        result = send_capture_event(sender, pos, CaptureEvent::Begin(t)) => {
+            result?;
+            Ok(true)
+        }
+    }
 }
 
 async fn handle_ei_event(
     ei_event: EiEvent,
-    current_client: Option<Position>,
+    current_client: Option<Rc<CaptureRoute>>,
     context: &ei::Context,
     event_tx: &Sender<(Position, CaptureEvent)>,
     release_session: &Notify,
@@ -746,12 +1224,9 @@ async fn handle_ei_event(
             return Err(CaptureError::Disconnected(format!("{:?}", d.reason)));
         }
         _ => {
-            if let Some(pos) = current_client {
+            if let Some(route) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    event_tx
-                        .send((pos, CaptureEvent::Input(event)))
-                        .await
-                        .expect("no channel");
+                    send_route_event(event_tx, &route, CaptureEvent::Input(event)).await?;
                 }
             }
         }
@@ -792,13 +1267,8 @@ impl LanMouseInputCapture for LibeiInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         self.cancellation_token.cancel();
-        let task = &mut self.capture_task;
         log::debug!("waiting for capture to terminate...");
-        let res = if !task.is_finished() {
-            task.await.expect("libei task panic")
-        } else {
-            Ok(())
-        };
+        let res = self.capture_task.join().await;
         self.terminated = true;
         log::debug!("done!");
         res
@@ -822,12 +1292,2003 @@ impl Stream for LibeiInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        match self.capture_task.poll_unpin(cx) {
-            Poll::Ready(r) => match r.expect("failed to join") {
-                Ok(()) => Poll::Ready(None),
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
+        match self.capture_task.poll_result(cx) {
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(Some(Ok(())) | None) => Poll::Ready(None),
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::future::poll_fn;
+    use std::cell::Cell;
+
+    struct TaskResourceProbe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for TaskResourceProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detached_capture_task_keeps_resource_until_cleanup_finishes() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let resource = Arc::new(TaskResourceProbe(drops.clone()));
+                let weak = Arc::downgrade(&resource);
+                let task_weak = weak.clone();
+                let cancel = CancellationToken::new();
+                let task_cancel = cancel.clone();
+                let (started, started_wait) = tokio::sync::oneshot::channel();
+                let (release_cleanup, cleanup_wait) = tokio::sync::oneshot::channel();
+                let (observed, observed_wait) = tokio::sync::oneshot::channel();
+                let task = CaptureTaskCompletion::spawn_owned(
+                    resource.clone(),
+                    move |_resource| async move {
+                        task_cancel.cancelled().await;
+                        started.send(()).unwrap();
+                        cleanup_wait.await.unwrap();
+                        // Observe ownership without ever dereferencing a potentially freed pointer.
+                        observed.send(task_weak.upgrade().is_some()).unwrap();
+                        Ok(())
+                    },
+                );
+                drop(resource);
+                cancel.cancel();
+                drop(task); // JoinHandle drop detaches the task, as frontend Drop does.
+                started_wait.await.unwrap();
+                let alive_during_cleanup = weak.upgrade().is_some();
+                let drops_during_cleanup = drops.load(std::sync::atomic::Ordering::SeqCst);
+                release_cleanup.send(()).unwrap();
+                let alive_at_cleanup_end = observed_wait.await.unwrap();
+                tokio::task::yield_now().await;
+                assert!(
+                    alive_during_cleanup,
+                    "frontend freed resource while cleanup was waiting"
+                );
+                assert_eq!(drops_during_cleanup, 0);
+                assert!(alive_at_cleanup_end);
+                assert!(weak.upgrade().is_none());
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_owned_join_wait_keeps_resource_and_task_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let resource = Arc::new(TaskResourceProbe(drops.clone()));
+                let weak = Arc::downgrade(&resource);
+                let (release_cleanup, cleanup_wait) = tokio::sync::oneshot::channel();
+                let mut task = CaptureTaskCompletion::spawn_owned(
+                    resource.clone(),
+                    move |_resource| async move {
+                        cleanup_wait.await.unwrap();
+                        Err(CaptureError::EndOfStream)
+                    },
+                );
+                drop(resource);
+                assert!(task.join().now_or_never().is_none());
+                assert!(weak.upgrade().is_some());
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+                release_cleanup.send(()).unwrap();
+                assert!(matches!(task.join().await, Err(CaptureError::EndOfStream)));
+                assert!(weak.upgrade().is_none());
+                assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(task.join().await.is_ok());
+            })
+            .await;
+    }
+
+    fn barrier(id: u32, position: (i32, i32, i32, i32)) -> ICBarrier {
+        ICBarrier::new(NonZeroU32::new(id).unwrap(), position)
+    }
+
+    #[test]
+    fn nearest_barrier_respects_segment_endpoints() {
+        let barriers = [
+            barrier(1, (0, 0, 0, 100)),
+            barrier(2, (-100, 500, 100, 500)),
+        ];
+        assert_eq!(
+            find_corresponding_client(&barriers, (0., 500.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_preserves_fractional_distance() {
+        let barriers = [barrier(1, (0, 0, 0, 100)), barrier(2, (1, 0, 1, 100))];
+        assert_eq!(
+            find_corresponding_client(&barriers, (0.75, 50.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_handles_point_segments() {
+        let barriers = [barrier(1, (0, 0, 0, 0)), barrier(2, (100, 0, 100, 100))];
+        assert_eq!(
+            find_corresponding_client(&barriers, (100., 50.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_preserves_integer_endpoint_precision() {
+        let barriers = [
+            barrier(1, (16_777_217, 0, 16_777_217, 100)),
+            barrier(2, (16_777_216, 0, 16_777_216, 100)),
+        ];
+        assert_eq!(
+            find_corresponding_client(&barriers, (16_777_216., 50.))
+                .unwrap()
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn nearest_barrier_reports_empty_geometry() {
+        assert!(find_corresponding_client(&[], (0., 0.)).is_err());
+    }
+
+    #[test]
+    fn nearest_barrier_rejects_nonfinite_cursor_coordinates() {
+        let barriers = [barrier(1, (0, 0, 0, 100))];
+        for pos in [(f32::NAN, 0.), (0., f32::INFINITY), (f32::NEG_INFINITY, 0.)] {
+            assert!(find_corresponding_client(&barriers, pos).is_err());
+        }
+    }
+
+    #[test]
+    fn nearest_barrier_keeps_first_exact_tie() {
+        let barriers = [barrier(5, (0, 0, 0, 100)), barrier(6, (0, 0, 100, 0))];
+        assert_eq!(
+            find_corresponding_client(&barriers, (0., 0.))
+                .unwrap()
+                .get(),
+            5
+        );
+    }
+
+    #[test]
+    fn barrier_distance_handles_reversed_endpoints_and_large_finite_coordinates() {
+        assert_eq!(distance_to_segment_squared((0, 100, 0, 0), (1., 50.)), 1.);
+        assert_eq!(distance_to_segment_squared((0, 0, 0, 100), (1., 101.)), 2.);
+        assert_eq!(distance_to_segment_squared((2, 3, 2, 3), (5., 7.)), 25.);
+        let distance = distance_to_segment_squared(
+            (i32::MIN, i32::MAX, i32::MAX, i32::MIN),
+            (f32::MAX, f32::MIN),
+        );
+        assert!(distance.is_finite() && distance > 0.);
+    }
+
+    #[test]
+    fn rejected_barriers_do_not_participate_in_fallback_or_routes() {
+        let rejected = barrier(1, (0, 0, 0, 100));
+        let accepted = barrier(2, (1, 0, 1, 100));
+        let routes = HashMap::from([
+            (rejected.barrier_id, Position::Left),
+            (accepted.barrier_id, Position::Right),
+        ]);
+        let (barriers, routes) =
+            accepted_barriers(vec![rejected, accepted], routes, &[rejected.barrier_id]).unwrap();
+        assert_eq!(
+            find_corresponding_client(&barriers, (0., 50.)).unwrap(),
+            accepted.barrier_id
+        );
+        assert!(!routes.contains_key(&rejected.barrier_id));
+        assert_eq!(routes.get(&accepted.barrier_id), Some(&Position::Right));
+    }
+
+    #[test]
+    fn all_rejected_barriers_report_setup_failure() {
+        let rejected = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(rejected.barrier_id, Position::Left)]);
+        assert!(accepted_barriers(vec![rejected], routes, &[rejected.barrier_id]).is_err());
+        assert!(accepted_barriers(vec![], HashMap::new(), &[]).is_err());
+    }
+
+    #[test]
+    fn partial_barrier_rejection_preserves_order_and_ignores_unknown_duplicates() {
+        let first = barrier(1, (0, 0, 0, 100));
+        let rejected = barrier(2, (0, 0, 100, 0));
+        let last = barrier(3, (100, 0, 100, 100));
+        let routes = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (rejected.barrier_id, Position::Top),
+            (last.barrier_id, Position::Right),
+        ]);
+        let unknown = NonZeroU32::new(99).unwrap();
+        let (barriers, routes) = accepted_barriers(
+            vec![first, rejected, last],
+            routes,
+            &[unknown, rejected.barrier_id, rejected.barrier_id],
+        )
+        .unwrap();
+        assert_eq!(
+            barriers.iter().map(|b| b.barrier_id).collect::<Vec<_>>(),
+            vec![first.barrier_id, last.barrier_id]
+        );
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.get(&first.barrier_id), Some(&Position::Left));
+        assert_eq!(routes.get(&last.barrier_id), Some(&Position::Right));
+    }
+
+    #[test]
+    fn accepted_barrier_response_retains_all_requested_routes() {
+        let first = barrier(1, (0, 0, 0, 100));
+        let last = barrier(2, (100, 0, 100, 100));
+        let original = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (last.barrier_id, Position::Right),
+        ]);
+        let (barriers, routes) =
+            accepted_barriers(vec![first, last], original.clone(), &[]).unwrap();
+        assert_eq!(routes, original);
+        assert_eq!(
+            barriers.iter().map(|b| b.barrier_id).collect::<Vec<_>>(),
+            vec![first.barrier_id, last.barrier_id]
+        );
+    }
+
+    fn activation_fixture(path: &str, id: Option<u32>, cursor: Option<(f32, f32)>) -> Activated {
+        use ashpd::zvariant::{LE, ObjectPath, Value, serialized::Context};
+        let path = ObjectPath::try_from(path).unwrap();
+        let mut options = HashMap::<&str, Value<'_>>::new();
+        options.insert("activation_id", Value::from(7u32));
+        if let Some(id) = id {
+            options.insert("barrier_id", Value::from(id));
+        }
+        if let Some(cursor) = cursor {
+            options.insert("cursor_position", Value::from(cursor));
+        }
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &(path, options)).unwrap();
+        data.deserialize::<Activated>().unwrap().0
+    }
+
+    #[test]
+    fn foreign_activation_with_reused_barrier_id_is_ignored() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/old", Some(1), Some((0., 50.)));
+        assert_eq!(
+            activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn foreign_activation_does_not_enter_current_geometry_fallback() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/other", None, None);
+        assert_eq!(
+            activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn current_activation_retains_explicit_and_geometry_routing() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        for id in [Some(1), Some(99), None] {
+            let activation = activation_fixture("/session/current", id, Some((0., 50.)));
+            assert_eq!(
+                activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+                Some(Position::Left)
+            );
+        }
+    }
+
+    #[test]
+    fn current_fallback_without_cursor_reports_error() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        for id in [None, Some(99)] {
+            let activation = activation_fixture("/session/current", id, None);
+            assert!(
+                activation_position(&activation, "/session/current", &[barrier], &routes).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn current_explicit_activation_rejects_nonfinite_coordinates() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/current", Some(1), Some((f32::NAN, 50.)));
+        assert!(activation_position(&activation, "/session/current", &[barrier], &routes).is_err());
+    }
+
+    #[test]
+    fn release_without_usable_cursor_omits_suggestion() {
+        for cursor in [None, Some((f32::NAN, 0.)), Some((0., f32::INFINITY))] {
+            assert_eq!(release_cursor_position(cursor, Position::Left, None), None);
+        }
+    }
+
+    #[test]
+    fn explicit_activation_without_cursor_keeps_known_route() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/current", Some(1), None);
+        assert_eq!(
+            activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+            Some(Position::Left)
+        );
+    }
+
+    fn decoded_release_options(
+        activated: &Activated,
+        pos: Position,
+    ) -> HashMap<String, ashpd::zvariant::OwnedValue> {
+        use ashpd::zvariant::{LE, serialized::Context};
+        let (x, y) = match pos {
+            Position::Left => (10, 0),
+            Position::Right => (-90, 0),
+            Position::Top => (0, 20),
+            Position::Bottom => (0, -80),
+        };
+        let region = region_fixture(100, 100, x, y);
+        let id = NonZeroU32::new(1).unwrap();
+        let barrier = ICBarrier::for_region(id, &region, pos).unwrap();
+        let options =
+            activation_release_options(activated, pos, &[barrier], &HashMap::from([(id, pos)]));
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn release_options_without_cursor_keep_activation_id() {
+        let activation = activation_fixture("/session/current", Some(1), None);
+        let options = decoded_release_options(&activation, Position::Left);
+        assert_eq!(options["activation_id"].downcast_ref::<u32>().unwrap(), 7);
+        assert!(!options.contains_key("cursor_position"));
+    }
+
+    #[test]
+    fn release_options_preserve_finite_inward_offsets() {
+        let activation = activation_fixture("/session/current", Some(1), Some((10., 20.)));
+        for (edge, expected) in [
+            (Position::Left, (11., 20.)),
+            (Position::Right, (9., 20.)),
+            (Position::Top, (10., 21.)),
+            (Position::Bottom, (10., 19.)),
+        ] {
+            let options = decoded_release_options(&activation, edge);
+            assert_eq!(
+                options["cursor_position"]
+                    .downcast_ref::<(f64, f64)>()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(options["activation_id"].downcast_ref::<u32>().unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn fallback_without_position_route_reports_error() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let activation = activation_fixture("/session/current", None, Some((0., 50.)));
+        assert!(
+            activation_position(&activation, "/session/current", &[barrier], &HashMap::new())
+                .is_err()
+        );
+    }
+
+    fn region_fixture(width: u32, height: u32, x: i32, y: i32) -> Region {
+        use ashpd::zvariant::{LE, serialized::Context};
+        let data =
+            ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &(width, height, x, y)).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    fn assert_overshoot_release(edge: Position, cursor: (f32, f32), expected: (f64, f64)) {
+        let region = region_fixture(100, 80, 10, -20);
+        let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
+        assert_eq!(
+            release_cursor_position(Some(cursor), edge, Some(barrier)),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn release_overshoot_left_projects_into_zone() {
+        assert_overshoot_release(Position::Left, (-50., 10.), (11., 10.));
+    }
+    #[test]
+    fn release_overshoot_right_projects_into_zone() {
+        assert_overshoot_release(Position::Right, (200., 10.), (109., 10.));
+    }
+    #[test]
+    fn release_overshoot_top_projects_into_zone() {
+        assert_overshoot_release(Position::Top, (50., -80.), (50., -19.));
+    }
+    #[test]
+    fn release_overshoot_bottom_projects_into_zone() {
+        assert_overshoot_release(Position::Bottom, (50., 200.), (50., 59.));
+    }
+
+    #[test]
+    fn release_corner_overshoot_stays_inside_region() {
+        for (edge, cursor, expected) in [
+            (Position::Left, (-50., 500.), (11., 59.)),
+            (Position::Right, (200., -100.), (109., -20.)),
+            (Position::Top, (-50., -80.), (10., -19.)),
+            (Position::Bottom, (200., 200.), (109., 59.)),
+        ] {
+            assert_overshoot_release(edge, cursor, expected);
+        }
+    }
+
+    #[test]
+    fn release_one_pixel_region_stays_inside_region() {
+        let region = region_fixture(1, 1, 10, -20);
+        for edge in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            let barrier =
+                ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
+            assert_eq!(
+                release_cursor_position(Some((-100., 200.)), edge, Some(barrier)),
+                Some((10., -20.))
+            );
+        }
+    }
+
+    #[test]
+    fn release_uses_reported_region_and_falls_back_within_route() {
+        use ashpd::zvariant::{LE, serialized::Context};
+        let first = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 80, 10, -20),
+            Position::Left,
+        )
+        .unwrap();
+        let second = ICBarrier::for_region(
+            NonZeroU32::new(2).unwrap(),
+            &region_fixture(100, 80, 400, -20),
+            Position::Left,
+        )
+        .unwrap();
+        let routes = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (second.barrier_id, Position::Left),
+        ]);
+        for (id, expected) in [
+            (Some(2), (401., 10.)),
+            (Some(99), (11., 10.)),
+            (None, (11., 10.)),
+        ] {
+            let activation = activation_fixture("/session/current", id, Some((-50., 10.)));
+            let options =
+                activation_release_options(&activation, Position::Left, &[first, second], &routes);
+            let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+            let (options, _) = data
+                .deserialize::<HashMap<String, ashpd::zvariant::OwnedValue>>()
+                .unwrap();
+            assert_eq!(
+                options["cursor_position"]
+                    .downcast_ref::<(f64, f64)>()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(options["activation_id"].downcast_ref::<u32>().unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn release_without_region_geometry_omits_suggestion() {
+        let cursor = Some((10., 20.));
+        assert_eq!(release_cursor_position(cursor, Position::Left, None), None);
+        assert_eq!(
+            release_cursor_position(cursor, Position::Left, Some(barrier(1, (0, 0, 0, 100)))),
+            None
+        );
+        assert!(
+            ICBarrier::for_region(
+                NonZeroU32::new(1).unwrap(),
+                &region_fixture(0, 0, 0, 0),
+                Position::Left
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_session_closes_on_idle_shutdown_and_setup_error() {
+        for result in [Ok(()), Err(CaptureError::EndOfStream)] {
+            let expected_error = result.is_err();
+            let closed = Rc::new(Cell::new(0));
+            let observed = closed.clone();
+            let result = finish_pending_session(result, Some(7), move |session| async move {
+                assert_eq!(session, 7);
+                observed.set(observed.get() + 1);
+                Ok(())
+            })
+            .await;
+            assert_eq!(
+                closed.get(),
+                1,
+                "unused first session must be explicitly closed"
+            );
+            assert_eq!(result.is_err(), expected_error);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumed_session_is_not_closed_again_at_capture_exit() {
+        let result = finish_pending_session(Ok(()), None::<()>, |_| async {
+            panic!("active branch already owns and closes the session");
+        })
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_session_close_failure_preserves_original_result() {
+        for original in [Ok(()), Err(CaptureError::EndOfStream)] {
+            let expected_error = original.is_err();
+            let result = finish_pending_session(original, Some(()), |_| async {
+                Err(io::Error::other("controlled close failure").into())
+            })
+            .await;
+            if expected_error {
+                assert!(matches!(result, Err(CaptureError::EndOfStream)));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_session_waits_for_close_and_retains_resource() {
+        let session = Arc::new(());
+        let weak = Arc::downgrade(&session);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut finish = Box::pin(finish_pending_session(
+            Err(CaptureError::EndOfStream),
+            Some(session),
+            |session| async move {
+                wait.await.unwrap();
+                assert_eq!(Arc::strong_count(&session), 1);
+                Ok(())
+            },
+        ));
+        assert!((&mut finish).now_or_never().is_none());
+        assert!(weak.upgrade().is_some());
+        release.send(()).unwrap();
+        assert!(matches!(finish.await, Err(CaptureError::EndOfStream)));
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_closed_begin_reports_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        assert!(
+            send_activation_event(&sender, Position::Left, 0.5, &CancellationToken::new())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_closed_input_reports_error() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let input = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 0,
+            dx: 1.,
+            dy: 2.,
+        }));
+        assert!(
+            send_capture_event(&sender, Position::Left, input)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_full_begin_is_interruptible() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_capture_event(&sender, Position::Right, CaptureEvent::Begin(0.25))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut send = Box::pin(send_activation_event(&sender, Position::Left, 0.5, &cancel));
+        assert!((&mut send).now_or_never().is_none());
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), send).await;
+        assert!(
+            matches!(result, Ok(Ok(false))),
+            "shutdown must interrupt full Begin channel: {result:?}"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.25))
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_requested_shutdown_precedes_ready_begin() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(
+            !send_activation_event(&sender, Position::Left, 0.5, &cancel)
+                .await
+                .unwrap()
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_healthy_begin_and_input_keep_order() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert!(
+            send_activation_event(&sender, Position::Left, 0.5, &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let input = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 1,
+            dx: 2.,
+            dy: 3.,
+        }));
+        send_capture_event(&sender, Position::Left, input.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Left, CaptureEvent::Begin(0.5))
+        );
+        assert_eq!(receiver.recv().await.unwrap(), (Position::Left, input));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_send_error_wakes_session_cleanup_without_panic() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let cleaned = Cell::new(false);
+        let handler = run_ei_handler(
+            send_capture_event(&sender, Position::Left, CaptureEvent::Begin(0.5)),
+            cancel_session.clone(),
+            cancel_ei.clone(),
+        );
+        let session = cancel_sibling_on_completion(
+            async {
+                cancel_session.cancelled().await;
+                cleaned.set(true);
+                Ok(())
+            },
+            cancel_ei,
+        );
+        let (handler, session) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                tokio::join!(handler, session)
+            })
+            .await
+            .expect("send failure must wake joined session cleanup");
+        assert!(
+            matches!(handler, Err(CaptureError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+        assert!(session.is_ok());
+        assert!(cleaned.get());
+    }
+
+    #[test]
+    fn activation_edge_position_preserves_crossed_fraction() {
+        let region = region_fixture(100, 80, -200, -20);
+        for (edge, cursor) in [
+            (Position::Left, (-250., 0.)),
+            (Position::Right, (-50., 0.)),
+            (Position::Top, (-175., -80.)),
+            (Position::Bottom, (-175., 200.)),
+        ] {
+            let barrier =
+                ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
+            let activation = activation_fixture("/session/current", Some(1), Some(cursor));
+            assert_eq!(
+                activation_edge_position(
+                    &activation,
+                    edge,
+                    &[barrier],
+                    &HashMap::from([(barrier.barrier_id, edge)])
+                ),
+                0.25
+            );
+        }
+    }
+
+    #[test]
+    fn activation_edge_position_clamps_cross_axis_overshoot() {
+        let region = region_fixture(100, 80, 10, -20);
+        for (edge, low, high) in [
+            (Position::Left, (-50., -100.), (-50., 200.)),
+            (Position::Right, (200., -100.), (200., 200.)),
+            (Position::Top, (-50., -80.), (200., -80.)),
+            (Position::Bottom, (-50., 200.), (200., 200.)),
+        ] {
+            let barrier =
+                ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge).unwrap();
+            let routes = HashMap::from([(barrier.barrier_id, edge)]);
+            for (cursor, expected) in [(low, 0.), (high, 1.)] {
+                let activation = activation_fixture("/session/current", Some(1), Some(cursor));
+                assert_eq!(
+                    activation_edge_position(&activation, edge, &[barrier], &routes),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn activation_edge_position_uses_owning_region_and_geometry_fallback() {
+        let first = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 100, 0, 0),
+            Position::Left,
+        )
+        .unwrap();
+        let second = ICBarrier::for_region(
+            NonZeroU32::new(2).unwrap(),
+            &region_fixture(100, 200, 0, 100),
+            Position::Left,
+        )
+        .unwrap();
+        let routes = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (second.barrier_id, Position::Left),
+        ]);
+        for (id, cursor) in [
+            (Some(2), (-30., 150.)),
+            (Some(99), (-30., 25.)),
+            (None, (-30., 25.)),
+        ] {
+            let activation = activation_fixture("/session/current", id, Some(cursor));
+            assert_eq!(
+                activation_edge_position(&activation, Position::Left, &[first, second], &routes),
+                0.25
+            );
+        }
+    }
+
+    #[test]
+    fn activation_edge_position_missing_metadata_keeps_midpoint() {
+        let edge = Position::Left;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 100, 0, 0),
+            edge,
+        )
+        .unwrap();
+        let routes = HashMap::from([(barrier.barrier_id, edge)]);
+        for cursor in [None, Some((f32::NAN, 25.)), Some((0., f32::INFINITY))] {
+            let activation = activation_fixture("/session/current", Some(1), cursor);
+            assert_eq!(
+                activation_edge_position(&activation, edge, &[barrier], &routes),
+                0.5
+            );
+        }
+        let activation = activation_fixture("/session/current", Some(1), Some((0., 25.)));
+        assert_eq!(
+            activation_edge_position(&activation, edge, &[], &routes),
+            0.5
+        );
+        let no_bounds = super::ICBarrier::new(barrier.barrier_id, barrier.position);
+        assert_eq!(
+            activation_edge_position(&activation, edge, &[no_bounds], &routes),
+            0.5
+        );
+    }
+
+    #[test]
+    fn activation_edge_position_preserves_fractional_coordinate() {
+        let edge = Position::Top;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 80, -20, 10),
+            edge,
+        )
+        .unwrap();
+        let activation = activation_fixture("/session/current", Some(1), Some((5.5, -50.)));
+        assert_eq!(
+            activation_edge_position(
+                &activation,
+                edge,
+                &[barrier],
+                &HashMap::from([(barrier.barrier_id, edge)])
+            ),
+            0.255
+        );
+    }
+
+    #[test]
+    fn activation_edge_position_one_pixel_extent_is_finite() {
+        let edge = Position::Left;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(1, 1, 10, -20),
+            edge,
+        )
+        .unwrap();
+        let routes = HashMap::from([(barrier.barrier_id, edge)]);
+        for (cursor, expected) in [((10., -20.), 0.), ((10., -19.), 1.)] {
+            let activation = activation_fixture("/session/current", Some(1), Some(cursor));
+            assert_eq!(
+                activation_edge_position(&activation, edge, &[barrier], &routes),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_edge_position_reaches_begin_channel() {
+        let edge = Position::Left;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 80, 10, -20),
+            edge,
+        )
+        .unwrap();
+        let activation = activation_fixture("/session/current", Some(1), Some((-50., 0.)));
+        let t = activation_edge_position(
+            &activation,
+            edge,
+            &[barrier],
+            &HashMap::from([(barrier.barrier_id, edge)]),
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert!(
+            send_activation_event(&sender, edge, t, &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (edge, CaptureEvent::Begin(0.25))
+        );
+    }
+
+    #[test]
+    fn barrier_region_rejects_empty_dimensions() {
+        for (width, height) in [(0, 80), (100, 0), (0, 0)] {
+            for edge in [
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ] {
+                assert!(pos_to_barrier(&region_fixture(width, height, 10, -20), edge).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn barrier_region_rejects_unrepresentable_endpoints() {
+        let region = region_fixture(2, 2, i32::MAX, i32::MAX);
+        for edge in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            assert!(pos_to_barrier(&region, edge).is_err());
+        }
+    }
+
+    #[test]
+    fn barrier_region_preserves_large_unsigned_extent() {
+        let region = region_fixture(u32::MAX, 2, i32::MIN, 0);
+        assert_eq!(
+            pos_to_barrier(&region, Position::Top).unwrap(),
+            (i32::MIN, 0, i32::MAX - 1, 0)
+        );
+        assert_eq!(
+            pos_to_barrier(&region, Position::Right).unwrap(),
+            (i32::MAX, 0, i32::MAX, 1)
+        );
+    }
+
+    #[test]
+    fn barrier_region_preserves_normal_edges_and_limit_coordinates() {
+        let region = region_fixture(100, 80, 10, -20);
+        for (edge, expected) in [
+            (Position::Left, (10, -20, 10, 59)),
+            (Position::Right, (110, -20, 110, 59)),
+            (Position::Top, (10, -20, 109, -20)),
+            (Position::Bottom, (10, 60, 109, 60)),
+        ] {
+            assert_eq!(pos_to_barrier(&region, edge).unwrap(), expected);
+        }
+        let corner = region_fixture(1, 1, i32::MAX, i32::MAX);
+        assert_eq!(
+            pos_to_barrier(&corner, Position::Left).unwrap(),
+            (i32::MAX, i32::MAX, i32::MAX, i32::MAX)
+        );
+        assert!(pos_to_barrier(&corner, Position::Right).is_err());
+        assert!(pos_to_barrier(&corner, Position::Bottom).is_err());
+    }
+
+    #[test]
+    fn barrier_region_validation_reaches_factory_and_selection() {
+        use ashpd::zvariant::{LE, Value, serialized::Context};
+        let invalid = region_fixture(0, 80, 10, -20);
+        assert!(
+            ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &invalid, Position::Left).is_err()
+        );
+        let options = HashMap::from([
+            ("zones", Value::from(vec![(0u32, 80u32, 10i32, -20i32)])),
+            ("zone_set", Value::from(1u32)),
+        ]);
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+        let (zones, _) = data.deserialize::<Zones>().unwrap();
+        assert!(
+            select_barriers(&zones, &[Position::Left], &mut NonZeroU32::new(1).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn released_route_clears_current_client_and_cancels_snapshot() {
+        let routing = Rc::new(CaptureRouting::default());
+        let active = routing.activate(Position::Left);
+        let snapshot = routing.snapshot().unwrap();
+        drop(active);
+        assert!(
+            routing.snapshot().is_none(),
+            "release must stop routing late events"
+        );
+        assert!(snapshot.cancelled.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn released_route_interrupts_pending_input_send() {
+        let routing = Rc::new(CaptureRouting::default());
+        let active = routing.activate(Position::Left);
+        let snapshot = routing.snapshot().unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_capture_event(&sender, Position::Right, CaptureEvent::Begin(0.25))
+            .await
+            .unwrap();
+        let mut send = Box::pin(send_route_event(
+            &sender,
+            &snapshot,
+            CaptureEvent::Begin(0.5),
+        ));
+        assert!((&mut send).now_or_never().is_none());
+        drop(active);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), send)
+                .await
+                .is_ok(),
+            "release must cancel input waiting for channel capacity"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.25))
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn released_route_does_not_send_when_channel_is_ready() {
+        let routing = Rc::new(CaptureRouting::default());
+        let active = routing.activate(Position::Left);
+        let snapshot = routing.snapshot().unwrap();
+        drop(active);
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_route_event(&sender, &snapshot, CaptureEvent::Begin(0.5))
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_route_isolated_from_old_guard_and_snapshot() {
+        let routing = Rc::new(CaptureRouting::default());
+        let old = routing.activate(Position::Left);
+        let old_snapshot = routing.snapshot().unwrap();
+        let new = routing.activate(Position::Right);
+        let new_snapshot = routing.snapshot().unwrap();
+        assert!(old_snapshot.cancelled.is_cancelled());
+        drop(old);
+        assert!(Rc::ptr_eq(&routing.snapshot().unwrap(), &new_snapshot));
+        assert!(!new_snapshot.cancelled.is_cancelled());
+        let (sender, mut receiver) = mpsc::channel(1);
+        let event = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 1,
+            dx: 2.,
+            dy: 3.,
+        }));
+        send_route_event(&sender, &old_snapshot, event.clone())
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+        send_route_event(&sender, &new_snapshot, event.clone())
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), (Position::Right, event));
+        drop(new);
+        assert!(routing.snapshot().is_none());
+        assert!(new_snapshot.cancelled.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_route_is_published_after_begin_is_queued() {
+        let routing = Rc::new(CaptureRouting::default());
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_capture_event(&sender, Position::Right, CaptureEvent::Begin(0.75))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut begin = Box::pin(send_activation_event(
+            &sender,
+            Position::Left,
+            0.25,
+            &cancel,
+        ));
+        assert!((&mut begin).now_or_never().is_none());
+        assert!(routing.snapshot().is_none());
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.75))
+        );
+        assert!(begin.await.unwrap());
+        let active = routing.activate(Position::Left);
+        assert_eq!(routing.snapshot().unwrap().pos, Position::Left);
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Left, CaptureEvent::Begin(0.25))
+        );
+        drop(active);
+        assert!(routing.snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_route_keeps_input_order_and_reports_closed_receiver() {
+        let routing = Rc::new(CaptureRouting::default());
+        let _active = routing.activate(Position::Left);
+        let route = routing.snapshot().unwrap();
+        let (sender, mut receiver) = mpsc::channel(2);
+        for dx in [1., 2.] {
+            let event = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+                time: 1,
+                dx,
+                dy: 0.,
+            }));
+            send_route_event(&sender, &route, event).await.unwrap();
+        }
+        for dx in [1., 2.] {
+            assert_eq!(
+                receiver.recv().await.unwrap(),
+                (
+                    Position::Left,
+                    CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+                        time: 1,
+                        dx,
+                        dy: 0.
+                    }))
+                )
+            );
+        }
+        drop(receiver);
+        assert!(
+            matches!(send_route_event(&sender, &route, CaptureEvent::Begin(0.5)).await,
+            Err(CaptureError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    fn zones_fixture(regions: Vec<(u32, u32, i32, i32)>) -> Zones {
+        use ashpd::zvariant::{LE, Value, serialized::Context};
+        let options = HashMap::from([
+            ("zones", Value::from(regions)),
+            ("zone_set", Value::from(1u32)),
+        ]);
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn barrier_id_exhaustion_returns_error_without_wrapping() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20)]);
+        let mut next = NonZeroU32::new(u32::MAX).unwrap();
+        assert!(select_barriers(&zones, &[Position::Left], &mut next).is_err());
+        assert_eq!(next.get(), u32::MAX);
+    }
+
+    #[test]
+    fn barrier_id_exhaustion_during_multiple_regions_returns_error() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20), (100, 80, 200, -20)]);
+        let mut next = NonZeroU32::new(u32::MAX - 1).unwrap();
+        assert!(select_barriers(&zones, &[Position::Left], &mut next).is_err());
+        assert_eq!(next.get(), u32::MAX);
+    }
+
+    #[test]
+    fn barrier_id_selection_preserves_routes_and_sequential_order() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20), (100, 80, 200, -20)]);
+        let mut next = NonZeroU32::new(1).unwrap();
+        let (barriers, routes) =
+            select_barriers(&zones, &[Position::Left, Position::Top], &mut next).unwrap();
+        assert_eq!(next.get(), 5);
+        assert_eq!(
+            barriers
+                .iter()
+                .map(|b| b.barrier_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            barriers.iter().map(|b| b.position).collect::<Vec<_>>(),
+            vec![
+                (10, -20, 10, 59),
+                (200, -20, 200, 59),
+                (10, -20, 109, -20),
+                (200, -20, 299, -20),
+            ]
+        );
+        for (id, expected) in [
+            (1, Position::Left),
+            (2, Position::Left),
+            (3, Position::Top),
+            (4, Position::Top),
+        ] {
+            assert_eq!(routes.get(&NonZeroU32::new(id).unwrap()), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn barrier_id_no_requests_do_not_consume_exhausted_counter() {
+        let zones = zones_fixture(vec![(100, 80, 10, -20)]);
+        let mut next = NonZeroU32::new(u32::MAX).unwrap();
+        let (barriers, routes) = select_barriers(&zones, &[], &mut next).unwrap();
+        assert!(barriers.is_empty() && routes.is_empty());
+        assert_eq!(next.get(), u32::MAX);
+        let empty = zones_fixture(vec![]);
+        let (barriers, routes) = select_barriers(&empty, &[Position::Left], &mut next).unwrap();
+        assert!(barriers.is_empty() && routes.is_empty());
+        assert_eq!(next.get(), u32::MAX);
+    }
+
+    fn zone_change_fixture(path: &str) -> ZonesChanged {
+        use ashpd::zvariant::{LE, OwnedObjectPath, Value, serialized::Context};
+        let options = HashMap::from([("zone_set", Value::from(1u32))]);
+        let path = OwnedObjectPath::try_from(path.to_owned()).unwrap();
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &(path, options)).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn foreign_zone_change_does_not_match_active_or_idle_session() {
+        let current = zone_change_fixture("/session/current");
+        let old = zone_change_fixture("/session/old");
+        assert!(zone_change_is_current(&current, Some("/session/current")));
+        assert!(!zone_change_is_current(&old, Some("/session/current")));
+        assert!(!zone_change_is_current(&current, None));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_zone_change_does_not_start_session_debounce() {
+        let mut zones = futures::stream::iter([false]).chain(futures::stream::pending());
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        let stop = CancellationToken::new();
+        let stop_update = CancellationToken::new();
+        let mut wait = Box::pin(wait_session_updates(
+            &mut zones,
+            &mut receiver,
+            &mut updates,
+            &stop,
+            &stop_update,
+        ));
+        let ignored = tokio::time::timeout(std::time::Duration::from_millis(80), &mut wait)
+            .await
+            .is_err();
+        if ignored {
+            stop.cancel();
+            (&mut wait).await.unwrap();
+        }
+        drop(wait);
+        assert!(
+            ignored,
+            "foreign signal triggered a completed rebuild debounce"
+        );
+        assert_eq!(updates.finish(), vec![Position::Left]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_zone_after_foreign_signal_still_completes_update() {
+        let mut zones =
+            futures::stream::iter([false, true, false]).chain(futures::stream::pending());
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                wait_session_updates(
+                    &mut zones,
+                    &mut receiver,
+                    &mut updates,
+                    &CancellationToken::new(),
+                    &CancellationToken::new()
+                )
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(updates.finish(), vec![Position::Left]);
+    }
+
+    #[test]
+    fn zone_identity_tracks_replacement_and_cleared_session() {
+        let old = zone_change_fixture("/session/old");
+        let new = zone_change_fixture("/session/new");
+        for (expected, old_matches, new_matches) in [
+            (Some("/session/old"), true, false),
+            (Some("/session/new"), false, true),
+            (None, false, false),
+        ] {
+            assert_eq!(zone_change_is_current(&old, expected), old_matches);
+            assert_eq!(zone_change_is_current(&new, expected), new_matches);
+        }
+    }
+
+    struct IgnoredZoneBurst {
+        polls: Rc<Cell<usize>>,
+    }
+    impl Stream for IgnoredZoneBurst {
+        type Item = bool;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<bool>> {
+            self.polls.set(self.polls.get() + 1);
+            Poll::Ready(Some(false))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ignored_zone_burst_yields_and_observes_cancellation() {
+        let polls = Rc::new(Cell::new(0));
+        let mut zones = IgnoredZoneBurst {
+            polls: polls.clone(),
+        };
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let session_stop = CancellationToken::new();
+        let mut wait = Box::pin(wait_session_updates(
+            &mut zones,
+            &mut receiver,
+            &mut updates,
+            &stop,
+            &session_stop,
+        ));
+        assert!((&mut wait).now_or_never().is_none());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        stop.cancel();
+        assert!(wait.await.is_ok());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        assert!(updates.finish().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_zone_at_budget_boundary_yields_before_more_signals() {
+        let polls = Rc::new(Cell::new(0));
+        let observed = polls.clone();
+        let mut zones = futures::stream::iter(
+            std::iter::repeat_n(false, 31)
+                .chain([true])
+                .chain(std::iter::repeat_n(true, 256)),
+        )
+        .inspect(move |_| observed.set(observed.get() + 1));
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let session_stop = CancellationToken::new();
+        let mut wait = Box::pin(wait_session_updates(
+            &mut zones,
+            &mut receiver,
+            &mut updates,
+            &stop,
+            &session_stop,
+        ));
+        assert!((&mut wait).now_or_never().is_none());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        stop.cancel();
+        assert!(wait.await.is_ok());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_does_not_block_async_control_progress() {
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let operation = run_token_io(move || {
+            started.send(()).unwrap();
+            wait_release
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .map_err(|_| io::Error::other("async control could not run during token IO"))
+        });
+        let control = async {
+            wait_started.await.unwrap();
+            let _ = release.send(());
+        };
+        let (result, ()) = tokio::join!(operation, control);
+        assert!(
+            result.is_ok(),
+            "token IO blocked the current-thread event loop: {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_read_preserves_trim_empty_and_missing_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        run_token_io(move || {
+            assert_eq!(read_token_from(&path), None);
+            fs::write(&path, "  test-only-value \n")?;
+            assert_eq!(read_token_from(&path).as_deref(), Some("test-only-value"));
+            fs::write(&path, " \n")?;
+            assert_eq!(read_token_from(&path), None);
+            fs::write(&path, [0xff])?;
+            assert_eq!(read_token_from(&path), None);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_write_preserves_private_mode_and_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/token");
+        run_token_io(move || {
+            write_token_to(&path, "test-only-long-value")?;
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+            write_token_to(&path, "short")?;
+            assert_eq!(fs::read_to_string(&path)?, "short");
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_worker_failure_is_an_error_not_capture_task_panic() {
+        let result = run_token_io::<(), _>(|| panic!("controlled token worker panic")).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("token worker failed")
+        );
+        let result = run_token_io::<(), _>(|| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled IO failure",
+            ))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn token_atomic_write_failure_preserves_previous_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        fs::write(&path, "test-only-old-value").unwrap();
+        let result = write_token_with(&path, "test-only-new-value", |file, bytes| {
+            file.write_all(&bytes[..5])?;
+            Err(io::Error::other("controlled partial write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "test-only-old-value");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn token_atomic_write_replaces_symlink_without_modifying_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("unrelated");
+        let path = directory.path().join("token");
+        fs::write(&target, "unrelated-data").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        write_token_to(&path, "test-only-new-value").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "unrelated-data");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "test-only-new-value");
+    }
+
+    #[test]
+    fn token_atomic_failed_first_write_leaves_no_partial_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        let result = write_token_with(&path, "test-only-new-value", |file, bytes| {
+            file.write_all(&bytes[..5])?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled write failure",
+            ))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn token_atomic_commit_failure_cleans_replacement_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        fs::create_dir(&path).unwrap();
+        assert!(write_token_to(&path, "test-only-new-value").is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
+    }
+
+    struct ReadyZoneBurst {
+        remaining: usize,
+        changes: Rc<Cell<usize>>,
+    }
+
+    impl Stream for ReadyZoneBurst {
+        type Item = bool;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<bool>> {
+            if self.remaining == 0 {
+                return Poll::Pending;
+            }
+            self.remaining -= 1;
+            self.changes.set(self.changes.get() + 1);
+            Poll::Ready(Some(true))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_burst_yields_before_draining_ready_signals() {
+        let changes = Rc::new(Cell::new(0));
+        let mut zones = ReadyZoneBurst {
+            remaining: 256,
+            changes: changes.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        let stop = CancellationToken::new();
+        let session_finished = CancellationToken::new();
+        {
+            let wait = wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &session_finished,
+            );
+            tokio::pin!(wait);
+            assert!(wait.as_mut().now_or_never().is_none());
+            assert!(
+                changes.get() <= 32,
+                "drained {} ready changes",
+                changes.get()
+            );
+            stop.cancel();
+            assert!(wait.await.is_ok());
+        }
+        assert_eq!(changes.get(), 32);
+        assert_eq!(updates.finish(), vec![Position::Left]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_control_runs_before_update_burst_drains() {
+        let changes = Rc::new(Cell::new(0));
+        let mut zones = ReadyZoneBurst {
+            remaining: 256,
+            changes: changes.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let session_finished = CancellationToken::new();
+        let (send_control, receive_control) = tokio::sync::oneshot::channel();
+        send_control.send(()).unwrap();
+        tokio::select! {
+            biased;
+            result = wait_session_updates(&mut zones, &mut events, &mut updates,
+                &stop, &session_finished) => panic!("update watcher exited early: {result:?}"),
+            result = receive_control => result.unwrap(),
+        }
+        assert_eq!(changes.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        assert_eq!(zones.remaining, 256 - MAX_SESSION_UPDATES_PER_YIELD);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_shutdown_interrupts_ready_update_burst() {
+        let changes = Rc::new(Cell::new(0));
+        let mut zones = ReadyZoneBurst {
+            remaining: 256,
+            changes: changes.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let stop_task = stop.clone();
+        let cancel_task = tokio::spawn(async move {
+            stop_task.cancel();
+        });
+        assert!(
+            wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &CancellationToken::new()
+            )
+            .await
+            .is_ok()
+        );
+        cancel_task.await.unwrap();
+        assert!(changes.get() < 256, "shutdown waited for the entire burst");
+        assert_eq!(updates.retained_positions(), 0);
+    }
+
+    // Prevent a regressed EOF busy loop from trapping the test runtime.
+    struct EofProbe {
+        initial_change: bool,
+        polls: Rc<Cell<usize>>,
+    }
+
+    impl Stream for EofProbe {
+        type Item = bool;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<bool>> {
+            self.polls.set(self.polls.get() + 1);
+            if self.initial_change {
+                self.initial_change = false;
+                Poll::Ready(Some(true))
+            } else if self.polls.get() <= 16 {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    async fn assert_closed_zone_stream(initial_change: bool) {
+        let polls = Rc::new(Cell::new(0));
+        let mut zones = EofProbe {
+            initial_change,
+            polls: polls.clone(),
+        };
+        let (_send, mut events) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let result = wait_session_updates(
+            &mut zones,
+            &mut events,
+            &mut updates,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .now_or_never();
+        let error = result
+            .expect("EOF caused repeated polling instead of failure")
+            .unwrap_err();
+        assert!(error.to_string().contains("zones"));
+        assert_eq!(polls.get(), if initial_change { 2 } else { 1 });
+    }
+
+    async fn assert_closed_client_channel(initial_change: bool) {
+        let mut zones = futures::stream::pending::<bool>();
+        let (send, mut events) = mpsc::channel(1);
+        if initial_change {
+            send.send(LibeiNotifyEvent::Create(Position::Right))
+                .await
+                .unwrap();
+        }
+        drop(send);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let result = wait_session_updates(
+            &mut zones,
+            &mut events,
+            &mut updates,
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .now_or_never();
+        let error = result.expect("closed channel did not finish").unwrap_err();
+        assert!(error.to_string().contains("client notification"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_zone_stream_before_debounce_reports_failure() {
+        assert_closed_zone_stream(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_zone_stream_during_debounce_reports_failure() {
+        assert_closed_zone_stream(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_client_channel_before_debounce_reports_failure() {
+        assert_closed_client_channel(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closed_client_channel_during_debounce_reports_failure() {
+        assert_closed_client_channel(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_update_shutdown_has_priority_over_closed_sources() {
+        for stop_backend in [false, true] {
+            let polls = Rc::new(Cell::new(0));
+            let mut zones = EofProbe {
+                initial_change: false,
+                polls: polls.clone(),
+            };
+            let (send, mut events) = mpsc::channel(1);
+            drop(send);
+            let stop = CancellationToken::new();
+            let session_finished = CancellationToken::new();
+            if stop_backend {
+                stop.cancel();
+            } else {
+                session_finished.cancel();
+            }
+            let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+            let result = wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &session_finished,
+            )
+            .await;
+            assert!(result.is_ok());
+            assert_eq!(polls.get(), 0);
+            assert_eq!(updates.finish(), vec![Position::Left]);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn healthy_updates_merge_until_original_debounce_finishes() {
+        let mut zones = futures::stream::pending::<bool>();
+        let (send, mut events) = mpsc::channel(3);
+        for event in [
+            LibeiNotifyEvent::Create(Position::Left),
+            LibeiNotifyEvent::Destroy(Position::Left),
+            LibeiNotifyEvent::Create(Position::Right),
+        ] {
+            send.send(event).await.unwrap();
+        }
+        let mut updates = CaptureClientUpdates::new(&[Position::Top]);
+        let stop = CancellationToken::new();
+        let session_finished = CancellationToken::new();
+        {
+            let wait = wait_session_updates(
+                &mut zones,
+                &mut events,
+                &mut updates,
+                &stop,
+                &session_finished,
+            );
+            tokio::pin!(wait);
+            assert!(wait.as_mut().now_or_never().is_none());
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), wait)
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+        }
+        // The sender stays open throughout the debounce.
+        drop(send);
+        assert_eq!(updates.finish(), vec![Position::Top, Position::Right]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_setup_failure_cancels_waiting_update_branch() {
+        let cancel_update = CancellationToken::new();
+        let joined = async {
+            tokio::join!(
+                cancel_sibling_on_completion(
+                    async { Err(CaptureError::Io(io::Error::other("setup failed"))) },
+                    cancel_update.clone(),
+                ),
+                cancel_update.cancelled(),
+            )
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_millis(100), joined)
+            .await
+            .expect("failed setup left update sibling pending");
+        assert!(
+            matches!(result, Err(CaptureError::Io(error)) if error.to_string() == "setup failed")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ei_handler_failure_reaches_session_owner() {
+        let cancel_session = CancellationToken::new();
+        let result = run_ei_handler(
+            async { Err(CaptureError::EndOfStream) },
+            cancel_session.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(cancel_session.is_cancelled());
+        assert!(matches!(result, Err(CaptureError::EndOfStream)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_session_failure_cancels_waiting_ei_sibling() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let joined = async {
+            tokio::join!(
+                run_ei_handler(std::future::pending(), cancel_session, cancel_ei.clone()),
+                cancel_sibling_on_completion(
+                    async { Err(CaptureError::ActivationClosed) },
+                    cancel_ei
+                ),
+            )
+        };
+        let (ei_result, session_result) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), joined)
+                .await
+                .expect("failed session left EI sibling pending");
+        assert!(ei_result.is_ok());
+        assert!(matches!(
+            session_result,
+            Err(CaptureError::ActivationClosed)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ei_failure_waits_for_session_cleanup_before_returning() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let (cleanup_finished, cleanup_wait) = tokio::sync::oneshot::channel();
+        let (cleanup_started, mut started_wait) = tokio::sync::oneshot::channel();
+        let session = async {
+            cancel_session.cancelled().await;
+            cleanup_started.send(()).unwrap();
+            cleanup_wait.await.unwrap();
+            Ok(())
+        };
+        let joined = async {
+            tokio::join!(
+                run_ei_handler(
+                    async { Err(CaptureError::Disconnected("test".into())) },
+                    cancel_session.clone(),
+                    cancel_ei.clone()
+                ),
+                cancel_sibling_on_completion(session, cancel_ei.clone()),
+            )
+        };
+        tokio::pin!(joined);
+        assert!(joined.as_mut().now_or_never().is_none());
+        assert!(started_wait.try_recv().is_ok());
+        assert!(!cancel_ei.is_cancelled());
+        cleanup_finished.send(()).unwrap();
+        let (ei_result, session_result) = joined.await;
+        assert!(matches!(ei_result, Err(CaptureError::Disconnected(reason)) if reason == "test"));
+        assert!(session_result.is_ok());
+        assert!(cancel_ei.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_ei_teardown_has_priority_over_ready_stream_error() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        cancel_ei.cancel();
+        let handler_polled = Cell::new(false);
+        let result = run_ei_handler(
+            async {
+                handler_polled.set(true);
+                Err(CaptureError::EndOfStream)
+            },
+            cancel_session.clone(),
+            cancel_ei,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(!handler_polled.get());
+        assert!(!cancel_session.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_session_exit_cancels_ei_without_failure() {
+        let cancel_session = CancellationToken::new();
+        let cancel_ei = CancellationToken::new();
+        let (ei_result, session_result) = tokio::join!(
+            run_ei_handler(
+                std::future::pending(),
+                cancel_session.clone(),
+                cancel_ei.clone()
+            ),
+            cancel_sibling_on_completion(async { Ok(()) }, cancel_ei),
+        );
+        assert!(ei_result.is_ok());
+        assert!(session_result.is_ok());
+        assert!(!cancel_session.is_cancelled());
+    }
+
+    #[test]
+    fn client_update_burst_retains_only_four_positions() {
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        for _ in 0..10_000 {
+            for pos in [
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ] {
+                updates.record(LibeiNotifyEvent::Destroy(pos));
+                updates.record(LibeiNotifyEvent::Create(pos));
+            }
+        }
+        assert!(
+            updates.retained_positions() <= 4,
+            "retained {} positions",
+            updates.retained_positions()
+        );
+        assert_eq!(
+            updates.finish(),
+            vec![
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom
+            ]
+        );
+    }
+
+    #[test]
+    fn client_updates_preserve_serial_membership_and_barrier_order() {
+        let positions = [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ];
+        let initial_states = [
+            vec![],
+            vec![Position::Top],
+            vec![Position::Right, Position::Left],
+            positions.to_vec(),
+        ];
+        // All five-operation sequences, including duplicates and destroy/recreate.
+        for initial in initial_states {
+            for mut sequence in 0..8usize.pow(5) {
+                let mut expected = initial.clone();
+                let mut updates = CaptureClientUpdates::new(&initial);
+                for _ in 0..5 {
+                    let operation = sequence % 8;
+                    sequence /= 8;
+                    let pos = positions[operation / 2];
+                    if operation % 2 == 0 {
+                        updates.record(LibeiNotifyEvent::Create(pos));
+                        if !expected.contains(&pos) {
+                            expected.push(pos);
+                        }
+                    } else {
+                        updates.record(LibeiNotifyEvent::Destroy(pos));
+                        expected.retain(|p| *p != pos);
+                    }
+                    assert!(updates.retained_positions() <= 4);
+                }
+                assert_eq!(updates.finish(), expected);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finished_capture_task_failure_is_not_silently_successful() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let handle =
+                    tokio::task::spawn_local(async { Err(CaptureError::ActivationClosed) });
+                tokio::task::yield_now().await;
+                assert!(handle.is_finished());
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                assert!(matches!(
+                    completion.join().await,
+                    Err(CaptureError::ActivationClosed)
+                ));
+                assert!(completion.join().await.is_ok());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_capture_task_reports_error_without_panicking() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let handle =
+                    tokio::task::spawn_local(std::future::pending::<Result<(), CaptureError>>());
+                handle.abort();
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                let result = poll_fn(|cx| completion.poll_result(cx)).await.unwrap();
+                assert!(result.unwrap_err().to_string().contains("cancel"));
+                assert!(poll_fn(|cx| completion.poll_result(cx)).await.is_none());
+                assert!(completion.join().await.is_ok());
+            })
+            .await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_task_panic_is_returned_once_as_cleanup_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let handle: JoinHandle<Result<(), CaptureError>> =
+                    tokio::task::spawn_local(async { panic!("simulated EIS panic") });
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                let error = completion.join().await.unwrap_err().to_string();
+                assert!(
+                    error.contains("libei capture task failed")
+                        && error.contains("simulated EIS panic")
+                );
+                assert!(completion.join().await.is_ok());
+                assert!(poll_fn(|cx| completion.poll_result(cx)).await.is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_join_wait_preserves_task_and_later_result() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (send, wait) = tokio::sync::oneshot::channel();
+                let handle = tokio::task::spawn_local(async {
+                    wait.await.unwrap();
+                    Err(CaptureError::ActivationClosed)
+                });
+                let mut completion = CaptureTaskCompletion {
+                    handle,
+                    joined: false,
+                };
+                assert!(completion.join().now_or_never().is_none());
+                assert!(!completion.joined);
+                send.send(()).unwrap();
+                assert!(matches!(
+                    completion.join().await,
+                    Err(CaptureError::ActivationClosed)
+                ));
+                assert!(poll_fn(|cx| completion.poll_result(cx)).await.is_none());
+            })
+            .await;
     }
 }

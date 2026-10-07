@@ -29,10 +29,11 @@
             <property name="margin-top">30</property>
             <property name="margin-bottom">30</property>
             <child>
-              <object class="GtkLabel">
+              <object class="GtkLabel" id="message">
                 <property name="label">An unauthorized Device is trying to connect. Do you want to authorize this Device?</property>
                 <property name="width-request">100</property>
-                <property name="wrap">word-wrap</property>
+                <property name="wrap">True</property>
+                <property name="wrap-mode">word-char</property>
               </object>
             </child>
             <child>

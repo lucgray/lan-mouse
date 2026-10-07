@@ -36,6 +36,10 @@ pub enum ProtocolError {
     /// buffer too small for clipboard data
     #[error("buffer too small for clipboard data")]
     BufferTooSmall,
+    #[error("invalid event frame length: {0}")]
+    InvalidFrameLength(usize),
+    #[error("event is not a clipboard event")]
+    NotClipboardEvent,
 }
 
 /// Position of a client
@@ -387,11 +391,7 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     let is_image = match event_type {
         t if t == EventType::ClipboardText as u8 => false,
         t if t == EventType::ClipboardImage as u8 => true,
-        _ => {
-            return Err(ProtocolError::InvalidEventId(
-                EventType::try_from(event_type).unwrap_err(),
-            ));
-        }
+        _ => return Err(ProtocolError::NotClipboardEvent),
     };
     if buf.len() < 5 {
         return Err(ProtocolError::BufferTooSmall);
@@ -403,6 +403,9 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     if buf.len() < 5 + length {
         return Err(ProtocolError::BufferTooSmall);
     }
+    if buf.len() != 5 + length {
+        return Err(ProtocolError::InvalidFrameLength(buf.len()));
+    }
     let data = &buf[5..5 + length];
     let clipboard_event = if is_image {
         ClipboardEvent::Image(data.to_vec())
@@ -410,6 +413,26 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         ClipboardEvent::Text(String::from_utf8(data.to_vec())?)
     };
     Ok(ProtoEvent::Input(InputEvent::Clipboard(clipboard_event)))
+}
+
+/// Decode exactly one DTLS application message. Never consume another datagram
+/// to complete a malformed frame: it may contain an unrelated input event.
+pub fn decode_event_frame(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
+    let event_type = *buf.first().ok_or(ProtocolError::BufferTooSmall)?;
+    if is_clipboard_event_type(event_type) {
+        return decode_clipboard_event(buf);
+    }
+    if buf.len() > MAX_EVENT_SIZE {
+        return Err(ProtocolError::InvalidFrameLength(buf.len()));
+    }
+    let mut fixed = [0; MAX_EVENT_SIZE];
+    fixed[..buf.len()].copy_from_slice(buf);
+    let event: ProtoEvent = fixed.try_into()?;
+    let (_, expected): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+    if buf.len() != expected && buf.len() != MAX_EVENT_SIZE {
+        return Err(ProtocolError::InvalidFrameLength(buf.len()));
+    }
+    Ok(event)
 }
 
 /// whether an event type byte is one of the variable-length clipboard types
@@ -420,6 +443,44 @@ pub fn is_clipboard_event_type(event_type: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_images_and_text_decode_in_both_receivers() {
+        for content in [
+            ClipboardEvent::Text("中文".into()),
+            ClipboardEvent::Image(vec![1, 2, 3]),
+        ] {
+            let event = ProtoEvent::Input(InputEvent::Clipboard(content));
+            let buf = encode_clipboard_event(&event).unwrap();
+            assert_eq!(as_input(decode_event_frame(&buf).unwrap()), as_input(event));
+            let mut truncated = buf.clone();
+            truncated.pop();
+            assert!(decode_event_frame(&truncated).is_err());
+            // A malformed clipboard frame cannot consume the following heartbeat.
+            assert!(matches!(
+                decode_event_frame(&[EventType::Ping as u8]).unwrap(),
+                ProtoEvent::Ping
+            ));
+            let mut extra = buf;
+            extra.push(0);
+            assert!(decode_event_frame(&extra).is_err());
+        }
+    }
+
+    #[test]
+    fn framed_fixed_events_reject_truncation_and_keep_padded_compatibility() {
+        let event = ProtoEvent::Enter(Position::Left, 0.5);
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+        assert!(
+            matches!(decode_event_frame(&buf[..len]).unwrap(), ProtoEvent::Enter(Position::Left, t) if t == 0.5)
+        );
+        assert!(
+            matches!(decode_event_frame(&buf).unwrap(), ProtoEvent::Enter(Position::Left, t) if t == 0.5)
+        );
+        assert!(decode_event_frame(&buf[..len - 1]).is_err());
+        assert!(decode_event_frame(&[]).is_err());
+        assert!(decode_clipboard_event(&[EventType::Ping as u8]).is_err());
+    }
 
     fn roundtrip(event: ProtoEvent) -> ProtoEvent {
         let (buf, len) = event.into();

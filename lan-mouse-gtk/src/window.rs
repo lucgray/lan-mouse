@@ -1,6 +1,7 @@
+mod authorization;
 mod imp;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -11,8 +12,7 @@ use gtk::{
 };
 
 use lan_mouse_ipc::{
-    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
-    Position,
+    ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, Position,
 };
 
 use crate::{
@@ -41,13 +41,18 @@ glib::wrapper! {
 }
 
 impl Window {
-    pub(super) fn new(app: &adw::Application, conn: FrontendRequestWriter) -> Self {
+    pub(super) fn new(app: &adw::Application, conn: crate::daemon_client::DaemonClient) -> Self {
         let window: Self = Object::builder().property("application", app).build();
-        window
-            .imp()
-            .frontend_request_writer
-            .borrow_mut()
-            .replace(conn);
+        window.imp().daemon_client.borrow_mut().replace(conn);
+        window.connect_close_request(|window| {
+            window.clear_authorization_dialogs();
+            for index in 0..window.clients().n_items() {
+                if let Some(row) = window.row_by_idx(index as i32) {
+                    row.flush_pending_edits();
+                }
+            }
+            glib::Propagation::Proceed
+        });
         window
     }
 
@@ -415,25 +420,58 @@ impl Window {
     }
 
     fn open_fingerprint_dialog(&self, fp: Option<String>) {
+        if !self.imp().daemon_ready.get() {
+            return;
+        }
+        if let Some(editor) = self.imp().fingerprint_window.borrow().as_ref() {
+            editor.present();
+            return;
+        }
+        if fp.is_none() {
+            if let Some(prompt) = self.imp().authorization_window.borrow().as_ref() {
+                prompt.present();
+                return;
+            }
+        }
         let window = FingerprintWindow::new(fp);
         window.set_transient_for(Some(self));
         window.connect_closure(
             "confirm-clicked",
             false,
             closure_local!(
-                #[strong(rename_to = parent)]
+                #[weak(rename_to = parent)]
                 self,
                 move |w: FingerprintWindow, desc: String, fp: String| {
-                    parent.request_fingerprint_add(desc, fp);
-                    w.close();
+                    if parent.imp().fingerprint_window.borrow().as_ref() != Some(&w)
+                        || !parent.imp().daemon_ready.get()
+                    {
+                        return;
+                    }
+                    // Keep the description/fingerprint draft open on a full or
+                    // disconnected request queue; closing is not a success signal.
+                    if parent.try_request(FrontendRequest::AuthorizeKey(desc, fp)) {
+                        w.close();
+                    }
                 }
             ),
         );
+        let parent = self.downgrade();
+        window.connect_close_request(move |w| {
+            if let Some(parent) = parent.upgrade() {
+                if parent.imp().fingerprint_window.borrow().as_ref() == Some(w) {
+                    parent.imp().fingerprint_window.borrow_mut().take();
+                    parent
+                        .imp()
+                        .authorization_queue
+                        .borrow_mut()
+                        .complete(Instant::now());
+                    parent.schedule_authorization();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.imp().fingerprint_window.replace(Some(window.clone()));
         window.present();
-    }
-
-    fn request_fingerprint_add(&self, desc: String, fp: String) {
-        self.request(FrontendRequest::AuthorizeKey(desc, fp));
     }
 
     fn request_fingerprint_remove(&self, fp: String) {
@@ -441,11 +479,107 @@ impl Window {
     }
 
     pub(crate) fn request(&self, request: FrontendRequest) {
-        let mut requester = self.imp().frontend_request_writer.borrow_mut();
-        let requester = requester.as_mut().unwrap();
-        if let Err(e) = requester.request(request) {
-            log::error!("error sending message: {e}");
+        self.try_request(request);
+    }
+
+    fn try_request(&self, request: FrontendRequest) -> bool {
+        if let FrontendRequest::WindowIdentifier(identifier) = &request {
+            self.imp()
+                .window_identifier
+                .replace(Some(identifier.clone()));
+            if self.daemon_generation() == 0 {
+                return true;
+            }
+        }
+        let edit = match &request {
+            FrontendRequest::UpdateHostname(handle, _) => Some((*handle, true)),
+            FrontendRequest::UpdatePort(handle, _) => Some((*handle, false)),
+            _ => None,
         };
+        let result = self
+            .imp()
+            .daemon_client
+            .borrow()
+            .as_ref()
+            .ok_or("Service unavailable")
+            .and_then(|client| client.request(self.daemon_generation(), request));
+        if let Err(error) = result {
+            if let Some((handle, hostname)) = edit {
+                if let Some(row) = self.row_for_handle(handle) {
+                    row.reject_edit_submission(hostname);
+                }
+            }
+            self.show_toast(error);
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn stop_daemon_client(&self) {
+        self.imp().daemon_ready.set(false);
+        self.clear_authorization_dialogs();
+        self.imp().daemon_client.borrow_mut().take();
+    }
+
+    pub(super) fn daemon_worker_stopped(&self) {
+        self.daemon_disconnected("IPC worker stopped. Relaunch the frontend to reconnect.");
+        self.imp()
+            .connection_row
+            .set_title("Service connection stopped");
+    }
+
+    pub(super) fn daemon_generation(&self) -> u64 {
+        self.imp().daemon_generation.get()
+    }
+
+    pub(super) fn daemon_connected(&self, generation: u64) {
+        self.imp().daemon_ready.set(false);
+        self.clear_authorization_dialogs();
+        self.imp().daemon_generation.set(generation);
+        self.imp()
+            .connection_row
+            .set_title("Synchronizing service state");
+        self.imp()
+            .connection_row
+            .set_subtitle("Waiting for current settings");
+        self.imp().connection_row.set_visible(true);
+        self.imp().service_controls.set_sensitive(false);
+        let identifier = self.imp().window_identifier.borrow().clone();
+        if let Some(identifier) = identifier {
+            self.request(FrontendRequest::WindowIdentifier(identifier));
+        }
+    }
+
+    pub(super) fn daemon_synced(&self) {
+        self.imp().daemon_ready.set(true);
+        self.present_next_authorization();
+        self.imp().connection_row.set_visible(false);
+        self.imp().service_controls.set_sensitive(true);
+        if let Some(settings) = self.imp().settings_window.borrow().as_ref() {
+            settings.set_daemon_available(true);
+        }
+    }
+
+    pub(super) fn daemon_disconnected(&self, error: &str) {
+        self.imp().daemon_generation.set(0);
+        self.imp().daemon_ready.set(false);
+        self.imp()
+            .connection_row
+            .set_title("Service disconnected — reconnecting");
+        self.imp().connection_row.set_subtitle(error);
+        self.imp().connection_row.set_visible(true);
+        self.imp().service_controls.set_sensitive(false);
+        self.clients().remove_all();
+        self.authorized().remove_all();
+        self.update_placeholder_visibility();
+        self.update_auth_placeholder_visibility();
+        self.set_pk_fp("Service disconnected");
+        self.set_capture(false);
+        self.set_emulation(false);
+        if let Some(settings) = self.imp().settings_window.borrow().as_ref() {
+            settings.set_daemon_available(false);
+        }
+        self.clear_authorization_dialogs();
     }
 
     pub(super) fn show_toast(&self, msg: &str) {
@@ -526,6 +660,11 @@ impl Window {
     }
 
     pub(super) fn set_authorized_keys(&self, fingerprints: HashMap<String, String>) {
+        let active_authorized = self
+            .imp()
+            .authorization_queue
+            .borrow_mut()
+            .set_authorized(fingerprints.keys().cloned().collect());
         let authorized = self.authorized();
         // clear list
         authorized.remove_all();
@@ -535,6 +674,15 @@ impl Window {
             authorized.append(&key_obj);
         }
         self.update_auth_placeholder_visibility();
+        if active_authorized {
+            let editor = self.imp().fingerprint_window.borrow().clone();
+            let prompt = self.imp().authorization_window.borrow().clone();
+            if let Some(editor) = editor {
+                editor.close();
+            } else if let Some(prompt) = prompt {
+                prompt.close();
+            }
+        }
     }
 
     pub(super) fn set_pk_fp(&self, fingerprint: &str) {
@@ -564,6 +712,7 @@ impl Window {
         }
         let settings_window = SettingsWindow::new();
         settings_window.set_transient_for(Some(self));
+        settings_window.set_daemon_available(self.imp().daemon_ready.get());
         let (clipboard_enabled, invert_scroll, mouse_sensitivity) = self.imp().settings.get();
         settings_window.update_values(clipboard_enabled, invert_scroll, mouse_sensitivity);
         settings_window.connect_clipboard_toggled(clone!(
@@ -590,20 +739,74 @@ impl Window {
     }
 
     pub(super) fn request_authorization(&self, fingerprint: &str) {
-        if let Some(w) = self.imp().authorization_window.borrow_mut().take() {
-            w.close();
+        if self.daemon_generation() == 0 {
+            return;
         }
-        let window = AuthorizationWindow::new(fingerprint);
+        self.imp()
+            .authorization_queue
+            .borrow_mut()
+            .enqueue(fingerprint, Instant::now());
+        self.present_next_authorization();
+    }
+
+    fn schedule_authorization(&self) {
+        if self.imp().authorization_next.borrow().is_some() {
+            return;
+        }
+        let parent = self.downgrade();
+        let source = glib::idle_add_local_once(move || {
+            if let Some(parent) = parent.upgrade() {
+                parent.imp().authorization_next.borrow_mut().take();
+                parent.present_next_authorization();
+            }
+        });
+        self.imp().authorization_next.replace(Some(source));
+    }
+
+    fn clear_authorization_dialogs(&self) {
+        if let Some(source) = self.imp().authorization_next.borrow_mut().take() {
+            source.remove();
+        }
+        self.imp().authorization_queue.borrow_mut().clear();
+        // Detach both before closing: callbacks cannot advance old queued prompts.
+        let prompt = self.imp().authorization_window.borrow_mut().take();
+        let editor = self.imp().fingerprint_window.borrow_mut().take();
+        if let Some(prompt) = prompt {
+            prompt.close();
+        }
+        if let Some(editor) = editor {
+            editor.close();
+        }
+    }
+
+    fn present_next_authorization(&self) {
+        if !self.imp().daemon_ready.get()
+            || self.imp().authorization_window.borrow().is_some()
+            || self.imp().fingerprint_window.borrow().is_some()
+        {
+            return;
+        }
+        let Some(fingerprint) = self.imp().authorization_queue.borrow_mut().next() else {
+            return;
+        };
+        let window = AuthorizationWindow::new(&fingerprint);
         window.set_transient_for(Some(self));
         window.connect_closure(
             "confirm-clicked",
             false,
             closure_local!(
-                #[strong(rename_to = parent)]
+                #[weak(rename_to = parent)]
                 self,
                 move |w: AuthorizationWindow, fp: String| {
-                    w.close();
+                    if parent.imp().authorization_window.borrow().as_ref() != Some(&w)
+                        || !parent.imp().daemon_ready.get()
+                    {
+                        return;
+                    }
+                    // Install the editor first, so closing the prompt preserves
+                    // this active identity through description editing.
                     parent.open_fingerprint_dialog(Some(fp));
+                    w.close();
                 }
             ),
         );
@@ -614,7 +817,350 @@ impl Window {
                 w.close();
             }),
         );
+        let parent = self.downgrade();
+        window.connect_close_request(move |w| {
+            if let Some(parent) = parent.upgrade() {
+                if parent.imp().authorization_window.borrow().as_ref() == Some(w) {
+                    parent.imp().authorization_window.borrow_mut().take();
+                    if parent.imp().fingerprint_window.borrow().is_none() {
+                        parent
+                            .imp()
+                            .authorization_queue
+                            .borrow_mut()
+                            .complete(Instant::now());
+                        parent.schedule_authorization();
+                    }
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.imp()
+            .authorization_window
+            .replace(Some(window.clone()));
         window.present();
-        self.imp().authorization_window.replace(Some(window));
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    #[ignore = "requires a GTK display; run separately"]
+    fn actual_authorization_windows_preserve_interaction_drafts_and_session_identity() {
+        fn test_fp(value: &str) -> String {
+            value
+                .bytes()
+                .chain(std::iter::repeat(0))
+                .take(32)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        }
+        fn advance(window: &Window) {
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + std::time::Duration::from_secs(2);
+            while window.imp().authorization_next.borrow().is_some() {
+                assert!(
+                    Instant::now() < deadline,
+                    "next authorization idle did not run"
+                );
+                context.iteration(false);
+            }
+        }
+        fn prompt(window: &Window) -> AuthorizationWindow {
+            window
+                .imp()
+                .authorization_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone()
+        }
+        fn editor(window: &Window) -> FingerprintWindow {
+            window
+                .imp()
+                .fingerprint_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .clone()
+        }
+        adw::init().unwrap();
+        gio::resources_register_include!("lan-mouse.gresource").unwrap();
+        let app = adw::Application::new(
+            Some("de.feschber.LanMouse.AuthorizationTest"),
+            gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let (client, current, mut requests) = crate::daemon_client::test_client();
+        let window = Window::new(&app, client);
+        window.present();
+        window.daemon_connected(1);
+        window.request_authorization(test_fp("before-sync").as_str());
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.set_authorized_keys(HashMap::from([(
+            test_fp("before-sync").as_str().into(),
+            "already accepted".into(),
+        )]));
+        window.daemon_synced();
+        assert!(window.imp().authorization_window.borrow().is_none());
+
+        window.request_authorization(test_fp("peer-a").as_str());
+        let original = prompt(&window);
+        assert!(original.imp().message.wraps());
+        assert_eq!(
+            original.imp().message.wrap_mode(),
+            gtk::pango::WrapMode::WordChar
+        );
+        for _ in 0..1000 {
+            window.request_authorization(test_fp("peer-a").as_str());
+            window.request_authorization(test_fp("peer-b").as_str());
+        }
+        assert_eq!(prompt(&window), original);
+        assert_eq!(
+            original.imp().fingerprint.text(),
+            test_fp("peer-a").as_str()
+        );
+        original.imp().confirm_button.emit_clicked();
+        let draft = editor(&window);
+        assert!(window.imp().authorization_window.borrow().is_none());
+        draft.imp().description.set_text("my peer description");
+        window.request_authorization(test_fp("peer-c").as_str());
+        window.request_authorization(test_fp("peer-a").as_str());
+        assert_eq!(editor(&window), draft);
+        assert_eq!(draft.imp().fingerprint.text(), test_fp("peer-a").as_str());
+        for _ in 0..64 {
+            window.request(FrontendRequest::Create);
+        }
+        draft.imp().confirm_button.emit_clicked();
+        assert_eq!(editor(&window), draft); // A full request queue keeps the draft open.
+        assert_eq!(draft.imp().description.text(), "my peer description");
+        assert!(window.imp().authorization_next.borrow().is_none());
+        while requests.try_recv().is_ok() {}
+        draft.imp().confirm_button.emit_clicked();
+        assert!(
+            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "my peer description" && fp == test_fp("peer-a").as_str())
+        );
+        assert!(window.imp().fingerprint_window.borrow().is_none());
+        advance(&window);
+        assert_eq!(
+            prompt(&window).imp().fingerprint.text(),
+            test_fp("peer-b").as_str()
+        );
+        window.set_authorized_keys(HashMap::from([
+            (test_fp("peer-b").as_str().into(), "b".into()),
+            (test_fp("peer-c").as_str().into(), "c".into()),
+        ]));
+        advance(&window);
+        assert!(window.imp().authorization_window.borrow().is_none());
+
+        window.open_fingerprint_dialog(None);
+        let manual = editor(&window);
+        manual.imp().description.set_text("manual description");
+        for invalid in ["", "bad", &"A".repeat(63), &"gg".repeat(32)] {
+            manual.imp().fingerprint.set_text(invalid);
+            manual.imp().confirm_button.emit_clicked();
+            assert_eq!(editor(&window), manual);
+            assert!(manual.imp().validation_error.is_visible());
+            assert!(manual.imp().fingerprint.has_css_class("error"));
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + std::time::Duration::from_secs(1);
+            while manual.imp().validation_error.height() == 0 || !manual.is_mapped() {
+                assert!(
+                    Instant::now() < deadline,
+                    "validation error was not laid out"
+                );
+                context.iteration(false);
+            }
+            let bounds = manual
+                .imp()
+                .validation_error
+                .compute_bounds(&manual)
+                .unwrap();
+            assert!(bounds.width() > 0.0 && bounds.height() > 0.0);
+            assert!(bounds.y() >= 0.0 && bounds.y() + bounds.height() <= manual.height() as f32);
+            assert_eq!(manual.imp().description.text(), "manual description");
+            assert!(requests.try_recv().is_err());
+        }
+        manual
+            .imp()
+            .fingerprint
+            .set_text(&test_fp("manual-key").replace(':', "").to_uppercase());
+        assert!(!manual.imp().validation_error.is_visible());
+        window.request_authorization(test_fp("peer-d").as_str());
+        assert_eq!(editor(&window), manual);
+        assert!(window.imp().authorization_window.borrow().is_none());
+        manual.imp().confirm_button.emit_clicked();
+        assert!(
+            matches!(requests.try_recv().unwrap(), (1, FrontendRequest::AuthorizeKey(desc, fp)) if desc == "manual description" && fp == test_fp("manual-key").as_str())
+        );
+        advance(&window);
+        prompt(&window).imp().cancel_button.emit_clicked();
+        advance(&window);
+        for _ in 0..1000 {
+            window.request_authorization(test_fp("peer-d").as_str());
+        }
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.request_authorization(test_fp("peer-e").as_str());
+        window.request_authorization(test_fp("peer-f").as_str());
+        prompt(&window).close(); // Window-manager close also advances the queue.
+        advance(&window);
+        let stale_prompt = prompt(&window);
+        assert_eq!(
+            stale_prompt.imp().fingerprint.text(),
+            test_fp("peer-f").as_str()
+        );
+        stale_prompt.imp().confirm_button.emit_clicked();
+        let stale_editor = editor(&window);
+        window.request_authorization(test_fp("peer-g").as_str());
+        current.store(0, Ordering::Release);
+        window.daemon_disconnected("fixture EOF");
+        assert!(window.imp().authorization_window.borrow().is_none());
+        assert!(window.imp().fingerprint_window.borrow().is_none());
+        assert!(!stale_editor.is_visible());
+        assert!(window.imp().authorization_next.borrow().is_none());
+        stale_editor.imp().confirm_button.emit_clicked();
+        stale_prompt.imp().confirm_button.emit_clicked();
+        assert!(requests.try_recv().is_err());
+        current.store(2, Ordering::Release);
+        window.daemon_connected(2);
+        window.request_authorization(test_fp("peer-d").as_str()); // Previous dismissal belongs to the old session.
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.daemon_synced();
+        assert_eq!(
+            prompt(&window).imp().fingerprint.text(),
+            test_fp("peer-d").as_str()
+        );
+        window.request_authorization(test_fp("never-replay").as_str());
+        prompt(&window).close();
+        assert!(window.imp().authorization_next.borrow().is_some());
+        current.store(0, Ordering::Release);
+        window.daemon_disconnected("before pending idle");
+        assert!(window.imp().authorization_next.borrow().is_none());
+        current.store(3, Ordering::Release);
+        window.daemon_connected(3);
+        window.daemon_synced();
+        assert!(window.imp().authorization_window.borrow().is_none());
+        window.set_authorized_keys(HashMap::new());
+        let weak = window.downgrade();
+        window.stop_daemon_client();
+        window.close();
+        drop(window);
+        assert!(
+            weak.upgrade().is_none(),
+            "authorization callbacks must not retain the parent window"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run separately"]
+    fn actual_window_retains_visibility_clears_stale_state_and_waits_for_sync() {
+        adw::init().unwrap();
+        gio::resources_register_include!("lan-mouse.gresource").unwrap();
+        let app = adw::Application::new(
+            Some("de.feschber.LanMouse.RecoveryTest"),
+            gio::ApplicationFlags::NON_UNIQUE,
+        );
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let (client, current, mut requests) = crate::daemon_client::test_client();
+        let window = Window::new(&app, client);
+        window.present();
+        window.daemon_connected(1);
+        assert!(!window.imp().service_controls.is_sensitive());
+        assert!(window.imp().connection_row.is_visible());
+        window.new_client(
+            7,
+            ClientConfig {
+                hostname: Some("old.local".into()),
+                ..Default::default()
+            },
+            ClientState {
+                alive: true,
+                ..Default::default()
+            },
+        );
+        window.set_capture(true);
+        window.set_emulation(true);
+        window.update_settings(true, false, 1.);
+        window.daemon_synced();
+        window.open_settings();
+        assert!(window.imp().service_controls.is_sensitive());
+        assert_eq!(window.clients().n_items(), 1);
+
+        current.store(0, Ordering::Release);
+        window.daemon_disconnected("fixture EOF");
+        assert!(window.is_visible());
+        assert_eq!(window.clients().n_items(), 0);
+        assert!(!window.imp().capture_active.get());
+        assert!(!window.imp().emulation_active.get());
+        assert!(window.imp().connection_row.is_visible());
+        assert!(!window.imp().service_controls.is_sensitive());
+        assert!(
+            !window
+                .imp()
+                .settings_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .imp()
+                .clipboard_switch
+                .is_sensitive()
+        );
+
+        current.store(2, Ordering::Release);
+        window.daemon_connected(2);
+        assert!(!window.imp().service_controls.is_sensitive());
+        window.new_client(
+            7,
+            ClientConfig {
+                hostname: Some("fresh.local".into()),
+                ..Default::default()
+            },
+            Default::default(),
+        );
+        window.update_settings(false, true, 0.5);
+        window.daemon_synced();
+        assert!(window.is_visible());
+        assert!(window.imp().service_controls.is_sensitive());
+        assert!(!window.imp().connection_row.is_visible());
+        assert_eq!(window.clients().n_items(), 1);
+        assert_eq!(
+            window
+                .client_by_idx(0)
+                .unwrap()
+                .get_data()
+                .hostname
+                .as_deref(),
+            Some("fresh.local")
+        );
+        assert_eq!(window.imp().settings.get(), (false, true, 0.5));
+        assert!(
+            window
+                .imp()
+                .settings_window
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .imp()
+                .clipboard_switch
+                .is_sensitive()
+        );
+        while requests.try_recv().is_ok() {}
+        for _ in 0..64 {
+            window.request(FrontendRequest::Create);
+        }
+        let row = window.row_for_handle(7).unwrap();
+        row.imp().hostname.set_text("retry.local");
+        row.flush_pending_edits(); // full queue rejects this submission
+        assert_eq!(row.imp().hostname.text(), "retry.local");
+        while requests.try_recv().is_ok() {}
+        row.flush_pending_edits(); // retry once capacity is available
+        assert!(
+            matches!(requests.try_recv().unwrap(), (2, FrontendRequest::UpdateHostname(7, Some(host))) if host == "retry.local")
+        );
+        window.stop_daemon_client();
+        window.close();
     }
 }

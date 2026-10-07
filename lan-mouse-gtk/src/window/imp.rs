@@ -6,7 +6,8 @@ use glib::subclass::InitializingObject;
 use gtk::glib::clone;
 use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, glib};
 
-use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
+use crate::daemon_client::DaemonClient;
+use lan_mouse_ipc::{DEFAULT_PORT, WindowIdentifier};
 
 use crate::authorization_window::AuthorizationWindow;
 use crate::settings_window::SettingsWindow;
@@ -48,11 +49,21 @@ pub struct Window {
     pub authorized_list: TemplateChild<ListBox>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
-    pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
+    pub(crate) daemon_client: RefCell<Option<DaemonClient>>,
+    pub daemon_generation: Cell<u64>,
+    pub daemon_ready: Cell<bool>,
+    pub window_identifier: RefCell<Option<WindowIdentifier>>,
+    #[template_child]
+    pub connection_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub service_controls: TemplateChild<gtk::Box>,
     pub port: Cell<u16>,
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    pub fingerprint_window: RefCell<Option<crate::fingerprint_window::FingerprintWindow>>,
+    pub(super) authorization_queue: RefCell<super::authorization::AuthorizationQueue>,
+    pub authorization_next: RefCell<Option<glib::SourceId>>,
     pub settings_window: RefCell<Option<SettingsWindow>>,
     /// last settings state received from the daemon
     /// (clipboard_enabled, invert_scroll, mouse_sensitivity)
@@ -202,6 +213,11 @@ impl Window {
 }
 
 impl ObjectImpl for Window {
+    fn dispose(&self) {
+        self.obj().clear_authorization_dialogs();
+        self.daemon_client.borrow_mut().take();
+    }
+
     fn constructed(&self) {
         if let Ok(hostname) = hostname::get() {
             self.hostname_label

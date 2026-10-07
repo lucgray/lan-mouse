@@ -22,9 +22,8 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::task::JoinHandle;
 
 use super::error::MacOSEmulationCreationError;
 
@@ -55,8 +54,6 @@ pub(crate) struct MacOSEmulation {
     button_click_state: i64,
     /// current modifier state
     modifier_state: Rc<Cell<XMods>>,
-    /// notify to cancel key repeats
-    notify_repeat_task: Arc<Notify>,
     /// key-repeat timing (initial delay + interval between repeats)
     options: EmulationOptions,
 }
@@ -94,6 +91,12 @@ fn cg_mouse_button_number(button: u32) -> Option<i64> {
 
 unsafe impl Send for MacOSEmulation {}
 
+impl Drop for MacOSEmulation {
+    fn drop(&mut self) {
+        self.stop_repeating();
+    }
+}
+
 impl MacOSEmulation {
     pub(crate) fn new(options: EmulationOptions) -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
@@ -108,7 +111,6 @@ impl MacOSEmulation {
             previous_button_click: None,
             button_click_state: 0,
             repeat_task: None,
-            notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Rc::new(Cell::new(XMods::empty())),
             options,
         })
@@ -130,29 +132,20 @@ impl MacOSEmulation {
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
         // repeat task
         let event_source = self.event_source.clone();
-        let notify = self.notify_repeat_task.clone();
         let modifiers = self.modifier_state.clone();
         let repeat_delay = self.options.key_repeat_delay;
         let repeat_interval = self.options.key_repeat_interval;
         let repeat_task = tokio::task::spawn_local(async move {
-            let stop = tokio::select! {
-                _ = tokio::time::sleep(repeat_delay) => false,
-                _ = notify.notified() => true,
-            };
-            if !stop {
-                loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
-                    tokio::select! {
-                        _ = tokio::time::sleep(repeat_interval) => {},
-                        _ = notify.notified() => break,
-                    }
-                }
-            }
             // The corresponding key-up is posted by the consume() loop when
             // the real release event arrives — never here. Emitting it on
             // task cancellation would release the key early whenever a
             // *different* key took over the repeat slot while this one is
             // still held.
+            tokio::time::sleep(repeat_delay).await;
+            loop {
+                key_event(event_source.clone(), key, 1, modifiers.get());
+                tokio::time::sleep(repeat_interval).await;
+            }
         });
         self.repeat_task = Some(repeat_task);
         self.repeating_key = Some(key);
@@ -162,7 +155,8 @@ impl MacOSEmulation {
     /// release is signalled by its own `state: 0` event.
     async fn stop_repeat_task(&mut self) {
         if let Some(task) = self.repeat_task.take() {
-            self.notify_repeat_task.notify_waiters();
+            // Abort is persistent even before the task registers a waiter.
+            task.abort();
             let _ = task.await;
         }
         self.repeating_key = None;
@@ -633,6 +627,12 @@ fn clamp_to_screen_space(
 
 #[async_trait]
 impl Emulation for MacOSEmulation {
+    fn stop_repeating(&mut self) {
+        if let Some(task) = self.repeat_task.take() {
+            task.abort();
+        }
+        self.repeating_key = None;
+    }
     async fn consume(
         &mut self,
         event: Event,
@@ -970,7 +970,9 @@ impl Emulation for MacOSEmulation {
 
     async fn destroy(&mut self, _handle: EmulationHandle) {}
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.stop_repeating();
+    }
 
     async fn warp(&mut self, _handle: EmulationHandle, pos: Position, t: f64) {
         let Some(point) = warp_target(pos, t) else {

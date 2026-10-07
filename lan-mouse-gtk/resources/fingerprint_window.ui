@@ -60,6 +60,7 @@
                       <object class="AdwActionRow">
                         <property name="child">
                           <object class="GtkText" id="fingerprint">
+                            <signal name="changed" handler="handle_fingerprint_changed" swapped="true"/>
                             <property name="margin-top">10</property>
                             <property name="margin-bottom">10</property>
                             <property name="margin-start">10</property>
@@ -72,6 +73,15 @@
                         </property>
                       </object>
                     </child>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="validation_error">
+                    <property name="visible">False</property>
+                    <property name="wrap">True</property>
+                    <property name="wrap-mode">word-char</property>
+                    <property name="xalign">0</property>
+                    <style><class name="error"/></style>
                   </object>
                 </child>
                 <child>

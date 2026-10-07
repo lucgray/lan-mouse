@@ -1,7 +1,7 @@
 mod imp;
 
 use glib::Object;
-use gtk::{gio, glib, subclass::prelude::ObjectSubclassIsExt};
+use gtk::{gio, glib, prelude::*, subclass::prelude::ObjectSubclassIsExt};
 
 glib::wrapper! {
     pub struct SettingsWindow(ObjectSubclass<imp::SettingsWindow>)
@@ -13,6 +13,12 @@ glib::wrapper! {
 impl SettingsWindow {
     pub(crate) fn new() -> Self {
         Object::builder().build()
+    }
+
+    pub(crate) fn set_daemon_available(&self, available: bool) {
+        self.imp().clipboard_switch.set_sensitive(available);
+        self.imp().invert_scroll_switch.set_sensitive(available);
+        self.imp().sensitivity_spin.set_sensitive(available);
     }
 
     /// apply daemon-side settings to the widgets without triggering the

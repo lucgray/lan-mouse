@@ -76,6 +76,7 @@ enum CliSubcommand {
     /// authorize a public key
     AuthorizeKey {
         description: String,
+        #[arg(value_parser = lan_mouse_ipc::normalize_fingerprint)]
         sha256_fingerprint: String,
     },
     /// deauthorize a public key
@@ -218,6 +219,23 @@ mod tests {
             CliSubcommand::SetMouseSensitivity {
                 mouse_sensitivity: 1.5,
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+    #[test]
+    fn cli_rejects_bad_fingerprint_before_connect_and_normalizes_paste() {
+        assert!(
+            CliArgs::try_parse_from(["lan-mouse-cli", "authorize-key", "peer", "invalid"]).is_err()
+        );
+        let input = "AB".repeat(32);
+        let args =
+            CliArgs::try_parse_from(["lan-mouse-cli", "authorize-key", "peer", &input]).unwrap();
+        assert!(
+            matches!(args.command, CliSubcommand::AuthorizeKey { sha256_fingerprint, .. } if sha256_fingerprint == vec!["ab"; 32].join(":"))
         );
     }
 }

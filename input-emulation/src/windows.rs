@@ -1,4 +1,8 @@
 use super::error::{EmulationError, WindowsEmulationCreationError};
+use crate::{
+    motion::MotionRemainders,
+    repeat::{RepeatAction, RepeatTarget},
+};
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
     scancode,
@@ -44,36 +48,43 @@ const KEY_LEFT_META: u32 = 125;
 const KEY_RIGHT_META: u32 = 126;
 // Linux keycode for L
 const KEY_L: u32 = 38;
-// Lock keys: real keyboards do not auto-repeat them, so the receiver
-// must not synthesize repeats either — repeating a lock key would
-// toggle it on and off for as long as it is held.
-const KEY_CAPS_LOCK: u32 = 58;
-const KEY_NUM_LOCK: u32 = 69;
-const KEY_SCROLL_LOCK: u32 = 70;
 
 pub(crate) struct WindowsEmulation {
     repeat_task: Option<AbortHandle>,
+    repeat_target: RepeatTarget,
     options: EmulationOptions,
     meta_pressed: bool,
+    motion_remainders: MotionRemainders,
 }
 
 impl WindowsEmulation {
     pub(crate) fn new(options: EmulationOptions) -> Result<Self, WindowsEmulationCreationError> {
         Ok(Self {
             repeat_task: None,
+            repeat_target: RepeatTarget::default(),
             options,
             meta_pressed: false,
+            motion_remainders: MotionRemainders::default(),
         })
     }
 }
 
 #[async_trait]
 impl Emulation for WindowsEmulation {
-    async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
+    fn stop_repeating(&mut self) {
+        self.kill_repeat_task();
+        self.repeat_target = RepeatTarget::default();
+    }
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    rel_mouse(dx as i32, dy as i32)?;
+                    self.motion_remainders
+                        .deliver(handle, (dx, dy), rel_mouse)?;
                 }
                 PointerEvent::Button {
                     time: _,
@@ -107,17 +118,10 @@ impl Emulation for WindowsEmulation {
                         return Ok(());
                     }
 
-                    match state {
-                        // pressed
-                        0 => self.kill_repeat_task(),
-                        1 => {
-                            // only the most recently pressed key repeats
-                            self.kill_repeat_task();
-                            if !matches!(key, KEY_CAPS_LOCK | KEY_NUM_LOCK | KEY_SCROLL_LOCK) {
-                                self.spawn_repeat_task(key).await;
-                            }
-                        }
-                        _ => {}
+                    match self.repeat_target.update(key, state) {
+                        RepeatAction::Start(key) => self.spawn_repeat_task(key).await,
+                        RepeatAction::Stop => self.kill_repeat_task(),
+                        RepeatAction::Unchanged => {}
                     }
                     key_event(key, state)?;
                 }
@@ -133,11 +137,19 @@ impl Emulation for WindowsEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, handle: EmulationHandle) {
+        self.motion_remainders.remove(handle);
+    }
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        self.motion_remainders.remove(handle);
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        self.motion_remainders.clear();
+        self.kill_repeat_task();
+        self.repeat_target = RepeatTarget::default();
+    }
 
     async fn warp(&mut self, _handle: EmulationHandle, pos: Position, t: f64) {
         let Some((x, y)) = warp_target(pos, t) else {
@@ -177,6 +189,12 @@ impl WindowsEmulation {
         if let Some(task) = self.repeat_task.take() {
             task.abort();
         }
+    }
+}
+
+impl Drop for WindowsEmulation {
+    fn drop(&mut self) {
+        self.kill_repeat_task();
     }
 }
 

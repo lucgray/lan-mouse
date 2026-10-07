@@ -11,6 +11,10 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use std::{collections::HashSet, io};
 use thiserror::Error;
@@ -132,13 +136,6 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
-}
-
-impl ConfigToml {
-    fn new(path: &Path) -> Result<ConfigToml, ConfigError> {
-        let config = fs::read_to_string(path)?;
-        Ok(toml::from_str::<_>(&config)?)
-    }
 }
 
 #[derive(Parser, Debug)]
@@ -332,12 +329,48 @@ pub struct Config {
     config_path: PathBuf,
     /// path to config directory (parent of above)
     config_dir: PathBuf,
+    watch_target: PathBuf,
+    watched_dirs: HashSet<PathBuf>,
     /// the (optional) toml config and it's path
     config_toml: Option<ConfigToml>,
+    /// Bytes last successfully loaded or saved; protects external edits.
+    disk_baseline: Option<String>,
+    pending_save: Option<ConfigToml>,
+    save_task: Option<tokio::task::JoinHandle<io::Result<String>>>,
+    read_task: Option<tokio::task::JoinHandle<ConfigReadResult>>,
+    reload_conflict: bool,
     // filesystem watcher
     watcher: notify::RecommendedWatcher,
     // channel for filesystem events
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
+    watch_overflow: Arc<WatchOverflow>,
+}
+
+type ConfigReadResult = io::Result<ReadSnapshot>;
+
+#[derive(Debug)]
+struct ReadSnapshot {
+    target: PathBuf,
+    config: io::Result<Option<(String, ConfigToml)>>,
+}
+
+#[derive(Debug, Default)]
+struct WatchOverflow {
+    rescan: AtomicBool,
+    error: Mutex<Option<notify::Error>>,
+}
+
+fn deliver_watch_event(
+    tx: &tokio::sync::mpsc::Sender<Result<notify::Event, notify::Error>>,
+    overflow: &WatchOverflow,
+    event: Result<notify::Event, notify::Error>,
+) {
+    if let Err(tokio::sync::mpsc::error::TrySendError::Full(event)) = tx.try_send(event) {
+        overflow.rescan.store(true, Ordering::Release);
+        if let Err(error) = event {
+            *overflow.error.lock().expect("watch error lock") = Some(error);
+        }
+    }
 }
 
 pub struct ConfigClient {
@@ -443,6 +476,11 @@ impl Config {
             .config
             .clone()
             .unwrap_or(default_path()?.join(CONFIG_FILE_NAME));
+        let config_path = if config_path.is_absolute() {
+            config_path
+        } else {
+            env::current_dir()?.join(config_path)
+        };
         let config_dir = config_path
             .parent()
             .expect("config directory")
@@ -455,20 +493,29 @@ impl Config {
         // and notify::Watcher (which requires the dir to exist on macOS
         // FSEvents and some Linux backends) has a concrete path to watch.
         fs::create_dir_all(&config_dir)?;
-        if !config_path.exists() {
+        let config_dir = fs::canonicalize(config_dir)?;
+        let config_path = config_dir.join(config_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "config path must name a file")
+        })?);
+        if fs::symlink_metadata(&config_path)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
             let default_toml = toml::to_string_pretty(&ConfigToml::default())
                 .expect("default ConfigToml serialization cannot fail");
             fs::write(&config_path, default_toml)?;
         }
 
-        let config_toml = match ConfigToml::new(&config_path) {
-            Err(e) => {
-                log::warn!("{config_path:?}: {e}");
-                log::warn!("Continuing without config file ...");
-                None
-            }
-            Ok(c) => Some(c),
-        };
+        let disk_baseline = fs::read_to_string(&config_path).ok();
+        let config_toml =
+            disk_baseline
+                .as_deref()
+                .and_then(|text| match toml::from_str::<ConfigToml>(text) {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        log::warn!("{config_path:?}: {error}; continuing without parsed config");
+                        None
+                    }
+                });
 
         // --cert-path <file> overrules default location
         let cert_path = args
@@ -478,52 +525,225 @@ impl Config {
             .unwrap_or(default_path()?.join(CERT_FILE_NAME));
 
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
+        let watch_overflow = Arc::new(WatchOverflow::default());
+        let overflow = watch_overflow.clone();
         let watcher = RecommendedWatcher::new(
-            move |res| {
-                let _ = tx.blocking_send(res);
-            },
+            move |res| deliver_watch_event(&tx, &overflow, res),
             notify::Config::default(),
         )?;
         let mut config = Config {
             args,
             cert_path,
+            watch_target: resolve_config_target(&config_path)?,
             config_path,
             config_dir,
+            watched_dirs: HashSet::new(),
             config_toml,
+            disk_baseline,
+            pending_save: None,
+            save_task: None,
+            read_task: None,
+            reload_conflict: false,
             watcher,
             watch_rx,
+            watch_overflow,
         };
         config.watch()?;
         Ok(config)
     }
 
     fn watch(&mut self) -> Result<(), notify::Error> {
-        self.watcher
-            .watch(&self.config_dir, notify::RecursiveMode::NonRecursive)?;
+        self.refresh_watch_target(self.watch_target.clone())
+    }
+
+    fn refresh_watch_target(&mut self, target: PathBuf) -> Result<(), notify::Error> {
+        let mut needed = HashSet::from([self.config_dir.clone()]);
+        if let Some(parent) = target.parent() {
+            needed.insert(parent.to_owned());
+        }
+        // Subscribe to the new target before retiring the previous directory.
+        let additions: Vec<_> = needed.difference(&self.watched_dirs).cloned().collect();
+        for directory in additions {
+            self.watcher
+                .watch(&directory, notify::RecursiveMode::NonRecursive)?;
+            self.watched_dirs.insert(directory);
+        }
+        let obsolete: Vec<_> = self.watched_dirs.difference(&needed).cloned().collect();
+        self.watched_dirs.extend(needed);
+        self.watch_target = target;
+        for directory in obsolete {
+            match self.watcher.unwatch(&directory) {
+                Ok(()) => {
+                    self.watched_dirs.remove(&directory);
+                }
+                Err(error) => log::warn!("could not retire config watch {directory:?}: {error}"),
+            }
+        }
         Ok(())
     }
 
     fn unwatch(&mut self) -> Result<(), notify::Error> {
-        self.watcher.unwatch(&self.config_dir)?;
+        let directories: Vec<_> = self.watched_dirs.iter().cloned().collect();
+        for directory in directories {
+            self.watcher.unwatch(&directory)?;
+            self.watched_dirs.remove(&directory);
+        }
         Ok(())
     }
 
-    pub async fn changed(&mut self) -> Result<(), notify::Error> {
+    pub async fn changed(&mut self) -> Result<bool, notify::Error> {
         loop {
+            if self.save_task.is_some() {
+                // The handle stays in Config across cancellation by select!, so
+                // a completed save cannot lose its baseline or error report.
+                self.finish_save().await?;
+                return Ok(false);
+            }
+            if self.read_task.is_some() {
+                return self.finish_read().await.map_err(Into::into);
+            }
+            let overflow_error = self
+                .watch_overflow
+                .error
+                .lock()
+                .expect("watch error lock")
+                .take();
+            if let Some(error) = overflow_error {
+                return Err(error);
+            }
+            if self.watch_overflow.rescan.swap(false, Ordering::AcqRel) {
+                self.start_read();
+                continue;
+            }
             let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
-            if event.paths.contains(&self.config_path)
-                && matches!(
-                    event.kind,
-                    EventKind::Create(_)
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Remove(_)
-                )
-                && self.read_from_disk()?
-            {
-                return Ok(());
+            let event = event?;
+            if event.paths.iter().any(|path| {
+                same_watch_path(path, &self.config_path)
+                    || same_watch_path(path, &self.watch_target)
+            }) && matches!(
+                event.kind,
+                EventKind::Create(_)
+                    | EventKind::Modify(ModifyKind::Any)
+                    | EventKind::Modify(ModifyKind::Data(_))
+                    | EventKind::Modify(ModifyKind::Name(_))
+                    | EventKind::Remove(_)
+            ) {
+                self.start_read();
             }
         }
+    }
+
+    /// Queue a snapshot without serializing or waiting for filesystem I/O.
+    /// At most one save runs and one newer snapshot is retained.
+    pub fn queue_write_back(&mut self) {
+        self.pending_save = Some(self.config_toml.clone().unwrap_or_default());
+        self.start_save();
+    }
+
+    fn start_save(&mut self) {
+        if self.save_task.is_some() || self.read_task.is_some() {
+            return;
+        }
+        if let Some(snapshot) = self.pending_save.take() {
+            let path = self.config_path.clone();
+            let baseline = self.disk_baseline.clone();
+            self.save_task = Some(tokio::task::spawn_blocking(move || {
+                save_snapshot(&path, baseline.as_deref(), snapshot)
+            }));
+        }
+    }
+
+    async fn finish_save(&mut self) -> io::Result<()> {
+        let result = self.save_task.as_mut().expect("save task").await;
+        self.save_task = None;
+        match result.map_err(io::Error::other).and_then(|result| result) {
+            Ok(bytes) => {
+                self.disk_baseline = Some(bytes);
+                self.start_save();
+                Ok(())
+            }
+            Err(error) => {
+                // Do not replay newer snapshots derived from an obsolete file.
+                // A subsequent external reload or explicit edit can try again.
+                self.pending_save = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn start_read(&mut self) {
+        let path = self.config_path.clone();
+        let baseline = self.disk_baseline.clone();
+        self.read_task = Some(tokio::task::spawn_blocking(move || {
+            read_snapshot(&path, baseline.as_deref())
+        }));
+    }
+
+    async fn finish_read(&mut self) -> io::Result<bool> {
+        let result = self.read_task.as_mut().expect("read task").await;
+        self.read_task = None;
+        let applied = result
+            .map_err(io::Error::other)
+            .and_then(|result| result)
+            .and_then(|snapshot| self.apply_read(snapshot));
+        match applied {
+            Ok(changed) => {
+                self.start_save();
+                Ok(changed)
+            }
+            Err(error) => {
+                if self.pending_save.take().is_some() {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "configuration reload failed; pending settings were not saved: {error}"
+                        ),
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_read(&mut self, snapshot: ReadSnapshot) -> io::Result<bool> {
+        self.refresh_watch_target(snapshot.target)
+            .map_err(io::Error::other)?;
+        let Some((bytes, config)) = snapshot.config? else {
+            return Ok(false);
+        };
+        let changed = self
+            .config_toml
+            .as_ref()
+            .is_none_or(|current| current != &config);
+        // The external file wins over snapshots derived from the old file.
+        // The service reports this explicitly while applying the reload.
+        if self.pending_save.take().is_some() && changed {
+            self.reload_conflict = true;
+        }
+        self.config_toml = Some(config);
+        self.disk_baseline = Some(bytes);
+        Ok(changed)
+    }
+
+    pub fn take_reload_conflict(&mut self) -> bool {
+        std::mem::take(&mut self.reload_conflict)
+    }
+
+    /// Wait until all accepted snapshots have been saved, or report failure.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        while self.save_task.is_some() || self.read_task.is_some() {
+            if self.read_task.is_some() {
+                self.finish_read().await?;
+                if self.take_reload_conflict() {
+                    return Err(io::Error::other(
+                        "external configuration replaced pending settings",
+                    ));
+                }
+            } else {
+                self.finish_save().await?;
+            }
+        }
+        Ok(())
     }
 
     /// the command to run
@@ -583,6 +803,7 @@ impl Config {
             .as_ref()
             .and_then(|c| c.input_post_processing.as_ref())
             .and_then(|i| i.mouse_sensitivity)
+            .filter(|value| value.is_finite())
             .unwrap_or(1.0)
     }
 
@@ -681,14 +902,7 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clients =
-            Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        self.toml_mut().clients = Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
     }
 
     /// set authorized keys
@@ -724,71 +938,54 @@ impl Config {
 
     /// persist the mouse sensitivity multiplier
     pub fn set_mouse_sensitivity(&mut self, sensitivity: f64) {
+        if !sensitivity.is_finite() {
+            log::warn!("ignoring nonfinite mouse sensitivity");
+            return;
+        }
         self.toml_mut()
             .input_post_processing
             .get_or_insert_with(Default::default)
             .mouse_sensitivity = Some(sensitivity);
     }
 
+    /// Blocking utility; service reloads use the retained background read task.
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
-        log::info!("reading config from {:?}", self.config_path);
-
-        let current_config = fs::read_to_string(&self.config_path)?;
-        let current_config = match current_config.parse::<DocumentMut>() {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("{:?} {e}", self.config_path());
-                return Ok(false);
-            }
-        };
-        let mut changed = false;
-        match toml_edit::de::from_document::<ConfigToml>(current_config) {
-            Ok(current_config) => {
-                changed = self
-                    .config_toml
-                    .as_ref()
-                    .is_none_or(|c| c != &current_config);
-                self.config_toml.replace(current_config);
-            }
-            Err(e) => log::warn!("{:?} {e}", self.config_path()),
-        };
-        if changed {
-            log::info!("config changed");
-        } else {
-            log::info!("config unchanged");
+        if self.save_task.is_some() || self.read_task.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "configuration I/O is running",
+            ));
         }
-        Ok(changed)
+        let snapshot = read_snapshot(&self.config_path, self.disk_baseline.as_deref())?;
+        self.apply_read(snapshot)
     }
 
+    /// Blocking utility retained for callers outside the service input loop.
     pub fn write_back(&mut self) -> Result<(), io::Error> {
+        if self.save_task.is_some() || self.read_task.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "configuration I/O is running",
+            ));
+        }
         log::info!("writing config to {:?}", self.config_path);
-        /* the new config */
-        let new_config = self.config_toml.clone().unwrap_or_default();
-        let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
-
-        /*
-         * TODO merge with current config file to preserve comments
-         * => eventually we might want to split this up into clients configured
-         * via the config file and clients managed through the GUI / frontend.
-         * The latter should be saved to $XDG_DATA_HOME instead of $XDG_CONFIG_HOME,
-         * and clients configured through .config could be made permanent.
-         * For now we just override the config file.
-         */
-
-        let _ = self.unwatch();
-        /* write new config to file */
-        if let Some(p) = self.config_path().parent() {
-            fs::create_dir_all(p)?;
+        if let Err(e) = self.unwatch() {
+            log::warn!("could not suspend config watcher: {e}");
         }
-        {
-            let mut f = File::create(self.config_path())?;
-            f.write_all(new_config.as_bytes())?;
-            f.sync_all()?;
+        let saved = save_snapshot(
+            self.config_path(),
+            self.disk_baseline.as_deref(),
+            self.config_toml.clone().unwrap_or_default(),
+        );
+        if let Ok(bytes) = &saved {
+            self.disk_baseline = Some(bytes.clone());
         }
-
-        let _ = self.watch();
-
-        Ok(())
+        // Always re-arm the watcher, including after write/sync/rename failure.
+        let watched = self.watch().map_err(io::Error::other);
+        if let Err(e) = &watched {
+            log::warn!("could not restore config watcher: {e}");
+        }
+        saved.map(|_| ()).and(watched)
     }
 
     /// whether clipboard sharing is enabled (default: true)
@@ -800,10 +997,762 @@ impl Config {
     }
 }
 
+#[cfg(not(windows))]
+fn same_watch_path(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn same_watch_path(left: &Path, right: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    fn equivalent_prefix(left: Prefix<'_>, right: Prefix<'_>) -> bool {
+        match (left, right) {
+            (
+                Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+            ) => a.eq_ignore_ascii_case(&b),
+            (
+                Prefix::UNC(a, b) | Prefix::VerbatimUNC(a, b),
+                Prefix::UNC(c, d) | Prefix::VerbatimUNC(c, d),
+            ) => a == c && b == d,
+            (a, b) => a == b,
+        }
+    }
+    let mut left = left.components();
+    let mut right = right.components();
+    match (left.next(), right.next()) {
+        (Some(Component::Prefix(a)), Some(Component::Prefix(b))) => {
+            equivalent_prefix(a.kind(), b.kind()) && left.eq(right)
+        }
+        (a, b) => a == b && left.eq(right),
+    }
+}
+
+fn resolve_config_target(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            // A dangling final link still has a watchable target directory.
+            // Preserve it and detect creation instead of writing defaults over it.
+            if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                return Err(error);
+            }
+            let target = fs::read_link(path)?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                path.parent().unwrap_or(Path::new(".")).join(target)
+            };
+            let parent = fs::canonicalize(target.parent().unwrap_or(Path::new(".")))?;
+            let name = target.file_name().ok_or(error)?;
+            Ok(parent.join(name))
+        }
+    }
+}
+
+fn read_snapshot(path: &Path, baseline: Option<&str>) -> ConfigReadResult {
+    let target = resolve_config_target(path)?;
+    let config = (|| {
+        let bytes = fs::read_to_string(&target)?;
+        if baseline == Some(bytes.as_str()) {
+            return Ok(None);
+        }
+        let document = bytes
+            .parse::<DocumentMut>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let config = toml_edit::de::from_document::<ConfigToml>(document)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Some((bytes, config)))
+    })();
+    Ok(ReadSnapshot { target, config })
+}
+
+fn save_snapshot(path: &Path, baseline: Option<&str>, snapshot: ConfigToml) -> io::Result<String> {
+    let baseline = baseline.ok_or_else(|| {
+        io::Error::other("configuration was not readable; refusing to overwrite it")
+    })?;
+    let bytes = toml_edit::ser::to_string_pretty(&snapshot).map_err(io::Error::other)?;
+    let verify = |target: &Path| -> io::Result<()> {
+        if fs::read_to_string(target)? != baseline {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "configuration changed externally; reload before saving",
+            ));
+        }
+        Ok(())
+    };
+    verify(path)?;
+    atomic_write_config_checked(path, |file| file.write_all(bytes.as_bytes()), verify)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn atomic_write_config(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
+    atomic_write_config_checked(path, write, |_| Ok(()))
+}
+
+fn atomic_write_config_checked(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+    before_commit: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    // Keep user-managed symlinks intact and replace their target instead.
+    let was_symlink =
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    let target = if was_symlink {
+        fs::canonicalize(path)?
+    } else {
+        path.to_owned()
+    };
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = fs::metadata(&target) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?;
+    }
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    if was_symlink && fs::canonicalize(path)? != target {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "configuration symlink changed while preparing save",
+        ));
+    }
+    before_commit(&target)?;
+    temporary.persist(&target).map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use input_event::scancode::Linux::*;
+
+    #[test]
+    fn failed_atomic_save_keeps_original_and_removes_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false\n").unwrap();
+        let error = atomic_write_config(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected write failure"))
+        });
+        assert!(error.is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "enable_clipboard = false\n"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        atomic_write_config(&path, |file| file.write_all(b"enable_clipboard = true\n")).unwrap();
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap()).enable_clipboard,
+            Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_symlink_and_target_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&target, "old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &link).unwrap();
+        atomic_write_config(&link, |file| file.write_all(b"new")).unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_is_restored_after_save_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let directory_path = directory.path().canonicalize().unwrap();
+        let blocked = directory_path.join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let watcher = RecommendedWatcher::new(
+            move |event| {
+                let _ = tx.blocking_send(event);
+            },
+            notify::Config::default(),
+        )
+        .unwrap();
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: directory.path().join("cert"),
+            watch_target: blocked.clone(),
+            watched_dirs: HashSet::new(),
+            config_path: blocked,
+            config_dir: directory_path.clone(),
+            config_toml: Some(parse("enable_clipboard = false")),
+            disk_baseline: None,
+            pending_save: None,
+            save_task: None,
+            read_task: None,
+            reload_conflict: false,
+            watcher,
+            watch_rx: rx,
+            watch_overflow: Arc::new(WatchOverflow::default()),
+        };
+        config.watch().unwrap();
+        assert!(config.write_back().is_err());
+        config.config_path = directory_path.join("config.toml");
+        atomic_write_config(config.config_path(), |file| {
+            file.write_all(b"enable_clipboard = true")
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), config.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(config.clipboard_enabled());
+    }
+
+    #[test]
+    fn deleting_last_client_persists_empty_list_and_other_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            enable_clipboard = false
+            [authorized_fingerprints]
+            trusted = "peer"
+            [[clients]]
+            hostname = "old-peer"
+            activate_on_startup = true
+        "#,
+        )
+        .unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(config.clients().len(), 1);
+        config.set_clients(Vec::new());
+        config.write_back().unwrap();
+        let reloaded =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        assert!(reloaded.clients().is_empty());
+        assert!(!reloaded.clipboard_enabled());
+        assert_eq!(
+            reloaded.authorized_fingerprints().get("trusted"),
+            Some(&"peer".into())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_error_is_reported_and_next_valid_edit_can_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        config.watch_rx = rx;
+        tx.send(Err(notify::Error::generic("injected watcher error")))
+            .await
+            .unwrap();
+        assert!(config.changed().await.is_err());
+        assert!(!config.clipboard_enabled());
+        fs::write(&path, "enable_clipboard = true").unwrap();
+        tx.send(Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(config.config_path().to_owned())))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), config.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(config.clipboard_enabled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_save_coalesces_and_survives_cancelled_wait_without_blocking_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let snapshot = config.config_toml.clone().unwrap();
+        let baseline = config.disk_baseline.clone();
+        let worker_path = path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        config.save_task = Some(tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            save_snapshot(&worker_path, baseline.as_deref(), snapshot)
+        }));
+        started_rx.await.unwrap();
+        for index in 1..=1000 {
+            config.set_mouse_sensitivity(index as f64 / 100.0);
+            config.set_clipboard_enabled(true);
+            config.queue_write_back();
+        }
+        assert_eq!(
+            config
+                .pending_save
+                .as_ref()
+                .unwrap()
+                .input_post_processing
+                .as_ref()
+                .unwrap()
+                .mouse_sensitivity,
+            Some(10.0)
+        );
+        // A main-runtime timer fires while the actual disk worker is held.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), config.changed())
+                .await
+                .is_err()
+        );
+        assert!(config.save_task.is_some());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), config.flush())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(config.save_task.is_none());
+        assert!(config.pending_save.is_none());
+        let persisted = parse(&fs::read_to_string(&path).unwrap());
+        assert_eq!(persisted.enable_clipboard, Some(true));
+        assert_eq!(
+            persisted.input_post_processing.unwrap().mouse_sensitivity,
+            Some(10.0)
+        );
+        // Watcher notifications from either saved snapshot cannot roll back
+        // newer runtime state. The latest bytes equal the committed baseline.
+        assert!(!config.read_from_disk().unwrap());
+        assert!(config.clipboard_enabled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_save_rejects_external_edit_then_can_save_after_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        config.set_clipboard_enabled(true);
+        let external =
+            "# editor change\nenable_clipboard = false\n[authorized_fingerprints]\nnew = 'peer'\n";
+        fs::write(&path, external).unwrap();
+        config.queue_write_back();
+        config.set_mouse_sensitivity(1.5);
+        config.queue_write_back();
+        let error = config.flush().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        assert!(config.pending_save.is_none());
+        assert!(config.read_from_disk().unwrap());
+        config.set_clipboard_enabled(true);
+        config.queue_write_back();
+        config.flush().await.unwrap();
+        let reloaded =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        assert!(reloaded.clipboard_enabled());
+        assert_eq!(
+            reloaded.authorized_fingerprints().get("new"),
+            Some(&"peer".into())
+        );
+        assert_eq!(reloaded.mouse_sensitivity(), 1.0);
+    }
+
+    #[test]
+    fn final_commit_guard_preserves_edit_made_while_preparing_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "original").unwrap();
+        let result = atomic_write_config_checked(
+            &path,
+            |temporary| {
+                temporary.write_all(b"queued save")?;
+                fs::write(&path, "external edit")
+            },
+            |target| {
+                if fs::read_to_string(target)? != "original" {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "changed externally",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external edit");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_overflow_does_not_block_and_preserves_error_and_final_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        config.watch_rx = rx;
+        deliver_watch_event(
+            &tx,
+            &config.watch_overflow,
+            Ok(notify::Event::new(EventKind::Any)),
+        );
+        for _ in 0..1000 {
+            deliver_watch_event(
+                &tx,
+                &config.watch_overflow,
+                Ok(notify::Event::new(EventKind::Any)),
+            );
+        }
+        deliver_watch_event(
+            &tx,
+            &config.watch_overflow,
+            Err(notify::Error::generic("overflow error")),
+        );
+        fs::write(&path, "enable_clipboard = true").unwrap();
+        deliver_watch_event(
+            &tx,
+            &config.watch_overflow,
+            Ok(notify::Event::new(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )))
+            .add_path(path)),
+        );
+        assert!(config.changed().await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), config.changed())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(config.clipboard_enabled());
+        drop(config);
+        // Closed receiver is also nonblocking.
+        deliver_watch_event(
+            &tx,
+            &WatchOverflow::default(),
+            Ok(notify::Event::new(EventKind::Any)),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_external_read_survives_cancelled_wait_and_reports_replaced_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let external =
+            "# external edit\nenable_clipboard = true\n[authorized_fingerprints]\nnew = 'peer'\n";
+        fs::write(&path, external).unwrap();
+        let worker_path = path.clone();
+        let baseline = config.disk_baseline.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        config.read_task = Some(tokio::task::spawn_blocking(move || {
+            let snapshot = read_snapshot(&worker_path, baseline.as_deref());
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            snapshot
+        }));
+        started_rx.await.unwrap();
+        config.set_mouse_sensitivity(2.5);
+        config.queue_write_back();
+        assert!(config.save_task.is_none());
+        assert!(config.pending_save.is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), config.changed())
+                .await
+                .is_err()
+        );
+        assert!(config.read_task.is_some());
+        assert_eq!(config.mouse_sensitivity(), 2.5);
+        release_tx.send(()).unwrap();
+        assert!(config.changed().await.unwrap());
+        assert!(config.take_reload_conflict());
+        assert!(!config.take_reload_conflict());
+        assert_eq!(config.mouse_sensitivity(), 1.0);
+        assert!(config.clipboard_enabled());
+        assert!(config.pending_save.is_none());
+        assert!(config.save_task.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+        // A subsequent explicit edit uses the newly loaded authorization.
+        config.set_mouse_sensitivity(1.75);
+        config.queue_write_back();
+        config.flush().await.unwrap();
+        assert_eq!(
+            parse(&fs::read_to_string(&path).unwrap())
+                .authorized_fingerprints
+                .unwrap()
+                .get("new"),
+            Some(&"peer".into())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn own_file_read_keeps_newer_edits_and_flush_waits_for_their_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        // Start the same production read path used for watcher notifications.
+        config.start_read();
+        config.set_clipboard_enabled(true);
+        config.set_mouse_sensitivity(2.0);
+        config.queue_write_back();
+        assert!(config.save_task.is_none());
+        config.flush().await.unwrap();
+        assert!(!config.take_reload_conflict());
+        assert!(config.clipboard_enabled());
+        let disk = parse(&fs::read_to_string(&path).unwrap());
+        assert_eq!(disk.enable_clipboard, Some(true));
+        assert_eq!(
+            disk.input_post_processing.unwrap().mouse_sensitivity,
+            Some(2.0)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_async_reload_preserves_state_and_can_recover_after_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let initial_baseline = config.disk_baseline.clone();
+        fs::write(&path, "enable_clipboard = [broken").unwrap();
+        config.start_read();
+        config.set_mouse_sensitivity(2.5);
+        config.queue_write_back();
+        let error = config.finish_read().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("pending settings were not saved")
+        );
+        assert!(!config.clipboard_enabled());
+        assert_eq!(config.mouse_sensitivity(), 2.5);
+        assert_eq!(config.disk_baseline, initial_baseline);
+        assert!(config.pending_save.is_none());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "enable_clipboard = [broken"
+        );
+        fs::write(&path, "enable_clipboard = true").unwrap();
+        config.start_read();
+        assert!(config.finish_read().await.unwrap());
+        assert!(config.clipboard_enabled());
+        assert_eq!(config.mouse_sensitivity(), 1.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_flush_reports_external_read_displacing_pending_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "enable_clipboard = false").unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+        let external = "# keep on exit\nenable_clipboard = true";
+        fs::write(&path, external).unwrap();
+        config.start_read();
+        config.set_mouse_sensitivity(2.0);
+        config.queue_write_back();
+        assert!(
+            config
+                .flush()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("replaced pending settings")
+        );
+        assert!(config.pending_save.is_none());
+        assert!(config.save_task.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), external);
+    }
+
+    async fn await_semantic_reload(config: &mut Config) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !config.changed().await.unwrap() {}
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn relative_single_filename_receives_absolute_watcher_events() {
+        let cwd = env::current_dir().unwrap();
+        let file = tempfile::NamedTempFile::new_in(&cwd)
+            .unwrap()
+            .into_temp_path();
+        fs::write(&file, "enable_clipboard = false").unwrap();
+        let relative = file.strip_prefix(&cwd).unwrap();
+        assert!(!relative.is_absolute());
+        assert_eq!(relative.components().count(), 1);
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", relative.to_str().unwrap()]).unwrap();
+        assert_eq!(config.config_path(), fs::canonicalize(&file).unwrap());
+        fs::write(&file, "enable_clipboard = true").unwrap();
+        await_semantic_reload(&mut config).await;
+        assert!(config.clipboard_enabled());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn symlink_external_atomic_edit_and_retarget_to_invalid_file_stay_watched() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let first_dir = directory.path().join("first");
+        let second_dir = directory.path().join("second");
+        fs::create_dir(&first_dir).unwrap();
+        fs::create_dir(&second_dir).unwrap();
+        let first = first_dir.join("config.toml");
+        let second = second_dir.join("config.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&first, "enable_clipboard = false").unwrap();
+        fs::write(&second, "enable_clipboard = [broken").unwrap();
+        symlink(&first, &link).unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", link.to_str().unwrap()]).unwrap();
+        atomic_write_config(&first, |file| file.write_all(b"enable_clipboard = true")).unwrap();
+        await_semantic_reload(&mut config).await;
+        assert!(config.clipboard_enabled());
+        let replacement = directory.path().join("replacement-link");
+        symlink(&second, &replacement).unwrap();
+        fs::rename(replacement, &link).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if config.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(config.clipboard_enabled());
+        assert_eq!(config.watch_target, fs::canonicalize(&second).unwrap());
+        assert!(
+            config
+                .watched_dirs
+                .contains(&second_dir.canonicalize().unwrap())
+        );
+        assert!(
+            !config
+                .watched_dirs
+                .contains(&first_dir.canonicalize().unwrap())
+        );
+        atomic_write_config(&second, |file| file.write_all(b"enable_clipboard = false")).unwrap();
+        await_semantic_reload(&mut config).await;
+        assert!(!config.clipboard_enabled());
+        config.set_mouse_sensitivity(1.5);
+        config.queue_write_back();
+        config.flush().await.unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            parse(&fs::read_to_string(&second).unwrap())
+                .input_post_processing
+                .unwrap()
+                .mouse_sensitivity,
+            Some(1.5)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dangling_final_symlink_is_preserved_and_target_creation_reloads() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let target_dir = directory.path().join("target");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("missing.toml");
+        let link = directory.path().join("config.toml");
+        symlink("target/missing.toml", &link).unwrap();
+        let mut config =
+            Config::new_with_args(["lan-mouse", "--config", link.to_str().unwrap()]).unwrap();
+        assert!(!target.exists());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(&target, "enable_clipboard = false").unwrap();
+        await_semantic_reload(&mut config).await;
+        assert!(!config.clipboard_enabled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlink_retarget_during_preparation_even_with_identical_contents() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.toml");
+        let second = directory.path().join("second.toml");
+        let link = directory.path().join("config.toml");
+        fs::write(&first, "same bytes").unwrap();
+        fs::write(&second, "same bytes").unwrap();
+        symlink(&first, &link).unwrap();
+        let result = atomic_write_config(&link, |file| {
+            file.write_all(b"queued changes")?;
+            fs::remove_file(&link)?;
+            symlink(&second, &link)
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::canonicalize(&link).unwrap(),
+            fs::canonicalize(&second).unwrap()
+        );
+        assert_eq!(fs::read_to_string(&first).unwrap(), "same bytes");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "same bytes");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn watcher_path_matching_accepts_verbatim_disk_and_unc_prefixes() {
+        assert!(same_watch_path(
+            Path::new(r"C:\settings\config.toml"),
+            Path::new(r"\\?\C:\settings\config.toml")
+        ));
+        assert!(same_watch_path(
+            Path::new(r"\\server\share\config.toml"),
+            Path::new(r"\\?\UNC\server\share\config.toml")
+        ));
+        assert!(!same_watch_path(
+            Path::new(r"C:\settings\config.toml"),
+            Path::new(r"\\?\D:\settings\config.toml")
+        ));
+        assert!(!same_watch_path(
+            Path::new(r"C:\settings\other.toml"),
+            Path::new(r"\\?\C:\settings\config.toml")
+        ));
+    }
 
     fn parse(toml: &str) -> ConfigToml {
         toml::from_str(toml).expect("valid toml")
@@ -876,6 +1825,33 @@ mod tests {
         assert_eq!(chord.modifier, KeyLeftMeta);
         assert_eq!(chord.trigger, KeyTab);
         assert_eq!(chord.to, KeyLeftAlt);
+    }
+
+    #[test]
+    fn nonfinite_sensitivity_uses_default_and_cannot_replace_valid_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        for raw in ["nan", "inf", "-inf"] {
+            fs::write(
+                &path,
+                format!("[input_post_processing]\nmouse_sensitivity = {raw}\n"),
+            )
+            .unwrap();
+            let mut config =
+                Config::new_with_args(["lan-mouse", "--config", path.to_str().unwrap()]).unwrap();
+            assert_eq!(config.mouse_sensitivity(), 1.0);
+            config.set_mouse_sensitivity(1.5);
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                config.set_mouse_sensitivity(value);
+                assert_eq!(config.mouse_sensitivity(), 1.5);
+            }
+            config.write_back().unwrap();
+            let persisted = parse(&fs::read_to_string(&path).unwrap());
+            assert_eq!(
+                persisted.input_post_processing.unwrap().mouse_sensitivity,
+                Some(1.5)
+            );
+        }
     }
 
     #[test]
