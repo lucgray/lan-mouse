@@ -32,6 +32,7 @@
 | R121 | libei激活路由生命周期已实现 | Begin入队后发布，释放取消旧快照/等待发送，精确guard身份避免清新路由；native恢复待验 |
 | R122 | libei屏障ID耗尽错误已实现 | checked_add失败返回错误，不panic/回绕；顺序/路由/空请求保持，native边界待验 |
 | R123 | libei区域通知会话过滤已实现 | 仅当前session启动重建，ignored计入32条让出预算，当前/旧/idle/边界回归通过 |
+| R124 | libei token IO移出事件线程 | spawn_blocking承接读写，慢操作期间async控制可运行；文件语义/权限回归通过，真实延迟待测 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2456,3 +2457,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 当前会话重复zone_set、其他portal信号与native调用挂起仍需评估。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分，没有本机部署。
 
 日志：libei-zone-identity-baseline.log、libei-zone-identity-fixed.log、libei-zone-identity-workspace.log、libei-zone-identity-clippy.log。
+
+
+## 第一百零九轮：libei恢复token磁盘IO阻塞事件线程
+
+### R124 / P2
+
+- create_session async内直接fs::read_to_string/create_dir_all/open/chmod/write_all，初始化或会话重建期间磁盘等待占住local async线程。提取原同步执行生产helper后受控基线失败：工作操作等async控制放行，控制无法运行，1s安全期限后操作报错。这个模型证明调度问题，不测实际磁盘慢速或输入延迟。
+- [x] run_token_io用spawn_blocking承接拥有数据的FnOnce，JoinError转上下文Io错误；token读取None fallback/trim/空文件行为保持，写入String归worker拥有。create_session await结果，写失败沿原warning路径，不误丢已启动Session。
+- [x] read_token_from/write_token_to拆出路径参数，测试只使用临时目录，不触碰已安装token/config。同步文件细节仍在worker内，目录创建、旧文件权限修复与覆盖语义保持；没有输入帧上的工作任务。
+
+### 验证与剩余磁盘边界
+
+- 4条新增测试通过：慢worker期间同线程async控制放行；真实文件missing/trim/empty/非法UTF-8读取；创建/覆盖后0600及旧0644修复；worker panic转错误/原PermissionDenied保持。受控worker panic日志未包含任何实际token。
+- libei95通过；工作区all-features input-capture158通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。没有启动实际portal、部署或真实全链路延迟测量。
+- b7549cc Rust37575879702 queued、Nix37575879654 in_progress，本轮HEAD需CI。
+- [ ] started blocking worker取消/全局数量、token原子持久化与路径fallback、window mutex poison及native等待仍需审。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS仍缺证据，不认定90分。
+
+日志：libei-token-io-baseline.log、libei-token-io-fixed.log、libei-token-io-workspace.log、libei-token-io-clippy.log。

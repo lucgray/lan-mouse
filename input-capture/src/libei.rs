@@ -25,7 +25,7 @@ use std::{
         fs::{OpenOptionsExt, PermissionsExt},
         net::UnixStream,
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
     sync::{Arc, LazyLock, Mutex, Once},
@@ -351,9 +351,8 @@ fn get_token_file_path() -> PathBuf {
 }
 
 /// Read the InputCapture token from file
-fn read_token() -> Option<String> {
-    let token_path = get_token_file_path();
-    match fs::read_to_string(&token_path) {
+fn read_token_from(token_path: &Path) -> Option<String> {
+    match fs::read_to_string(token_path) {
         // an interrupted write leaves the file empty, which is no token at all
         Ok(token) => Some(token.trim().to_string()).filter(|t| !t.is_empty()),
         Err(_) => None,
@@ -361,8 +360,7 @@ fn read_token() -> Option<String> {
 }
 
 /// Write the InputCapture token to file
-fn write_token(token: &str) -> io::Result<()> {
-    let token_path = get_token_file_path();
+fn write_token_to(token_path: &Path, token: &str) -> io::Result<()> {
     if let Some(parent) = token_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -376,12 +374,37 @@ fn write_token(token: &str) -> io::Result<()> {
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(&token_path)?;
+        .open(token_path)?;
     if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
         log::warn!("could not restrict {}: {e}", token_path.display());
     }
     file.write_all(token.as_bytes())?;
     Ok(())
+}
+
+async fn run_token_io<T, F>(operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| io::Error::other(format!("InputCapture token worker failed: {error}")))?
+}
+
+async fn read_token() -> Option<String> {
+    match run_token_io(|| Ok(read_token_from(&get_token_file_path()))).await {
+        Ok(token) => token,
+        Err(error) => {
+            log::warn!("could not read InputCapture token: {error}");
+            None
+        }
+    }
+}
+
+async fn write_token(token: &str) -> io::Result<()> {
+    let token = token.to_owned();
+    run_token_io(move || write_token_to(&get_token_file_path(), &token)).await
 }
 
 async fn create_session(
@@ -397,7 +420,7 @@ async fn create_session(
             let options = StartOptions::default()
                 .set_capabilities(capabilities())
                 .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                .set_restore_token(read_token());
+                .set_restore_token(read_token().await);
             let response = match input_capture
                 .start(&session, ashpd_window_identifier.as_ref(), options)
                 .await
@@ -415,7 +438,7 @@ async fn create_session(
 
             // The restore token is only valid once, we need to re-save it each time
             if let Some(token_str) = response.restore_token() {
-                if let Err(e) = write_token(token_str) {
+                if let Err(e) = write_token(token_str).await {
                     log::warn!("failed to save InputCapture token: {e}");
                 }
             }
@@ -2595,6 +2618,81 @@ mod tests {
         stop.cancel();
         assert!(wait.await.is_ok());
         assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_does_not_block_async_control_progress() {
+        let (started, wait_started) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = std::sync::mpsc::channel();
+        let operation = run_token_io(move || {
+            started.send(()).unwrap();
+            wait_release
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .map_err(|_| io::Error::other("async control could not run during token IO"))
+        });
+        let control = async {
+            wait_started.await.unwrap();
+            let _ = release.send(());
+        };
+        let (result, ()) = tokio::join!(operation, control);
+        assert!(
+            result.is_ok(),
+            "token IO blocked the current-thread event loop: {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_read_preserves_trim_empty_and_missing_behavior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        run_token_io(move || {
+            assert_eq!(read_token_from(&path), None);
+            fs::write(&path, "  test-only-value \n")?;
+            assert_eq!(read_token_from(&path).as_deref(), Some("test-only-value"));
+            fs::write(&path, " \n")?;
+            assert_eq!(read_token_from(&path), None);
+            fs::write(&path, [0xff])?;
+            assert_eq!(read_token_from(&path), None);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_write_preserves_private_mode_and_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/token");
+        run_token_io(move || {
+            write_token_to(&path, "test-only-long-value")?;
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+            write_token_to(&path, "short")?;
+            assert_eq!(fs::read_to_string(&path)?, "short");
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn token_io_worker_failure_is_an_error_not_capture_task_panic() {
+        let result = run_token_io::<(), _>(|| panic!("controlled token worker panic")).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("token worker failed")
+        );
+        let result = run_token_io::<(), _>(|| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled IO failure",
+            ))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
     struct ReadyZoneBurst {

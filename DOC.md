@@ -1532,3 +1532,20 @@ stream poll loop. They do not start the 50ms debounce, but count toward the
 at that budget boundary also yields before more data is consumed. EOF/error and
 client notification behavior remain unchanged. Tests cover typed signal decoding
 and update helpers; real D-Bus session churn remains unverified.
+
+
+### Libei token IO and event-loop progress
+
+InputCapture restore-token reads and writes run on Tokio's blocking pool rather
+than directly on the local async event thread. Read results keep their existing
+trim/empty/missing behavior; writes retain private mode, parent creation and
+replacement semantics. The write worker owns its token string. Worker join errors
+become IO errors: reads fall back to no restore token, and save errors are logged
+without failing an already-started portal session.
+
+Controlled slow-operation tests establish that an async control task can progress
+on the same runtime while the worker waits. Real temporary-file tests check read
+behavior and 0600 write mode. They do not measure real storage latency, peer input
+latency or total startup time. This adds blocking jobs per initialization/token
+save, not per input frame. Started blocking work is not made cancelable or globally
+bounded here; atomic persistence and token-path handling remain separate items.
