@@ -1,6 +1,6 @@
 # Lan Mouse 性能与体验审查清单
 
-初次审查日期：2026-10-03；修复状态更新：2026-10-06。初次审查对象：`work/src-latest`，当时 HEAD `1185ee3`，工作树干净；与运行中的 fork.7 相比，源码额外包含 Windows 返回光标修复。本文不表示该修复已经部署。
+初次审查日期：2026-10-03；修复状态更新：2026-10-07。初次审查对象：`work/src-latest`，当时 HEAD `1185ee3`，工作树干净；与运行中的 fork.7 相比，源码额外包含 Windows 返回光标修复。本文不表示该修复已经部署。
 
 ## 当前修复状态（fix/input-reliability-review）
 
@@ -23,6 +23,7 @@
 | R89 | 已实现并通过真实 UDP 构造故障回归 | 首次 poll 起的 handshake guard 在取消/构造错误后停止worker并关闭raw会话；成功解除，非Tokio线程Drop复用保存的runtime；全局额度与runtime退出仍待验 |
 | R90 | 已实现并通过真实 DTLS 并行监听回归 | accept future 按监听器保留，其他接入/控制等待取消不丢弃它；独立两秒重试、换端口/退出取消旧池；慢握手期限策略仍待验 |
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
+| R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
 | R111 | libei fallback屏障几何匹配已实现 | 有限线段/f64平方距离，保留小数及端点精度；退化点/空集合/非法坐标处理；原生多屏与缺失metadata待验 |
@@ -2261,3 +2262,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] zones_changed及其他portal信号的会话范围继续审；当前会话缺cursor metadata仍有expect、release及layer-shell错误路径待处理。千次真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS验收缺少证据，不认定90分。
 
 日志：libei-session-identity-baseline.log、libei-session-identity-fixed.log、libei-session-identity-workspace.log、libei-session-identity-clippy.log。
+
+
+## 第九十九轮：libei可选cursor字段与释放请求
+
+### R114 / P1
+
+- 当前会话fallback仍expect(cursor_position)，release_capture同样expect；optional字段缺失可panic。有效explicit ID路径原来跳过有限坐标检查，NaN仍可被路由并在释放时写入建议。
+- 提取旧release位置/选项生产helper后三条基线失败：fallback无cursor panic、known-ID NaN未拒绝、release无cursor panic。固定同会话/公开ashpd Activated解码fixture，没有创建真实portal。
+- [x] 当前会话已有合法ID可直接路由，无cursor不强行几何推断；fallback要求cursor并报上下文Io错误，geometry路由不一致同样报错而不expect。显式提供的非finite cursor在Begin前拒绝；foreign session仍先忽略。
+- [x] Release选项始终保留收到的activation ID；无cursor/非finite坐标省略cursor_position建议并仍调用portal.release。有限坐标保持原四向1px偏移。官方Release规范将cursor_position定义为建议，ashpd字段可选且skip None；不虚构坐标，也不把native Release成功当物理定位证明。
+
+### 验证、CI和剩余原生边界
+
+- 三条失败回归通过，补四条：known ID无cursor保持route，真实ReleaseOptions D-Bus序列化/字典解码证明无cursor key且activation ID=7；四向有限偏移/ID保持；geometry无route返回错误。libei模块43条通过，input-capture106通过/1忽略，root201通过/3忽略及其他workspace组件通过；严格Clippy/fmt/diff通过。
+- 上一轮最后remote核对因自动审批额度失败未执行；本日reset后正常审批重核对，9f2305d PR/远端一致。Rust37450139306 completed/success，17个Formatting/四平台build/check/clippy/test jobs全部success；Nix37450139298 completed/success。本轮新HEAD还需CI，不将上一轮通过扩大到本轮。
+- 官方来源：[InputCapture Release/Activated](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.InputCapture.html#org-freedesktop-portal-inputcapture-release)。规范还允许激活cursor在Zones外几十像素；现1px内收的overshoot处理、zones signal身份及native compositor恢复继续审。
+- [ ] 未实例化实际portal.release，不证明省略建议后的具体物理指针位置。千次真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms和8h RSS验收缺失，不认定90分；没有本机部署。
+
+日志：libei-cursor-metadata-baseline.log、libei-cursor-metadata-fixed.log、libei-cursor-metadata-workspace.log、libei-cursor-metadata-clippy.log。

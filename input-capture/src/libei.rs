@@ -670,28 +670,23 @@ fn activation_position(
         );
         return Ok(None);
     }
-    let barrier_id = match activated.barrier_id() {
-        Some(ActivatedBarrier::Barrier(id)) => id,
-        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(
-            barriers,
-            activated
-                .cursor_position()
-                .expect("no cursor position reported by compositor"),
-        )?,
-    };
-    let pos = match routes.get(&barrier_id) {
-        Some(pos) => *pos,
-        None => {
-            log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-            let id = find_corresponding_client(
-                barriers,
-                activated
-                    .cursor_position()
-                    .expect("no cursor position reported by compositor"),
-            )?;
-            *routes.get(&id).expect("invalid barrier id")
+    let cursor = activated.cursor_position();
+    if cursor.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite()) {
+        return Err(io::Error::other("libei activation has nonfinite cursor coordinates").into());
+    }
+    if let Some(ActivatedBarrier::Barrier(id)) = activated.barrier_id() {
+        if let Some(pos) = routes.get(&id) {
+            return Ok(Some(*pos));
         }
-    };
+        log::warn!("INVALID BARRIER ID: Id {id} does not exist!");
+    }
+    let cursor = cursor.ok_or_else(|| {
+        io::Error::other("libei activation cannot locate a barrier without cursor coordinates")
+    })?;
+    let id = find_corresponding_client(barriers, cursor)?;
+    let pos = routes.get(&id).copied().ok_or_else(|| {
+        io::Error::other("libei activation barrier geometry has no position route")
+    })?;
     Ok(Some(pos))
 }
 
@@ -808,18 +803,11 @@ async fn do_capture_session(
     Ok(())
 }
 
-async fn release_capture(
-    input_capture: &InputCapture,
-    session: &Session<InputCapture>,
-    activated: Activated,
+fn release_cursor_position(
+    cursor: Option<(f32, f32)>,
     current_pos: Position,
-) -> Result<(), CaptureError> {
-    if let Some(activation_id) = activated.activation_id() {
-        log::debug!("releasing input capture {activation_id}");
-    }
-    let (x, y) = activated
-        .cursor_position()
-        .expect("compositor did not report cursor position!");
+) -> Option<(f64, f64)> {
+    let (x, y) = cursor.filter(|(x, y)| x.is_finite() && y.is_finite())?;
     log::debug!("client entered @ ({x}, {y})");
     let (dx, dy) = match current_pos {
         // offset cursor position to not enter again immediately
@@ -830,9 +818,25 @@ async fn release_capture(
     };
     // release 1px to the right of the entered zone
     let cursor_position = (x as f64 + dx, y as f64 + dy);
-    let release_options = ReleaseOptions::default()
+    Some(cursor_position)
+}
+
+fn activation_release_options(activated: &Activated, pos: Position) -> ReleaseOptions {
+    ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
-        .set_cursor_position(Some(cursor_position));
+        .set_cursor_position(release_cursor_position(activated.cursor_position(), pos))
+}
+
+async fn release_capture(
+    input_capture: &InputCapture,
+    session: &Session<InputCapture>,
+    activated: Activated,
+    current_pos: Position,
+) -> Result<(), CaptureError> {
+    if let Some(activation_id) = activated.activation_id() {
+        log::debug!("releasing input capture {activation_id}");
+    }
+    let release_options = activation_release_options(&activated, current_pos);
     input_capture.release(session, release_options).await?;
     Ok(())
 }
@@ -1158,6 +1162,7 @@ mod tests {
         use ashpd::zvariant::{LE, ObjectPath, Value, serialized::Context};
         let path = ObjectPath::try_from(path).unwrap();
         let mut options = HashMap::<&str, Value<'_>>::new();
+        options.insert("activation_id", Value::from(7u32));
         if let Some(id) = id {
             options.insert("barrier_id", Value::from(id));
         }
@@ -1201,6 +1206,92 @@ mod tests {
                 Some(Position::Left)
             );
         }
+    }
+
+    #[test]
+    fn current_fallback_without_cursor_reports_error() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        for id in [None, Some(99)] {
+            let activation = activation_fixture("/session/current", id, None);
+            assert!(
+                activation_position(&activation, "/session/current", &[barrier], &routes).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn current_explicit_activation_rejects_nonfinite_coordinates() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/current", Some(1), Some((f32::NAN, 50.)));
+        assert!(activation_position(&activation, "/session/current", &[barrier], &routes).is_err());
+    }
+
+    #[test]
+    fn release_without_usable_cursor_omits_suggestion() {
+        for cursor in [None, Some((f32::NAN, 0.)), Some((0., f32::INFINITY))] {
+            assert_eq!(release_cursor_position(cursor, Position::Left), None);
+        }
+    }
+
+    #[test]
+    fn explicit_activation_without_cursor_keeps_known_route() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let routes = HashMap::from([(barrier.barrier_id, Position::Left)]);
+        let activation = activation_fixture("/session/current", Some(1), None);
+        assert_eq!(
+            activation_position(&activation, "/session/current", &[barrier], &routes).unwrap(),
+            Some(Position::Left)
+        );
+    }
+
+    fn decoded_release_options(
+        activated: &Activated,
+        pos: Position,
+    ) -> HashMap<String, ashpd::zvariant::OwnedValue> {
+        use ashpd::zvariant::{LE, serialized::Context};
+        let options = activation_release_options(activated, pos);
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &options).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn release_options_without_cursor_keep_activation_id() {
+        let activation = activation_fixture("/session/current", Some(1), None);
+        let options = decoded_release_options(&activation, Position::Left);
+        assert_eq!(options["activation_id"].downcast_ref::<u32>().unwrap(), 7);
+        assert!(!options.contains_key("cursor_position"));
+    }
+
+    #[test]
+    fn release_options_preserve_finite_inward_offsets() {
+        let activation = activation_fixture("/session/current", Some(1), Some((10., 20.)));
+        for (edge, expected) in [
+            (Position::Left, (11., 20.)),
+            (Position::Right, (9., 20.)),
+            (Position::Top, (10., 21.)),
+            (Position::Bottom, (10., 19.)),
+        ] {
+            let options = decoded_release_options(&activation, edge);
+            assert_eq!(
+                options["cursor_position"]
+                    .downcast_ref::<(f64, f64)>()
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(options["activation_id"].downcast_ref::<u32>().unwrap(), 7);
+        }
+    }
+
+    #[test]
+    fn fallback_without_position_route_reports_error() {
+        let barrier = barrier(1, (0, 0, 0, 100));
+        let activation = activation_fixture("/session/current", None, Some((0., 50.)));
+        assert!(
+            activation_position(&activation, "/session/current", &[barrier], &HashMap::new())
+                .is_err()
+        );
     }
 
     struct ReadyZoneBurst {

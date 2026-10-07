@@ -1336,8 +1336,7 @@ ties retain the first configured barrier. Valid explicit barrier IDs still use
 the existing direct lookup.
 
 Empty fallback geometry or nonfinite cursor coordinates return a capture error
-through the existing session cleanup path. This does not validate missing cursor
-metadata at other activation/release call sites or change native barrier setup.
+through the existing session cleanup path. Native barrier setup is unchanged.
 Actual compositor and multi-monitor activation behavior needs platform testing.
 
 
@@ -1368,5 +1367,23 @@ Serialize implementation, which serializes its object path. The library's path()
 accessor is private; a typed zvariant object-path round trip avoids parsing Debug
 output. Serialization errors return CaptureError through existing cleanup. The
 activation check itself compares borrowed path strings without another marshal.
-Zone-change session filtering and current-session cursor metadata/release behavior
-remain separate validation items. Real portal session churn needs platform tests.
+Zone-change session filtering remains a separate validation item. Real portal
+session churn and physical release behavior need platform tests.
+
+
+### Optional libei activation cursor metadata
+
+A known barrier ID can route an activation without cursor coordinates. Geometry
+fallback requires coordinates and returns a contextual capture error when they
+are absent; an inconsistent geometry-to-route map also reports an error. Supplied
+nonfinite activation coordinates are rejected before Begin. Foreign-session
+activations are still ignored before metadata validation.
+
+Release always builds options carrying the received activation ID. When cursor
+coordinates are missing or nonfinite, it omits the optional position suggestion
+and still requests portal release. Finite coordinates retain the existing one-pixel
+inward suggestion. This follows the portal's optional Release cursor_position
+contract; the compositor controls the final pointer position. Native release and
+overshoot behavior remain for validation.
+
+Specification: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.InputCapture.html#org-freedesktop-portal-inputcapture-release
