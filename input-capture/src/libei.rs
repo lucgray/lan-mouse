@@ -16,7 +16,7 @@ use reis::{
     tokio::EiConvertEventStream,
 };
 use std::{
-    cell::Cell,
+    cell::RefCell,
     collections::{HashMap, HashSet},
     env, fs,
     io::{self, Write},
@@ -460,12 +460,74 @@ async fn connect_to_eis(
     Ok((context, conn, event_stream))
 }
 
+#[derive(Default)]
+struct CaptureRouting {
+    route: RefCell<Option<Rc<CaptureRoute>>>,
+}
+
+struct CaptureRoute {
+    pos: Position,
+    cancelled: CancellationToken,
+}
+
+struct CaptureRouteGuard {
+    routing: Rc<CaptureRouting>,
+    route: Rc<CaptureRoute>,
+}
+
+impl CaptureRouting {
+    fn snapshot(&self) -> Option<Rc<CaptureRoute>> {
+        self.route.borrow().clone()
+    }
+
+    fn activate(self: &Rc<Self>, pos: Position) -> CaptureRouteGuard {
+        let route = Rc::new(CaptureRoute {
+            pos,
+            cancelled: CancellationToken::new(),
+        });
+        if let Some(previous) = self.route.replace(Some(route.clone())) {
+            previous.cancelled.cancel();
+        }
+        CaptureRouteGuard {
+            routing: self.clone(),
+            route,
+        }
+    }
+}
+
+impl Drop for CaptureRouteGuard {
+    fn drop(&mut self) {
+        self.route.cancelled.cancel();
+        let is_current = self
+            .routing
+            .route
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, &self.route));
+        if is_current {
+            self.routing.route.borrow_mut().take();
+        }
+    }
+}
+
+async fn send_route_event(
+    sender: &Sender<(Position, CaptureEvent)>,
+    route: &CaptureRoute,
+    event: CaptureEvent,
+) -> Result<(), CaptureError> {
+    tokio::select! {
+        biased;
+        _ = route.cancelled.cancelled() => Ok(()),
+        result = send_capture_event(sender, route.pos, event) => result,
+    }
+}
+
 async fn libei_event_handler(
     mut ei_event_stream: EiConvertEventStream,
     context: ei::Context,
     event_tx: Sender<(Position, CaptureEvent)>,
     release_session: Arc<Notify>,
-    current_pos: Rc<Cell<Option<Position>>>,
+    current_pos: Rc<CaptureRouting>,
 ) -> Result<(), CaptureError> {
     loop {
         let ei_event = ei_event_stream
@@ -473,7 +535,7 @@ async fn libei_event_handler(
             .await
             .ok_or(CaptureError::EndOfStream)??;
         log::trace!("from ei: {ei_event:?}");
-        let client = current_pos.get();
+        let client = current_pos.snapshot();
         handle_ei_event(ei_event, client, &context, &event_tx, &release_session).await?;
     }
 }
@@ -778,7 +840,7 @@ async fn do_capture_session(
 ) -> Result<(), CaptureError> {
     let session_handle = capture_session_handle(session)?;
     // current client
-    let current_pos = Rc::new(Cell::new(None));
+    let current_pos = Rc::new(CaptureRouting::default());
 
     // connect to eis server
     let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
@@ -822,7 +884,6 @@ async fn do_capture_session(
 
                     let Some(pos) = activation_position(&activated, session_handle.as_str(),
                         &barriers, &pos_for_barrier_id)? else { continue; };
-                    current_pos.replace(Some(pos));
 
                     // client entered => send event
                     let t = activation_edge_position(&activated, pos, &barriers, &pos_for_barrier_id);
@@ -830,6 +891,7 @@ async fn do_capture_session(
                         break;
                     }
 
+                    let active_route = current_pos.activate(pos);
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
                             log::debug!("release session requested");
@@ -844,6 +906,7 @@ async fn do_capture_session(
                         },
                     }
 
+                    drop(active_route);
                     release_capture(input_capture, session, activated, pos, &barriers, &pos_for_barrier_id).await?;
 
                 }
@@ -1062,7 +1125,7 @@ async fn send_activation_event(
 
 async fn handle_ei_event(
     ei_event: EiEvent,
-    current_client: Option<Position>,
+    current_client: Option<Rc<CaptureRoute>>,
     context: &ei::Context,
     event_tx: &Sender<(Position, CaptureEvent)>,
     release_session: &Notify,
@@ -1098,9 +1161,9 @@ async fn handle_ei_event(
             return Err(CaptureError::Disconnected(format!("{:?}", d.reason)));
         }
         _ => {
-            if let Some(pos) = current_client {
+            if let Some(route) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    send_capture_event(event_tx, pos, CaptureEvent::Input(event)).await?;
+                    send_route_event(event_tx, &route, CaptureEvent::Input(event)).await?;
                 }
             }
         }
@@ -1178,6 +1241,7 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::*;
     use futures::future::poll_fn;
+    use std::cell::Cell;
 
     struct TaskResourceProbe(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for TaskResourceProbe {
@@ -2120,6 +2184,156 @@ mod tests {
         let (zones, _) = data.deserialize::<Zones>().unwrap();
         assert!(
             select_barriers(&zones, &[Position::Left], &mut NonZeroU32::new(1).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn released_route_clears_current_client_and_cancels_snapshot() {
+        let routing = Rc::new(CaptureRouting::default());
+        let active = routing.activate(Position::Left);
+        let snapshot = routing.snapshot().unwrap();
+        drop(active);
+        assert!(
+            routing.snapshot().is_none(),
+            "release must stop routing late events"
+        );
+        assert!(snapshot.cancelled.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn released_route_interrupts_pending_input_send() {
+        let routing = Rc::new(CaptureRouting::default());
+        let active = routing.activate(Position::Left);
+        let snapshot = routing.snapshot().unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_capture_event(&sender, Position::Right, CaptureEvent::Begin(0.25))
+            .await
+            .unwrap();
+        let mut send = Box::pin(send_route_event(
+            &sender,
+            &snapshot,
+            CaptureEvent::Begin(0.5),
+        ));
+        assert!((&mut send).now_or_never().is_none());
+        drop(active);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), send)
+                .await
+                .is_ok(),
+            "release must cancel input waiting for channel capacity"
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.25))
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn released_route_does_not_send_when_channel_is_ready() {
+        let routing = Rc::new(CaptureRouting::default());
+        let active = routing.activate(Position::Left);
+        let snapshot = routing.snapshot().unwrap();
+        drop(active);
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_route_event(&sender, &snapshot, CaptureEvent::Begin(0.5))
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_route_isolated_from_old_guard_and_snapshot() {
+        let routing = Rc::new(CaptureRouting::default());
+        let old = routing.activate(Position::Left);
+        let old_snapshot = routing.snapshot().unwrap();
+        let new = routing.activate(Position::Right);
+        let new_snapshot = routing.snapshot().unwrap();
+        assert!(old_snapshot.cancelled.is_cancelled());
+        drop(old);
+        assert!(Rc::ptr_eq(&routing.snapshot().unwrap(), &new_snapshot));
+        assert!(!new_snapshot.cancelled.is_cancelled());
+        let (sender, mut receiver) = mpsc::channel(1);
+        let event = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+            time: 1,
+            dx: 2.,
+            dy: 3.,
+        }));
+        send_route_event(&sender, &old_snapshot, event.clone())
+            .await
+            .unwrap();
+        assert!(receiver.try_recv().is_err());
+        send_route_event(&sender, &new_snapshot, event.clone())
+            .await
+            .unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), (Position::Right, event));
+        drop(new);
+        assert!(routing.snapshot().is_none());
+        assert!(new_snapshot.cancelled.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capture_route_is_published_after_begin_is_queued() {
+        let routing = Rc::new(CaptureRouting::default());
+        let (sender, mut receiver) = mpsc::channel(1);
+        send_capture_event(&sender, Position::Right, CaptureEvent::Begin(0.75))
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let mut begin = Box::pin(send_activation_event(
+            &sender,
+            Position::Left,
+            0.25,
+            &cancel,
+        ));
+        assert!((&mut begin).now_or_never().is_none());
+        assert!(routing.snapshot().is_none());
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Right, CaptureEvent::Begin(0.75))
+        );
+        assert!(begin.await.unwrap());
+        let active = routing.activate(Position::Left);
+        assert_eq!(routing.snapshot().unwrap().pos, Position::Left);
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (Position::Left, CaptureEvent::Begin(0.25))
+        );
+        drop(active);
+        assert!(routing.snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_route_keeps_input_order_and_reports_closed_receiver() {
+        let routing = Rc::new(CaptureRouting::default());
+        let _active = routing.activate(Position::Left);
+        let route = routing.snapshot().unwrap();
+        let (sender, mut receiver) = mpsc::channel(2);
+        for dx in [1., 2.] {
+            let event = CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+                time: 1,
+                dx,
+                dy: 0.,
+            }));
+            send_route_event(&sender, &route, event).await.unwrap();
+        }
+        for dx in [1., 2.] {
+            assert_eq!(
+                receiver.recv().await.unwrap(),
+                (
+                    Position::Left,
+                    CaptureEvent::Input(Event::Pointer(input_event::PointerEvent::Motion {
+                        time: 1,
+                        dx,
+                        dy: 0.
+                    }))
+                )
+            );
+        }
+        drop(receiver);
+        assert!(
+            matches!(send_route_event(&sender, &route, CaptureEvent::Begin(0.5)).await,
+            Err(CaptureError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe)
         );
     }
 

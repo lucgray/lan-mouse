@@ -1485,3 +1485,20 @@ handles setup failure. No input-frame work or serialized protocol fields change.
 Tests decode actual ashpd Region/Zones data but do not establish that a live
 compositor has supplied malformed regions. Barrier ID exhaustion is a separate
 remaining validation item.
+
+
+### Libei activation-scoped input routing
+
+The current route is published only after Begin has entered the capture channel.
+Each activation owns a route guard and cancellation token. Ordinary release drops
+the guard before awaiting portal Release; session cancellation/error exits also
+drop it. This clears the matching route and cancels any input send still waiting
+for channel capacity. A saved old route cannot send after its activation ends.
+Replacing a route cancels the previous one; dropping an old guard cannot clear
+the replacement because identity is checked.
+
+Healthy inputs keep FIFO and closed-receiver error propagation. EIS handlers keep
+a reference-counted route snapshot across send waits; route/token allocations
+occur per activation rather than per input event. Cancellation does not withdraw
+events already accepted into downstream queues. Native portal restoration and
+physical cross-device behavior remain validation items.

@@ -29,6 +29,7 @@
 | R118 | libei事件通道错误/Begin取消已实现 | 关闭通道报BrokenPipe而非panic，满通道Begin可取消；联合等待模型回归通过，native清理待验 |
 | R119 | libei进入位置比例已实现 | 使用activation坐标/所属region计算Begin(t)，四向/多屏/越界/回退通过，双机定位待验 |
 | R120 | libei区域坐标校验已实现 | i64计算/u32完整尺寸，空区域/不可表示端点返回错误，合法大尺寸及setup传播回归通过 |
+| R121 | libei激活路由生命周期已实现 | Begin入队后发布，释放取消旧快照/等待发送，精确guard身份避免清新路由；native恢复待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2398,3 +2399,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] barrier ID checked_add仍expect，ZonesChanged身份、release后current_pos、native等待继续审。千次真实双机往返、原生恢复、完整p95≤20ms/p99≤50ms及8h RSS缺证据，不认定90分。
 
 日志：libei-region-arithmetic-baseline.log、libei-region-arithmetic-fixed.log、libei-region-arithmetic-workspace.log、libei-region-arithmetic-clippy.log。
+
+
+## 第一百零六轮：libei释放后旧路由与等待发送
+
+### R121 / P1
+
+- current_pos在Activated时写Some，但普通release_capture后没有清空；EIS后续事件继续按旧Position发送。仅置None也不解决已取snapshot并等待mpsc容量的send。路由原来在Begin入队前发布，Begin等待期间也可能先转发输入。
+- 提取原旧路由/发送语义后3条受控基线失败：release后仍有current route，旧快照在ready通道继续发送，满通道等待不被release中断。模型用生产routing/send helper与真实mpsc；没有实际EIS设备或portal。
+- [x] 当前route改为每次activation的Rc CaptureRoute与CancellationToken；guard退出取消自身route，并仅在Rc身份相同才清当前route。替换路由立即取消旧token，旧guard不能清新路由。
+- [x] Begin成功入队后才发布路由；普通释放先drop guard再await portal Release。cancel分支break/错误scope退出也Drop guard。send_route_event biased优先旧route取消，pending发送退出且不排迟到事件；健康错误仍通过send_capture_event。
+
+### 验证、性能范围与剩余迟到事件
+
+- 3条失败回归通过；补3条：替代路由与旧guard/snapshot隔离，Begin满队列期间路由未发布/入队后才发布，正常输入FIFO及BrokenPipe保持。libei81通过；工作区all-features input-capture144通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。
+- route/token在activation时分配；输入使用Rc snapshot及取消选择，成功路径没有逐event新堆分配/任务。没有对新增引用计数和select成本作实机时延结论；通道容量/协议未变。
+- fa575e0 Rust37574840912 queued、Nix37574840968 in_progress，本轮HEAD需CI。
+- [ ] 已经进入下游队列/网络的事件不由路由取消撤回；EIS/native释放、真实双机往返和故障恢复仍需验证。ZonesChanged归属、ID耗尽、native等待继续审。完整p95≤20ms/p99≤50ms及8h RSS缺验收证据，不认定90分；没有本机部署。
+
+日志：libei-route-release-baseline.log、libei-route-release-fixed.log、libei-route-release-workspace.log、libei-route-release-clippy.log。
