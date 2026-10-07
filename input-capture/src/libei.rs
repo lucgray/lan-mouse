@@ -21,10 +21,7 @@ use std::{
     env, fs,
     io::{self, Write},
     num::NonZeroU32,
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        net::UnixStream,
-    },
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     pin::Pin,
     rc::Rc,
@@ -353,7 +350,7 @@ fn get_token_file_path() -> PathBuf {
 /// Read the InputCapture token from file
 fn read_token_from(token_path: &Path) -> Option<String> {
     match fs::read_to_string(token_path) {
-        // an interrupted write leaves the file empty, which is no token at all
+        // Empty legacy files contain no usable restore token.
         Ok(token) => Some(token.trim().to_string()).filter(|t| !t.is_empty()),
         Err(_) => None,
     }
@@ -361,24 +358,27 @@ fn read_token_from(token_path: &Path) -> Option<String> {
 
 /// Write the InputCapture token to file
 fn write_token_to(token_path: &Path, token: &str) -> io::Result<()> {
-    if let Some(parent) = token_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    write_token_with(token_path, token, |file, bytes| file.write_all(bytes))
+}
 
-    // the token lets its holder skip the consent dialog, so keep it private;
-    // mode() only applies on create, hence set_permissions for older files,
-    // and only best-effort: some filesystems refuse chmod, and the file is
-    // already truncated by then
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(token_path)?;
-    if let Err(e) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-        log::warn!("could not restrict {}: {e}", token_path.display());
-    }
-    file.write_all(token.as_bytes())?;
+fn write_token_with(
+    token_path: &Path,
+    token: &str,
+    write: impl FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let parent = token_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    // Prepare a private replacement without truncating or following the old path.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    write(temporary.as_file_mut(), token.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(token_path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -2693,6 +2693,65 @@ mod tests {
         })
         .await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn token_atomic_write_failure_preserves_previous_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        fs::write(&path, "test-only-old-value").unwrap();
+        let result = write_token_with(&path, "test-only-new-value", |file, bytes| {
+            file.write_all(&bytes[..5])?;
+            Err(io::Error::other("controlled partial write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "test-only-old-value");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn token_atomic_write_replaces_symlink_without_modifying_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("unrelated");
+        let path = directory.path().join("token");
+        fs::write(&target, "unrelated-data").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        write_token_to(&path, "test-only-new-value").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "unrelated-data");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "test-only-new-value");
+    }
+
+    #[test]
+    fn token_atomic_failed_first_write_leaves_no_partial_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        let result = write_token_with(&path, "test-only-new-value", |file, bytes| {
+            file.write_all(&bytes[..5])?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "controlled write failure",
+            ))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn token_atomic_commit_failure_cleans_replacement_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        fs::create_dir(&path).unwrap();
+        assert!(write_token_to(&path, "test-only-new-value").is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&path).unwrap().count(), 0);
     }
 
     struct ReadyZoneBurst {

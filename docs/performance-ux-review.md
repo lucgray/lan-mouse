@@ -33,6 +33,7 @@
 | R122 | libei屏障ID耗尽错误已实现 | checked_add失败返回错误，不panic/回绕；顺序/路由/空请求保持，native边界待验 |
 | R123 | libei区域通知会话过滤已实现 | 仅当前session启动重建，ignored计入32条让出预算，当前/旧/idle/边界回归通过 |
 | R124 | libei token IO移出事件线程 | spawn_blocking承接读写，慢操作期间async控制可运行；文件语义/权限回归通过，真实延迟待测 |
+| R125 | libei token原子替换已实现 | 同目录私有临时文件/write+sync后persist，失败保留旧路径/清临时，symlink目标不改；实机rotation待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2475,3 +2476,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] started blocking worker取消/全局数量、token原子持久化与路径fallback、window mutex poison及native等待仍需审。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS仍缺证据，不认定90分。
 
 日志：libei-token-io-baseline.log、libei-token-io-fixed.log、libei-token-io-workspace.log、libei-token-io-clippy.log。
+
+
+## 第一百一十轮：libei token写入失败破坏旧文件
+
+### R125 / P2
+
+- 原OpenOptions.truncate先清空已有token，后write失败留下部分内容；final token path是symlink时跟随并修改目标。两条实际临时文件基线失败：partial写后错误旧值变为5字节前缀，symlink的无关target被覆写。均是构造文件场景，不触碰实际token。
+- [x] write_token_with同目录NamedTempFile，写入前要求0600，完整write后sync_all再persist替换；任一步返回错误时保留旧destination并由临时对象Drop清理。旧路径不truncate/follow，symlink被替换而target保持。
+- [x] write_token_to生产write_all复用同helper，仍在上一轮blocking worker运行；chmod失败改为拒绝保存新token，create_session保留已启动session并记录保存错误。每save新增temp/sync/rename，无每帧工作/协议变化。
+
+### 验证与授权可复用范围
+
+- 4条新增回归通过：partial失败保留旧值且无临时残留；symlink target保留、token路径变普通文件；首次partial失败无最终文件且保留原PermissionDenied；destination为目录导致persist失败且无残留。此前正常读写/覆盖/0600及worker调度回归保持。
+- libei99通过；工作区all-features input-capture162通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。没有实际portal token rotation、进程crash或断电测试，没有本机部署。
+- 1060e63 Rust37576198154 queued、Nix37576198137 queued，本轮HEAD需CI。
+- [ ] token一次性，保存失败后保留的旧值可能已消费，不保证下次免授权；父目录fsync/断电durability及parent路径竞争未闭环。真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
+
+日志：libei-token-atomic-baseline.log、libei-token-atomic-fixed.log、libei-token-atomic-workspace.log、libei-token-atomic-clippy.log。

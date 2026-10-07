@@ -1548,4 +1548,23 @@ on the same runtime while the worker waits. Real temporary-file tests check read
 behavior and 0600 write mode. They do not measure real storage latency, peer input
 latency or total startup time. This adds blocking jobs per initialization/token
 save, not per input frame. Started blocking work is not made cancelable or globally
-bounded here; atomic persistence and token-path handling remain separate items.
+bounded here; atomic persistence is described below and token-path handling
+remains a separate item.
+
+
+### Atomic InputCapture token replacement
+
+Token saving creates a temporary file beside the destination, requires private
+0600 permissions, writes the full value and syncs that file before persisting it
+as the token path. Write/sync/rename errors preserve the previous destination;
+normal error cleanup removes the temporary file. The old path is not truncated
+or followed: an existing token symlink is replaced without changing its target.
+This is an application-managed token file, unlike the configurable user config
+symlink behavior.
+
+Saving still runs in the blocking worker. If private permissions cannot be set,
+saving reports an error rather than publishing a new token with wider access.
+The portal session remains started and logs a save error. A previous token may
+already have been consumed, so preserving its file does not guarantee future
+consent-free startup. Parent-directory synchronization and power-loss durability
+are not established here; real portal token rotation remains unverified.
