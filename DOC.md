@@ -1621,7 +1621,7 @@ events, drops the read guard, then flushes protocol requests. Flush errors propa
 while the stream remains terminal; resources already taken are not restored.
 The connection/global objects remain owned until backend drop. Controlled callback
 models validate cleanup order and state, not actual compositor unlock or receipt
-of destroy requests. Already-queued input during ordinary release still requires audit.
+of destroy requests. Native queued callbacks after release still require audit.
 
 
 ### Layer-shell window retirement
@@ -1690,3 +1690,29 @@ regain, active/queued loss, fused failure, first-failure preservation, source
 isolation and healthy additions. Private native client proxies validate local
 identity and destruction; no real seat hotplug, compositor ACK or remote key
 restoration is claimed.
+
+
+### Layer-shell explicit release input boundary
+
+Explicit release (including release_to) now takes focus, clears this backend's
+application event queue and resets the wheel marker before native capture cleanup
+and flush. Begin, key, modifier and motion events from the old session cannot be
+returned by that queue afterward. The recorded first failure and sticky failed
+state are retained: release does not hide overload/capability-loss errors or
+reactivate a failed backend. Termination shares this release path and explicitly
+clears the pending failure as part of its existing terminal cleanup.
+
+Ungrab, retirement of captured windows and a matching native Leave also reset the
+wheel marker. Retirement of an unrelated focus preserves its state. Native Leave
+keeps its previous application queue behavior; this change does not drain the
+Wayland library's event queue or prove all late native Enter events are rejected.
+Healthy explicit release still allows a later valid capture session; late key
+callbacks without focus and relative callbacks from retired objects are rejected
+by the existing source/route checks. Already-forwarded keys remain handled by the
+capture manager's existing pressed-key cleanup.
+
+Five regressions cover old queued data, the cross-session wheel marker, pending
+failures, a release/late-callback/new-capture sequence and orphan cleanup without
+focus. Native proxy fixtures verify local object destruction and mapping behavior,
+not compositor receipt, pointer return or physical end-to-end timing. Per-axis
+wheel frame grouping, native callback ordering and re-entry still require review.

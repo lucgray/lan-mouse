@@ -40,6 +40,7 @@
 | R129 | layer-shell窗口退役清理已实现 | 删除目标focus先release再drop，保留无关focus；重建清旧路由/队列，单pass retain；原生热插拔待验 |
 | R130 | layer-shell旧回调源隔离已实现 | Leave核对surface再take focus，相对运动核对当前proxy，pointer核对当前源；真实client ID复用回归通过，native时序待验 |
 | R131 | layer-shell seat设备所有权/失能清理已实现 | 重复caps复用/保存keyboard，丢能力take+release，active loss一次故障并fuse；idle可重建，真实热插拔/远端松键待验 |
+| R132 | layer-shell显式释放应用队列已实现 | release/release_to清旧Begin/输入与wheel marker，保留首错/failed；新捕获与迟到源回归通过，原生队列/返回待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2615,3 +2616,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 普通release保留旧queued输入、Enter替换focus时资源归属、Closed处理、滚轮frame状态、post-terminate控制与dispatch预算继续审。真实seat热插拔/远端按键恢复、千次双机切换、完整p95≤20ms/p99≤50ms和8h RSS仍未验收，不认定90分。
 
 日志：layer-shell-seat-baseline.log（先三条所有权失败，再两条loss失败）、layer-shell-seat-fixed.log、layer-shell-seat-workspace.log、layer-shell-seat-clippy.log。
+
+
+## 第一百一十七轮：layer-shell显式释放后旧输入与滚轮标记跨会话残留
+
+### R132 / P1
+
+- InputCapture wrapper清自身pending，但layer-shell release原只State.ungrab，不清backend pending_events；旧Begin/keydown/up/modifier/motion仍可被随后poll消费，且scroll_discrete_pending跨session保留。提取旧release语义后的两条基线失败：混合Left/Right旧事件仍出队；release后旧discrete marker仍true。
+- [x] release_capture_session先take focus、clear应用events/reset marker，然后调用native release。State.release_session供release与terminate共用，release_to调用release继承。普通release保留pending_failure/failed，不用释放吞掉已有故障或恢复已失败backend；terminate已有terminal策略再清pending_failure。
+- [x] State.ungrab、匹配Leave和retire captured/orphan focus都reset wheel marker；无关focus retire不动当前marker。匹配native Leave没有改变原queued事件处理策略；本轮只切断显式release的应用队列，不宣称已drain Wayland内部事件。
+- [x] 健康queue复用容量允许新Begin/输入；take focus与destroy旧relative后，晚到key因无focus忽略、旧relative来源不匹配而忽略。已发送按键由既有capture manager pressed-key/remap cleanup负责，本轮没有新LAN消息。
+
+### 验证与范围
+
+- 五条新增回归通过：两条失败基线；release保留QueueOverloaded/SeatCapabilityLost首错并经生产stream helper融合；真实client proxy下old Begin/key/motion→release→晚到keyup/old motion→Right新Begin/新motion，只有新会话被消费且旧relative本地is_alive=false；无focus仍清Right旧Begin并重复cleanup只destroy一次orphan relative。
+- helper状态/typed输入/真实本地proxy模型验证，不实例化真实LayerShell State或compositor；没有native回包/物理光标返回/端到端延迟证明。Wayland库尚未dispatch的Enter仍可能需单独generation/边界策略，不用应用队列清空替代该验收。
+- layer-shell47通过，workspace/all-features input-capture209通过/1忽略、root201通过/3忽略及其他组件通过；strict Clippy/fmt/diff通过。没有本机部署或桌面配置修改。
+- 上一HEAD 63c90f8 Rust37580035424 queued、Nix37580035431 in_progress；本轮HEAD仍需CI。
+- [ ] 当前单一wheel marker会跨横/纵轴耦合，Frame只TODO；已读锁定依赖wayland-client 0.31.14/wayland.xml的frame与axis_value120定义，下一轮验证按frame/axis分组，不能假设axis_value120固定配对顺序。Enter资源替换、Closed处理、post-terminate控制与dispatch预算仍待审。千次双机切换/原生故障恢复、完整p95≤20ms/p99≤50ms和8h RSS缺实机验收，不认定90分。
+
+日志：layer-shell-release-buffer-baseline.log、layer-shell-release-buffer-fixed.log、layer-shell-release-buffer-workspace.log、layer-shell-release-buffer-clippy.log。

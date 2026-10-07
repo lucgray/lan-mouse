@@ -525,11 +525,28 @@ impl State {
     }
 
     fn ungrab(&mut self) {
+        self.scroll_discrete_pending = false;
         release_layer_capture(
             self.focused.take(),
             &mut self.pointer_lock,
             &mut self.rel_pointer,
             &mut self.shortcut_inhibitor,
+        );
+    }
+
+    fn release_session(&mut self) {
+        release_capture_session(
+            &mut self.focused,
+            &mut self.pending_events,
+            &mut self.scroll_discrete_pending,
+            |focused| {
+                release_layer_capture(
+                    focused,
+                    &mut self.pointer_lock,
+                    &mut self.rel_pointer,
+                    &mut self.shortcut_inhibitor,
+                );
+            },
         );
     }
 
@@ -541,6 +558,7 @@ impl State {
             position,
             |window| window.pos,
             |focus| {
+                self.scroll_discrete_pending = false;
                 release_layer_capture(
                     focus,
                     &mut self.pointer_lock,
@@ -588,6 +606,20 @@ impl State {
             self.add_client(pos);
         }
     }
+}
+
+fn release_capture_session<F>(
+    focused: &mut Option<F>,
+    pending: &mut PendingCaptureEvents,
+    scroll_discrete_pending: &mut bool,
+    release: impl FnOnce(Option<F>),
+) {
+    let focused = focused.take();
+    pending.events.clear();
+    *scroll_discrete_pending = false;
+    // Keep the first recorded failure: explicit release must not hide a fault
+    // or reset the sticky failed state before the stream reports it.
+    release(focused);
 }
 
 fn release_layer_capture(
@@ -892,7 +924,7 @@ impl Capture for LayerShellInputCapture {
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.inner.get_mut();
-        inner.state.ungrab();
+        inner.state.release_session();
         Ok(inner.flush_events()?)
     }
 
@@ -903,7 +935,7 @@ impl Capture for LayerShellInputCapture {
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         let inner = self.inner.get_mut();
         Ok(terminate_capture(&mut self.terminated, || {
-            inner.state.ungrab();
+            inner.state.release_session();
             update_seat_devices(
                 &mut inner.state.pointer,
                 &mut inner.state.keyboard,
@@ -915,7 +947,6 @@ impl Capture for LayerShellInputCapture {
             );
             inner.state.active_windows.clear();
             inner.state.active_positions.clear();
-            inner.state.pending_events.events.clear();
             inner.state.pending_events.pending_failure = None;
             inner.state.read_guard.take();
             inner.flush_events()
@@ -1066,6 +1097,7 @@ impl Dispatch<WlPointer, ()> for State {
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
                 }
+                app.scroll_discrete_pending = false;
                 release_layer_capture(
                     focused,
                     &mut app.pointer_lock,
@@ -1863,6 +1895,199 @@ mod tests {
             matches!(pending.pop_front(), Some(Ok((Position::Right, CaptureEvent::Begin(t)))) if t == 0.75)
         );
         assert!(!pending.failed);
+    }
+
+    #[test]
+    fn release_session_discards_old_begin_keys_modifiers_and_motion() {
+        let mut pending = PendingCaptureEvents::default();
+        for event in [
+            CaptureEvent::Begin(0.25),
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 1,
+                key: 29,
+                state: 1,
+            })),
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 2,
+                key: 29,
+                state: 0,
+            })),
+            CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 4,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            })),
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                time: 3,
+                dx: 100.0,
+                dy: -50.0,
+            })),
+        ] {
+            pending.push_back((Position::Left, event));
+        }
+        pending.push_back((Position::Right, CaptureEvent::Begin(0.75)));
+        let mut focus = Some(Position::Left);
+        let mut scroll_pending = false;
+        let mut released = None;
+        release_capture_session(&mut focus, &mut pending, &mut scroll_pending, |focus| {
+            released = focus
+        });
+        assert_eq!(released, Some(Position::Left));
+        assert!(focus.is_none());
+        assert!(
+            pending.pop_front().is_none(),
+            "old session input remained consumable after release"
+        );
+    }
+
+    #[test]
+    fn release_session_does_not_carry_scroll_marker_into_next_capture() {
+        let mut pending = PendingCaptureEvents::default();
+        pending.push_back((
+            Position::Left,
+            CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: 120,
+            })),
+        ));
+        let mut focus = Some(Position::Left);
+        let mut scroll_pending = true;
+        release_capture_session(&mut focus, &mut pending, &mut scroll_pending, |_| {});
+        assert!(
+            !scroll_pending,
+            "old discrete wheel marker suppresses next capture's continuous scroll"
+        );
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn release_session_preserves_first_failure_and_fused_error() {
+        for error in [
+            CaptureError::LayerShellQueueOverloaded,
+            CaptureError::LayerShellSeatCapabilityLost { lost: "keyboard" },
+        ] {
+            let expected = error.to_string();
+            let mut pending = PendingCaptureEvents::default();
+            pending.fail(error);
+            let mut focus = Some(Position::Left);
+            let mut scroll_pending = true;
+            release_capture_session(&mut focus, &mut pending, &mut scroll_pending, |_| {});
+            assert!(pending.failed);
+            let mut terminal = false;
+            let result = poll_capture_stream(&mut terminal, || Poll::Ready(pending.pop_front()));
+            let Poll::Ready(Some(Err(error))) = result else {
+                panic!("release swallowed pending failure");
+            };
+            assert_eq!(error.to_string(), expected);
+            assert!(matches!(
+                poll_capture_stream::<()>(&mut terminal, || panic!("failed stream resumed")),
+                Poll::Ready(None)
+            ));
+            assert!(!pending.push_back((Position::Right, CaptureEvent::Begin(0.75))));
+            assert!(pending.pop_front().is_none());
+        }
+    }
+
+    #[test]
+    fn release_session_cuts_old_callbacks_and_allows_new_capture() {
+        use wayland_client::Proxy;
+        let fixture = NativeProxyFixture::new();
+        let keyboard = fixture.seat.get_keyboard(&fixture.qh, ());
+        let old_relative = fixture.relative[0].clone();
+        let mut relative = Some(old_relative.clone());
+        let mut focus = Some(Position::Left);
+        let mut scroll_pending = true;
+        let mut pending = PendingCaptureEvents::default();
+        pending.push_back((Position::Left, CaptureEvent::Begin(0.25)));
+        pending.push_back(
+            keyboard_capture_event(
+                Some(&keyboard),
+                &keyboard,
+                native_key(wl_keyboard::KeyState::Pressed),
+                focus,
+            )
+            .unwrap(),
+        );
+        pending.push_back(
+            relative_motion_event(relative.as_ref(), &old_relative, native_motion(), focus)
+                .unwrap(),
+        );
+        release_capture_session(&mut focus, &mut pending, &mut scroll_pending, |focused| {
+            assert_eq!(focused, Some(Position::Left));
+            relative.take().unwrap().destroy();
+        });
+        assert!(focus.is_none() && !old_relative.is_alive());
+        assert!(pending.pop_front().is_none());
+        assert!(!pending.failed);
+        assert!(
+            keyboard_capture_event(
+                Some(&keyboard),
+                &keyboard,
+                native_key(wl_keyboard::KeyState::Released),
+                focus
+            )
+            .is_none()
+        );
+        assert!(
+            relative_motion_event(relative.as_ref(), &old_relative, native_motion(), focus)
+                .is_none()
+        );
+
+        focus = Some(Position::Right);
+        relative = Some(fixture.relative[1].clone());
+        pending.push_back((Position::Right, CaptureEvent::Begin(0.75)));
+        assert!(
+            relative_motion_event(relative.as_ref(), &old_relative, native_motion(), focus)
+                .is_none()
+        );
+        pending.push_back(
+            relative_motion_event(
+                relative.as_ref(),
+                &fixture.relative[1],
+                native_motion(),
+                focus,
+            )
+            .unwrap(),
+        );
+        assert!(
+            matches!(pending.pop_front(), Some(Ok((Position::Right, CaptureEvent::Begin(t)))) if t == 0.75)
+        );
+        assert!(matches!(
+            pending.pop_front(),
+            Some(Ok((
+                Position::Right,
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                    dx: 4.25,
+                    dy: -2.5,
+                    ..
+                }))
+            )))
+        ));
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn release_session_without_focus_discards_queue_and_releases_orphan_once() {
+        let fixture = NativeProxyFixture::new();
+        let mut relative = Some(fixture.relative[0].clone());
+        let mut focus: Option<Position> = None;
+        let mut pending = PendingCaptureEvents::default();
+        let mut scroll_pending = true;
+        let mut destroyed = 0;
+        pending.push_back((Position::Right, CaptureEvent::Begin(0.75)));
+        for _ in 0..2 {
+            release_capture_session(&mut focus, &mut pending, &mut scroll_pending, |focused| {
+                assert!(focused.is_none());
+                if let Some(relative) = relative.take() {
+                    relative.destroy();
+                    destroyed += 1;
+                }
+            });
+            assert!(pending.pop_front().is_none());
+        }
+        assert_eq!(destroyed, 1);
+        assert!(!scroll_pending && !pending.failed);
     }
 
     #[test]
