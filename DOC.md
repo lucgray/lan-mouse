@@ -1367,8 +1367,8 @@ Serialize implementation, which serializes its object path. The library's path()
 accessor is private; a typed zvariant object-path round trip avoids parsing Debug
 output. Serialization errors return CaptureError through existing cleanup. The
 activation check itself compares borrowed path strings without another marshal.
-Zone-change session filtering remains a separate validation item. Real portal
-session churn and physical release behavior need platform tests.
+Zone-change session filtering is described below. Real portal session churn
+and physical release behavior need platform tests.
 
 
 ### Optional libei activation cursor metadata
@@ -1515,3 +1515,20 @@ creates a new backend/session.
 Normal client/region order and sequential IDs are unchanged. Empty requests do
 not consume IDs. Boundary tests start near u32::MAX; they do not establish that
 an installed instance has exhausted its counter or caused a physical failure.
+
+
+### Libei zone-change session scope
+
+ZonesChanged signals match the currently running capture session's object path.
+The path is cached before session setup and shared with the signal mapper; the
+activation branch uses the same cached identity. After the joined branches finish,
+the zone identity is cleared before disable/close. Idle operation ignores zone
+signals because no active barrier session needs rebuilding; the next active setup
+queries current zones.
+
+Foreign signals are consumed as ignored updates rather than filtered inside a
+stream poll loop. They do not start the 50ms debounce, but count toward the
+32-update cooperative yield budget before and during debounce. A current signal
+at that budget boundary also yields before more data is consumed. EOF/error and
+client notification behavior remain unchanged. Tests cover typed signal decoding
+and update helpers; real D-Bus session churn remains unverified.

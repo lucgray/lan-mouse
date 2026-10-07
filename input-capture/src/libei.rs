@@ -3,7 +3,7 @@ use ashpd::{
         PersistMode, Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, StartOptions, Zones,
+            InputCapture, Region, ReleaseOptions, StartOptions, Zones, ZonesChanged,
         },
     },
     enumflags2::BitFlags,
@@ -600,7 +600,17 @@ async fn do_capture(
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
     let result = async {
-        let mut zones_changed = input_capture.receive_zones_changed().await?;
+        let zone_session = Rc::new(RefCell::new(None::<ashpd::zvariant::OwnedObjectPath>));
+        let zone_identity = zone_session.clone();
+        let mut zones_changed = input_capture
+            .receive_zones_changed()
+            .await?
+            .map(move |change| {
+                zone_change_is_current(
+                    &change,
+                    zone_identity.borrow().as_ref().map(|path| path.as_str()),
+                )
+            });
 
         loop {
             // do capture session
@@ -630,20 +640,26 @@ async fn do_capture(
                     }
                 };
 
-                let capture_session = do_capture_session(
-                    input_capture,
-                    &mut session,
-                    &event_tx,
-                    &active_clients,
-                    &mut next_barrier_id,
-                    &notify_release,
-                    cancel_session.clone(),
-                );
+                let capture_session = async {
+                    let handle = capture_session_handle(&session)?;
+                    zone_session.replace(Some(handle.clone()));
+                    do_capture_session(
+                        input_capture,
+                        &mut session,
+                        &event_tx,
+                        &active_clients,
+                        &mut next_barrier_id,
+                        &notify_release,
+                        (cancel_session.clone(), handle),
+                    )
+                    .await
+                };
                 let capture_session =
                     cancel_sibling_on_completion(capture_session, cancel_update.clone());
 
                 let (capture_result, update_result) =
                     tokio::join!(capture_session, handle_session_update_request);
+                zone_session.replace(None);
                 log::debug!("capture session + session_update task done!");
 
                 // disable capture
@@ -696,17 +712,27 @@ where
     result
 }
 
+enum SessionUpdate {
+    ZoneChanged,
+    Client(LibeiNotifyEvent),
+    Ignored,
+}
+
+fn zone_change_is_current(change: &ZonesChanged, expected: Option<&str>) -> bool {
+    expected.is_some_and(|path| change.session_handle().as_str() == path)
+}
+
 async fn next_session_update(
-    zones_changed: &mut (impl Stream + Unpin),
+    zones_changed: &mut (impl Stream<Item = bool> + Unpin),
     capture_event: &mut Receiver<LibeiNotifyEvent>,
-) -> Result<Option<LibeiNotifyEvent>, CaptureError> {
+) -> Result<SessionUpdate, CaptureError> {
     // Keep the two data sources fair when either produces a burst.
     tokio::select! {
         change = zones_changed.next() => change
-            .map(|_| None)
+            .map(|current| if current { SessionUpdate::ZoneChanged } else { SessionUpdate::Ignored })
             .ok_or_else(|| io::Error::other("libei zones change stream closed").into()),
         event = capture_event.recv() => event
-            .map(Some)
+            .map(SessionUpdate::Client)
             .ok_or_else(|| io::Error::other("libei client notification channel closed").into()),
     }
 }
@@ -714,25 +740,39 @@ async fn next_session_update(
 const MAX_SESSION_UPDATES_PER_YIELD: usize = 32;
 
 async fn wait_session_updates(
-    zones_changed: &mut (impl Stream + Unpin),
+    zones_changed: &mut (impl Stream<Item = bool> + Unpin),
     capture_event: &mut Receiver<LibeiNotifyEvent>,
     client_updates: &mut CaptureClientUpdates,
     cancellation_token: &CancellationToken,
     cancel_update: &CancellationToken,
 ) -> Result<(), CaptureError> {
-    let update = tokio::select! {
-        biased;
-        _ = cancellation_token.cancelled() => return Ok(()),
-        _ = cancel_update.cancelled() => return Ok(()),
-        update = next_session_update(zones_changed, capture_event) => update?,
+    let mut processed = 0;
+    let update = loop {
+        let update = tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => return Ok(()),
+            _ = cancel_update.cancelled() => return Ok(()),
+            update = next_session_update(zones_changed, capture_event) => update?,
+        };
+        processed += 1;
+        if !matches!(update, SessionUpdate::Ignored) {
+            if processed == MAX_SESSION_UPDATES_PER_YIELD {
+                tokio::task::yield_now().await;
+                processed = 0;
+            }
+            break update;
+        }
+        if processed == MAX_SESSION_UPDATES_PER_YIELD {
+            tokio::task::yield_now().await;
+            processed = 0;
+        }
     };
-    if let Some(event) = update {
+    if let SessionUpdate::Client(event) = update {
         client_updates.record(event);
     }
 
     let sleep = tokio::time::sleep(std::time::Duration::from_millis(50));
     tokio::pin!(sleep);
-    let mut processed = 1;
     loop {
         tokio::select! {
             biased;
@@ -740,7 +780,7 @@ async fn wait_session_updates(
             _ = cancel_update.cancelled() => return Ok(()),
             _ = &mut sleep => return Ok(()),
             update = next_session_update(zones_changed, capture_event) => {
-                if let Some(event) = update? {
+                if let SessionUpdate::Client(event) = update? {
                     client_updates.record(event);
                 }
             },
@@ -836,9 +876,9 @@ async fn do_capture_session(
     active_clients: &[Position],
     next_barrier_id: &mut NonZeroU32,
     notify_release: &Notify,
-    cancel_session: CancellationToken,
+    control: (CancellationToken, ashpd::zvariant::OwnedObjectPath),
 ) -> Result<(), CaptureError> {
-    let session_handle = capture_session_handle(session)?;
+    let (cancel_session, session_handle) = control;
     // current client
     let current_pos = Rc::new(CaptureRouting::default());
 
@@ -2409,20 +2449,168 @@ mod tests {
         assert_eq!(next.get(), u32::MAX);
     }
 
+    fn zone_change_fixture(path: &str) -> ZonesChanged {
+        use ashpd::zvariant::{LE, OwnedObjectPath, Value, serialized::Context};
+        let options = HashMap::from([("zone_set", Value::from(1u32))]);
+        let path = OwnedObjectPath::try_from(path.to_owned()).unwrap();
+        let data = ashpd::zvariant::to_bytes(Context::new_dbus(LE, 0), &(path, options)).unwrap();
+        data.deserialize().unwrap().0
+    }
+
+    #[test]
+    fn foreign_zone_change_does_not_match_active_or_idle_session() {
+        let current = zone_change_fixture("/session/current");
+        let old = zone_change_fixture("/session/old");
+        assert!(zone_change_is_current(&current, Some("/session/current")));
+        assert!(!zone_change_is_current(&old, Some("/session/current")));
+        assert!(!zone_change_is_current(&current, None));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_zone_change_does_not_start_session_debounce() {
+        let mut zones = futures::stream::iter([false]).chain(futures::stream::pending());
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        let stop = CancellationToken::new();
+        let stop_update = CancellationToken::new();
+        let mut wait = Box::pin(wait_session_updates(
+            &mut zones,
+            &mut receiver,
+            &mut updates,
+            &stop,
+            &stop_update,
+        ));
+        let ignored = tokio::time::timeout(std::time::Duration::from_millis(80), &mut wait)
+            .await
+            .is_err();
+        if ignored {
+            stop.cancel();
+            (&mut wait).await.unwrap();
+        }
+        drop(wait);
+        assert!(
+            ignored,
+            "foreign signal triggered a completed rebuild debounce"
+        );
+        assert_eq!(updates.finish(), vec![Position::Left]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_zone_after_foreign_signal_still_completes_update() {
+        let mut zones =
+            futures::stream::iter([false, true, false]).chain(futures::stream::pending());
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[Position::Left]);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                wait_session_updates(
+                    &mut zones,
+                    &mut receiver,
+                    &mut updates,
+                    &CancellationToken::new(),
+                    &CancellationToken::new()
+                )
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(updates.finish(), vec![Position::Left]);
+    }
+
+    #[test]
+    fn zone_identity_tracks_replacement_and_cleared_session() {
+        let old = zone_change_fixture("/session/old");
+        let new = zone_change_fixture("/session/new");
+        for (expected, old_matches, new_matches) in [
+            (Some("/session/old"), true, false),
+            (Some("/session/new"), false, true),
+            (None, false, false),
+        ] {
+            assert_eq!(zone_change_is_current(&old, expected), old_matches);
+            assert_eq!(zone_change_is_current(&new, expected), new_matches);
+        }
+    }
+
+    struct IgnoredZoneBurst {
+        polls: Rc<Cell<usize>>,
+    }
+    impl Stream for IgnoredZoneBurst {
+        type Item = bool;
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<bool>> {
+            self.polls.set(self.polls.get() + 1);
+            Poll::Ready(Some(false))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ignored_zone_burst_yields_and_observes_cancellation() {
+        let polls = Rc::new(Cell::new(0));
+        let mut zones = IgnoredZoneBurst {
+            polls: polls.clone(),
+        };
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let session_stop = CancellationToken::new();
+        let mut wait = Box::pin(wait_session_updates(
+            &mut zones,
+            &mut receiver,
+            &mut updates,
+            &stop,
+            &session_stop,
+        ));
+        assert!((&mut wait).now_or_never().is_none());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        stop.cancel();
+        assert!(wait.await.is_ok());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        assert!(updates.finish().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_zone_at_budget_boundary_yields_before_more_signals() {
+        let polls = Rc::new(Cell::new(0));
+        let observed = polls.clone();
+        let mut zones = futures::stream::iter(
+            std::iter::repeat_n(false, 31)
+                .chain([true])
+                .chain(std::iter::repeat_n(true, 256)),
+        )
+        .inspect(move |_| observed.set(observed.get() + 1));
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let mut updates = CaptureClientUpdates::new(&[]);
+        let stop = CancellationToken::new();
+        let session_stop = CancellationToken::new();
+        let mut wait = Box::pin(wait_session_updates(
+            &mut zones,
+            &mut receiver,
+            &mut updates,
+            &stop,
+            &session_stop,
+        ));
+        assert!((&mut wait).now_or_never().is_none());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+        stop.cancel();
+        assert!(wait.await.is_ok());
+        assert_eq!(polls.get(), MAX_SESSION_UPDATES_PER_YIELD);
+    }
+
     struct ReadyZoneBurst {
         remaining: usize,
         changes: Rc<Cell<usize>>,
     }
 
     impl Stream for ReadyZoneBurst {
-        type Item = ();
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+        type Item = bool;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<bool>> {
             if self.remaining == 0 {
                 return Poll::Pending;
             }
             self.remaining -= 1;
             self.changes.set(self.changes.get() + 1);
-            Poll::Ready(Some(()))
+            Poll::Ready(Some(true))
         }
     }
 
@@ -2519,12 +2707,12 @@ mod tests {
     }
 
     impl Stream for EofProbe {
-        type Item = ();
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<()>> {
+        type Item = bool;
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<bool>> {
             self.polls.set(self.polls.get() + 1);
             if self.initial_change {
                 self.initial_change = false;
-                Poll::Ready(Some(()))
+                Poll::Ready(Some(true))
             } else if self.polls.get() <= 16 {
                 Poll::Ready(None)
             } else {
@@ -2557,7 +2745,7 @@ mod tests {
     }
 
     async fn assert_closed_client_channel(initial_change: bool) {
-        let mut zones = futures::stream::pending::<()>();
+        let mut zones = futures::stream::pending::<bool>();
         let (send, mut events) = mpsc::channel(1);
         if initial_change {
             send.send(LibeiNotifyEvent::Create(Position::Right))
@@ -2632,7 +2820,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn healthy_updates_merge_until_original_debounce_finishes() {
-        let mut zones = futures::stream::pending::<()>();
+        let mut zones = futures::stream::pending::<bool>();
         let (send, mut events) = mpsc::channel(3);
         for event in [
             LibeiNotifyEvent::Create(Position::Left),

@@ -31,6 +31,7 @@
 | R120 | libei区域坐标校验已实现 | i64计算/u32完整尺寸，空区域/不可表示端点返回错误，合法大尺寸及setup传播回归通过 |
 | R121 | libei激活路由生命周期已实现 | Begin入队后发布，释放取消旧快照/等待发送，精确guard身份避免清新路由；native恢复待验 |
 | R122 | libei屏障ID耗尽错误已实现 | checked_add失败返回错误，不panic/回绕；顺序/路由/空请求保持，native边界待验 |
+| R123 | libei区域通知会话过滤已实现 | 仅当前session启动重建，ignored计入32条让出预算，当前/旧/idle/边界回归通过 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2437,3 +2438,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] ZonesChanged会话归属、native等待及其他panic路径继续审；千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。
 
 日志：libei-barrier-id-baseline.log、libei-barrier-id-fixed.log、libei-barrier-id-workspace.log、libei-barrier-id-clippy.log。
+
+
+## 第一百零八轮：libei ZonesChanged会话归属与无关通知突发
+
+### R123 / P1
+
+- ashpd receive_zones_changed只订阅名称，信号公开session_handle；原next_session_update忽略payload，把任何会话通知当重建原因。两条提取基线失败：旧会话/idle均匹配，foreign通知启动50ms debounce并完成一次update。
+- [x] 在capture分支初始化缓存当前Session路径，同时供Activated与ZonesChanged使用；joined分支完成后、disable/close前清空。idle无active barrier session时忽略zone通知，下一次active setup仍查询最新Zones。路径取得错误保留在capture future内，经原join/sibling/close清理。
+- [x] signal mapper只标识是否当前会话，不用filter内部无限吞信号；next_session_update区分ZoneChanged/Client/Ignored。ignored不启动debounce，但仍计入32条yield预算，合并期不延長原timer；current恰为第32条也yield并重置预算。
+
+### 验证和原生边界
+
+- 6条新增回归通过：typed ashpd ZonesChanged current/foreign/idle匹配，foreign不启动debounce，foreign后current仍完成更新，会话替换/清空匹配，持续ignored32条yield且取消后不再消费，第32条current边界yield。此前EOF、client debounce和公平性回归保持。
+- libei91通过；工作区all-features input-capture154通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。测试解码真实信号类型与生产helper，不运行live proxy/session churn，不证明具体物理切屏恢复。
+- a7675da Rust37575413405 in_progress、Nix37575413345 queued；本轮HEAD仍需CI。每信号路径只借用比较缓存路径，不逐输入marshal；会话初始化时缓存/clone一次身份。
+- [ ] 当前会话重复zone_set、其他portal信号与native调用挂起仍需评估。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分，没有本机部署。
+
+日志：libei-zone-identity-baseline.log、libei-zone-identity-fixed.log、libei-zone-identity-workspace.log、libei-zone-identity-clippy.log。
