@@ -1451,3 +1451,20 @@ Normal Begin/input ordering and the channel capacity stay unchanged. EIS input
 sends retain the outer run_ei_handler cancellation path. These changes do not add
 per-event tasks or allocations on successful sends. Controlled channel/join tests
 verify propagation and cooperation, not native compositor disable/Close success.
+
+
+### Libei normalized entry position
+
+Libei Begin now uses the activation cursor's cross-axis position within the owning
+region rather than always reporting the midpoint. Known barrier IDs select their
+own region; absent or unknown IDs reuse nearest-barrier lookup within the resolved
+route. Left/right normalize Y and top/bottom normalize X, clamping overshoot to
+0..=1. Negative offsets and fractional cursor positions are preserved. The full
+logical region extent is used, consistent with exclusive bounds in X11/Windows
+capture; one-pixel regions have a nonzero extent.
+
+Absent/nonfinite cursor or missing geometry retains the midpoint fallback. Current
+activation validation still rejects explicitly nonfinite coordinates before Begin.
+The computed value flows through the existing cancellation-aware Begin send with
+no protocol change. Receiver backends that cannot warp retain their existing
+behavior; actual peer placement remains a platform validation item.

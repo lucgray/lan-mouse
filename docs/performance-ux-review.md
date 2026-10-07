@@ -27,6 +27,7 @@
 | R116 | libei释放越界位置已修复 | 按所属region投影、内收并clamp；四边/角落/单像素/多屏回归通过，真实compositor定位待验 |
 | R117 | libei未使用初始会话清理已实现 | 正常/错误退出显式await Close，已消耗会话不重复关闭；真实portal释放、panic及挂起关闭待验 |
 | R118 | libei事件通道错误/Begin取消已实现 | 关闭通道报BrokenPipe而非panic，满通道Begin可取消；联合等待模型回归通过，native清理待验 |
+| R119 | libei进入位置比例已实现 | 使用activation坐标/所属region计算Begin(t)，四向/多屏/越界/回退通过，双机定位待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2359,3 +2360,22 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 原生Close挂起、非send路径panic、ZonesChanged归属及物理后端恢复继续审。千次双机往返、完整p95≤20ms/p99≤50ms和8h RSS未验收，不认定90分，没有本机部署。
 
 日志：libei-event-channel-baseline.log、libei-event-channel-fixed.log、libei-event-channel-workspace.log、libei-event-channel-clippy.log。
+
+
+## 第一百零四轮：libei进入位置不再固定中点
+
+### R119 / P2
+
+- CaptureEvent::Begin文档要求跨边缘比例，src/capture保留enter_t并发CaptureBegin；X11/Windows已有坐标归一化。但libei无论Activated cursor如何均Begin(0.5)，有metadata仍丢弃真实位置，支持warp的对端被建议定位到中点。
+- 提取旧中点生产语义后2条基线失败：负offset region四向进入25%仍返回50%，cross-axis越界仍返回50%而非端点。fixture通过公开ashpd Activated/zvariant构造，未使用真实portal。
+- [x] activation_edge_position用有限cursor及已接受barrier的region bounds；known ID保持所属region，未知/缺失ID复用当前route内最近geometry。Left/Right用Y，Top/Bottom用X，按完整logical extent归一化再clamp0..=1，保留fractional/负offset。
+- [x] 元数据不足回退0.5；现activation_position仍在Begin前拒绝已提供的nonfinite坐标。send_activation_event接收实际t，沿原取消优先/错误传播逻辑发送；没有LAN协议或每帧工作变更。
+
+### 验证与真实定位范围
+
+- 7条新增测试通过：四向25%，四向两端越界，known ID多屏/未知ID最近fallback，缺cursor/非法cursor/缺geometry回退，小数25.5%，1×1 extent有限，以及helper计算值经真实mpsc得到Begin(0.25)。上一轮发送取消/FIFO回归继续通过。
+- libei70通过；工作区all-features input-capture133通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。没有实际portal或peer warp，不将mpsc正例当物理定位证明。
+- a91e615 Rust37574265308 queued、Nix37574265335 in_progress；本轮HEAD仍需CI。
+- [ ] release后current_pos及迟到输入、ZonesChanged身份、native调用挂起继续审。接收端不支持warp时仍不能保证落点。千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms和8h RSS未验收，不认定90分；没有本机部署。
+
+日志：libei-enter-position-baseline.log、libei-enter-position-fixed.log、libei-enter-position-workspace.log、libei-enter-position-clippy.log。

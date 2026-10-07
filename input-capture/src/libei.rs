@@ -803,7 +803,8 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    if !send_activation_event(event_tx, pos, &cancel_session).await? {
+                    let t = activation_edge_position(&activated, pos, &barriers, &pos_for_barrier_id);
+                    if !send_activation_event(event_tx, pos, t, &cancel_session).await? {
                         break;
                     }
 
@@ -855,6 +856,32 @@ async fn do_capture_session(
     b?;
 
     Ok(())
+}
+
+fn activation_edge_position(
+    activated: &Activated,
+    pos: Position,
+    barriers: &[ICBarrier],
+    routes: &HashMap<BarrierID, Position>,
+) -> f64 {
+    let Some((x, y)) = activated
+        .cursor_position()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+    else {
+        return 0.5;
+    };
+    let Some((min_x, min_y, max_x, max_y)) =
+        release_barrier(activated, pos, barriers, routes).and_then(|barrier| barrier.zone_bounds)
+    else {
+        return 0.5;
+    };
+    // Bounds store the last pixel; normalize against the full logical extent,
+    // matching the exclusive screen bounds used by X11 and Windows capture.
+    let (coordinate, min, max) = match pos {
+        Position::Left | Position::Right => (f64::from(y), min_y, max_y),
+        Position::Top | Position::Bottom => (f64::from(x), min_x, max_x),
+    };
+    ((coordinate - min) / (max - min + 1.)).clamp(0., 1.)
 }
 
 fn release_cursor_position(
@@ -998,12 +1025,13 @@ async fn send_capture_event(
 async fn send_activation_event(
     sender: &Sender<(Position, CaptureEvent)>,
     pos: Position,
+    t: f64,
     cancel_session: &CancellationToken,
 ) -> Result<bool, CaptureError> {
     tokio::select! {
         biased;
         _ = cancel_session.cancelled() => Ok(false),
-        result = send_capture_event(sender, pos, CaptureEvent::Begin(0.5)) => {
+        result = send_capture_event(sender, pos, CaptureEvent::Begin(t)) => {
             result?;
             Ok(true)
         }
@@ -1706,7 +1734,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
         assert!(
-            send_activation_event(&sender, Position::Left, &CancellationToken::new())
+            send_activation_event(&sender, Position::Left, 0.5, &CancellationToken::new())
                 .await
                 .is_err()
         );
@@ -1735,7 +1763,7 @@ mod tests {
             .await
             .unwrap();
         let cancel = CancellationToken::new();
-        let mut send = Box::pin(send_activation_event(&sender, Position::Left, &cancel));
+        let mut send = Box::pin(send_activation_event(&sender, Position::Left, 0.5, &cancel));
         assert!((&mut send).now_or_never().is_none());
         cancel.cancel();
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), send).await;
@@ -1756,7 +1784,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(
-            !send_activation_event(&sender, Position::Left, &cancel)
+            !send_activation_event(&sender, Position::Left, 0.5, &cancel)
                 .await
                 .unwrap()
         );
@@ -1767,7 +1795,7 @@ mod tests {
     async fn capture_send_healthy_begin_and_input_keep_order() {
         let (sender, mut receiver) = mpsc::channel(2);
         assert!(
-            send_activation_event(&sender, Position::Left, &CancellationToken::new())
+            send_activation_event(&sender, Position::Left, 0.5, &CancellationToken::new())
                 .await
                 .unwrap()
         );
@@ -1817,6 +1845,172 @@ mod tests {
         );
         assert!(session.is_ok());
         assert!(cleaned.get());
+    }
+
+    #[test]
+    fn activation_edge_position_preserves_crossed_fraction() {
+        let region = region_fixture(100, 80, -200, -20);
+        for (edge, cursor) in [
+            (Position::Left, (-250., 0.)),
+            (Position::Right, (-50., 0.)),
+            (Position::Top, (-175., -80.)),
+            (Position::Bottom, (-175., 200.)),
+        ] {
+            let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+            let activation = activation_fixture("/session/current", Some(1), Some(cursor));
+            assert_eq!(
+                activation_edge_position(
+                    &activation,
+                    edge,
+                    &[barrier],
+                    &HashMap::from([(barrier.barrier_id, edge)])
+                ),
+                0.25
+            );
+        }
+    }
+
+    #[test]
+    fn activation_edge_position_clamps_cross_axis_overshoot() {
+        let region = region_fixture(100, 80, 10, -20);
+        for (edge, low, high) in [
+            (Position::Left, (-50., -100.), (-50., 200.)),
+            (Position::Right, (200., -100.), (200., 200.)),
+            (Position::Top, (-50., -80.), (200., -80.)),
+            (Position::Bottom, (-50., 200.), (200., 200.)),
+        ] {
+            let barrier = ICBarrier::for_region(NonZeroU32::new(1).unwrap(), &region, edge);
+            let routes = HashMap::from([(barrier.barrier_id, edge)]);
+            for (cursor, expected) in [(low, 0.), (high, 1.)] {
+                let activation = activation_fixture("/session/current", Some(1), Some(cursor));
+                assert_eq!(
+                    activation_edge_position(&activation, edge, &[barrier], &routes),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn activation_edge_position_uses_owning_region_and_geometry_fallback() {
+        let first = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 100, 0, 0),
+            Position::Left,
+        );
+        let second = ICBarrier::for_region(
+            NonZeroU32::new(2).unwrap(),
+            &region_fixture(100, 200, 0, 100),
+            Position::Left,
+        );
+        let routes = HashMap::from([
+            (first.barrier_id, Position::Left),
+            (second.barrier_id, Position::Left),
+        ]);
+        for (id, cursor) in [
+            (Some(2), (-30., 150.)),
+            (Some(99), (-30., 25.)),
+            (None, (-30., 25.)),
+        ] {
+            let activation = activation_fixture("/session/current", id, Some(cursor));
+            assert_eq!(
+                activation_edge_position(&activation, Position::Left, &[first, second], &routes),
+                0.25
+            );
+        }
+    }
+
+    #[test]
+    fn activation_edge_position_missing_metadata_keeps_midpoint() {
+        let edge = Position::Left;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 100, 0, 0),
+            edge,
+        );
+        let routes = HashMap::from([(barrier.barrier_id, edge)]);
+        for cursor in [None, Some((f32::NAN, 25.)), Some((0., f32::INFINITY))] {
+            let activation = activation_fixture("/session/current", Some(1), cursor);
+            assert_eq!(
+                activation_edge_position(&activation, edge, &[barrier], &routes),
+                0.5
+            );
+        }
+        let activation = activation_fixture("/session/current", Some(1), Some((0., 25.)));
+        assert_eq!(
+            activation_edge_position(&activation, edge, &[], &routes),
+            0.5
+        );
+        let no_bounds = super::ICBarrier::new(barrier.barrier_id, barrier.position);
+        assert_eq!(
+            activation_edge_position(&activation, edge, &[no_bounds], &routes),
+            0.5
+        );
+    }
+
+    #[test]
+    fn activation_edge_position_preserves_fractional_coordinate() {
+        let edge = Position::Top;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 80, -20, 10),
+            edge,
+        );
+        let activation = activation_fixture("/session/current", Some(1), Some((5.5, -50.)));
+        assert_eq!(
+            activation_edge_position(
+                &activation,
+                edge,
+                &[barrier],
+                &HashMap::from([(barrier.barrier_id, edge)])
+            ),
+            0.255
+        );
+    }
+
+    #[test]
+    fn activation_edge_position_one_pixel_extent_is_finite() {
+        let edge = Position::Left;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(1, 1, 10, -20),
+            edge,
+        );
+        let routes = HashMap::from([(barrier.barrier_id, edge)]);
+        for (cursor, expected) in [((10., -20.), 0.), ((10., -19.), 1.)] {
+            let activation = activation_fixture("/session/current", Some(1), Some(cursor));
+            assert_eq!(
+                activation_edge_position(&activation, edge, &[barrier], &routes),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_edge_position_reaches_begin_channel() {
+        let edge = Position::Left;
+        let barrier = ICBarrier::for_region(
+            NonZeroU32::new(1).unwrap(),
+            &region_fixture(100, 80, 10, -20),
+            edge,
+        );
+        let activation = activation_fixture("/session/current", Some(1), Some((-50., 0.)));
+        let t = activation_edge_position(
+            &activation,
+            edge,
+            &[barrier],
+            &HashMap::from([(barrier.barrier_id, edge)]),
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert!(
+            send_activation_event(&sender, edge, t, &CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (edge, CaptureEvent::Begin(0.25))
+        );
     }
 
     struct ReadyZoneBurst {
