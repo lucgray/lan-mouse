@@ -1643,3 +1643,24 @@ rebuild cleanup, queued-route filtering, stale focus, orphan cleanup, overload
 preservation and last-owner lifetime. These exercise production helpers and real
 Rc drop/Weak observations, not native compositor proxies. Physical unlock and
 output hotplug behavior still require platform verification.
+
+
+### Layer-shell callback source isolation
+
+Pointer callbacks are accepted only from the current wl_pointer. Leave takes the
+focus only if its surface matches the focused window, then submits capture
+release while retaining that owner. A late Leave from an old surface cannot clear
+a replacement focus. Relative-motion callbacks compare their source against the
+current relative-pointer proxy before constructing or routing an input event;
+retired objects and missing capture/focus do not emit motion. Accepted motion
+keeps the existing unaccelerated coordinates and microsecond-to-millisecond time
+conversion. These identity comparisons are scoped to this backend's single
+Wayland connection and queue, using complete proxies instead of raw protocol IDs.
+
+Six regressions use actual wayland-client proxies on private Unix socket pairs,
+including a controlled wl_display.delete_id frame to verify rejection of an old
+pointer after its numerical ID is reused. Typed motion events are passed through
+the production mapping helper. No real compositor receives these fixtures, and
+these tests do not validate physical pointer recovery or native event timing.
+Seat capability ownership, keyboard-source isolation and layer-surface Closed
+handling still require review.

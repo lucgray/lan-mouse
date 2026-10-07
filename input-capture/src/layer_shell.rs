@@ -633,6 +633,50 @@ fn retire_capture_windows<W>(
     // Removing windows does not recover a previously overloaded backend.
 }
 
+fn capture_source_matches<I: PartialEq>(current: Option<&I>, source: &I) -> bool {
+    current.is_some_and(|current| current == source)
+}
+
+fn take_focus_on_leave<S: PartialEq, F>(
+    focused: &mut Option<F>,
+    surface: &S,
+    focus_surface: impl Fn(&F) -> &S,
+) -> Option<F> {
+    if capture_source_matches(focused.as_ref().map(focus_surface), surface) {
+        focused.take()
+    } else {
+        None
+    }
+}
+
+fn relative_motion_event(
+    current: Option<&ZwpRelativePointerV1>,
+    source: &ZwpRelativePointerV1,
+    event: zwp_relative_pointer_v1::Event,
+    position: Option<Position>,
+) -> Option<(Position, CaptureEvent)> {
+    if !capture_source_matches(current, source) {
+        return None;
+    }
+    if let zwp_relative_pointer_v1::Event::RelativeMotion {
+        utime_hi,
+        utime_lo,
+        dx_unaccel: dx,
+        dy_unaccel: dy,
+        ..
+    } = event
+    {
+        let pos = position?;
+        let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
+        Some((
+            pos,
+            CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })),
+        ))
+    } else {
+        None
+    }
+}
+
 fn ungrab_resources<F>(
     focused: Option<F>,
     release_focus: impl FnOnce(&F),
@@ -866,6 +910,9 @@ impl Dispatch<WlPointer, ()> for State {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        if !capture_source_matches(app.pointer.as_ref(), pointer) {
+            return;
+        }
         match event {
             wl_pointer::Event::Enter {
                 serial,
@@ -890,7 +937,11 @@ impl Dispatch<WlPointer, ()> for State {
                     .unwrap();
                 app.queue_capture_event((pos, CaptureEvent::Begin(0.5)));
             }
-            wl_pointer::Event::Leave { .. } => {
+            wl_pointer::Event::Leave { surface, .. } => {
+                let focused = take_focus_on_leave(&mut app.focused, &surface, |w| &w.surface);
+                if focused.is_none() {
+                    return;
+                }
                 /* There are rare cases, where when a window is opened in
                  * just the wrong moment, the pointer is released, while
                  * still grabbed.
@@ -901,7 +952,12 @@ impl Dispatch<WlPointer, ()> for State {
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
                 }
-                app.ungrab();
+                release_layer_capture(
+                    focused,
+                    &mut app.pointer_lock,
+                    &mut app.rel_pointer,
+                    &mut app.shortcut_inhibitor,
+                );
             }
             wl_pointer::Event::Button {
                 serial: _,
@@ -1019,27 +1075,19 @@ impl Dispatch<WlKeyboard, ()> for State {
 impl Dispatch<ZwpRelativePointerV1, ()> for State {
     fn event(
         app: &mut Self,
-        _: &ZwpRelativePointerV1,
+        source: &ZwpRelativePointerV1,
         event: <ZwpRelativePointerV1 as wayland_client::Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwp_relative_pointer_v1::Event::RelativeMotion {
-            utime_hi,
-            utime_lo,
-            dx_unaccel: dx,
-            dy_unaccel: dy,
-            ..
-        } = event
-        {
-            if let Some(pos) = app.focused.as_ref().map(|window| window.pos) {
-                let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
-                app.queue_capture_event((
-                    pos,
-                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })),
-                ));
-            }
+        if let Some(event) = relative_motion_event(
+            app.rel_pointer.as_ref(),
+            source,
+            event,
+            app.focused.as_ref().map(|window| window.pos),
+        ) {
+            app.queue_capture_event(event);
         }
     }
 }
@@ -1178,6 +1226,221 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NativeProxyFixture {
+        _connection: Connection,
+        _peer: std::os::unix::net::UnixStream,
+        surfaces: [WlSurface; 2],
+        pointers: [WlPointer; 2],
+        relative: [ZwpRelativePointerV1; 2],
+        seat: wl_seat::WlSeat,
+        qh: QueueHandle<ProxyFixtureState>,
+    }
+
+    struct ProxyFixtureState;
+    delegate_noop!(ProxyFixtureState: ignore wl_registry::WlRegistry);
+    delegate_noop!(ProxyFixtureState: wl_compositor::WlCompositor);
+    delegate_noop!(ProxyFixtureState: ignore WlSurface);
+    delegate_noop!(ProxyFixtureState: ignore wl_seat::WlSeat);
+    delegate_noop!(ProxyFixtureState: ignore WlPointer);
+    delegate_noop!(ProxyFixtureState: ZwpRelativePointerManagerV1);
+    delegate_noop!(ProxyFixtureState: ignore ZwpRelativePointerV1);
+
+    impl NativeProxyFixture {
+        fn new() -> Self {
+            let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let connection = Connection::from_socket(client).unwrap();
+            let queue = connection.new_event_queue::<ProxyFixtureState>();
+            let qh = queue.handle();
+            let registry = connection.display().get_registry(&qh, ());
+            // Allocate real client objects on a private socket, without a real
+            // compositor. Requests are not flushed to the desktop.
+            let compositor = registry.bind::<wl_compositor::WlCompositor, _, _>(1, 4, &qh, ());
+            let seat = registry.bind::<wl_seat::WlSeat, _, _>(2, 8, &qh, ());
+            let manager = registry.bind::<ZwpRelativePointerManagerV1, _, _>(3, 1, &qh, ());
+            let pointers = [seat.get_pointer(&qh, ()), seat.get_pointer(&qh, ())];
+            let relative = [
+                manager.get_relative_pointer(&pointers[0], &qh, ()),
+                manager.get_relative_pointer(&pointers[1], &qh, ()),
+            ];
+            let surfaces = [
+                compositor.create_surface(&qh, ()),
+                compositor.create_surface(&qh, ()),
+            ];
+            Self {
+                _connection: connection,
+                _peer: peer,
+                surfaces,
+                pointers,
+                relative,
+                seat,
+                qh,
+            }
+        }
+
+        fn acknowledge_deleted_id(&mut self, id: u32) {
+            // A controlled wl_display.delete_id frame lets the real client
+            // backend recycle an ID. This is not a compositor acceptance test.
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&1u32.to_ne_bytes());
+            frame.extend_from_slice(&((12u32 << 16) | 1).to_ne_bytes());
+            frame.extend_from_slice(&id.to_ne_bytes());
+            self._peer.write_all(&frame).unwrap();
+            // An internal display event can be consumed without enqueuing a
+            // dispatched event, so the read may end with WouldBlock afterward.
+            read_wayland_result(self._connection.prepare_read().unwrap().read()).unwrap();
+        }
+    }
+
+    fn native_motion() -> zwp_relative_pointer_v1::Event {
+        zwp_relative_pointer_v1::Event::RelativeMotion {
+            utime_hi: 1,
+            utime_lo: 8000,
+            dx: 40.0,
+            dy: -20.0,
+            dx_unaccel: 4.25,
+            dy_unaccel: -2.5,
+        }
+    }
+
+    #[test]
+    fn stale_surface_leave_preserves_replacement_focus() {
+        let fixture = NativeProxyFixture::new();
+        let mut focus = Some((fixture.surfaces[1].clone(), Position::Right));
+        let release = take_focus_on_leave(&mut focus, &fixture.surfaces[0], |focus| &focus.0);
+        assert!(
+            release.is_none(),
+            "old surface released replacement capture"
+        );
+        assert_eq!(focus.as_ref().unwrap().1, Position::Right);
+        assert_eq!(focus.as_ref().unwrap().0, fixture.surfaces[1]);
+    }
+
+    #[test]
+    fn stale_relative_motion_is_not_routed_to_replacement_focus() {
+        let fixture = NativeProxyFixture::new();
+        let event = relative_motion_event(
+            Some(&fixture.relative[1]),
+            &fixture.relative[0],
+            native_motion(),
+            Some(Position::Right),
+        );
+        assert!(
+            event.is_none(),
+            "old relative object sent movement to replacement route"
+        );
+    }
+
+    #[test]
+    fn current_surface_leave_accepts_clone_and_takes_focus_once() {
+        let fixture = NativeProxyFixture::new();
+        let mut focus = Some((fixture.surfaces[1].clone(), Position::Right));
+        let source = fixture.surfaces[1].clone();
+        let released = take_focus_on_leave(&mut focus, &source, |focus| &focus.0).unwrap();
+        assert_eq!(released.1, Position::Right);
+        assert_eq!(released.0, source);
+        assert!(focus.is_none());
+        assert!(take_focus_on_leave(&mut focus, &source, |focus| &focus.0).is_none());
+    }
+
+    #[test]
+    fn current_relative_motion_preserves_route_mapping_and_fifo() {
+        let fixture = NativeProxyFixture::new();
+        let source = fixture.relative[1].clone();
+        let mut pending = PendingCaptureEvents::default();
+        for index in 0..3 {
+            let event = zwp_relative_pointer_v1::Event::RelativeMotion {
+                utime_hi: 1,
+                utime_lo: 8000 + 1000 * index,
+                dx: 40.0,
+                dy: -20.0,
+                dx_unaccel: 4.25 + f64::from(index),
+                dy_unaccel: -2.5,
+            };
+            pending.push_back(
+                relative_motion_event(
+                    Some(&fixture.relative[1]),
+                    &source,
+                    event,
+                    Some(Position::Right),
+                )
+                .unwrap(),
+            );
+        }
+        for index in 0..3 {
+            let (pos, event) = pending.pop_front().unwrap().unwrap();
+            assert_eq!(pos, Position::Right);
+            assert!(
+                matches!(event, CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy }))
+                if time == (((1u64 << 32) + 8000 + 1000 * index) / 1000) as u32
+                && dx == 4.25 + index as f64 && dy == -2.5)
+            );
+        }
+        assert!(pending.pop_front().is_none());
+    }
+
+    #[test]
+    fn retired_relative_source_and_absent_focus_cannot_emit_motion() {
+        let fixture = NativeProxyFixture::new();
+        fixture.relative[0].destroy();
+        assert!(
+            relative_motion_event(
+                Some(&fixture.relative[1]),
+                &fixture.relative[0],
+                native_motion(),
+                Some(Position::Right),
+            )
+            .is_none()
+        );
+        assert!(
+            relative_motion_event(
+                None,
+                &fixture.relative[1],
+                native_motion(),
+                Some(Position::Right),
+            )
+            .is_none()
+        );
+        assert!(
+            relative_motion_event(
+                Some(&fixture.relative[1]),
+                &fixture.relative[1],
+                native_motion(),
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn native_source_identity_rejects_replaced_pointer_even_with_recycled_id() {
+        use wayland_client::Proxy;
+        let mut fixture = NativeProxyFixture::new();
+        assert!(capture_source_matches(
+            Some(&fixture.pointers[1]),
+            &fixture.pointers[1].clone()
+        ));
+        assert!(!capture_source_matches(
+            Some(&fixture.pointers[1]),
+            &fixture.pointers[0]
+        ));
+        assert!(!capture_source_matches(None, &fixture.pointers[1]));
+        let retired = fixture.pointers[0].clone();
+        let id = retired.id().protocol_id();
+        retired.release();
+        fixture.acknowledge_deleted_id(id);
+        let replacement = fixture.seat.get_pointer(&fixture.qh, ());
+        assert_eq!(
+            id,
+            replacement.id().protocol_id(),
+            "fixture did not recycle native ID"
+        );
+        assert!(!capture_source_matches(Some(&replacement), &retired));
+        assert!(capture_source_matches(
+            Some(&replacement),
+            &replacement.clone()
+        ));
+    }
 
     #[test]
     fn wayland_closed_socket_read_is_reported() {

@@ -38,6 +38,7 @@
 | R127 | layer-shell应用事件队列已限额 | 每backend256，过载清积压/一次ungrab请求/明确错误并fuse；正常FIFO及替代queue回归通过 |
 | R128 | layer-shell释放/terminate清理已实现 | 无focus仍take/destroy捕获资源，terminate停流/清窗口队列并flush；模型回归通过，compositor响应待验 |
 | R129 | layer-shell窗口退役清理已实现 | 删除目标focus先release再drop，保留无关focus；重建清旧路由/队列，单pass retain；原生热插拔待验 |
+| R130 | layer-shell旧回调源隔离已实现 | Leave核对surface再take focus，相对运动核对当前proxy，pointer核对当前源；真实client ID复用回归通过，native时序待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2572,3 +2573,23 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] 旧surface迟到Leave/Closed callback与新focus的隔离、普通release已queued输入、post-terminate控制调用及dispatch预算继续审。双机千次往返/热插拔恢复、完整p95≤20ms/p99≤50ms与8h RSS仍缺实机验收，不认定90分。
 
 日志：layer-shell-retirement-baseline.log、layer-shell-retirement-fixed.log、layer-shell-retirement-workspace.log、layer-shell-retirement-clippy.log。
+
+
+## 第一百一十五轮：layer-shell旧Leave与相对运动误作用于新捕获
+
+### R130 / P1
+
+- pointer Leave原忽略surface并总ungrab；RelativeMotion原忽略source，以当前focus路由任何来源的运动。生产逻辑提取后的两条基线失败：old surface取走replacement focus；old relative pointer运动变成Right新路由输入。基线命令还执行三条已有stale过滤用例且通过，不将其算作新增。
+- [x] WlPointer整个callback先核对app.pointer，旧pointer的Enter/Button/Axis/Leave等被忽略。Leave用take_focus_on_leave核对当前focus.surface，再take owner并release_layer_capture；不同surface/无focus不误释放新捕获。
+- [x] RelativeMotion经relative_motion_event先核对当前app.rel_pointer与source，匹配且有focus才构造输入。无新增proxy clone/heap分配的per-motion过滤；现有时间换算/unaccelerated坐标保持，尚无实测延迟收益。
+- [x] 使用proxy完整身份而非protocol_id。身份范围是同一State/event queue的连接；检查本地Rust backend源码发现Eq包含ID/serial/interface，不能将它误称为跨连接的全局身份。曾按跨连接全局身份设计的测试被事实否定，已改为生产所需的同一连接ID复用验证。
+
+### 验证与范围
+
+- 六条新增回归通过：两条失败基线；当前surface clone取focus一次/第二Leave无影响；当前相对运动保持Right route/坐标/time/FIFO；已destroy旧relative/缺current/缺focus不发运动；同连接旧pointer经受控delete_id后，数字ID已复用仍不能匹配replacement，clone可匹配。
+- 夹具通过Connection::from_socket、真实registry/seat/compositor/relative manager client proxy分配对象；不连桌面，没有真实server globals或compositor ACK。仅ID复用用例向私有socket注入受控wl_display.delete_id并实际read；typed RelativeMotion由测试构造交给生产helper，不是完整native事件回放。
+- 最初私有socket写在沙箱中报PermissionDenied，正常提权后内部delete_id被消费且read返回WouldBlock；按生产read_wayland_result处理，并由实际ID复用断言证明消费。最终layer-shell32通过，workspace input-capture194通过/1忽略、root201通过/3忽略及其他组件通过；strict Clippy/fmt/diff通过。
+- 上一HEAD c0110d9的Rust37578640268与Nix37578640319均in_progress；本轮HEAD仍需CI。没有部署或改本机桌面配置，没有LAN序列化变化。
+- [ ] seat Capabilities变化反复创建pointer/keyboard、缺能力时未清理，且get_keyboard返回值未保存到state；键盘旧源隔离、Enter替换不同focus时的资源所属、Closed处理继续审。原生千次切换/热插拔恢复、完整p95/p99与8h RSS仍未验收，不认定90分。
+
+日志：layer-shell-source-baseline.log、layer-shell-source-fixed.log、layer-shell-source-workspace.log、layer-shell-source-clippy.log。
