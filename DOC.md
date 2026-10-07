@@ -1420,3 +1420,19 @@ unit coverage of serialized options does not prove physical pointer recovery.
 No LAN protocol fields change. Geometry metadata is stored during configuration;
 projection occurs on release rather than each input frame. Native malformed-region
 arithmetic and actual multi-machine switching remain separate validation items.
+
+
+### Libei unused first-session cleanup
+
+The initial session is created before any client becomes active. The capture task
+now collects its normal or error result before returning and explicitly awaits
+Close on that session if the active branch has not taken ownership. This covers
+idle cancellation, update-source errors and signal-subscription setup errors.
+A session consumed by the active branch keeps its existing disable/close path and
+is not closed a second time by the finalizer. Close failures are logged without
+replacing the original result, matching existing session cleanup behavior.
+
+The finalizer retains the session while Close is pending. There is no new timeout
+or abort; a stalled native Close can still delay completion. Controlled finalizer
+tests do not establish real portal resource release, and panic/runtime shutdown
+remain outside this normal/error return cleanup path.

@@ -25,6 +25,7 @@
 | R94 | 部分实现：控制/剪贴板跨Service额度 | 每peer32/global128；Clipboard/Hello/Ping恢复通知持有到Service处理或丢弃；Leave代理、Enter派生已补齐；churn仍待有界 |
 | R115 | libei后台portal所有权已实现 | Arc task owner替代裸指针/unsafe，Drop detach及取消join等待期间资源存活；真实portal关闭/总资源仍待验 |
 | R116 | libei释放越界位置已修复 | 按所属region投影、内收并clamp；四边/角落/单像素/多屏回归通过，真实compositor定位待验 |
+| R117 | libei未使用初始会话清理已实现 | 正常/错误退出显式await Close，已消耗会话不重复关闭；真实portal释放、panic及挂起关闭待验 |
 | R114 | libei缺失/非法cursor metadata处理已实现 | 已知ID无cursor可路由/释放，fallback缺cursor报错；Release省略非法建议并保持activation ID；native释放位置待验 |
 | R113 | libei激活会话身份校验已实现 | Activated session path在路由/状态/Begin前核对，其他会话忽略；真实portal切换与其他信号身份待验 |
 | R112 | portal拒绝屏障处理已实现 | failed IDs同步过滤几何/路由；部分成功保留顺序，全部失败报错；原生拒绝及逐边UI状态待验 |
@@ -2320,3 +2321,21 @@ Linux 工作区全特性测试通过（root 83 个通过 + 1 个默认忽略）�
 - [ ] pos_to_barrier中的异常region整数算术、ZonesChanged身份、空闲session关闭等仍需独立审查。千次真实双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms及8h RSS未验收，不认定90分。本轮提交HEAD需CI验证。
 
 日志：libei-release-overshoot-baseline.log、libei-release-overshoot-fixed.log、libei-release-overshoot-workspace.log、libei-release-overshoot-clippy.log。
+
+
+## 第一百零二轮：libei未使用初始会话的退出清理
+
+### R117 / P1
+
+- new先创建first_session，do_capture仅在active_clients非空时take它并disable/close。空闲取消、update EOF或receive_zones_changed失败原来直接返回，未使用会话只被drop。锁定ashpd0.13.9 Session没有Drop实现；close显式发送D-Bus Close，不能将Rust对象释放当关闭证明。
+- 提取旧退出语义的生产finalizer后，受控基线失败：未消耗session的close回调计数为0。这个模型验证退出清理规则，没有实例化实际Session或证明真实资源泄漏数量。
+- [x] 将订阅初始化及capture循环的Result收集在内层async块；正常/错误返回均经过finish_pending_session，仍存在的初始session显式await close。active分支take后外层为None，保留原disable/close路径且不重复关闭。
+- [x] close失败记录warning并保留原Result；close pending期间保留session，完成前不发布task结果。不引入超时/abort、逐帧工作或协议变更。
+
+### 验证与未覆盖边界
+
+- 4条新增测试通过：成功/EndOfStream退出均关闭一次，None不调用close，close失败保留成功/原EndOfStream，oneshot慢close期间资源存活且结果pending、放行后释放。测试调用生产finalizer，未运行真实D-Bus初始化或native Close。
+- libei57通过；工作区all-features input-capture120通过/1忽略、root201通过/3忽略及其他组件通过；严格Clippy/fmt/diff通过。上一轮7fcff70 Rust37573789904与Nix37573789877查询为queued，本轮新HEAD仍需CI。
+- [ ] panic、runtime退出及永久pending Close仍未由此finalizer解决；真实portal资源释放、千次双机往返、原生故障恢复、完整p95≤20ms/p99≤50ms与8h RSS未验收，不认定90分。没有本机部署。
+
+日志：libei-idle-session-baseline.log、libei-idle-session-fixed.log、libei-idle-session-workspace.log、libei-idle-session-clippy.log。

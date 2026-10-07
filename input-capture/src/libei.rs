@@ -515,76 +515,101 @@ async fn do_capture(
     let mut active_clients: Vec<Position> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
-    let mut zones_changed = input_capture.receive_zones_changed().await?;
+    let result = async {
+        let mut zones_changed = input_capture.receive_zones_changed().await?;
 
-    loop {
-        // do capture session
-        let cancel_session = CancellationToken::new();
-        let cancel_update = CancellationToken::new();
+        loop {
+            // do capture session
+            let cancel_session = CancellationToken::new();
+            let cancel_update = CancellationToken::new();
 
-        let mut client_updates = CaptureClientUpdates::new(&active_clients);
-        let handle_session_update_request = cancel_sibling_on_completion(
-            wait_session_updates(
-                &mut zones_changed,
-                &mut capture_event,
-                &mut client_updates,
-                &cancellation_token,
-                &cancel_update,
-            ),
-            cancel_session.clone(),
-        );
-
-        if !active_clients.is_empty() {
-            // create session
-            let mut session = match session.take() {
-                Some(s) => s,
-                None => {
-                    create_session(input_capture, window_identifier.clone())
-                        .await?
-                        .0
-                }
-            };
-
-            let capture_session = do_capture_session(
-                input_capture,
-                &mut session,
-                &event_tx,
-                &active_clients,
-                &mut next_barrier_id,
-                &notify_release,
+            let mut client_updates = CaptureClientUpdates::new(&active_clients);
+            let handle_session_update_request = cancel_sibling_on_completion(
+                wait_session_updates(
+                    &mut zones_changed,
+                    &mut capture_event,
+                    &mut client_updates,
+                    &cancellation_token,
+                    &cancel_update,
+                ),
                 cancel_session.clone(),
             );
-            let capture_session =
-                cancel_sibling_on_completion(capture_session, cancel_update.clone());
 
-            let (capture_result, update_result) =
-                tokio::join!(capture_session, handle_session_update_request);
-            log::debug!("capture session + session_update task done!");
+            if !active_clients.is_empty() {
+                // create session
+                let mut session = match session.take() {
+                    Some(s) => s,
+                    None => {
+                        create_session(input_capture, window_identifier.clone())
+                            .await?
+                            .0
+                    }
+                };
 
-            // disable capture
-            log::debug!("disabling input capture");
-            if let Err(e) = input_capture.disable(&session, Default::default()).await {
-                log::warn!("input_capture.disable(&session) {e}");
+                let capture_session = do_capture_session(
+                    input_capture,
+                    &mut session,
+                    &event_tx,
+                    &active_clients,
+                    &mut next_barrier_id,
+                    &notify_release,
+                    cancel_session.clone(),
+                );
+                let capture_session =
+                    cancel_sibling_on_completion(capture_session, cancel_update.clone());
+
+                let (capture_result, update_result) =
+                    tokio::join!(capture_session, handle_session_update_request);
+                log::debug!("capture session + session_update task done!");
+
+                // disable capture
+                log::debug!("disabling input capture");
+                if let Err(e) = input_capture.disable(&session, Default::default()).await {
+                    log::warn!("input_capture.disable(&session) {e}");
+                }
+                if let Err(e) = session.close().await {
+                    log::warn!("session.close(): {e}");
+                }
+
+                // propagate error from capture session
+                capture_result?;
+                update_result?;
+            } else {
+                handle_session_update_request.await?;
             }
-            if let Err(e) = session.close().await {
-                log::warn!("session.close(): {e}");
+
+            // update clients if requested
+            active_clients = client_updates.finish();
+
+            // break
+            if cancellation_token.is_cancelled() {
+                break Ok(());
             }
-
-            // propagate error from capture session
-            capture_result?;
-            update_result?;
-        } else {
-            handle_session_update_request.await?;
-        }
-
-        // update clients if requested
-        active_clients = client_updates.finish();
-
-        // break
-        if cancellation_token.is_cancelled() {
-            break Ok(());
         }
     }
+    .await;
+    finish_pending_session(result, session, |session| async move {
+        session.close().await.map_err(CaptureError::from)
+    })
+    .await
+}
+
+async fn finish_pending_session<S, F>(
+    result: Result<(), CaptureError>,
+    pending_session: Option<S>,
+    close: impl FnOnce(S) -> F,
+) -> Result<(), CaptureError>
+where
+    F: std::future::Future<Output = Result<(), CaptureError>>,
+{
+    if let Some(session) = pending_session {
+        // The first session can remain unused on idle shutdown or setup failure.
+        // Finish native cleanup before publishing the task's original result.
+        if let Err(error) = close(session).await {
+            log::warn!("unused capture session.close(): {error}");
+        }
+    }
+    result
 }
 
 async fn next_session_update(
@@ -1582,6 +1607,73 @@ mod tests {
             release_cursor_position(cursor, Position::Left, Some(empty)),
             None
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_session_closes_on_idle_shutdown_and_setup_error() {
+        for result in [Ok(()), Err(CaptureError::EndOfStream)] {
+            let expected_error = result.is_err();
+            let closed = Rc::new(Cell::new(0));
+            let observed = closed.clone();
+            let result = finish_pending_session(result, Some(7), move |session| async move {
+                assert_eq!(session, 7);
+                observed.set(observed.get() + 1);
+                Ok(())
+            })
+            .await;
+            assert_eq!(
+                closed.get(),
+                1,
+                "unused first session must be explicitly closed"
+            );
+            assert_eq!(result.is_err(), expected_error);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumed_session_is_not_closed_again_at_capture_exit() {
+        let result = finish_pending_session(Ok(()), None::<()>, |_| async {
+            panic!("active branch already owns and closes the session");
+        })
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_session_close_failure_preserves_original_result() {
+        for original in [Ok(()), Err(CaptureError::EndOfStream)] {
+            let expected_error = original.is_err();
+            let result = finish_pending_session(original, Some(()), |_| async {
+                Err(io::Error::other("controlled close failure").into())
+            })
+            .await;
+            if expected_error {
+                assert!(matches!(result, Err(CaptureError::EndOfStream)));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_session_waits_for_close_and_retains_resource() {
+        let session = Arc::new(());
+        let weak = Arc::downgrade(&session);
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut finish = Box::pin(finish_pending_session(
+            Err(CaptureError::EndOfStream),
+            Some(session),
+            |session| async move {
+                wait.await.unwrap();
+                assert_eq!(Arc::strong_count(&session), 1);
+                Ok(())
+            },
+        ));
+        assert!((&mut finish).now_or_never().is_none());
+        assert!(weak.upgrade().is_some());
+        release.send(()).unwrap();
+        assert!(matches!(finish.await, Err(CaptureError::EndOfStream)));
+        assert!(weak.upgrade().is_none());
     }
 
     struct ReadyZoneBurst {
