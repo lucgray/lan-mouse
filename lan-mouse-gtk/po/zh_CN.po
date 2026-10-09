@@ -1,0 +1,314 @@
+# Lan Mouse — Simplified Chinese translation
+msgid ""
+msgstr ""
+"Project-Id-Version: lan-mouse 0.11.0\n"
+"Report-Msgid-Bugs-To: https://github.com/lucgray/lan-mouse/issues\n"
+"POT-Creation-Date: 2026-10-01 00:00+0000\n"
+"PO-Revision-Date: 2026-10-01 00:00+0000\n"
+"Last-Translator: \n"
+"Language-Team: \n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#. resources/window.ui — menu
+msgid "_Preferences"
+msgstr "首选项(_P)"
+
+#. resources/window.ui — menu
+msgid "_Close window"
+msgstr "关闭窗口(_C)"
+
+#. resources/window.ui
+msgid "Lan Mouse"
+msgstr "Lan Mouse"
+
+#. resources/window.ui
+msgid "Transferring…"
+msgstr "传输中…"
+
+#. resources/window.ui
+msgid "easily use your mouse and keyboard on multiple computers"
+msgstr "在多台电脑间共享你的鼠标和键盘"
+
+#. resources/window.ui
+msgid "Capture / Emulation Status"
+msgstr "捕获 / 模拟状态"
+
+#. resources/window.ui
+msgid "Reenable"
+msgstr "重新启用"
+
+#. resources/window.ui
+msgid "Connections"
+msgstr "连接"
+
+#. resources/window.ui
+msgid "Add"
+msgstr "添加"
+
+#. resources/window.ui
+msgid "Incoming Connections"
+msgstr "传入连接"
+
+#. resources/window.ui
+msgid "hostname &amp; port"
+msgstr "主机名和端口"
+
+#. resources/window.ui
+msgid "certificate fingerprint"
+msgstr "证书指纹"
+
+#. resources/window.ui
+msgid "No connections!"
+msgstr "没有连接！"
+
+#. resources/window.ui
+msgid "add a new client via the + button"
+msgstr "通过 + 按钮添加新客户端"
+
+#. resources/window.ui
+msgid "no devices registered!"
+msgstr "没有已注册的设备！"
+
+#. resources/window.ui
+msgid "authorize a new device via the \"Authorize\" button"
+msgstr "通过“授权”按钮授权新设备"
+
+#. resources/window.ui — client_row.ui
+msgid "enable"
+msgstr "启用"
+
+#. resources/client_row.ui
+msgid "resolve host"
+msgstr "解析主机"
+
+#. resources/client_row.ui
+msgid "hostname"
+msgstr "主机名"
+
+#. resources/client_row.ui
+msgid "port"
+msgstr "端口"
+
+#. resources/client_row.ui
+msgid "position"
+msgstr "位置"
+
+#. resources/authorization_window.ui
+msgid "Unauthorized Device"
+msgstr "未授权设备"
+
+#. resources/authorization_window.ui — settings_window.rs
+msgid "Cancel"
+msgstr "取消"
+
+#. resources/authorization_window.ui
+msgid "Authorize"
+msgstr "授权"
+
+#. resources/fingerprint_window.ui
+msgid "Add Certificate Fingerprint"
+msgstr "添加证书指纹"
+
+#. resources/fingerprint_window.ui
+msgid "Confirm"
+msgstr "确认"
+
+#. resources/key_row.ui
+msgid "revoke authorization"
+msgstr "撤销授权"
+
+#. resources/settings_window.ui — language dropdown
+msgid "System default"
+msgstr "跟随系统"
+
+#. resources/settings_window.ui — language dropdown
+msgid "English"
+msgstr "English"
+
+#. resources/settings_window.ui — window title
+msgid "Preferences"
+msgstr "首选项"
+
+#. resources/settings_window.ui — also window.ui
+msgid "General"
+msgstr "常规"
+
+#. resources/settings_window.ui
+msgid "Language"
+msgstr "语言"
+
+#. resources/settings_window.ui
+msgid "Restart Lan Mouse to apply"
+msgstr "重启 Lan Mouse 后生效"
+
+#. resources/settings_window.ui
+msgid "Sharing"
+msgstr "共享"
+
+#. resources/settings_window.ui
+msgid "Share clipboard"
+msgstr "共享剪贴板"
+
+#. resources/settings_window.ui
+msgid "Send text and images you copy to connected devices"
+msgstr "将你复制的文本和图片发送到已连接的设备"
+
+#. resources/settings_window.ui
+msgid "Download folder"
+msgstr "下载目录"
+
+#. resources/settings_window.ui
+msgid "Choose…"
+msgstr "选择…"
+
+#. resources/settings_window.ui
+msgid "Input"
+msgstr "输入"
+
+#. resources/settings_window.ui
+msgid "Invert scrolling"
+msgstr "反转滚动"
+
+#. resources/settings_window.ui
+msgid "Reverse the scroll direction on devices you control"
+msgstr "反转被控设备上的滚动方向"
+
+#. resources/settings_window.ui
+msgid "Mouse sensitivity"
+msgstr "鼠标灵敏度"
+
+#. resources/settings_window.ui
+msgid "Pointer speed multiplier applied on controlled devices"
+msgstr "应用于被控设备的指针速度倍率"
+
+#. resources/settings_window.ui
+msgid "Key repeat delay"
+msgstr "按键重复延迟"
+
+#. resources/settings_window.ui
+msgid ""
+"Hold time before a key repeats, in ms — applied on Windows and macOS "
+"receivers"
+msgstr "按住按键多久后开始重复（毫秒）——在 Windows 和 macOS 接收端生效"
+
+#. resources/settings_window.ui
+msgid "Repeat interval"
+msgstr "重复间隔"
+
+#. resources/settings_window.ui
+msgid ""
+"Time between repeats once repeating, in ms — applied on Windows and "
+"macOS receivers"
+msgstr "开始重复后每次重复的间隔（毫秒）——在 Windows 和 macOS 接收端生效"
+
+#. resources/settings_window.ui
+msgid "Connection"
+msgstr "连接"
+
+#. resources/settings_window.ui
+msgid "Listen port"
+msgstr "监听端口"
+
+#. resources/settings_window.ui
+msgid "Port peers connect on — must match on every device"
+msgstr "对端设备连接所用的端口——所有设备上必须一致"
+
+#. resources/settings_window.ui
+msgid "Advanced"
+msgstr "高级"
+
+#. resources/settings_window.ui
+msgid ""
+"key remapping and enter/release binds are configured in config.toml — "
+"restart Lan Mouse to apply"
+msgstr ""
+"键位重映射和进入/释放快捷键在 config.toml 中配置——修改后重启 Lan "
+"Mouse 生效"
+
+#. resources/settings_window.ui
+msgid "About"
+msgstr "关于"
+
+#. resources/settings_window.ui
+msgid "Version"
+msgstr "版本"
+
+#. resources/settings_window.ui
+msgid "Website"
+msgstr "网站"
+
+#. resources/settings_window.ui
+msgid "Report an issue"
+msgstr "报告问题"
+
+#. resources/settings_window.ui
+msgid "Issue tracker"
+msgstr "问题跟踪"
+
+#. resources/settings_window.ui
+msgid "License"
+msgstr "许可证"
+
+#. src/lib.rs — toast
+msgid "device connected: {addr}"
+msgstr "设备已连接：{addr}"
+
+#. src/lib.rs — toast
+msgid "device entered: {addr} ({pos})"
+msgstr "设备进入：{addr}（{pos}）"
+
+#. src/lib.rs — toast
+msgid "{addr} disconnected"
+msgstr "{addr} 已断开"
+
+#. src/lib.rs — clipboard kind
+msgid "text"
+msgstr "文本"
+
+#. src/lib.rs — clipboard kind
+msgid "image"
+msgstr "图片"
+
+#. src/lib.rs — clipboard kind
+msgid "files"
+msgstr "文件"
+
+#. src/lib.rs — clipboard kind
+msgid "files (saved to {dir})"
+msgstr "文件（已保存到 {dir}）"
+
+#. src/lib.rs — clipboard direction
+msgid "received"
+msgstr "已接收"
+
+#. src/lib.rs — clipboard direction
+msgid "shared"
+msgstr "已发送"
+
+#. src/lib.rs — clipboard toast
+msgid "clipboard {kind} {direction} ({size})"
+msgstr "剪贴板 {kind}{direction}（{size}）"
+
+#. src/lib.rs — clipboard toast
+msgid "clipboard too large to share: {size} ({limit} limit)"
+msgstr "剪贴板内容过大，无法共享：{size}（上限 {limit}）"
+
+#. src/window.rs — transfer progress
+msgid "Receiving…"
+msgstr "接收中…"
+
+#. src/window.rs — transfer progress
+msgid "Sending…"
+msgstr "发送中…"
+
+#. src/settings_window.rs — file chooser
+msgid "Choose download folder"
+msgstr "选择下载目录"
+
+#. src/settings_window.rs — file chooser button
+msgid "Select"
+msgstr "选择"

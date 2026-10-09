@@ -1,8 +1,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use adw::ActionRow;
 use adw::subclass::prelude::*;
+use adw::{ActionRow, ComboRow};
 use glib::subclass::InitializingObject;
 use gtk::{Button, CompositeTemplate, SpinButton, Switch, glib};
 
@@ -19,6 +19,16 @@ pub struct SettingsWindow {
     pub download_dir_row: TemplateChild<ActionRow>,
     #[template_child]
     pub download_dir_button: TemplateChild<Button>,
+    #[template_child]
+    pub language_row: TemplateChild<ComboRow>,
+    #[template_child]
+    pub port_spin: TemplateChild<SpinButton>,
+    #[template_child]
+    pub key_delay_spin: TemplateChild<SpinButton>,
+    #[template_child]
+    pub key_interval_spin: TemplateChild<SpinButton>,
+    #[template_child]
+    pub version_row: TemplateChild<ActionRow>,
     /// suppresses change callbacks while daemon state is applied to the
     /// widgets, so a settings sync doesn't echo back as a request
     pub updating: Rc<Cell<bool>>,

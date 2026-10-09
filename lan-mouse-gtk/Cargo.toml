@@ -1,7 +1,7 @@
 [package]
 name = "lan-mouse-gtk"
 description = "GTK4 / Libadwaita Frontend for lan-mouse"
-version = "0.3.0"
+version = "0.11.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/feschber/lan-mouse"
@@ -10,6 +10,7 @@ repository = "https://github.com/feschber/lan-mouse"
 gtk = { package = "gtk4", version = "0.9.0", features = ["v4_2"] }
 adw = { package = "libadwaita", version = "0.7.0", features = ["v1_1"] }
 async-channel = { version = "2.1.1" }
+gettextrs = { package = "gettext-rs", version = "0.8.0", features = ["gettext-system"] }
 hostname = "0.4.0"
 log = "0.4.20"
 input-event = { path = "../input-event", version = "0.4.0" }
@@ -29,6 +30,7 @@ tray-icon = { version = "0.24.1", default-features = false }
 
 [build-dependencies]
 glib-build-tools = { version = "0.20.0" }
+polib = "0.3.0"
 
 
 [features]

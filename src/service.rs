@@ -24,6 +24,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -309,6 +310,10 @@ impl Service {
             }
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
             FrontendRequest::SetDownloadDir(dir) => self.set_download_dir(dir),
+            FrontendRequest::SetLanguage(lang) => self.set_language(lang),
+            FrontendRequest::SetKeyRepeat { delay, interval } => {
+                self.set_key_repeat(delay, interval)
+            }
             FrontendRequest::WindowIdentifier(handle) => {
                 log::info!("xdg-foreign handle: {handle:?}");
                 self.window_identifier
@@ -423,6 +428,7 @@ impl Service {
                 Ok(port) => {
                     self.port = port;
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
+                    self.notify_settings();
                 }
                 Err(e) => self
                     .notify_frontend(FrontendEvent::PortChanged(self.port, Some(format!("{e}")))),
@@ -944,6 +950,26 @@ impl Service {
         self.notify_settings();
     }
 
+    fn set_language(&mut self, language: Option<String>) {
+        log::info!("ui language set to {language:?} (applies on next frontend start)");
+        self.config.set_language(language);
+        self.save_config();
+        self.notify_settings();
+    }
+
+    /// key-repeat timing in ms — applied live on backends that synthesize
+    /// repeats themselves (Windows, macOS) and persisted for the rest
+    fn set_key_repeat(&mut self, delay: u64, interval: u64) {
+        log::info!("key repeat set to {delay}ms delay / {interval}ms interval");
+        self.emulation.request_key_repeat(
+            Duration::from_millis(delay),
+            Duration::from_millis(interval),
+        );
+        self.config.set_key_repeat(Some(delay), Some(interval));
+        self.save_config();
+        self.notify_settings();
+    }
+
     /// push the current settings to the frontend
     fn notify_settings(&mut self) {
         self.notify_frontend(FrontendEvent::Settings {
@@ -951,6 +977,14 @@ impl Service {
             invert_scroll: self.config.invert_scroll(),
             mouse_sensitivity: self.config.mouse_sensitivity(),
             download_dir: self.download_dir().display().to_string(),
+            port: self.port,
+            language: self.config.language().unwrap_or_default(),
+            key_repeat_delay: self.config.emulation_options().key_repeat_delay.as_millis() as u64,
+            key_repeat_interval: self
+                .config
+                .emulation_options()
+                .key_repeat_interval
+                .as_millis() as u64,
         });
     }
 

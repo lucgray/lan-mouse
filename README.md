@@ -491,6 +491,10 @@ jail_bind = [ "KeyScrollLock" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# optional UI language for the GTK frontend, e.g. "zh_CN" or "en".
+# Unset = follow the system locale. Applies on the next frontend start.
+language = "zh_CN"
+
 # optional key-repeat timing for the *receiving* side, in milliseconds. Only the
 # macOS and Windows emulation backends use these (other platforms let the OS
 # generate key repeat): `key_repeat_delay` is how long a key must be held before
@@ -655,6 +659,22 @@ invert_scroll_horizontal = false
 
 Like `remap_keys`, this happens on the *sending* side only, so scrolling on
 the local machine itself is unaffected.
+
+### GTK preferences & i18n
+
+The GTK frontend's Preferences window (hamburger menu → Preferences)
+covers the day-to-day settings: UI language, clipboard sharing,
+download folder, scroll inversion, mouse sensitivity, key-repeat
+timing, and the listen port. Changes are applied live where the
+backends support it and persisted to `config.toml`.
+
+Translations use gettext: catalogs live in `lan-mouse-gtk/po/` as
+`.po` files, are compiled to `.mo` at build time, and embedded in the
+binary — no installed locale files are needed. The UI language follows
+the system locale unless the top-level `language` key in `config.toml`
+(or the Preferences → Language row) overrides it; a frontend restart
+applies the change. Currently ships `zh_CN`; English is the source
+language.
 
 ### Clipboard sharing
 

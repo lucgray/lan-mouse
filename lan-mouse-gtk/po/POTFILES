@@ -1,0 +1,13 @@
+# Files containing translatable strings, for xgettext.
+# Rebuild the template with:
+#   xgettext --files-from=POTFILES --keyword=translatable \
+#     --keyword=gettextrs::gettext --keyword=i18n::tr -o lan-mouse.pot
+resources/window.ui
+resources/settings_window.ui
+resources/client_row.ui
+resources/authorization_window.ui
+resources/fingerprint_window.ui
+resources/key_row.ui
+src/lib.rs
+src/window.rs
+src/settings_window.rs

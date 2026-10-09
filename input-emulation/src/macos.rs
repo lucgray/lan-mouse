@@ -972,6 +972,11 @@ impl Emulation for MacOSEmulation {
 
     async fn terminate(&mut self) {}
 
+    fn set_key_repeat(&mut self, delay: Duration, interval: Duration) {
+        self.options.key_repeat_delay = delay;
+        self.options.key_repeat_interval = interval;
+    }
+
     async fn warp(&mut self, _handle: EmulationHandle, pos: Position, t: f64) {
         let Some(point) = warp_target(pos, t) else {
             log::warn!("could not determine display bounds for cursor warp");

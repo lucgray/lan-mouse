@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<interface>
+<interface domain="lan-mouse">
 	<template class="KeyRow" parent="AdwActionRow">
 		<child type="prefix">
 			<object class="GtkButton" id="delete_button">

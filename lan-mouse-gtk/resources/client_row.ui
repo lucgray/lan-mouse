@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<interface>
+<interface domain="lan-mouse">
 	<template class="ClientRow" parent="AdwExpanderRow">
 		<property name="title">hostname</property>
 		<!-- enabled -->

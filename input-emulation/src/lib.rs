@@ -521,6 +521,12 @@ impl InputEmulation {
     pub fn update_config(&mut self, input_config: InputConfig) {
         self.input_config = input_config;
     }
+
+    /// Update the key-repeat timing on the active backend. Only backends
+    /// that synthesize repeats themselves (Windows, macOS) apply it.
+    pub fn set_key_repeat(&mut self, delay: Duration, interval: Duration) {
+        self.emulation.set_key_repeat(delay, interval);
+    }
 }
 
 #[async_trait]
@@ -537,6 +543,10 @@ trait Emulation: Send {
     /// `pos`. Best-effort: a no-op default for backends that can't do
     /// an absolute warp, or platforms not implemented yet.
     async fn warp(&mut self, _handle: EmulationHandle, _pos: Position, _t: f64) {}
+
+    /// Update synthetic key-repeat timing. Default no-op for backends
+    /// that leave repeat generation to the receiving OS.
+    fn set_key_repeat(&mut self, _delay: Duration, _interval: Duration) {}
 }
 
 #[cfg(test)]
