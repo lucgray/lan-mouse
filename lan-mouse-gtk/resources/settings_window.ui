@@ -29,6 +29,19 @@
                 </child>
               </object>
             </child>
+            <child>
+              <object class="AdwActionRow" id="download_dir_row">
+                <property name="title" translatable="yes">Download folder</property>
+                <property name="subtitle">~/Downloads</property>
+                <property name="activatable-widget">download_dir_button</property>
+                <child type="suffix">
+                  <object class="GtkButton" id="download_dir_button">
+                    <property name="label" translatable="yes">Choose…</property>
+                    <property name="valign">center</property>
+                  </object>
+                </child>
+              </object>
+            </child>
           </object>
         </child>
         <child>

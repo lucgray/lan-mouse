@@ -676,8 +676,17 @@ receiving side, up to 256MB. The GTK window shows a progress bar
 while a transfer is running. Old peers silently skip fragment and
 file datagrams they don't understand, so connections stay alive.
 
-Transferred files land in `~/Downloads` (or the OS download dir);
-folders and items that aren't regular files are skipped.
+Transferred files land in `~/Downloads` (or the OS download dir) by
+default; folders and items that aren't regular files are skipped.
+The destination can be changed in the GTK Preferences window
+("Download folder") or with the top-level `download_dir` key in
+`config.toml`:
+
+```toml
+download_dir = "/path/to/folder"
+```
+
+The directory is created if it does not exist.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

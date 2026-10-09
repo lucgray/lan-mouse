@@ -18,6 +18,9 @@ pub enum ClipboardError {
 pub struct ClipboardEmulation {
     // Use Arc<Mutex<>> to share clipboard across threads
     clipboard: Arc<Mutex<Option<Clipboard>>>,
+    /// user-configured directory for received files (`None` = system
+    /// downloads directory)
+    download_dir: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// strip any directory components / weirdness from a wire-supplied
@@ -72,7 +75,14 @@ impl ClipboardEmulation {
 
         Ok(Self {
             clipboard: Arc::new(Mutex::new(clipboard)),
+            download_dir: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// directory received files are written to (`None` = the system
+    /// downloads directory)
+    pub fn set_download_dir(&self, dir: Option<PathBuf>) {
+        *self.download_dir.lock().unwrap() = dir;
     }
 
     /// Set clipboard content from a clipboard event
@@ -150,9 +160,19 @@ impl ClipboardEmulation {
             }
             ClipboardEvent::Files(files) => {
                 let clipboard_arc = self.clipboard.clone();
+                let dir_override = self.download_dir.lock().unwrap().clone();
                 spawn_blocking(move || {
-                    let dir = download_dir()
-                        .ok_or_else(|| ClipboardError::Set("no downloads directory".into()))?;
+                    let dir = match dir_override {
+                        Some(dir) => {
+                            // the configured directory may not exist yet
+                            std::fs::create_dir_all(&dir).map_err(|e| {
+                                ClipboardError::Set(format!("cannot create {}: {e}", dir.display()))
+                            })?;
+                            dir
+                        }
+                        None => download_dir()
+                            .ok_or_else(|| ClipboardError::Set("no downloads directory".into()))?,
+                    };
                     let mut written = Vec::with_capacity(files.len());
                     for ClipboardFile { name, data } in &files {
                         let path = unique_download_path(&dir, &safe_file_name(name));

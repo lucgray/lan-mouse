@@ -1,9 +1,10 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use adw::ActionRow;
 use adw::subclass::prelude::*;
 use glib::subclass::InitializingObject;
-use gtk::{CompositeTemplate, SpinButton, Switch, glib};
+use gtk::{Button, CompositeTemplate, SpinButton, Switch, glib};
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/de/feschber/LanMouse/settings_window.ui")]
@@ -14,6 +15,10 @@ pub struct SettingsWindow {
     pub invert_scroll_switch: TemplateChild<Switch>,
     #[template_child]
     pub sensitivity_spin: TemplateChild<SpinButton>,
+    #[template_child]
+    pub download_dir_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub download_dir_button: TemplateChild<Button>,
     /// suppresses change callbacks while daemon state is applied to the
     /// widgets, so a settings sync doesn't echo back as a request
     pub updating: Rc<Cell<bool>>,

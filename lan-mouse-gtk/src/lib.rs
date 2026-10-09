@@ -473,8 +473,14 @@ fn build_ui(app: &Application) {
                         clipboard_enabled,
                         invert_scroll,
                         mouse_sensitivity,
+                        download_dir,
                     } => {
-                        window.update_settings(clipboard_enabled, invert_scroll, mouse_sensitivity);
+                        window.update_settings(
+                            clipboard_enabled,
+                            invert_scroll,
+                            mouse_sensitivity,
+                            download_dir,
+                        );
                     }
                     FrontendEvent::ClipboardShared {
                         received,
@@ -482,9 +488,17 @@ fn build_ui(app: &Application) {
                         bytes,
                     } => {
                         let kind = match kind {
-                            ClipboardContentKind::Text => "text",
-                            ClipboardContentKind::Image => "image",
-                            ClipboardContentKind::Files => "files (saved to Downloads)",
+                            ClipboardContentKind::Text => "text".to_string(),
+                            ClipboardContentKind::Image => "image".to_string(),
+                            ClipboardContentKind::Files if received => {
+                                let dir = window.download_dir();
+                                if dir.is_empty() {
+                                    "files".to_string()
+                                } else {
+                                    format!("files (saved to {dir})")
+                                }
+                            }
+                            ClipboardContentKind::Files => "files".to_string(),
                         };
                         let direction = if received { "received" } else { "shared" };
                         window.show_toast(

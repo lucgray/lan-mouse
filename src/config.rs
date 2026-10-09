@@ -97,6 +97,9 @@ struct ConfigToml {
     input_post_processing: Option<InputConfig>,
     /// enable clipboard sharing between machines (default: true)
     enable_clipboard: Option<bool>,
+    /// directory files received via the clipboard are written to
+    /// (default: the system downloads directory)
+    download_dir: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -714,6 +717,11 @@ impl Config {
         self.toml_mut().enable_clipboard = Some(enabled);
     }
 
+    /// persist the clipboard file download directory (`None` = default)
+    pub fn set_download_dir(&mut self, dir: Option<PathBuf>) {
+        self.toml_mut().download_dir = dir;
+    }
+
     /// persist the scroll-inversion toggle
     pub fn set_invert_scroll(&mut self, invert: bool) {
         self.toml_mut()
@@ -798,6 +806,14 @@ impl Config {
             .and_then(|c| c.enable_clipboard)
             .unwrap_or(true)
     }
+
+    /// configured directory for received clipboard files
+    /// (`None` = system downloads directory)
+    pub fn download_dir(&self) -> Option<PathBuf> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.download_dir.clone())
+    }
 }
 
 #[cfg(test)]
@@ -817,6 +833,12 @@ mod tests {
         assert_eq!(c.enter_binds, None);
         assert_eq!(c.input_pre_processing, None);
         assert_eq!(c.input_post_processing, None);
+    }
+
+    #[test]
+    fn parses_download_dir() {
+        let c = parse("download_dir = \"/tmp/lm-downloads\"");
+        assert_eq!(c.download_dir, Some(PathBuf::from("/tmp/lm-downloads")));
     }
 
     #[test]

@@ -567,13 +567,28 @@ impl Window {
         clipboard_enabled: bool,
         invert_scroll: bool,
         mouse_sensitivity: f64,
+        download_dir: String,
     ) {
         self.imp()
             .settings
             .set((clipboard_enabled, invert_scroll, mouse_sensitivity));
+        self.imp()
+            .settings_download_dir
+            .replace(download_dir.clone());
         if let Some(w) = self.imp().settings_window.borrow().as_ref() {
-            w.update_values(clipboard_enabled, invert_scroll, mouse_sensitivity);
+            w.update_values(
+                clipboard_enabled,
+                invert_scroll,
+                mouse_sensitivity,
+                &download_dir,
+            );
         }
+    }
+
+    /// directory received clipboard files are written to, as last
+    /// reported by the daemon
+    pub(super) fn download_dir(&self) -> String {
+        self.imp().settings_download_dir.borrow().clone()
     }
 
     pub(crate) fn open_settings(&self) {
@@ -584,7 +599,18 @@ impl Window {
         let settings_window = SettingsWindow::new();
         settings_window.set_transient_for(Some(self));
         let (clipboard_enabled, invert_scroll, mouse_sensitivity) = self.imp().settings.get();
-        settings_window.update_values(clipboard_enabled, invert_scroll, mouse_sensitivity);
+        let download_dir = self.imp().settings_download_dir.borrow().clone();
+        settings_window.update_values(
+            clipboard_enabled,
+            invert_scroll,
+            mouse_sensitivity,
+            &download_dir,
+        );
+        settings_window.connect_download_dir_activated(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |dir| window.request(FrontendRequest::SetDownloadDir(Some(dir)))
+        ));
         settings_window.connect_clipboard_toggled(clone!(
             #[weak(rename_to = window)]
             self,

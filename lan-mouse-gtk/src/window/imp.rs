@@ -65,6 +65,8 @@ pub struct Window {
     /// last settings state received from the daemon
     /// (clipboard_enabled, invert_scroll, mouse_sensitivity)
     pub settings: Cell<(bool, bool, f64)>,
+    /// effective download directory reported by the daemon
+    pub settings_download_dir: RefCell<String>,
 }
 
 #[glib::object_subclass]
@@ -218,6 +220,7 @@ impl ObjectImpl for Window {
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);
         self.settings.set((true, false, 1.0));
+        self.settings_download_dir.replace(String::new());
         let obj = self.obj();
         obj.setup_icon();
         obj.setup_clients();

@@ -1199,6 +1199,6 @@ mod tests {
         assert!(reasm.push(&frags[2]).unwrap().is_none());
         assert_eq!(reasm.missing_seqs(10), vec![1, 3]);
         assert_eq!(reasm.missing_seqs(1), vec![1]);
-        assert!(reasm.wants_request() == false); // no quiet period yet
+        assert!(!reasm.wants_request()); // no quiet period yet
     }
 }

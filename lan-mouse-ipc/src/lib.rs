@@ -231,6 +231,8 @@ pub enum FrontendEvent {
         clipboard_enabled: bool,
         invert_scroll: bool,
         mouse_sensitivity: f64,
+        /// directory received clipboard files are written to
+        download_dir: String,
     },
     /// clipboard content was shared in either direction
     ClipboardShared {
@@ -298,6 +300,9 @@ pub enum FrontendRequest {
     WindowIdentifier(WindowIdentifier),
     /// enable/disable clipboard sharing at runtime
     SetClipboardEnabled(bool),
+    /// set the directory received clipboard files are written to
+    /// (`None` restores the default downloads directory)
+    SetDownloadDir(Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

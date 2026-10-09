@@ -22,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{Arc, Mutex, RwLock},
 };
 use thiserror::Error;
@@ -140,7 +141,11 @@ impl Service {
         // clipboard monitor + emulation
         let clipboard_enabled = config.clipboard_enabled();
         let (clipboard_monitor, clipboard_emulation) = if clipboard_enabled {
-            Self::create_clipboard_parts()
+            let parts = Self::create_clipboard_parts();
+            if let Some(ref e) = parts.1 {
+                e.set_download_dir(config.download_dir());
+            }
+            parts
         } else {
             log::info!("Clipboard sharing disabled by configuration");
             (None, None)
@@ -303,6 +308,7 @@ impl Service {
                 self.update_mouse_sensitivity(mouse_sensitivity)
             }
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
+            FrontendRequest::SetDownloadDir(dir) => self.set_download_dir(dir),
             FrontendRequest::WindowIdentifier(handle) => {
                 log::info!("xdg-foreign handle: {handle:?}");
                 self.window_identifier
@@ -883,6 +889,9 @@ impl Service {
             // (e.g. clipboard unavailable at daemon startup)
             if self.clipboard_monitor.is_none() || self.clipboard_emulation.is_none() {
                 let (monitor, emulation) = Self::create_clipboard_parts();
+                if let Some(ref e) = emulation {
+                    e.set_download_dir(self.config.download_dir());
+                }
                 if self.clipboard_monitor.is_none() {
                     self.clipboard_monitor = monitor;
                 }
@@ -916,12 +925,32 @@ impl Service {
         self.notify_settings();
     }
 
+    /// effective directory received clipboard files are written to
+    fn download_dir(&self) -> PathBuf {
+        self.config
+            .download_dir()
+            .or_else(input_emulation::clipboard::download_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// update the directory received clipboard files are written to
+    fn set_download_dir(&mut self, dir: Option<String>) {
+        let dir = dir.map(PathBuf::from);
+        self.config.set_download_dir(dir.clone());
+        self.save_config();
+        if let Some(ref e) = self.clipboard_emulation {
+            e.set_download_dir(dir);
+        }
+        self.notify_settings();
+    }
+
     /// push the current settings to the frontend
     fn notify_settings(&mut self) {
         self.notify_frontend(FrontendEvent::Settings {
             clipboard_enabled: self.clipboard_enabled,
             invert_scroll: self.config.invert_scroll(),
             mouse_sensitivity: self.config.mouse_sensitivity(),
+            download_dir: self.download_dir().display().to_string(),
         });
     }
 
