@@ -9,6 +9,7 @@ use std::{
 };
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
@@ -38,6 +39,10 @@ enum ConnMsg {
 
 type TaggedStream = Pin<Box<dyn Stream<Item = (u64, ConnMsg)>>>;
 
+/// per-connection outbound queue — a frontend this far behind is
+/// dropped instead of back-pressuring the service loop
+const FRONTEND_QUEUE: usize = 128;
+
 pub struct AsyncFrontendListener {
     #[cfg(windows)]
     listener: TcpListener,
@@ -46,10 +51,10 @@ pub struct AsyncFrontendListener {
     #[cfg(unix)]
     socket_path: PathBuf,
     line_streams: SelectAll<TaggedStream>,
-    /// write halves keyed by the same connection id as the tagged
+    /// outbound queues keyed by the same connection id as the tagged
     /// read stream — removed together on EOF or error so
     /// `frontend_connected` cannot stay stuck on a dead stream
-    tx_streams: HashMap<u64, ConnWriter>,
+    tx_streams: HashMap<u64, mpsc::Sender<String>>,
     next_conn_id: u64,
 }
 
@@ -123,11 +128,18 @@ impl AsyncFrontendListener {
         };
         json.push('\n');
 
-        // TODO do simultaneously
+        // non-blocking enqueue per connection — a slow or dead
+        // frontend fills its bounded queue and gets dropped rather
+        // than stalling every other frontend and the service loop
         let mut failed = vec![];
-        for (id, tx) in self.tx_streams.iter_mut() {
-            if tx.write(json.as_bytes()).await.is_err() {
-                failed.push(*id);
+        for (id, tx) in self.tx_streams.iter() {
+            match tx.try_send(json.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!("frontend {id} not keeping up, disconnecting");
+                    failed.push(*id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => failed.push(*id),
             }
         }
         for id in failed {
@@ -179,7 +191,19 @@ impl Stream for AsyncFrontendListener {
                     .map(move |m| (id, m)),
             );
             self.line_streams.push(tagged);
-            self.tx_streams.insert(id, tx);
+            // a dedicated writer task per connection: broadcasts just
+            // enqueue, and write_all (not write) guarantees the whole
+            // frame lands; a wedged client only blocks its own task
+            let (msg_tx, mut msg_rx) = mpsc::channel::<String>(FRONTEND_QUEUE);
+            self.tx_streams.insert(id, msg_tx);
+            tokio::spawn(async move {
+                let mut tx: ConnWriter = tx;
+                while let Some(msg) = msg_rx.recv().await {
+                    if tx.write_all(msg.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
             sync = true;
         }
         if sync {
