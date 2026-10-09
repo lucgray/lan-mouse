@@ -4,6 +4,7 @@ use input_event::{
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
+    collections::HashMap,
     fmt::{Debug, Display, Formatter},
     mem::size_of,
 };
@@ -572,7 +573,10 @@ pub struct ClipboardReassembler {
     got_bytes: u64,
     /// seq bitmap; num <= 445k for the size cap so this stays small
     seen: Vec<u64>,
-    data: Vec<u8>,
+    /// seq → payload, sparse on purpose: allocation tracks bytes
+    /// actually received instead of the peer-declared `total`, so a
+    /// forged header cannot force a 256MiB buffer into existence
+    fragments: HashMap<u32, Vec<u8>>,
     last_fragment: Option<std::time::Instant>,
 }
 
@@ -594,7 +598,9 @@ impl ClipboardReassembler {
         self.got = 0;
         self.got_bytes = 0;
         self.seen.clear();
-        self.data.clear();
+        // assign a fresh map — clear() keeps the allocated capacity
+        // and a forged transfer must not pin hundreds of MiB
+        self.fragments = HashMap::new();
         self.last_fragment = None;
     }
 
@@ -680,13 +686,20 @@ impl ClipboardReassembler {
         let stale = self
             .last_fragment
             .is_some_and(|t| t.elapsed() > REASSEMBLY_TIMEOUT);
+        // every fragment except the tail must carry a full payload —
+        // that is exactly what the sender emits, and a short middle
+        // fragment would just leave a hole the length check below
+        // rejects anyway
+        if seq != num - 1 && dgram.len() - CLIPBOARD_FRAGMENT_HEADER != CLIPBOARD_FRAGMENT_PAYLOAD {
+            self.reset();
+            return Err(ProtocolError::InvalidFragment);
+        }
         if stale || self.id != id || self.num != num || self.total != total {
             self.reset();
             self.id = id;
             self.total = total;
             self.num = num;
             self.seen.resize(num.div_ceil(64) as usize, 0);
-            self.data.resize(total as usize, 0);
         }
         let word = (seq / 64) as usize;
         let bit = 1u64 << (seq % 64);
@@ -697,19 +710,24 @@ impl ClipboardReassembler {
         }
         self.seen[word] |= bit;
         self.got += 1;
-        let start = seq as usize * CLIPBOARD_FRAGMENT_PAYLOAD;
         let payload = &dgram[CLIPBOARD_FRAGMENT_HEADER..];
-        let end = (start + payload.len()).min(self.data.len());
-        self.data[start..end].copy_from_slice(&payload[..end - start]);
-        self.got_bytes += (end - start) as u64;
+        self.got_bytes += payload.len() as u64;
+        self.fragments.insert(seq, payload.to_vec());
         self.last_fragment = Some(std::time::Instant::now());
         if self.got == self.num {
-            self.num = 0;
-            self.got = 0;
-            self.got_bytes = 0;
-            self.seen.clear();
-            self.last_fragment = None;
-            return Ok(Some(std::mem::take(&mut self.data)));
+            let mut out = Vec::with_capacity(self.total as usize);
+            for seq in 0..self.num {
+                // every seq is present: seen marks all num bits
+                if let Some(frag) = self.fragments.remove(&seq) {
+                    out.extend_from_slice(&frag);
+                }
+            }
+            let assembled_ok = out.len() == self.total as usize;
+            self.reset();
+            if !assembled_ok {
+                return Err(ProtocolError::InvalidFragment);
+            }
+            return Ok(Some(out));
         }
         Ok(None)
     }
@@ -1297,5 +1315,32 @@ mod tests {
         assert!(reasm.push(&frags[0]).unwrap().is_none());
         let out = reasm.push(&frags[1]).unwrap().expect("complete");
         assert_eq!(out, encoded);
+    }
+
+    #[test]
+    fn reassembler_no_premature_allocation() {
+        // a legal header claiming the 256MiB cap but carrying only a
+        // small tail fragment must not allocate anywhere near `total` —
+        // storage is sparse and tracks received bytes
+        let mut reasm = ClipboardReassembler::new();
+        let total = MAX_CLIPBOARD_TRANSFER_SIZE as u32;
+        let num = (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64) as u32;
+        let frag = forged_fragment(total, num - 1, num, 7, &[0xAB; 100]);
+        assert!(matches!(reasm.push(&frag), Ok(None)));
+        assert_eq!(reasm.progress(), Some((100, total as u64)));
+        reasm.reset();
+        assert!(reasm.progress().is_none());
+    }
+
+    #[test]
+    fn reassembler_rejects_short_middle_fragment() {
+        // every non-tail fragment must carry a full payload — the real
+        // sender pads all but the last; anything else is forged
+        let mut reasm = ClipboardReassembler::new();
+        let frag = forged_fragment(2400, 0, 2, 9, &[0xAB; 100]);
+        assert!(matches!(
+            reasm.push(&frag),
+            Err(ProtocolError::InvalidFragment)
+        ));
     }
 }

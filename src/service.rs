@@ -39,6 +39,11 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    /// a subsystem died on its own — the daemon exits nonzero so a
+    /// supervisor (Restart=on-failure) brings it back instead of
+    /// treating the death as a clean shutdown
+    #[error("subsystem exited: {0}")]
+    SubsystemExited(&'static str),
 }
 
 pub struct Service {
@@ -243,12 +248,17 @@ impl Service {
         }
 
         let mut liveness_tick = tokio::time::interval(Duration::from_secs(1));
+        // set when the loop exits because a subsystem died rather than
+        // via a normal shutdown signal — turns the exit into Err so a
+        // supervisor can tell a crash from a requested stop
+        let mut fatal: Option<&'static str> = None;
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => match request {
                     Some(_) => self.handle_frontend_request(request),
                     None => {
                         log::error!("frontend listener channel closed, shutting down");
+                        fatal = Some("frontend listener");
                         break;
                     }
                 },
@@ -257,6 +267,7 @@ impl Service {
                     Some(event) => self.handle_emulation_event(event).await,
                     None => {
                         log::error!("emulation task exited, shutting down");
+                        fatal = Some("emulation");
                         break;
                     }
                 },
@@ -264,6 +275,7 @@ impl Service {
                     Some(event) => self.handle_capture_event(event),
                     None => {
                         log::error!("capture task exited, shutting down");
+                        fatal = Some("capture");
                         break;
                     }
                 },
@@ -271,6 +283,7 @@ impl Service {
                     Some(event) => self.handle_resolver_event(event),
                     None => {
                         log::error!("dns resolver task exited, shutting down");
+                        fatal = Some("dns resolver");
                         break;
                     }
                 },
@@ -280,14 +293,17 @@ impl Service {
                 _ = liveness_tick.tick() => {
                     if !self.emulation.is_alive() {
                         log::error!("emulation task exited, shutting down");
+                        fatal = Some("emulation");
                         break;
                     }
                     if !self.capture.is_alive() {
                         log::error!("capture task exited, shutting down");
+                        fatal = Some("capture");
                         break;
                     }
                     if !self.resolver.is_alive() {
                         log::error!("dns resolver task exited, shutting down");
+                        fatal = Some("dns resolver");
                         break;
                     }
                     self.expire_clipboard_batches();
@@ -320,6 +336,7 @@ impl Service {
                     Ok(()) => break,
                     Err(e) => {
                         log::error!("failed to wait for CTRL+C: {e}");
+                        fatal = Some("signal handling");
                         break;
                     }
                 },
@@ -367,7 +384,10 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
-        Ok(())
+        match fatal {
+            Some(subsystem) => Err(ServiceError::SubsystemExited(subsystem)),
+            None => Ok(()),
+        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {

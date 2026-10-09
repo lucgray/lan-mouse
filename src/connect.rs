@@ -494,11 +494,15 @@ async fn receive_loop(
     let mut buf = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
     let mut reassembler = ClipboardReassembler::new();
     let mut last_reported = 0u64;
+    let mut recv_err = None;
     loop {
         let n = tokio::select! {
             r = conn.recv(&mut buf) => match r {
                 Ok(n) => n,
-                Err(_) => break,
+                Err(e) => {
+                    recv_err = Some(e);
+                    break;
+                }
             },
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if reassembler.wants_request() {
@@ -624,13 +628,19 @@ async fn receive_loop(
             ProtoEvent::Hello { commit } => {
                 client_manager.set_peer_commit(handle, Some(commit));
             }
-            event => tx
-                .send((handle, IncomingEvent::Event(event)))
-                .expect("channel closed"),
+            event => {
+                if tx.send((handle, IncomingEvent::Event(event))).is_err() {
+                    log::debug!("service channel closed, receive loop for {addr} exiting");
+                    return;
+                }
+            }
         }
     }
 
-    log::warn!("recv error");
+    match recv_err {
+        Some(e) => log::warn!("recv error from {addr}: {e}"),
+        None => log::info!("connection from {addr} closed"),
+    }
     disconnect(&client_manager, handle, addr, &conns).await;
 }
 
