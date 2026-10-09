@@ -150,7 +150,7 @@ pub(crate) async fn send_clipboard_datagrams(
     Ok(())
 }
 
-/// bind a socket matching the target's address family — an IPv4-bound
+/// bind a socket matching the target's address family -- an IPv4-bound
 /// socket can't send to an IPv6 peer ("address family not supported")
 fn bind_addr_for(addr: SocketAddr) -> SocketAddr {
     if addr.is_ipv6() {
@@ -525,7 +525,7 @@ async fn receive_loop(
             match reassembler.push(&buf[..n]) {
                 Ok(Some(encoded)) => {
                     last_reported = 0;
-                    // full payload — tell the frontend the bar can hide
+                    // full payload -- tell the frontend the bar can hide
                     let _ = tx.send((
                         handle,
                         IncomingEvent::ClipboardProgress {
@@ -547,7 +547,7 @@ async fn receive_loop(
                         if received < last_reported {
                             last_reported = 0;
                         }
-                        // ~1% steps only — the frontend channel is small
+                        // ~1% steps only -- the frontend channel is small
                         if received - last_reported >= (total / 100).max(1) {
                             last_reported = received;
                             let _ = tx.send((
@@ -633,5 +633,68 @@ mod tests {
         assert!(bind_addr_for(v4).is_ipv4());
         let v6: SocketAddr = "[fe80::1]:4242".parse().unwrap();
         assert!(bind_addr_for(v6).is_ipv6());
+    }
+
+    /// payloads above the single-datagram budget must travel as
+    /// fragment datagrams -- a bigger datagram gets IP-fragmented and
+    /// one lost slice silently drops the whole transfer
+    #[tokio::test]
+    async fn oversized_clipboard_uses_fragment_datagrams() {
+        use lan_mouse_proto::{
+            CLIPBOARD_FRAGMENT_HEADER, CLIPBOARD_FRAGMENT_PAYLOAD, is_clipboard_fragment_type,
+        };
+        use tokio::net::UdpSocket;
+
+        let max_dgram = CLIPBOARD_FRAGMENT_PAYLOAD + CLIPBOARD_FRAGMENT_HEADER;
+
+        async fn send_and_collect(payload_len: usize) -> Vec<Vec<u8>> {
+            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            sender
+                .connect(receiver.local_addr().unwrap())
+                .await
+                .unwrap();
+            let conn: Arc<dyn Conn + Send + Sync> = Arc::new(sender);
+            let encoded = vec![0xABu8; payload_len];
+            send_clipboard_datagrams(&conn, &encoded, None)
+                .await
+                .unwrap();
+
+            let mut datagrams = Vec::new();
+            let mut buf = vec![0u8; 66_000];
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_millis(200), receiver.recv(&mut buf)).await
+            {
+                datagrams.push(buf[..n].to_vec());
+            }
+            datagrams
+        }
+
+        // a small payload goes out as a single legacy datagram
+        let datagrams = send_and_collect(500).await;
+        assert_eq!(datagrams.len(), 1);
+        assert_eq!(datagrams[0].len(), 500);
+        assert!(!is_clipboard_fragment_type(datagrams[0][0]));
+
+        // a 2KB payload -- previously one IP-fragmented datagram -- now
+        // travels as two fragment datagrams under the MTU budget
+        let datagrams = send_and_collect(2000).await;
+        assert_eq!(datagrams.len(), 2);
+        for dgram in &datagrams {
+            assert!(
+                dgram.len() <= max_dgram,
+                "datagram of {} bytes exceeds the fragment budget",
+                dgram.len()
+            );
+            assert!(is_clipboard_fragment_type(dgram[0]));
+        }
+
+        // and a >64KB payload still fragments instead of erroring
+        let datagrams = send_and_collect(70_000).await;
+        assert!(datagrams.len() > 2);
+        for dgram in &datagrams {
+            assert!(dgram.len() <= max_dgram);
+            assert!(is_clipboard_fragment_type(dgram[0]));
+        }
     }
 }
