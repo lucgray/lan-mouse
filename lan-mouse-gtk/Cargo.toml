@@ -10,7 +10,6 @@ repository = "https://github.com/feschber/lan-mouse"
 gtk = { package = "gtk4", version = "0.9.0", features = ["v4_2"] }
 adw = { package = "libadwaita", version = "0.7.0", features = ["v1_1"] }
 async-channel = { version = "2.1.1" }
-gettextrs = { package = "gettext-rs", version = "0.8.0", features = ["gettext-system"] }
 hostname = "0.4.0"
 log = "0.4.20"
 input-event = { path = "../input-event", version = "0.4.0" }
@@ -36,3 +35,9 @@ polib = "0.3.0"
 [features]
 default = ["wayland_window_identifier"]
 wayland_window_identifier = ["dep:gdk4_wayland"]
+
+# gettext links the platform libintl — glibc on Linux shares its registry
+# with GTK's builder translation; on Windows gettext-sys cannot build
+# (autotools under MSVC), so i18n falls back to an in-crate .mo lookup
+[target.'cfg(unix)'.dependencies]
+gettextrs = { package = "gettext-rs", version = "0.8.0", features = ["gettext-system"] }

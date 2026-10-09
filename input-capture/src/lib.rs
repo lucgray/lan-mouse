@@ -378,6 +378,10 @@ impl Stream for InputCapture {
     }
 }
 
+// async_trait 0.1.89 marks its generated futures `#[must_use]`, which
+// clippy 1.99's double_must_use flags; the attribute is macro output,
+// not ours, so allow it at the trait until the macro stops emitting it
+#[allow(clippy::double_must_use)]
 #[async_trait]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a new client with the given id
