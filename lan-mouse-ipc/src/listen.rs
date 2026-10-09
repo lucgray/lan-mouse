@@ -56,9 +56,13 @@ pub struct AsyncFrontendListener {
     /// `frontend_connected` cannot stay stuck on a dead stream
     tx_streams: HashMap<u64, mpsc::Sender<String>>,
     /// per-connection kill switch — resolves the tagged read stream
-    /// (via take_until) so a dropped client releases reader, writer
-    /// and socket, not just its outbound queue
+    /// (via take_until) so a dropped client releases its read half
     kill: HashMap<u64, oneshot::Sender<()>>,
+    /// writer task handles — a writer parked in `write_all` by
+    /// backpressure never polls its queue, so it cannot notice the
+    /// sender being dropped; drop_conn must abort it explicitly to
+    /// release the socket's write half
+    writers: HashMap<u64, tokio::task::JoinHandle<()>>,
     next_conn_id: u64,
 }
 
@@ -82,6 +86,7 @@ impl AsyncFrontendListener {
                 line_streams: SelectAll::new(),
                 tx_streams: HashMap::new(),
                 kill: HashMap::new(),
+                writers: HashMap::new(),
                 next_conn_id: 0,
             })
         }
@@ -119,6 +124,7 @@ impl AsyncFrontendListener {
             line_streams: SelectAll::new(),
             tx_streams: HashMap::new(),
             kill: HashMap::new(),
+            writers: HashMap::new(),
             next_conn_id: 0,
         })
     }
@@ -160,11 +166,16 @@ impl AsyncFrontendListener {
     }
 
     /// release every resource of one connection: the outbound queue
-    /// (sender drop ends the writer task, which drops the write half)
-    /// and the read stream (kill resolves take_until, which drops the
-    /// read half) — the client's socket fully closes
+    /// sender (so a queued writer ends), the writer task itself (it
+    /// may be parked in `write_all` on a non-reading client — abort
+    /// drops the socket's write half), and the read stream (kill
+    /// resolves take_until, dropping the read half) — the client's
+    /// socket fully closes
     fn drop_conn(&mut self, id: u64) {
         self.tx_streams.remove(&id);
+        if let Some(writer) = self.writers.remove(&id) {
+            writer.abort();
+        }
         if let Some(kill) = self.kill.remove(&id) {
             let _ = kill.send(());
         }
@@ -222,7 +233,7 @@ impl Stream for AsyncFrontendListener {
             // frame lands; a wedged client only blocks its own task
             let (msg_tx, mut msg_rx) = mpsc::channel::<String>(FRONTEND_QUEUE);
             self.tx_streams.insert(id, msg_tx);
-            tokio::spawn(async move {
+            let writer = tokio::spawn(async move {
                 let mut tx: ConnWriter = tx;
                 while let Some(msg) = msg_rx.recv().await {
                     if tx.write_all(msg.as_bytes()).await.is_err() {
@@ -230,6 +241,7 @@ impl Stream for AsyncFrontendListener {
                     }
                 }
             });
+            self.writers.insert(id, writer);
             sync = true;
         }
         if sync {
@@ -248,6 +260,17 @@ mod tests {
     /// unique socket path per test so parallel tests don't collide
     fn test_socket_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("lan-mouse-test-{name}-{}.sock", std::process::id()))
+    }
+
+    /// drive one poll cycle: a kill only takes effect once the
+    /// SelectAll drains the ended stream — in production the service
+    /// loop polls continuously, tests must do it explicitly
+    async fn pump(listener: &mut AsyncFrontendListener) {
+        futures::future::poll_fn(|cx| {
+            let _ = listener.poll_next_unpin(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
     }
 
     /// a dropped frontend must release reader, writer, queue and the
@@ -271,13 +294,7 @@ mod tests {
         assert!(!listener.frontend_connected());
         assert!(listener.tx_streams.is_empty());
         assert!(listener.kill.is_empty());
-        // a kill only takes effect once the SelectAll drains the ended
-        // stream — in production the service loop polls continuously
-        futures::future::poll_fn(|cx| {
-            let _ = listener.poll_next_unpin(cx);
-            std::task::Poll::Ready(())
-        })
-        .await;
+        pump(&mut listener).await;
 
         // once both halves drop the client sees EOF
         let mut buf = [0u8; 1];
@@ -336,5 +353,55 @@ mod tests {
             .expect("good client read timed out")
             .expect("read");
         assert!(n > 0);
+    }
+
+    /// a writer parked in `write_all` by a non-reading client never
+    /// polls its queue, so removing the sender alone cannot end it —
+    /// drop_conn must abort the task for the socket's write half to
+    /// be released. Before that fix this test timed out on read: the
+    /// stuck client's socket stayed half-open forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_writer_aborted_releases_socket() {
+        let path = test_socket_path("blocked-writer");
+        let mut listener = AsyncFrontendListener::new_with_path(path.clone())
+            .await
+            .expect("listener");
+        // a client that never reads: its writer ends up parked in
+        // write_all once the socket buffer fills
+        let mut stuck = UnixStream::connect(&path).await.expect("connect stuck");
+        let _ = listener.next().await;
+        assert!(listener.frontend_connected());
+
+        // flood until the queue overflows and the conn is dropped —
+        // at that point the writer task is blocked in write_all, not
+        // in recv(), so only abort() can stop it
+        let big = FrontendEvent::Error("x".repeat(64 * 1024));
+        for _ in 0..512 {
+            listener.broadcast(big.clone()).await;
+            tokio::task::yield_now().await;
+            if !listener.frontend_connected() {
+                break;
+            }
+        }
+        assert!(
+            !listener.frontend_connected(),
+            "stuck client was never dropped (socket buffers too large?)"
+        );
+        assert!(listener.writers.is_empty());
+        pump(&mut listener).await;
+
+        // both halves released → after draining whatever the writer
+        // pushed before the abort, the client observes EOF promptly
+        let mut buf = vec![0u8; 64 * 1024];
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let n = stuck.read(&mut buf).await.expect("client read");
+                if n == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("client read timed out — blocked writer still holds the socket");
     }
 }
