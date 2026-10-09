@@ -60,6 +60,10 @@ pub enum ProtocolError {
     /// buffer too small for clipboard data
     #[error("buffer too small for clipboard data")]
     BufferTooSmall,
+    /// malformed or inconsistent fragment header — the values a
+    /// peer sent cannot describe a valid transfer
+    #[error("invalid clipboard fragment header")]
+    InvalidFragment,
 }
 
 /// Position of a client
@@ -657,15 +661,21 @@ impl ClipboardReassembler {
         let seq = u32::from_be_bytes(dgram[5..9].try_into().unwrap());
         let num = u32::from_be_bytes(dgram[9..13].try_into().unwrap());
         let id = u32::from_be_bytes(dgram[13..17].try_into().unwrap());
+        // `num` must match the sender's fragment count exactly —
+        // `clipboard_fragment_at`/`ClipboardFragmenter` derive it as
+        // `total.div_ceil(PAYLOAD)`, so any other value is a forged
+        // header. An oversized `num` would blow up `seen` (~536MB per
+        // u32::MAX) and index `data` out of bounds; an undersized one
+        // truncates the transfer.
         if total == 0
             || num == 0
             || seq >= num
             || total as usize > MAX_CLIPBOARD_TRANSFER_SIZE
-            || (num as u64) < (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64)
+            || (num as u64) != (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64)
             || dgram.len() - CLIPBOARD_FRAGMENT_HEADER > CLIPBOARD_FRAGMENT_PAYLOAD
         {
             self.reset();
-            return Err(ProtocolError::BufferTooSmall);
+            return Err(ProtocolError::InvalidFragment);
         }
         let stale = self
             .last_fragment
@@ -1200,5 +1210,92 @@ mod tests {
         assert_eq!(reasm.missing_seqs(10), vec![1, 3]);
         assert_eq!(reasm.missing_seqs(1), vec![1]);
         assert!(!reasm.wants_request()); // no quiet period yet
+    }
+
+    /// craft a fragment datagram with arbitrary header values
+    fn forged_fragment(total: u32, seq: u32, num: u32, id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut dgram = Vec::with_capacity(CLIPBOARD_FRAGMENT_HEADER + payload.len());
+        dgram.push(EventType::ClipboardFragment as u8);
+        dgram.extend_from_slice(&total.to_be_bytes());
+        dgram.extend_from_slice(&seq.to_be_bytes());
+        dgram.extend_from_slice(&num.to_be_bytes());
+        dgram.extend_from_slice(&id.to_be_bytes());
+        dgram.extend_from_slice(payload);
+        dgram
+    }
+
+    #[test]
+    fn reassembler_rejects_oversized_num() {
+        // a peer-controlled `num` bigger than ceil(total/PAYLOAD) used
+        // to resize `seen` to ~536MB for u32::MAX and allowed seq
+        // values that indexed `data` out of bounds — must be rejected
+        let mut reasm = ClipboardReassembler::new();
+        let dgram = forged_fragment(1200, 0, u32::MAX, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+        // huge but plausible-looking num is rejected equally
+        let dgram = forged_fragment(1200, 0, 1_000_000, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+    }
+
+    #[test]
+    fn reassembler_rejects_undersized_num_and_seq_out_of_range() {
+        let mut reasm = ClipboardReassembler::new();
+        // num too small to hold `total`
+        let dgram = forged_fragment(10_000, 0, 1, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+        // seq >= num
+        let dgram = forged_fragment(2400, 2, 2, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+        // total above the transfer cap
+        let dgram = forged_fragment(
+            MAX_CLIPBOARD_TRANSFER_SIZE as u32 + 1200,
+            0,
+            218_455,
+            1,
+            &[0u8; 16],
+        );
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+    }
+
+    #[test]
+    fn reassembler_valid_transfer_unaffected() {
+        // a transfer produced by the real fragmenter must still pass —
+        // the tightened `num` check uses the same formula as the sender
+        let mut reasm = ClipboardReassembler::new();
+        let encoded = vec![9u8; CLIPBOARD_FRAGMENT_PAYLOAD * 2 + 5];
+        let frags: Vec<Vec<u8>> = ClipboardFragmenter::new(&encoded).collect();
+        assert_eq!(frags.len(), 3);
+        assert!(reasm.push(&frags[0]).unwrap().is_none());
+        assert!(reasm.push(&frags[1]).unwrap().is_none());
+        // exact-boundary tail: total % PAYLOAD != 0
+        let out = reasm.push(&frags[2]).unwrap().expect("complete");
+        assert_eq!(out, encoded);
+    }
+
+    #[test]
+    fn reassembler_valid_transfer_exact_multiple() {
+        // total is an exact multiple of PAYLOAD — last fragment index
+        // must not trip the bounds arithmetic
+        let mut reasm = ClipboardReassembler::new();
+        let encoded = vec![9u8; CLIPBOARD_FRAGMENT_PAYLOAD * 2];
+        let frags: Vec<Vec<u8>> = ClipboardFragmenter::new(&encoded).collect();
+        assert!(reasm.push(&frags[0]).unwrap().is_none());
+        let out = reasm.push(&frags[1]).unwrap().expect("complete");
+        assert_eq!(out, encoded);
     }
 }
