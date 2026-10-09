@@ -63,3 +63,64 @@ Run from repo root—no `cd` in scripts.
 2. Implement minimal change; flag follow-up work.
 3. Add proportional tests; run `cargo test` on affected crates.
 4. Run `cargo fmt` and `cargo clippy --workspace --all-targets --all-features`.
+
+## Commit conventions
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<optional scope>): <imperative summary ≤ 72 chars>
+
+<optional body: motivation and approach, wrapped at 72 chars>
+```
+
+- Types: `feat`, `fix`, `refactor`, `perf`, `docs`, `test`, `build`, `ci`, `chore`, `revert`.
+- Scope (optional, lowercase): the touched component — e.g. `gtk`, `wlroots`, `evdev`, `proto`, `ipc`, `clipboard`, `windows`, `macos`, `ci`.
+- Summary: imperative mood ("add", "fix", "handle"), no trailing period. `fix:` must describe the user-visible bug, not the code change ("fix scroll direction on evdev receivers", not "negate value").
+- Body: explain *why* (root cause, link to issue/PR number) and anything non-obvious about *how*. Reference issues as `#123` or full URLs to upstream (`feschber/lan-mouse#123`).
+- Breaking protocol changes: footer `BREAKING-CHANGE: <what breaks>` and bump `PROTOCOL_VERSION`.
+- One logical change per commit — don't mix a fix with unrelated cleanup.
+
+## Pull request conventions
+
+- Title: same format as commits (`fix(wlroots): keep locked modifiers out of depressed mask`).
+- Body: fill in `.github/PULL_REQUEST_TEMPLATE.md` — Summary (what and why, for a reader who hasn't seen the diff), Changes, Testing (commands actually run and their results), Follow-ups. Attach screenshots/screencasts for UI changes.
+- Link issues (`Fixes #123`, `Refs feschber/lan-mouse#456`) so they auto-close.
+- One PR = one logical change. Split refactorings from behavior changes.
+- Keep PRs reviewable: explain non-obvious decisions in the body rather than inline comments.
+- Never `@mention` users; describe community contributions neutrally (e.g. "ported from upstream PR").
+
+## Issue conventions
+
+Use the templates under `.github/ISSUE_TEMPLATE/`. A well-formed report includes:
+
+- **Environment**: OS + version, display server/compositor (`echo $XDG_SESSION_TYPE`), Lan Mouse version/commit, role (sender/receiver), backend flags.
+- **Reproduction**: minimal numbered steps; state whether it reproduces on the physical keyboard/mouse.
+- **Expected vs actual behavior.**
+- **Logs**: `LAN_MOUSE_LOG_LEVEL=debug` output, attached as file — never screenshot text.
+- For upstream issues fixed by this fork, note the fixing commit/tag.
+
+## Logging
+
+The codebase uses the `log` facade; `env_logger` selects output via `LAN_MOUSE_LOG_LEVEL` (e.g. `info,input_capture::clipboard=debug`).
+
+- Never `println!`/`eprintln!` in library or daemon code — always the `log` macros.
+- Levels:
+  - `error!` — operation failed and the user is affected (connect lost, backend died, config write failed). Every `error!` should also reach the frontend when a user action caused it — see Error handling.
+  - `warn!` — recovered from something abnormal (retry succeeded, peer vanished, oversized clipboard dropped).
+  - `info!` — lifecycle and user-visible state changes (client connected/activated, port changed, config written). Sparse; a healthy session should be quiet.
+  - `debug!` — diagnostics for bug reports (event details, decisions, fallbacks). May include event payloads but never secrets.
+  - `trace!` — hot-path spam (per-event/packet); kept off by default.
+- Messages: lowercase, no trailing punctuation, carry context — include the peer handle/addr, path, fd, or backend name so a stranger can locate the source (`"emulation backend wlroots failed to release key {key}: {e}"`, not `"release failed"`).
+- No sensitive data: never log certificates, private keys, or fingerprints of other machines beyond what the UI already shows.
+- Logs are for operators; user-facing notices go through `FrontendEvent` toasts instead of or in addition to logs.
+
+## Error handling
+
+- **No silent failures.** Every `Result` must be propagated with `?`, or explicitly logged if deliberately ignored (`let _ =` requires a comment justifying why the error is impossible/irrelevant). This is what kept bugs like the clipboard UTF-8 panic from being noticed.
+- Library crates (input-*) return typed `thiserror` errors — one enum per failure surface, `#[error]` strings lowercase with context. Don't wrap everything in `anyhow`; the root `LanMouseError` aggregates typed errors.
+- `Option`: `unwrap`/`expect` only when the invariant is locally provable (e.g. value just inserted) — prefer `let Some(x) = ... else { ... }` with a log line for "impossible" states that would indicate a bug elsewhere.
+- **Panic containment**: anything that formats or slices user/peer-supplied data (clipboard text, hostnames, protocol bytes) must be boundary-safe — string slices use `floor_char_boundary`/`.chars()`, byte buffers use length checks. A malformed packet must not panic the daemon.
+- **Surfacing to the user**: failures a user should see (config not writable, port busy, backend unavailable, clipboard transfer failed) go to `FrontendEvent::Error`/`Status` so the GTK frontend shows a toast — log *and* notify, don't pick one.
+- Fatal startup errors: log `error!` and exit non-zero; daemon runtime errors: log `error!`, notify frontend, keep serving other clients.
+- `std::process::exit`/`abort` only in `main.rs` paths, never inside library code.

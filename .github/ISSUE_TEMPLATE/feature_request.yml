@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose new functionality for Lan Mouse (fork)
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that Lan Mouse can't do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like, and where it should live (config.toml, GTK settings, CLI flag, protocol).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or other tools you currently use.
+    validations:
+      required: false
+  - type: input
+    id: upstream
+    attributes:
+      label: Related upstream issue/PR
+      description: If feschber/lan-mouse has a matching issue or unmerged PR, link it.
+      placeholder: feschber/lan-mouse#123
+    validations:
+      required: false
