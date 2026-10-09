@@ -312,3 +312,23 @@ msgstr "选择下载目录"
 #. src/settings_window.rs — file chooser button
 msgid "Select"
 msgstr "选择"
+
+#. settings_window.ui — notifications combo
+msgid "Notifications"
+msgstr "通知方式"
+
+#. settings_window.ui — notifications combo subtitle
+msgid "Where hints like \"clipboard shared\" are shown"
+msgstr "“剪贴板已共享”等提示的显示位置"
+
+#. settings_window.ui — notification mode options
+msgid "In-app banner"
+msgstr "应用内横幅"
+
+#. settings_window.ui — notification mode options
+msgid "System notifications"
+msgstr "系统通知"
+
+#. settings_window.ui — notification mode options
+msgid "Banner and system notifications"
+msgstr "横幅和系统通知"

@@ -453,9 +453,27 @@ impl Window {
         };
     }
 
+    /// user-facing hint — routed by the configured notification mode:
+    /// "app" shows the in-window banner, "system" an OS notification
+    /// (which still reaches the user while the window is hidden to the
+    /// tray), "both" shows both.
     pub(super) fn show_toast(&self, msg: &str) {
-        let toast = adw::Toast::new(msg);
-        self.add_toast(toast);
+        let mode = self.imp().settings.borrow().notification_mode.clone();
+        let mode = if mode.is_empty() {
+            "app"
+        } else {
+            mode.as_str()
+        };
+        if mode != "system" {
+            self.add_toast(adw::Toast::new(msg));
+        }
+        if mode == "system" || mode == "both" {
+            if let Some(app) = self.application() {
+                let notification = gio::Notification::new(&gettext("Lan Mouse"));
+                notification.set_body(Some(msg));
+                app.send_notification(None, &notification);
+            }
+        }
     }
 
     pub(super) fn add_toast(&self, toast: adw::Toast) {
@@ -633,6 +651,11 @@ impl Window {
             move |delay, interval| {
                 window.request(FrontendRequest::SetKeyRepeat { delay, interval })
             }
+        ));
+        settings_window.connect_notification_mode_changed(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |mode| window.request(FrontendRequest::SetNotificationMode(mode.to_string()))
         ));
         self.imp()
             .settings_window

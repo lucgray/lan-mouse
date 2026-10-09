@@ -261,19 +261,23 @@ impl LanMouseListener {
         }
     }
 
+    /// Reply to an incoming peer's clipboard share. Returns `true` when
+    /// the payload was handed to the connection, `false` when the send
+    /// failed (encode error, peer not connected or a datagram write
+    /// error) so the service can surface it to the user.
     pub(crate) async fn reply_clipboard(
         &self,
         addr: SocketAddr,
         event: ProtoEvent,
         progress: Option<&Sender<(u64, u64)>>,
-    ) {
+    ) -> bool {
         use lan_mouse_proto::encode_clipboard_event;
 
         let buf = match encode_clipboard_event(&event) {
             Ok(b) => b,
             Err(e) => {
                 log::error!("Failed to encode clipboard event: {}", e);
-                return;
+                return false;
             }
         };
 
@@ -286,12 +290,20 @@ impl LanMouseListener {
         let conns = self.conns.lock().await;
         for (a, conn) in conns.iter() {
             if *a == addr {
-                match crate::connect::send_clipboard_datagrams(conn, &buf, progress).await {
-                    Ok(_) => log::debug!("Clipboard sent successfully to {}", addr),
-                    Err(e) => log::error!("Failed to send clipboard to {}: {:?}", addr, e),
-                }
+                return match crate::connect::send_clipboard_datagrams(conn, &buf, progress).await {
+                    Ok(_) => {
+                        log::debug!("Clipboard sent successfully to {}", addr);
+                        true
+                    }
+                    Err(e) => {
+                        log::error!("Failed to send clipboard to {}: {:?}", addr, e);
+                        false
+                    }
+                };
             }
         }
+        log::warn!("cannot reply clipboard to {addr}: peer not connected");
+        false
     }
 
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {

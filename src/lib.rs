@@ -8,6 +8,7 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+mod notify;
 mod remap;
 mod scroll;
 pub mod service;

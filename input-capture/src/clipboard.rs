@@ -33,7 +33,9 @@ fn file_name(path: &std::path::Path) -> Option<String> {
 }
 
 /// read the clipboard's signature: file list first (a copied file may
-/// also offer its path as text), then text, then images.
+/// also offer its path as text), then images, then text. An image wins
+/// over text because applications that copy an image commonly also offer
+/// alt text or a URL for it — the image is the more specific payload.
 /// Returns `None` for empty or unsupported content.
 fn read_clipboard_sig(clipboard: &mut Clipboard) -> Option<ContentSig> {
     match clipboard.get().file_list() {
@@ -43,13 +45,6 @@ fn read_clipboard_sig(clipboard: &mut Clipboard) -> Option<ContentSig> {
             ));
         }
         _ => {}
-    }
-    match clipboard.get_text() {
-        Ok(text) => {
-            log::trace!("Clipboard text read: {} bytes", text.len());
-            return Some(ContentSig::Text(text));
-        }
-        Err(e) => log::trace!("No clipboard text: {}", e),
     }
     match clipboard.get_image() {
         Ok(image) => {
@@ -69,6 +64,13 @@ fn read_clipboard_sig(clipboard: &mut Clipboard) -> Option<ContentSig> {
             }
         }
         Err(e) => log::trace!("No clipboard image: {}", e),
+    }
+    match clipboard.get_text() {
+        Ok(text) => {
+            log::trace!("Clipboard text read: {} bytes", text.len());
+            return Some(ContentSig::Text(text));
+        }
+        Err(e) => log::trace!("No clipboard text: {}", e),
     }
     None
 }
@@ -235,6 +237,14 @@ impl ClipboardMonitor {
     }
 
     /// Update the last known clipboard content (called when we set the clipboard)
+    /// forget the recorded signature so the next identical clipboard
+    /// content is treated as a fresh change — used when a share attempt
+    /// failed and the user may copy the same content again to retry.
+    pub fn clear_last_sig(&self) {
+        let mut last_sig = self.last_sig.lock().unwrap();
+        *last_sig = None;
+    }
+
     /// This prevents detecting our own clipboard changes as external changes
     pub fn update_last_content(&self, content: ClipboardEvent) {
         let mut last_sig = self.last_sig.lock().unwrap();

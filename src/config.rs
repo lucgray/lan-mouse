@@ -103,6 +103,9 @@ struct ConfigToml {
     /// UI language override, e.g. "zh_CN" — unset means "follow the
     /// system locale". Consumed by the GTK frontend (gettext `LANGUAGE`).
     language: Option<String>,
+    /// where user-facing hints are shown: "app" (in-window banner,
+    /// default), "system" (OS notifications) or "both"
+    notification_mode: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -825,6 +828,17 @@ impl Config {
 
     pub fn set_language(&mut self, language: Option<String>) {
         self.toml_mut().language = language;
+    }
+
+    /// "app" | "system" | "both" — None keeps the built-in default.
+    pub fn notification_mode(&self) -> Option<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.notification_mode.clone())
+    }
+
+    pub fn set_notification_mode(&mut self, mode: Option<String>) {
+        self.toml_mut().notification_mode = mode;
     }
 
     /// Key-repeat timing in milliseconds — None restores backend defaults.

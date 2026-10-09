@@ -33,6 +33,13 @@
       <item>中文（简体）</item>
     </items>
   </object>
+  <object class="GtkStringList" id="notification_model">
+    <items>
+      <item translatable="yes">In-app banner</item>
+      <item translatable="yes">System notifications</item>
+      <item translatable="yes">Banner and system notifications</item>
+    </items>
+  </object>
   <template class="SettingsWindow" parent="AdwPreferencesWindow">
     <property name="title" translatable="yes">Preferences</property>
     <property name="default-width">560</property>
@@ -47,6 +54,13 @@
                 <property name="title" translatable="yes">Language</property>
                 <property name="subtitle" translatable="yes">Restart Lan Mouse to apply</property>
                 <property name="model">language_model</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwComboRow" id="notification_row">
+                <property name="title" translatable="yes">Notifications</property>
+                <property name="subtitle" translatable="yes">Where hints like &quot;clipboard shared&quot; are shown</property>
+                <property name="model">notification_model</property>
               </object>
             </child>
           </object>

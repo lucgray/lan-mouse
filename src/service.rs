@@ -85,6 +85,30 @@ pub struct Service {
     /// outgoing clipboard transfer progress (fed by send loops)
     clipboard_progress_tx: local_channel::mpsc::Sender<(u64, u64)>,
     clipboard_progress_rx: local_channel::mpsc::Receiver<(u64, u64)>,
+    /// completion reports for clipboard sends (`batch id`, `ok`) — the
+    /// "shared" hint fires only once every send of a batch reported back
+    clipboard_send_done_tx: local_channel::mpsc::Sender<(u64, bool)>,
+    clipboard_send_done_rx: local_channel::mpsc::Receiver<(u64, bool)>,
+    /// a local clipboard change fans out to N peers; each batch resolves
+    /// when all its sends report
+    pending_clipboard_batches: HashMap<u64, PendingSendBatch>,
+    next_clipboard_batch: u64,
+    /// result reports from detached local-clipboard-write tasks:
+    /// `Ok` carries (kind, bytes) for the "received" hint, `Err` the
+    /// failure text for a user-visible error
+    clipboard_applied_tx:
+        local_channel::mpsc::Sender<Result<(input_event::ClipboardContentKind, usize), String>>,
+    clipboard_applied_rx:
+        local_channel::mpsc::Receiver<Result<(input_event::ClipboardContentKind, usize), String>>,
+}
+
+/// one local clipboard change fanned out to N peers
+struct PendingSendBatch {
+    kind: input_event::ClipboardContentKind,
+    bytes: usize,
+    expected: u32,
+    done: u32,
+    ok: u32,
 }
 
 #[derive(Debug)]
@@ -157,6 +181,8 @@ impl Service {
 
         let port = config.port();
         let (clipboard_progress_tx, clipboard_progress_rx) = local_channel::mpsc::channel();
+        let (clipboard_send_done_tx, clipboard_send_done_rx) = local_channel::mpsc::channel();
+        let (clipboard_applied_tx, clipboard_applied_rx) = local_channel::mpsc::channel();
         let service = Self {
             config,
             capture,
@@ -181,6 +207,12 @@ impl Service {
             window_identifier,
             clipboard_progress_tx,
             clipboard_progress_rx,
+            clipboard_send_done_tx,
+            clipboard_send_done_rx,
+            pending_clipboard_batches: Default::default(),
+            next_clipboard_batch: 0,
+            clipboard_applied_tx,
+            clipboard_applied_rx,
         };
         Ok(service)
     }
@@ -231,6 +263,26 @@ impl Service {
                             received,
                             total,
                         });
+                    }
+                },
+                done = self.clipboard_send_done_rx.recv() => {
+                    if let Some((batch, ok)) = done {
+                        self.record_clipboard_send_done(batch, ok);
+                    }
+                },
+                applied = self.clipboard_applied_rx.recv() => {
+                    match applied {
+                        Some(Ok((kind, bytes))) => {
+                            self.notify_frontend(FrontendEvent::ClipboardShared {
+                                received: true,
+                                kind,
+                                bytes,
+                            });
+                        }
+                        Some(Err(e)) => {
+                            self.notify_frontend(FrontendEvent::Error(e));
+                        }
+                        None => {}
                     }
                 },
             }
@@ -311,6 +363,7 @@ impl Service {
             FrontendRequest::SetClipboardEnabled(enabled) => self.set_clipboard_enabled(enabled),
             FrontendRequest::SetDownloadDir(dir) => self.set_download_dir(dir),
             FrontendRequest::SetLanguage(lang) => self.set_language(lang),
+            FrontendRequest::SetNotificationMode(mode) => self.set_notification_mode(mode),
             FrontendRequest::SetKeyRepeat { delay, interval } => {
                 self.set_key_repeat(delay, interval)
             }
@@ -474,11 +527,17 @@ impl Service {
                     if let Some(ref clipboard_emulation) = self.clipboard_emulation {
                         if let Err(e) = clipboard_emulation.set(clipboard_event.clone()).await {
                             log::warn!("Failed to set clipboard: {}", e);
+                            self.notify_frontend(FrontendEvent::Error(format!(
+                                "failed to apply received clipboard: {e}"
+                            )));
                         } else {
                             self.notify_clipboard_shared(&clipboard_event, true);
                         }
                     }
                 }
+            }
+            EmulationEvent::ClipboardSendDone { batch, ok } => {
+                self.record_clipboard_send_done(batch, ok);
             }
         }
     }
@@ -522,13 +581,22 @@ impl Service {
                         monitor.update_last_content(clipboard_event.clone());
                     }
                     if let Some(ref clipboard_emulation) = self.clipboard_emulation {
-                        // Spawn async task to set clipboard
+                        // the "received" hint fires when the write task
+                        // reports back — before that, success is unknown
                         let clipboard_emulation = clipboard_emulation.clone();
-                        self.notify_clipboard_shared(&clipboard_event, true);
+                        let applied_tx = self.clipboard_applied_tx.clone();
                         tokio::task::spawn_local(async move {
-                            if let Err(e) = clipboard_emulation.set(clipboard_event).await {
-                                log::warn!("Failed to set clipboard: {}", e);
-                            }
+                            let result =
+                                match clipboard_emulation.set(clipboard_event.clone()).await {
+                                    Ok(()) => {
+                                        Ok((clipboard_event.kind(), clipboard_event.content_len()))
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to set clipboard: {}", e);
+                                        Err(format!("failed to apply received clipboard: {e}"))
+                                    }
+                                };
+                            let _ = applied_tx.send(result);
                         });
                     }
                 }
@@ -576,23 +644,32 @@ impl Service {
             // Send clipboard to all active clients (machines we're controlling)
             let active_clients: Vec<_> = self.client_manager.active_clients().into_iter().collect();
 
-            let mut shared = false;
+            let batch_id = self.next_clipboard_batch;
+            self.next_clipboard_batch += 1;
+            let mut expected = 0u32;
             for handle in active_clients {
                 // large payloads take seconds on the wire — run each
                 // send detached so the service loop (and the progress
-                // events it reports) keeps running
+                // events it reports) keeps running; every send reports
+                // its outcome so the "shared" hint is honest
                 let sender = self.conn_sender.clone();
                 let progress_tx = self.clipboard_progress_tx.clone();
+                let done_tx = self.clipboard_send_done_tx.clone();
                 let event = proto_event.clone();
                 tokio::task::spawn_local(async move {
-                    if let Err(e) = sender
+                    let ok = match sender
                         .send_clipboard(event, handle, Some(&progress_tx))
                         .await
                     {
-                        log::warn!("Failed to send clipboard to client {}: {}", handle, e);
-                    }
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Failed to send clipboard to client {}: {}", handle, e);
+                            false
+                        }
+                    };
+                    let _ = done_tx.send((batch_id, ok));
                 });
-                shared = true;
+                expected += 1;
             }
 
             // Also send clipboard to all incoming connections (machines controlling us)
@@ -608,14 +685,57 @@ impl Service {
                     addr,
                     clipboard_event.clone(),
                     Some(self.clipboard_progress_tx.clone()),
+                    batch_id,
                 );
-                shared = true;
+                expected += 1;
             }
 
-            // only hint when the content actually went somewhere
-            if shared {
-                self.notify_clipboard_shared(&clipboard_event, false);
+            if expected > 0 {
+                self.pending_clipboard_batches.insert(
+                    batch_id,
+                    PendingSendBatch {
+                        kind: clipboard_event.kind(),
+                        bytes: clipboard_event.content_len(),
+                        expected,
+                        done: 0,
+                        ok: 0,
+                    },
+                );
             }
+        }
+    }
+
+    /// one send of a clipboard batch finished. The "shared" hint fires
+    /// only when every send reported — as success when at least one
+    /// peer got it, as an error (with retry allowed) when all failed.
+    fn record_clipboard_send_done(&mut self, batch: u64, ok: bool) {
+        let Some(mut b) = self.pending_clipboard_batches.remove(&batch) else {
+            return;
+        };
+        b.done += 1;
+        if ok {
+            b.ok += 1;
+        }
+        if b.done < b.expected {
+            self.pending_clipboard_batches.insert(batch, b);
+            return;
+        }
+        if b.ok > 0 {
+            self.notify_frontend(FrontendEvent::ClipboardShared {
+                received: false,
+                kind: b.kind,
+                bytes: b.bytes,
+            });
+        } else {
+            // every send failed — forget the recorded signature so the
+            // user can retry by copying the same content again
+            if let Some(ref monitor) = self.clipboard_monitor {
+                monitor.clear_last_sig();
+            }
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "clipboard share failed — could not reach any of {} peer(s)",
+                b.expected
+            )));
         }
     }
 
@@ -716,6 +836,11 @@ impl Service {
     }
 
     fn notify_frontend(&mut self, event: FrontendEvent) {
+        // headless fallback: without a frontend there is no window to
+        // host a banner — surface user-facing events as OS notifications
+        if !self.frontend_listener.frontend_connected() {
+            crate::notify::notify_for_event(&event);
+        }
         self.pending_frontend_events.push_back(event);
         self.frontend_event_pending.notify_one();
     }
@@ -970,6 +1095,22 @@ impl Service {
         self.notify_settings();
     }
 
+    /// app/system/both — validated against the known modes, anything
+    /// else is dropped with a warning so a typo can't silence hints
+    fn set_notification_mode(&mut self, mode: String) {
+        const MODES: [&str; 3] = ["app", "system", "both"];
+        if !MODES.contains(&mode.as_str()) {
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "invalid notification mode '{mode}' — expected one of {MODES:?}"
+            )));
+            return;
+        }
+        log::info!("notification mode set to {mode}");
+        self.config.set_notification_mode(Some(mode));
+        self.save_config();
+        self.notify_settings();
+    }
+
     /// push the current settings to the frontend
     fn notify_settings(&mut self) {
         self.notify_frontend(FrontendEvent::Settings {
@@ -985,7 +1126,15 @@ impl Service {
                 .emulation_options()
                 .key_repeat_interval
                 .as_millis() as u64,
+            notification_mode: self.notification_mode(),
         });
+    }
+
+    /// "app" | "system" | "both" — the GTK default is "app"
+    fn notification_mode(&self) -> String {
+        self.config
+            .notification_mode()
+            .unwrap_or_else(|| "app".to_string())
     }
 
     /// let the frontend know clipboard content travelled in either direction

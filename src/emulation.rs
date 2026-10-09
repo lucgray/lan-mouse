@@ -73,6 +73,13 @@ pub(crate) enum EmulationEvent {
         received: u64,
         total: u64,
     },
+    /// a clipboard reply to an incoming peer finished. `ok` is false
+    /// when the datagram write failed, so the service can report the
+    /// share as failed instead of claiming success.
+    ClipboardSendDone {
+        batch: u64,
+        ok: bool,
+    },
 }
 
 enum EmulationRequest {
@@ -89,6 +96,8 @@ enum EmulationRequest {
         SocketAddr,
         input_event::ClipboardEvent,
         Option<Sender<(u64, u64)>>,
+        /// send-batch id for the ClipboardSendDone completion report
+        u64,
     ),
 }
 
@@ -131,9 +140,12 @@ impl Emulation {
         addr: SocketAddr,
         clipboard: input_event::ClipboardEvent,
         progress: Option<Sender<(u64, u64)>>,
+        batch: u64,
     ) {
         self.request_tx
-            .send(EmulationRequest::SendClipboard(addr, clipboard, progress))
+            .send(EmulationRequest::SendClipboard(
+                addr, clipboard, progress, batch,
+            ))
             .expect("channel closed");
     }
 
@@ -308,9 +320,15 @@ impl ListenTask {
                         self.emulation_proxy.set_key_repeat(delay, interval);
                     }
                     // send clipboard to a specific address
-                    EmulationRequest::SendClipboard(addr, clipboard_event, progress) => {
+                    EmulationRequest::SendClipboard(addr, clipboard_event, progress, batch) => {
                         let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
-                        self.listener.reply_clipboard(addr, proto_event, progress.as_ref()).await;
+                        let ok = self
+                            .listener
+                            .reply_clipboard(addr, proto_event, progress.as_ref())
+                            .await;
+                        self.event_tx
+                            .send(EmulationEvent::ClipboardSendDone { batch, ok })
+                            .expect("channel closed");
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
