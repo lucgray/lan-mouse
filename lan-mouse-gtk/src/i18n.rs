@@ -74,6 +74,9 @@ fn parse_mo(b: &[u8]) -> Option<std::collections::HashMap<String, String>> {
 
 include!(concat!(env!("OUT_DIR"), "/languages.rs"));
 
+/// textdomain name — only libintl consumes it (unix); the in-crate
+/// catalog lookup keys off LANGUAGES directly
+#[cfg(unix)]
 pub const DOMAIN: &str = "lan-mouse";
 
 /// Initialize gettext: apply the language configured in config.toml,
