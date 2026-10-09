@@ -30,11 +30,17 @@ pub struct SettingsValues {
     /// key-repeat timing in ms
     pub key_repeat_delay: u64,
     pub key_repeat_interval: u64,
+    /// "app" | "system" | "both" — where hints are shown
+    pub notification_mode: String,
 }
 
 /// Language choices offered in the combo row, in dropdown order;
 /// index 0 is the "system default" sentinel stored as an empty string.
 pub(crate) const LANGUAGE_CODES: [&str; 3] = ["", "en", "zh_CN"];
+
+/// notification-mode values in dropdown order — must match
+/// `notification_model` in settings_window.ui
+pub(crate) const NOTIFICATION_MODES: [&str; 3] = ["app", "system", "both"];
 
 impl SettingsWindow {
     pub(crate) fn new() -> Self {
@@ -74,6 +80,11 @@ impl SettingsWindow {
             .position(|c| *c == values.language)
             .unwrap_or(0);
         self.imp().language_row.set_selected(index as u32);
+        let index = NOTIFICATION_MODES
+            .iter()
+            .position(|m| *m == values.notification_mode)
+            .unwrap_or(0);
+        self.imp().notification_row.set_selected(index as u32);
         updating.set(false);
     }
 
@@ -121,6 +132,21 @@ impl SettingsWindow {
                 f(code);
             }
         });
+    }
+
+    /// `f` is called with the chosen mode ("app" | "system" | "both")
+    pub(crate) fn connect_notification_mode_changed(&self, f: impl Fn(&'static str) + 'static) {
+        let updating = self.imp().updating.clone();
+        self.imp()
+            .notification_row
+            .connect_selected_notify(move |row| {
+                if updating.get() {
+                    return;
+                }
+                if let Some(mode) = NOTIFICATION_MODES.get(row.selected() as usize) {
+                    f(mode);
+                }
+            });
     }
 
     /// `f` is called with (delay_ms, interval_ms) whenever either

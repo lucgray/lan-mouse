@@ -663,10 +663,22 @@ the local machine itself is unaffected.
 ### GTK preferences & i18n
 
 The GTK frontend's Preferences window (hamburger menu → Preferences)
-covers the day-to-day settings: UI language, clipboard sharing,
-download folder, scroll inversion, mouse sensitivity, key-repeat
-timing, and the listen port. Changes are applied live where the
-backends support it and persisted to `config.toml`.
+covers the day-to-day settings: UI language, notifications,
+clipboard sharing, download folder, scroll inversion, mouse
+sensitivity, key-repeat timing, and the listen port. Changes are
+applied live where the backends support it and persisted to
+`config.toml`.
+
+Hints like "clipboard shared" default to an in-window banner; the
+Preferences → Notifications row (or `notification_mode` in
+`config.toml`) routes them to OS notifications instead — or to
+both. With no frontend attached at all (daemon-only, or a hidden
+tray window), the daemon falls back to desktop notifications on
+Linux and macOS so hints are never invisible:
+
+```toml
+notification_mode = "system"  # "app" (default) | "system" | "both"
+```
 
 Translations use gettext: catalogs live in `lan-mouse-gtk/po/` as
 `.po` files, are compiled to `.mo` at build time, and embedded in the

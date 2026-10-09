@@ -493,6 +493,7 @@ fn build_ui(app: &Application) {
                         language,
                         key_repeat_delay,
                         key_repeat_interval,
+                        notification_mode,
                     } => {
                         window.update_settings(settings_window::SettingsValues {
                             clipboard_enabled,
@@ -503,6 +504,7 @@ fn build_ui(app: &Application) {
                             language,
                             key_repeat_delay,
                             key_repeat_interval,
+                            notification_mode,
                         });
                     }
                     FrontendEvent::ClipboardShared {

@@ -22,6 +22,8 @@ pub struct SettingsWindow {
     #[template_child]
     pub language_row: TemplateChild<ComboRow>,
     #[template_child]
+    pub notification_row: TemplateChild<ComboRow>,
+    #[template_child]
     pub port_spin: TemplateChild<SpinButton>,
     #[template_child]
     pub key_delay_spin: TemplateChild<SpinButton>,

@@ -91,6 +91,12 @@ impl AsyncFrontendListener {
         Ok(adapter)
     }
 
+    /// whether any frontend is currently connected — used to decide
+    /// whether OS-level notifications are needed as a fallback channel.
+    pub fn frontend_connected(&self) -> bool {
+        !self.tx_streams.is_empty()
+    }
+
     pub async fn broadcast(&mut self, notify: FrontendEvent) {
         // encode event
         let mut json = serde_json::to_string(&notify).unwrap();
