@@ -2,12 +2,13 @@ use futures::{Stream, StreamExt, stream::SelectAll};
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::{
+    collections::HashMap,
     io::ErrorKind,
     pin::Pin,
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
@@ -22,6 +23,21 @@ use tokio::net::TcpStream;
 
 use crate::{FrontendEvent, FrontendRequest, IpcError, IpcListenerCreationError};
 
+#[cfg(unix)]
+type ConnWriter = WriteHalf<UnixStream>;
+#[cfg(windows)]
+type ConnWriter = WriteHalf<TcpStream>;
+
+/// a message from one frontend's read stream — either a read result
+/// or the stream's end-of-file marker, tagged so the matching write
+/// half can be dropped at the same time
+enum ConnMsg {
+    Line(std::io::Result<String>),
+    Closed,
+}
+
+type TaggedStream = Pin<Box<dyn Stream<Item = (u64, ConnMsg)>>>;
+
 pub struct AsyncFrontendListener {
     #[cfg(windows)]
     listener: TcpListener,
@@ -29,14 +45,12 @@ pub struct AsyncFrontendListener {
     listener: UnixListener,
     #[cfg(unix)]
     socket_path: PathBuf,
-    #[cfg(unix)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<UnixStream>>>>,
-    #[cfg(windows)]
-    line_streams: SelectAll<LinesStream<BufReader<ReadHalf<TcpStream>>>>,
-    #[cfg(unix)]
-    tx_streams: Vec<WriteHalf<UnixStream>>,
-    #[cfg(windows)]
-    tx_streams: Vec<WriteHalf<TcpStream>>,
+    line_streams: SelectAll<TaggedStream>,
+    /// write halves keyed by the same connection id as the tagged
+    /// read stream — removed together on EOF or error so
+    /// `frontend_connected` cannot stay stuck on a dead stream
+    tx_streams: HashMap<u64, ConnWriter>,
+    next_conn_id: u64,
 }
 
 impl AsyncFrontendListener {
@@ -85,7 +99,8 @@ impl AsyncFrontendListener {
             #[cfg(unix)]
             socket_path,
             line_streams: SelectAll::new(),
-            tx_streams: vec![],
+            tx_streams: HashMap::new(),
+            next_conn_id: 0,
         };
 
         Ok(adapter)
@@ -99,23 +114,25 @@ impl AsyncFrontendListener {
 
     pub async fn broadcast(&mut self, notify: FrontendEvent) {
         // encode event
-        let mut json = serde_json::to_string(&notify).unwrap();
+        let mut json = match serde_json::to_string(&notify) {
+            Ok(json) => json,
+            Err(e) => {
+                log::error!("failed to encode frontend event: {e}");
+                return;
+            }
+        };
         json.push('\n');
 
-        let mut keep = vec![];
         // TODO do simultaneously
-        for tx in self.tx_streams.iter_mut() {
-            // write len + payload
+        let mut failed = vec![];
+        for (id, tx) in self.tx_streams.iter_mut() {
             if tx.write(json.as_bytes()).await.is_err() {
-                keep.push(false);
-                continue;
+                failed.push(*id);
             }
-            keep.push(true);
         }
-
-        // could not find a better solution because async
-        let mut keep = keep.into_iter();
-        self.tx_streams.retain(|_| keep.next().unwrap());
+        for id in failed {
+            self.tx_streams.remove(&id);
+        }
     }
 }
 
@@ -130,9 +147,22 @@ impl Drop for AsyncFrontendListener {
 impl Stream for AsyncFrontendListener {
     type Item = Result<FrontendRequest, IpcError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Poll::Ready(Some(Ok(l))) = self.line_streams.poll_next_unpin(cx) {
-            let request = serde_json::from_str(l.as_str()).map_err(|e| e.into());
-            return Poll::Ready(Some(request));
+        // drain read events first: a stream that hit EOF or an I/O
+        // error drops its write half so broadcasts stop addressing it
+        while let Poll::Ready(Some((id, msg))) = self.line_streams.poll_next_unpin(cx) {
+            match msg {
+                ConnMsg::Closed => {
+                    self.tx_streams.remove(&id);
+                }
+                ConnMsg::Line(Err(e)) => {
+                    log::warn!("frontend connection lost: {e}");
+                    self.tx_streams.remove(&id);
+                }
+                ConnMsg::Line(Ok(l)) => {
+                    let request = serde_json::from_str(l.as_str()).map_err(|e| e.into());
+                    return Poll::Ready(Some(request));
+                }
+            }
         }
         let mut sync = false;
         while let Poll::Ready(Ok((stream, _))) = self.listener.poll_accept(cx) {
@@ -140,8 +170,16 @@ impl Stream for AsyncFrontendListener {
             let buf_reader = BufReader::new(rx);
             let lines = buf_reader.lines();
             let lines = LinesStream::new(lines);
-            self.line_streams.push(lines);
-            self.tx_streams.push(tx);
+            let id = self.next_conn_id;
+            self.next_conn_id += 1;
+            let tagged: TaggedStream = Box::pin(
+                lines
+                    .map(ConnMsg::Line)
+                    .chain(futures::stream::once(async { ConnMsg::Closed }))
+                    .map(move |m| (id, m)),
+            );
+            self.line_streams.push(tagged);
+            self.tx_streams.insert(id, tx);
             sync = true;
         }
         if sync {
