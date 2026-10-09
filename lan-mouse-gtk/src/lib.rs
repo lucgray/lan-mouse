@@ -2,6 +2,7 @@ mod authorization_window;
 mod client_object;
 mod client_row;
 mod fingerprint_window;
+mod i18n;
 mod key_object;
 mod key_row;
 #[cfg(target_os = "linux")]
@@ -142,6 +143,8 @@ fn gtk_main() -> glib::ExitCode {
         configure_macos_bundle_environment();
         install_macos_gtk_log_filter();
     }
+
+    i18n::init();
 
     gio::resources_register_include!("lan-mouse.gresource").expect("Failed to register resources.");
 
@@ -457,30 +460,50 @@ fn build_ui(app: &Application) {
                         fingerprint: _,
                         addr,
                     } => {
-                        window.show_toast(format!("device connected: {addr}").as_str());
+                        window.show_toast(
+                            i18n::tr("device connected: {addr}", &[("addr", &addr.to_string())])
+                                .as_str(),
+                        );
                     }
                     FrontendEvent::DeviceEntered {
                         fingerprint: _,
                         addr,
                         pos,
                     } => {
-                        window.show_toast(format!("device entered: {addr} ({pos})").as_str());
+                        window.show_toast(
+                            i18n::tr(
+                                "device entered: {addr} ({pos})",
+                                &[("addr", &addr.to_string()), ("pos", &pos.to_string())],
+                            )
+                            .as_str(),
+                        );
                     }
                     FrontendEvent::IncomingDisconnected(addr) => {
-                        window.show_toast(format!("{addr} disconnected").as_str());
+                        window.show_toast(
+                            i18n::tr("{addr} disconnected", &[("addr", &addr.to_string())])
+                                .as_str(),
+                        );
                     }
                     FrontendEvent::Settings {
                         clipboard_enabled,
                         invert_scroll,
                         mouse_sensitivity,
                         download_dir,
+                        port,
+                        language,
+                        key_repeat_delay,
+                        key_repeat_interval,
                     } => {
-                        window.update_settings(
+                        window.update_settings(settings_window::SettingsValues {
                             clipboard_enabled,
                             invert_scroll,
                             mouse_sensitivity,
                             download_dir,
-                        );
+                            port,
+                            language,
+                            key_repeat_delay,
+                            key_repeat_interval,
+                        });
                     }
                     FrontendEvent::ClipboardShared {
                         received,
@@ -488,22 +511,33 @@ fn build_ui(app: &Application) {
                         bytes,
                     } => {
                         let kind = match kind {
-                            ClipboardContentKind::Text => "text".to_string(),
-                            ClipboardContentKind::Image => "image".to_string(),
+                            ClipboardContentKind::Text => gettextrs::gettext("text"),
+                            ClipboardContentKind::Image => gettextrs::gettext("image"),
                             ClipboardContentKind::Files if received => {
                                 let dir = window.download_dir();
                                 if dir.is_empty() {
-                                    "files".to_string()
+                                    gettextrs::gettext("files")
                                 } else {
-                                    format!("files (saved to {dir})")
+                                    i18n::tr("files (saved to {dir})", &[("dir", &dir)])
                                 }
                             }
-                            ClipboardContentKind::Files => "files".to_string(),
+                            ClipboardContentKind::Files => gettextrs::gettext("files"),
                         };
-                        let direction = if received { "received" } else { "shared" };
+                        let direction = if received {
+                            gettextrs::gettext("received")
+                        } else {
+                            gettextrs::gettext("shared")
+                        };
                         window.show_toast(
-                            format!("clipboard {kind} {direction} ({})", human_bytes(bytes))
-                                .as_str(),
+                            i18n::tr(
+                                "clipboard {kind} {direction} ({size})",
+                                &[
+                                    ("kind", &kind),
+                                    ("direction", &direction),
+                                    ("size", &human_bytes(bytes)),
+                                ],
+                            )
+                            .as_str(),
                         );
                     }
                     FrontendEvent::ClipboardProgress {
@@ -515,10 +549,12 @@ fn build_ui(app: &Application) {
                     }
                     FrontendEvent::ClipboardTooLarge { bytes, limit } => {
                         window.show_toast(
-                            format!(
-                                "clipboard too large to share: {} ({} limit)",
-                                human_bytes(bytes),
-                                human_bytes(limit)
+                            i18n::tr(
+                                "clipboard too large to share: {size} ({limit} limit)",
+                                &[
+                                    ("size", &human_bytes(bytes)),
+                                    ("limit", &human_bytes(limit)),
+                                ],
                             )
                             .as_str(),
                         );

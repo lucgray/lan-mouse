@@ -1,7 +1,7 @@
 [package]
 name = "lan-mouse-gtk"
 description = "GTK4 / Libadwaita Frontend for lan-mouse"
-version = "0.3.0"
+version = "0.11.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/feschber/lan-mouse"
@@ -29,8 +29,15 @@ tray-icon = { version = "0.24.1", default-features = false }
 
 [build-dependencies]
 glib-build-tools = { version = "0.20.0" }
+polib = "0.3.0"
 
 
 [features]
 default = ["wayland_window_identifier"]
 wayland_window_identifier = ["dep:gdk4_wayland"]
+
+# gettext links the platform libintl — glibc on Linux shares its registry
+# with GTK's builder translation; on Windows gettext-sys cannot build
+# (autotools under MSVC), so i18n falls back to an in-crate .mo lookup
+[target.'cfg(unix)'.dependencies]
+gettextrs = { package = "gettext-rs", version = "0.8.0", features = ["gettext-system"] }

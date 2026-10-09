@@ -63,10 +63,7 @@ pub struct Window {
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
     pub settings_window: RefCell<Option<SettingsWindow>>,
     /// last settings state received from the daemon
-    /// (clipboard_enabled, invert_scroll, mouse_sensitivity)
-    pub settings: Cell<(bool, bool, f64)>,
-    /// effective download directory reported by the daemon
-    pub settings_download_dir: RefCell<String>,
+    pub settings: RefCell<crate::settings_window::SettingsValues>,
 }
 
 #[glib::object_subclass]
@@ -219,8 +216,14 @@ impl ObjectImpl for Window {
         }
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);
-        self.settings.set((true, false, 1.0));
-        self.settings_download_dir.replace(String::new());
+        self.settings
+            .replace(crate::settings_window::SettingsValues {
+                clipboard_enabled: true,
+                invert_scroll: false,
+                mouse_sensitivity: 1.0,
+                port: DEFAULT_PORT,
+                ..Default::default()
+            });
         let obj = self.obj();
         obj.setup_icon();
         obj.setup_clients();

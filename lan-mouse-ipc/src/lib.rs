@@ -233,6 +233,13 @@ pub enum FrontendEvent {
         mouse_sensitivity: f64,
         /// directory received clipboard files are written to
         download_dir: String,
+        /// the daemon's listen port
+        port: u16,
+        /// UI language override — empty means "follow the system locale"
+        language: String,
+        /// key-repeat timing in ms, applied on Windows/macOS receivers
+        key_repeat_delay: u64,
+        key_repeat_interval: u64,
     },
     /// clipboard content was shared in either direction
     ClipboardShared {
@@ -303,6 +310,15 @@ pub enum FrontendRequest {
     /// set the directory received clipboard files are written to
     /// (`None` restores the default downloads directory)
     SetDownloadDir(Option<String>),
+    /// persist a UI language override (`None` follows the system locale;
+    /// applies on the next frontend start)
+    SetLanguage(Option<String>),
+    /// key-repeat timing in milliseconds, applied live on backends that
+    /// synthesize repeats themselves (Windows, macOS receivers)
+    SetKeyRepeat {
+        delay: u64,
+        interval: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

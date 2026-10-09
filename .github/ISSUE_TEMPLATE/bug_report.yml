@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a defect in Lan Mouse (fork)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+        This fork tracks its own issues here; bugs that reproduce on
+        upstream `feschber/lan-mouse` should reference the upstream issue number.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Fill in for every machine involved in the reproduction.
+      value: |
+        - Lan Mouse version / commit: 
+        - OS + version (sender): 
+        - OS + version (receiver): 
+        - Session type + compositor (Linux): `echo $XDG_SESSION_TYPE` — 
+        - Capture / emulation backends or CLI flags: 
+        - Clipboard sync enabled? (yes/no)
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimal numbered steps. Note whether the issue also occurs with a physical keyboard/mouse attached directly.
+      placeholder: |
+        1. Start receiver with ...
+        2. Move pointer to the right edge
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Run with `LAN_MOUSE_LOG_LEVEL=debug` and attach the relevant section
+        as a file (drag & drop). Do not paste screenshots of text.
+      render: shell
+    validations:
+      required: false

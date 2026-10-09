@@ -84,6 +84,7 @@ enum EmulationRequest {
     Terminate,
     UpdateScrollingInversion(bool),
     UpdateMouseSensitivity(f64),
+    SetKeyRepeat(Duration, Duration),
     SendClipboard(
         SocketAddr,
         input_event::ClipboardEvent,
@@ -151,6 +152,12 @@ impl Emulation {
     pub(crate) fn request_scrolling_inversion(&self, invert_scroll: bool) {
         self.request_tx
             .send(EmulationRequest::UpdateScrollingInversion(invert_scroll))
+            .expect("channel closed")
+    }
+
+    pub(crate) fn request_key_repeat(&self, delay: Duration, interval: Duration) {
+        self.request_tx
+            .send(EmulationRequest::SetKeyRepeat(delay, interval))
             .expect("channel closed")
     }
 
@@ -297,6 +304,9 @@ impl ListenTask {
                         self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
                         self.emulation_proxy.update_config();
                     }
+                    EmulationRequest::SetKeyRepeat(delay, interval) => {
+                        self.emulation_proxy.set_key_repeat(delay, interval);
+                    }
                     // send clipboard to a specific address
                     EmulationRequest::SendClipboard(addr, clipboard_event, progress) => {
                         let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
@@ -352,6 +362,7 @@ enum ProxyRequest {
     Terminate,
     Reenable,
     UpdateConfig(InputConfig),
+    SetKeyRepeat(Duration, Duration),
 }
 
 impl EmulationProxy {
@@ -434,6 +445,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn set_key_repeat(&self, delay: Duration, interval: Duration) {
+        self.request_tx
+            .send(ProxyRequest::SetKeyRepeat(delay, interval))
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -473,6 +490,10 @@ impl EmulationTask {
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::UpdateConfig(input_config) => {
                         self.input_config = input_config;
+                    }
+                    ProxyRequest::SetKeyRepeat(delay, interval) => {
+                        self.options.key_repeat_delay = delay;
+                        self.options.key_repeat_interval = interval;
                     }
                 }
             }
@@ -543,6 +564,11 @@ impl EmulationTask {
                         self.input_config = input_config;
                         emulation.update_config(input_config);
                     }
+                    ProxyRequest::SetKeyRepeat(delay, interval) => {
+                        self.options.key_repeat_delay = delay;
+                        self.options.key_repeat_interval = interval;
+                        emulation.set_key_repeat(delay, interval);
+                    }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
@@ -594,6 +620,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
             ProxyRequest::UpdateConfig(_) => continue,
+            ProxyRequest::SetKeyRepeat(_, _) => continue,
         }
     }
 }

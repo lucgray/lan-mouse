@@ -100,6 +100,9 @@ struct ConfigToml {
     /// directory files received via the clipboard are written to
     /// (default: the system downloads directory)
     download_dir: Option<PathBuf>,
+    /// UI language override, e.g. "zh_CN" — unset means "follow the
+    /// system locale". Consumed by the GTK frontend (gettext `LANGUAGE`).
+    language: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -813,6 +816,21 @@ impl Config {
         self.config_toml
             .as_ref()
             .and_then(|c| c.download_dir.clone())
+    }
+
+    /// UI language override ("en", "zh_CN", ...) — None = system locale.
+    pub fn language(&self) -> Option<String> {
+        self.config_toml.as_ref().and_then(|c| c.language.clone())
+    }
+
+    pub fn set_language(&mut self, language: Option<String>) {
+        self.toml_mut().language = language;
+    }
+
+    /// Key-repeat timing in milliseconds — None restores backend defaults.
+    pub fn set_key_repeat(&mut self, delay: Option<u64>, interval: Option<u64>) {
+        self.toml_mut().key_repeat_delay = delay;
+        self.toml_mut().key_repeat_interval = interval;
     }
 }
 

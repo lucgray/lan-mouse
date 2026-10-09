@@ -10,14 +10,19 @@ use gtk::{
     glib::{self, closure_local},
 };
 
+use gettextrs::gettext;
+
 use lan_mouse_ipc::{
     ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
     Position,
 };
 
 use crate::{
-    authorization_window::AuthorizationWindow, fingerprint_window::FingerprintWindow,
-    key_object::KeyObject, key_row::KeyRow, settings_window::SettingsWindow,
+    authorization_window::AuthorizationWindow,
+    fingerprint_window::FingerprintWindow,
+    key_object::KeyObject,
+    key_row::KeyRow,
+    settings_window::{SettingsValues, SettingsWindow},
 };
 
 use super::{client_object::ClientObject, client_row::ClientRow};
@@ -548,10 +553,10 @@ impl Window {
             imp.transfer_revealer.set_reveal_child(false);
             return;
         }
-        imp.transfer_label.set_label(if incoming {
-            "Receiving…"
+        imp.transfer_label.set_label(&if incoming {
+            gettext("Receiving…")
         } else {
-            "Sending…"
+            gettext("Sending…")
         });
         let fraction = received as f64 / total as f64;
         imp.transfer_bar.set_fraction(fraction);
@@ -562,33 +567,17 @@ impl Window {
 
     /// store the settings state pushed by the daemon and apply it to an
     /// open settings window, if any
-    pub(super) fn update_settings(
-        &self,
-        clipboard_enabled: bool,
-        invert_scroll: bool,
-        mouse_sensitivity: f64,
-        download_dir: String,
-    ) {
-        self.imp()
-            .settings
-            .set((clipboard_enabled, invert_scroll, mouse_sensitivity));
-        self.imp()
-            .settings_download_dir
-            .replace(download_dir.clone());
+    pub(super) fn update_settings(&self, values: SettingsValues) {
         if let Some(w) = self.imp().settings_window.borrow().as_ref() {
-            w.update_values(
-                clipboard_enabled,
-                invert_scroll,
-                mouse_sensitivity,
-                &download_dir,
-            );
+            w.update_values(&values);
         }
+        self.imp().settings.replace(values);
     }
 
     /// directory received clipboard files are written to, as last
     /// reported by the daemon
     pub(super) fn download_dir(&self) -> String {
-        self.imp().settings_download_dir.borrow().clone()
+        self.imp().settings.borrow().download_dir.clone()
     }
 
     pub(crate) fn open_settings(&self) {
@@ -598,14 +587,8 @@ impl Window {
         }
         let settings_window = SettingsWindow::new();
         settings_window.set_transient_for(Some(self));
-        let (clipboard_enabled, invert_scroll, mouse_sensitivity) = self.imp().settings.get();
-        let download_dir = self.imp().settings_download_dir.borrow().clone();
-        settings_window.update_values(
-            clipboard_enabled,
-            invert_scroll,
-            mouse_sensitivity,
-            &download_dir,
-        );
+        let values = self.imp().settings.borrow().clone();
+        settings_window.update_values(&values);
         settings_window.connect_download_dir_activated(clone!(
             #[weak(rename_to = window)]
             self,
@@ -626,6 +609,29 @@ impl Window {
             self,
             move |sensitivity| {
                 window.request(FrontendRequest::UpdateMouseSensitivity(sensitivity))
+            }
+        ));
+        settings_window.connect_language_changed(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |code| {
+                window.request(FrontendRequest::SetLanguage(if code.is_empty() {
+                    None
+                } else {
+                    Some(code.to_string())
+                }))
+            }
+        ));
+        settings_window.connect_port_changed(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |port| window.request(FrontendRequest::ChangePort(port))
+        ));
+        settings_window.connect_key_repeat_changed(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |delay, interval| {
+                window.request(FrontendRequest::SetKeyRepeat { delay, interval })
             }
         ));
         self.imp()
