@@ -113,8 +113,8 @@ pub(crate) async fn send_clipboard_datagrams(
     // lost slice drops the whole transfer with no retransmit, so
     // anything that doesn't fit is sent via the reliable fragment
     // path instead.
-    const MAX_CLIPBOARD_DATAGRAM: usize = lan_mouse_proto::CLIPBOARD_FRAGMENT_PAYLOAD
-        + lan_mouse_proto::CLIPBOARD_FRAGMENT_HEADER;
+    const MAX_CLIPBOARD_DATAGRAM: usize =
+        lan_mouse_proto::CLIPBOARD_FRAGMENT_PAYLOAD + lan_mouse_proto::CLIPBOARD_FRAGMENT_HEADER;
     if encoded.len() <= MAX_CLIPBOARD_DATAGRAM {
         conn.send(encoded).await?;
         return Ok(());
