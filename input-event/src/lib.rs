@@ -49,6 +49,18 @@ pub enum ClipboardEvent {
     Text(String),
     /// image content from clipboard, PNG-encoded
     Image(Vec<u8>),
+    /// files copied in a file manager; the receiver writes them to
+    /// its downloads directory and puts them on its own clipboard
+    Files(Vec<ClipboardFile>),
+}
+
+/// one file inside a [`ClipboardEvent::Files`] payload
+#[derive(Debug, PartialEq, Clone)]
+pub struct ClipboardFile {
+    /// bare file name, no directory components
+    pub name: String,
+    /// file contents
+    pub data: Vec<u8>,
 }
 
 /// the kind of payload a [`ClipboardEvent`] carries
@@ -56,6 +68,7 @@ pub enum ClipboardEvent {
 pub enum ClipboardContentKind {
     Text,
     Image,
+    Files,
 }
 
 impl ClipboardEvent {
@@ -63,14 +76,16 @@ impl ClipboardEvent {
         match self {
             ClipboardEvent::Text(_) => ClipboardContentKind::Text,
             ClipboardEvent::Image(_) => ClipboardContentKind::Image,
+            ClipboardEvent::Files(_) => ClipboardContentKind::Files,
         }
     }
 
-    /// size of the content in bytes (text characters / PNG bytes)
+    /// size of the content in bytes (text characters / PNG bytes / file data)
     pub fn content_len(&self) -> usize {
         match self {
             ClipboardEvent::Text(t) => t.len(),
             ClipboardEvent::Image(png) => png.len(),
+            ClipboardEvent::Files(files) => files.iter().map(|f| f.data.len()).sum(),
         }
     }
 }
@@ -187,6 +202,11 @@ impl Display for ClipboardEvent {
             }
             ClipboardEvent::Image(png) => {
                 write!(f, "clipboard(image: {} bytes)", png.len())
+            }
+            ClipboardEvent::Files(files) => {
+                let names: Vec<&str> = files.iter().take(3).map(|f| f.name.as_str()).collect();
+                let suffix = if files.len() > 3 { ", ..." } else { "" };
+                write!(f, "clipboard(files: {}{})", names.join(", "), suffix)
             }
         }
     }

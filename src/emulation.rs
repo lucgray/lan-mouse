@@ -68,6 +68,11 @@ pub(crate) enum EmulationEvent {
     },
     /// clipboard data received from remote
     ClipboardReceived(input_event::ClipboardEvent),
+    /// fragment progress of a clipboard transfer the peer is sending us
+    ClipboardProgress {
+        received: u64,
+        total: u64,
+    },
 }
 
 enum EmulationRequest {
@@ -79,7 +84,11 @@ enum EmulationRequest {
     Terminate,
     UpdateScrollingInversion(bool),
     UpdateMouseSensitivity(f64),
-    SendClipboard(SocketAddr, input_event::ClipboardEvent),
+    SendClipboard(
+        SocketAddr,
+        input_event::ClipboardEvent,
+        Option<Sender<(u64, u64)>>,
+    ),
 }
 
 impl Emulation {
@@ -116,9 +125,14 @@ impl Emulation {
             .expect("channel closed");
     }
 
-    pub(crate) fn send_clipboard(&self, addr: SocketAddr, clipboard: input_event::ClipboardEvent) {
+    pub(crate) fn send_clipboard(
+        &self,
+        addr: SocketAddr,
+        clipboard: input_event::ClipboardEvent,
+        progress: Option<Sender<(u64, u64)>>,
+    ) {
         self.request_tx
-            .send(EmulationRequest::SendClipboard(addr, clipboard))
+            .send(EmulationRequest::SendClipboard(addr, clipboard, progress))
             .expect("channel closed");
     }
 
@@ -262,6 +276,9 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
                             }
                     }
+                    Some(ListenEvent::ClipboardProgress { received, total }) => {
+                        self.event_tx.send(EmulationEvent::ClipboardProgress { received, total }).expect("channel closed");
+                    }
                     None => break
                 }}
                 event = self.emulation_proxy.event() => {
@@ -281,9 +298,9 @@ impl ListenTask {
                         self.emulation_proxy.update_config();
                     }
                     // send clipboard to a specific address
-                    EmulationRequest::SendClipboard(addr, clipboard_event) => {
+                    EmulationRequest::SendClipboard(addr, clipboard_event, progress) => {
                         let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
-                        self.listener.reply_clipboard(addr, proto_event).await;
+                        self.listener.reply_clipboard(addr, proto_event, progress.as_ref()).await;
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);

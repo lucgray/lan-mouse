@@ -19,7 +19,7 @@ plus feature merges: per-client hotkey switching, key/chord remapping and
 scroll inversion (`[input_pre_processing]`), cross-axis warp position
 preservation, scroll-direction unification, macOS receive loops +
 hotplug/relaunch fixes, a Windows service mode with MSI packaging, and
-text + image clipboard sharing (`enable_clipboard`).
+clipboard sharing for text, images and files (`enable_clipboard`).
 
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 
@@ -658,17 +658,26 @@ the local machine itself is unaffected.
 
 ### Clipboard sharing
 
-Text and images copied to the clipboard are shared with connected peers
-and set on the receiving machine automatically. Enabled by default;
-disable it in the GTK Preferences window or with:
+Text, images and files copied to the clipboard are shared with
+connected peers and set on the receiving machine automatically.
+Enabled by default; disable it in the GTK Preferences window or with:
 
 ```toml
 enable_clipboard = false
 ```
 
-Text and PNG-encoded images up to 64KB are shared — larger or other
-formats are skipped and the frontend shows a hint when content was too
-large to send.
+Text and PNG-encoded images are shared as-is. Files copied in a file
+manager are transferred to the receiving machine's Downloads folder
+(with an automatic rename on name conflicts) and set on its clipboard.
+
+Payloads that don't fit in a single datagram are sent as self-
+describing fragments (~1200 bytes each) and reassembled on the
+receiving side, up to 256MB. The GTK window shows a progress bar
+while a transfer is running. Old peers silently skip fragment and
+file datagrams they don't understand, so connections stay alive.
+
+Transferred files land in `~/Downloads` (or the OS download dir);
+folders and items that aren't regular files are skipped.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

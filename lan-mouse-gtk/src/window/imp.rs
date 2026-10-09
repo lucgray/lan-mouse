@@ -4,7 +4,9 @@ use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
 use glib::subclass::InitializingObject;
 use gtk::glib::clone;
-use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, glib};
+use gtk::{
+    Button, CompositeTemplate, Entry, Image, Label, ListBox, ProgressBar, Revealer, gdk, gio, glib,
+};
 
 use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
 
@@ -34,6 +36,12 @@ pub struct Window {
     pub hostname_label: TemplateChild<Label>,
     #[template_child]
     pub toast_overlay: TemplateChild<ToastOverlay>,
+    #[template_child]
+    pub transfer_revealer: TemplateChild<Revealer>,
+    #[template_child]
+    pub transfer_label: TemplateChild<Label>,
+    #[template_child]
+    pub transfer_bar: TemplateChild<ProgressBar>,
     #[template_child]
     pub capture_emulation_group: TemplateChild<PreferencesGroup>,
     #[template_child]

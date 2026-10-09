@@ -56,6 +56,27 @@ sequenceDiagram
     Bob-->>-Alice: Ack (Keyboard Layout)
 ```
 
+## Clipboard events
+
+Clipboard events (`ClipboardText`, `ClipboardImage`, `ClipboardFile`)
+travel as regular UDP datagrams: `[u8 type][u32 len][payload]`.
+`ClipboardFile` carries `[u32 count]{[u32 name_len][name][u64 data_len]
+[data]}` per file.
+
+A payload that fits in one datagram (≤ 65,507 bytes) is sent directly
+for compatibility with older peers. Larger payloads up to 256MB are
+split by `ClipboardFragmenter` into `ClipboardFragment` datagrams:
+
+`[u8 type][u32 total_len][u32 seq][u32 num][u32 transfer_id][≤1200B]`
+
+Each datagram is self-describing so out-of-order delivery and
+interleaved input events are harmless. `transfer_id` is an FNV-1a hash
+of the encoded payload — a new clipboard transfer resets any partial
+reassembly. `ClipboardReassembler` on the receiver deduplicates by
+`seq`, drops incomplete state after 10s of silence, and reports
+progress used by the GTK transfer bar. Old peers skip the unknown
+event types and keep the connection alive.
+
 ## Problems
 The general Idea is to have a bidirectional connection by default, meaning
 any connected device can not only receive events but also send events back.

@@ -1,5 +1,6 @@
 use arboard::{Clipboard, ImageData};
-use input_event::{ClipboardEvent, decode_image_rgba};
+use input_event::{ClipboardEvent, ClipboardFile, decode_image_rgba};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::task::spawn_blocking;
@@ -17,6 +18,45 @@ pub enum ClipboardError {
 pub struct ClipboardEmulation {
     // Use Arc<Mutex<>> to share clipboard across threads
     clipboard: Arc<Mutex<Option<Clipboard>>>,
+}
+
+/// strip any directory components / weirdness from a wire-supplied
+/// file name so it can only ever land inside the downloads dir
+fn safe_file_name(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .trim_matches('.');
+    if base.is_empty() {
+        "lan-mouse-file".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// `dir/name`, falling back to `dir/name (N).ext` on conflicts
+fn unique_download_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for i in 1..1000u32 {
+        let candidate = dir.join(format!("{stem} ({i}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem}-{}{ext}", std::process::id()))
+}
+
+/// directory received clipboard files are written to
+pub fn download_dir() -> Option<PathBuf> {
+    dirs::download_dir().or_else(dirs::home_dir)
 }
 
 impl ClipboardEmulation {
@@ -103,6 +143,52 @@ impl ClipboardEmulation {
                         .map_err(|e| ClipboardError::Set(format!("{}", e)))?;
 
                     log::debug!("Clipboard image set: {}x{}", width, height);
+                    Ok(())
+                })
+                .await
+                .map_err(|e| ClipboardError::Access(format!("Task join error: {}", e)))?
+            }
+            ClipboardEvent::Files(files) => {
+                let clipboard_arc = self.clipboard.clone();
+                spawn_blocking(move || {
+                    let dir = download_dir()
+                        .ok_or_else(|| ClipboardError::Set("no downloads directory".into()))?;
+                    let mut written = Vec::with_capacity(files.len());
+                    for ClipboardFile { name, data } in &files {
+                        let path = unique_download_path(&dir, &safe_file_name(name));
+                        std::fs::write(&path, data).map_err(|e| {
+                            ClipboardError::Set(format!("cannot write {}: {e}", path.display()))
+                        })?;
+                        log::info!("wrote clipboard file {}", path.display());
+                        written.push(path);
+                    }
+                    if written.is_empty() {
+                        return Err(ClipboardError::Set("no files to write".into()));
+                    }
+                    // advertise the written files on our own clipboard
+                    // so they can be pasted straight into a file manager
+                    let mut clipboard_guard = clipboard_arc.lock().unwrap();
+                    let clipboard = match clipboard_guard.as_mut() {
+                        Some(c) => c,
+                        None => match Clipboard::new() {
+                            Ok(c) => {
+                                *clipboard_guard = Some(c);
+                                clipboard_guard.as_mut().unwrap()
+                            }
+                            Err(e) => {
+                                return Err(ClipboardError::Access(format!("{}", e)));
+                            }
+                        },
+                    };
+                    if let Err(e) = clipboard.set().file_list(&written) {
+                        // the files are on disk either way
+                        log::warn!("could not set clipboard file list: {e}");
+                    }
+                    log::debug!(
+                        "Clipboard file list set: {} file(s) in {}",
+                        written.len(),
+                        dir.display()
+                    );
                     Ok(())
                 })
                 .await

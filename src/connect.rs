@@ -43,6 +43,41 @@ pub(crate) enum LanMouseConnectionError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// send an encoded clipboard event over `conn`. Payloads that fit the
+/// legacy single-datagram format go out as one message; larger ones are
+/// split into [`lan_mouse_proto::EventType::ClipboardFragment`] datagrams
+/// the peer reassembles. Fragment datagrams stay below the typical LAN
+/// MTU so no IP fragmentation is involved and a lost fragment aborts
+/// just this transfer, not the connection.
+pub(crate) async fn send_clipboard_datagrams(
+    conn: &Arc<dyn Conn + Send + Sync>,
+    encoded: &[u8],
+    progress: Option<&Sender<(u64, u64)>>,
+) -> Result<(), webrtc_util::Error> {
+    use lan_mouse_proto::ClipboardFragmenter;
+    // largest message that still fits one UDP datagram (65535 minus
+    // IPv4/UDP headers); anything bigger is sent as fragments
+    const MAX_CLIPBOARD_DATAGRAM: usize = 65_507;
+    if encoded.len() <= MAX_CLIPBOARD_DATAGRAM {
+        conn.send(encoded).await?;
+        return Ok(());
+    }
+    let total = encoded.len() as u64;
+    for (i, dgram) in ClipboardFragmenter::new(encoded).enumerate() {
+        conn.send(&dgram).await?;
+        if let Some(progress) = progress {
+            let done =
+                ((i as u64 + 1) * lan_mouse_proto::CLIPBOARD_FRAGMENT_PAYLOAD as u64).min(total);
+            let _ = progress.send((done, total));
+        }
+        if i % 256 == 255 {
+            // keep the single-threaded runtime responsive mid-transfer
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(())
+}
+
 /// bind a socket matching the target's address family — an IPv4-bound
 /// socket can't send to an IPv6 peer ("address family not supported")
 fn bind_addr_for(addr: SocketAddr) -> SocketAddr {
@@ -103,19 +138,29 @@ async fn connect_any(
     }
 }
 
+/// messages an outgoing connection produces for the rest of the daemon
+pub(crate) enum IncomingEvent {
+    Event(ProtoEvent),
+    /// fragment progress of a clipboard transfer the peer is sending us
+    ClipboardProgress {
+        received: u64,
+        total: u64,
+    },
+}
+
 #[derive(Clone)]
 pub(crate) struct LanMouseConnectionSender {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    recv_tx: Sender<(ClientHandle, IncomingEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 }
 
 pub(crate) struct LanMouseConnection {
     sender: LanMouseConnectionSender,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+    recv_rx: Receiver<(ClientHandle, IncomingEvent)>,
 }
 
 impl LanMouseConnection {
@@ -136,7 +181,7 @@ impl LanMouseConnection {
         self.sender.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    pub(crate) async fn recv(&mut self) -> (ClientHandle, IncomingEvent) {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
@@ -197,11 +242,14 @@ impl LanMouseConnectionSender {
         Err(LanMouseConnectionError::NotConnected)
     }
 
-    /// Send clipboard event with variable-length encoding
+    /// Send clipboard event with variable-length encoding.
+    /// `progress` (if given) receives (transferred, total) byte counts
+    /// while a fragmented transfer runs.
     pub(crate) async fn send_clipboard(
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
+        progress: Option<&Sender<(u64, u64)>>,
     ) -> Result<(), LanMouseConnectionError> {
         use lan_mouse_proto::encode_clipboard_event;
 
@@ -219,12 +267,9 @@ impl LanMouseConnectionSender {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(&buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send clipboard: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
+                if let Err(e) = send_clipboard_datagrams(&conn, &buf, progress).await {
+                    log::warn!("client {handle} failed to send clipboard: {e}");
+                    disconnect(&self.client_manager, handle, addr, &self.conns).await;
                 }
                 log::trace!("{event} >->->->->- {addr}");
                 return Ok(());
@@ -246,7 +291,7 @@ async fn connect_to_handle(
     handle: ClientHandle,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<(ClientHandle, IncomingEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
@@ -337,20 +382,47 @@ async fn receive_loop(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
+    tx: Sender<(ClientHandle, IncomingEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    use lan_mouse_proto::{EventType, MAX_CLIPBOARD_SIZE, decode_clipboard_event};
+    use lan_mouse_proto::{
+        ClipboardReassembler, MAX_CLIPBOARD_SIZE, decode_clipboard_event, is_clipboard_event_type,
+        is_clipboard_fragment_type,
+    };
 
-    // Buffer needs to be large enough for clipboard data.
+    // Buffer needs to be large enough for a single clipboard datagram
+    // (legacy format, up to MAX_CLIPBOARD_SIZE + header) or one
+    // clipboard fragment. Fragmented transfers are reassembled below.
     // Use Vec instead of array for large buffers to avoid stack overflow.
     let mut buf = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
+    let mut reassembler = ClipboardReassembler::new();
     while let Ok(n) = conn.recv(&mut buf).await {
         if n == 0 {
             break;
         }
         // Clipboard events use variable-length encoding
-        let event = if buf[0] == EventType::ClipboardText as u8 {
+        let event = if is_clipboard_fragment_type(buf[0]) {
+            match reassembler.push(&buf[..n]) {
+                Ok(Some(encoded)) => match decode_clipboard_event(&encoded) {
+                    Ok(event) => event,
+                    Err(e) => {
+                        log::warn!("Failed to decode clipboard from {addr}: {e:?}");
+                        continue;
+                    }
+                },
+                Ok(None) => {
+                    if let Some((received, total)) = reassembler.progress() {
+                        let _ =
+                            tx.send((handle, IncomingEvent::ClipboardProgress { received, total }));
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("bad clipboard fragment from {addr}: {e}");
+                    continue;
+                }
+            }
+        } else if is_clipboard_event_type(buf[0]) {
             match decode_clipboard_event(&buf[..n]) {
                 Ok(event) => event,
                 Err(e) => {
@@ -386,7 +458,9 @@ async fn receive_loop(
             ProtoEvent::Hello { commit } => {
                 client_manager.set_peer_commit(handle, Some(commit));
             }
-            event => tx.send((handle, event)).expect("channel closed"),
+            event => tx
+                .send((handle, IncomingEvent::Event(event)))
+                .expect("channel closed"),
         }
     }
 

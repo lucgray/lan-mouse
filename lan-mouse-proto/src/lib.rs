@@ -1,4 +1,6 @@
-use input_event::{ClipboardEvent, Event as InputEvent, KeyboardEvent, PointerEvent};
+use input_event::{
+    ClipboardEvent, ClipboardFile, Event as InputEvent, KeyboardEvent, PointerEvent,
+};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -12,11 +14,33 @@ use thiserror::Error;
 /// For clipboard events, we have a separate MAX_CLIPBOARD_SIZE limit
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
-/// maximum clipboard data size (64KB)
-/// Clipboard events are sent as a single (DTLS-fragmented) message, so the
-/// payload must stay below the maximum UDP payload (~64KB). Covers text and
-/// reasonably-sized PNG images; larger content is dropped with a UI hint.
+/// maximum clipboard data size for the single-datagram format (64KB)
+/// Clipboard events up to this size are sent as one message: the legacy
+/// wire format every peer understands. Larger payloads are sent as
+/// [`EventType::ClipboardFragment`] datagrams instead.
 pub const MAX_CLIPBOARD_SIZE: usize = 64 * 1024;
+
+/// maximum clipboard payload size including fragmented transfers (256MB)
+pub const MAX_CLIPBOARD_TRANSFER_SIZE: usize = 256 * 1024 * 1024;
+
+/// payload bytes carried by one clipboard fragment datagram.
+/// Kept below the typical LAN MTU so no IP fragmentation is needed.
+pub const CLIPBOARD_FRAGMENT_PAYLOAD: usize = 1200;
+
+/// [u8 type][u32 total_len][u32 seq][u32 num][u32 transfer_id] before
+/// the payload bytes
+pub const CLIPBOARD_FRAGMENT_HEADER: usize = 17;
+
+/// FNV-1a over the encoded event — identifies a transfer so a new
+/// clipboard payload with the same total/fragment count cannot be
+/// merged into an in-flight reassembly
+fn transfer_id(encoded: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for b in encoded {
+        h = (h ^ *b as u32).wrapping_mul(0x01000193);
+    }
+    h
+}
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -138,6 +162,14 @@ pub enum EventType {
     Hello,
     ClipboardText,
     ClipboardImage,
+    /// a fragment of an encoded clipboard event (text/image/file),
+    /// used for payloads larger than [`MAX_CLIPBOARD_SIZE`]. Not a
+    /// [`ProtoEvent`] variant — receivers collect the payload bytes and
+    /// decode the reassembled event with [`decode_clipboard_event`].
+    ClipboardFragment,
+    /// one or more files copied in a file manager. Payload:
+    /// `[u32 count]{[u32 name_len][name][u64 data_len][data]}`
+    ClipboardFile,
 }
 
 impl ProtoEvent {
@@ -157,6 +189,7 @@ impl ProtoEvent {
                 InputEvent::Clipboard(c) => match c {
                     ClipboardEvent::Text(_) => EventType::ClipboardText,
                     ClipboardEvent::Image(_) => EventType::ClipboardImage,
+                    ClipboardEvent::Files(_) => EventType::ClipboardFile,
                 },
             },
             ProtoEvent::Ping => EventType::Ping,
@@ -229,7 +262,10 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 }
                 Ok(Self::Hello { commit })
             }
-            EventType::ClipboardText | EventType::ClipboardImage => {
+            EventType::ClipboardText
+            | EventType::ClipboardImage
+            | EventType::ClipboardFile
+            | EventType::ClipboardFragment => {
                 // Clipboard events use variable-length encoding
                 // This path should not be reached for fixed-size buffer decoding
                 Err(ProtocolError::BufferTooSmall)
@@ -365,9 +401,25 @@ pub fn encode_clipboard_event(event: &ProtoEvent) -> Result<Vec<u8>, ProtocolErr
         ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(png))) => {
             (EventType::ClipboardImage, png.as_slice())
         }
+        ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(files))) => {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(files.len() as u32).to_be_bytes());
+            for file in files {
+                let name = file.name.as_bytes();
+                payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                payload.extend_from_slice(name);
+                payload.extend_from_slice(&(file.data.len() as u64).to_be_bytes());
+                payload.extend_from_slice(&file.data);
+            }
+            let mut buf = Vec::with_capacity(1 + 4 + payload.len());
+            buf.push(EventType::ClipboardFile as u8);
+            buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&payload);
+            return Ok(buf);
+        }
         _ => panic!("encode_clipboard_event called on non-clipboard event"),
     };
-    if data.len() > MAX_CLIPBOARD_SIZE {
+    if data.len() > MAX_CLIPBOARD_TRANSFER_SIZE {
         return Err(ProtocolError::ClipboardTooLarge(data.len()));
     }
     let mut buf = Vec::with_capacity(1 + 4 + data.len());
@@ -377,6 +429,176 @@ pub fn encode_clipboard_event(event: &ProtoEvent) -> Result<Vec<u8>, ProtocolErr
     Ok(buf)
 }
 
+/// whether an event type byte is a clipboard fragment datagram
+pub fn is_clipboard_fragment_type(event_type: u8) -> bool {
+    event_type == EventType::ClipboardFragment as u8
+}
+
+/// Split an encoded clipboard event into self-describing fragment
+/// datagrams: `[type][u32 total_len][u32 seq][u32 num][payload]`.
+/// Each datagram carries its position, so input events may interleave
+/// and datagrams may arrive out of order or be dropped (the transfer
+/// simply never completes; the next clipboard change resets state).
+pub struct ClipboardFragmenter<'a> {
+    encoded: &'a [u8],
+    num: u32,
+    next: u32,
+    id: u32,
+}
+
+impl<'a> ClipboardFragmenter<'a> {
+    /// `encoded` must come from [`encode_clipboard_event`]; callers
+    /// decide the single-datagram vs fragmented path on its length.
+    pub fn new(encoded: &'a [u8]) -> Self {
+        let num = encoded.len().div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD) as u32;
+        Self {
+            encoded,
+            num,
+            next: 0,
+            id: transfer_id(encoded),
+        }
+    }
+
+    pub fn len(&self) -> u32 {
+        self.num
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num == 0
+    }
+}
+
+impl Iterator for ClipboardFragmenter<'_> {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.num {
+            return None;
+        }
+        let start = self.next as usize * CLIPBOARD_FRAGMENT_PAYLOAD;
+        let end = (start + CLIPBOARD_FRAGMENT_PAYLOAD).min(self.encoded.len());
+        let mut dgram = Vec::with_capacity(CLIPBOARD_FRAGMENT_HEADER + end - start);
+        dgram.push(EventType::ClipboardFragment as u8);
+        dgram.extend_from_slice(&(self.encoded.len() as u32).to_be_bytes());
+        dgram.extend_from_slice(&self.next.to_be_bytes());
+        dgram.extend_from_slice(&self.num.to_be_bytes());
+        dgram.extend_from_slice(&self.id.to_be_bytes());
+        dgram.extend_from_slice(&self.encoded[start..end]);
+        self.next += 1;
+        Some(dgram)
+    }
+}
+
+/// Reassembles [`ClipboardFragment`] datagrams from one peer into the
+/// original encoded clipboard event.
+///
+/// A fragment whose declared `total_len`/`num` differs from the
+/// in-flight transfer resets the state — the clipboard changed mid
+/// flight. Stale state is also dropped after [`REASSEMBLY_TIMEOUT`]
+/// without a new fragment.
+#[derive(Default)]
+pub struct ClipboardReassembler {
+    id: u32,
+    total: u32,
+    num: u32,
+    got: u32,
+    /// payload bytes actually written so far
+    got_bytes: u64,
+    /// seq bitmap; num <= 445k for the size cap so this stays small
+    seen: Vec<u64>,
+    data: Vec<u8>,
+    last_fragment: Option<std::time::Instant>,
+}
+
+/// drop an incomplete reassembly after this much silence
+const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl ClipboardReassembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.id = 0;
+        self.num = 0;
+        self.got = 0;
+        self.got_bytes = 0;
+        self.seen.clear();
+        self.data.clear();
+        self.last_fragment = None;
+    }
+
+    /// (transferred, total) payload bytes while a transfer is in
+    /// flight; None when idle
+    pub fn progress(&self) -> Option<(u64, u64)> {
+        if self.num == 0 {
+            None
+        } else {
+            Some((self.got_bytes, self.total as u64))
+        }
+    }
+
+    /// feed one received datagram; Ok(Some(encoded)) once the full
+    /// payload is assembled — pass it to [`decode_clipboard_event`]
+    pub fn push(&mut self, dgram: &[u8]) -> Result<Option<Vec<u8>>, ProtocolError> {
+        if !is_clipboard_fragment_type(dgram.first().copied().unwrap_or(0)) {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        if dgram.len() < CLIPBOARD_FRAGMENT_HEADER {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        let total = u32::from_be_bytes(dgram[1..5].try_into().unwrap());
+        let seq = u32::from_be_bytes(dgram[5..9].try_into().unwrap());
+        let num = u32::from_be_bytes(dgram[9..13].try_into().unwrap());
+        let id = u32::from_be_bytes(dgram[13..17].try_into().unwrap());
+        if total == 0
+            || num == 0
+            || seq >= num
+            || total as usize > MAX_CLIPBOARD_TRANSFER_SIZE
+            || (num as u64) < (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64)
+            || dgram.len() - CLIPBOARD_FRAGMENT_HEADER > CLIPBOARD_FRAGMENT_PAYLOAD
+        {
+            self.reset();
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        let stale = self
+            .last_fragment
+            .is_some_and(|t| t.elapsed() > REASSEMBLY_TIMEOUT);
+        if stale || self.id != id || self.num != num || self.total != total {
+            self.reset();
+            self.id = id;
+            self.total = total;
+            self.num = num;
+            self.seen.resize(num.div_ceil(64) as usize, 0);
+            self.data.resize(total as usize, 0);
+        }
+        let word = (seq / 64) as usize;
+        let bit = 1u64 << (seq % 64);
+        if self.seen[word] & bit != 0 {
+            // duplicate fragment: harmless, ignore
+            self.last_fragment = Some(std::time::Instant::now());
+            return Ok(None);
+        }
+        self.seen[word] |= bit;
+        self.got += 1;
+        let start = seq as usize * CLIPBOARD_FRAGMENT_PAYLOAD;
+        let payload = &dgram[CLIPBOARD_FRAGMENT_HEADER..];
+        let end = (start + payload.len()).min(self.data.len());
+        self.data[start..end].copy_from_slice(&payload[..end - start]);
+        self.got_bytes += (end - start) as u64;
+        self.last_fragment = Some(std::time::Instant::now());
+        if self.got == self.num {
+            self.num = 0;
+            self.got = 0;
+            self.got_bytes = 0;
+            self.seen.clear();
+            self.last_fragment = None;
+            return Ok(Some(std::mem::take(&mut self.data)));
+        }
+        Ok(None)
+    }
+}
+
 /// Decode a clipboard event from a byte slice
 /// Format: [event_type: u8][length: u32][data bytes]
 pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
@@ -384,9 +606,10 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         return Err(ProtocolError::BufferTooSmall);
     }
     let event_type = buf[0];
+    let is_file = event_type == EventType::ClipboardFile as u8;
     let is_image = match event_type {
         t if t == EventType::ClipboardText as u8 => false,
-        t if t == EventType::ClipboardImage as u8 => true,
+        t if t == EventType::ClipboardImage as u8 || is_file => true,
         _ => {
             return Err(ProtocolError::InvalidEventId(
                 EventType::try_from(event_type).unwrap_err(),
@@ -397,14 +620,16 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
         return Err(ProtocolError::BufferTooSmall);
     }
     let length = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
-    if length > MAX_CLIPBOARD_SIZE {
+    if length > MAX_CLIPBOARD_TRANSFER_SIZE {
         return Err(ProtocolError::ClipboardTooLarge(length));
     }
     if buf.len() < 5 + length {
         return Err(ProtocolError::BufferTooSmall);
     }
     let data = &buf[5..5 + length];
-    let clipboard_event = if is_image {
+    let clipboard_event = if is_file {
+        ClipboardEvent::Files(decode_clipboard_files(data)?)
+    } else if is_image {
         ClipboardEvent::Image(data.to_vec())
     } else {
         ClipboardEvent::Text(String::from_utf8(data.to_vec())?)
@@ -412,9 +637,46 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     Ok(ProtoEvent::Input(InputEvent::Clipboard(clipboard_event)))
 }
 
+/// decode the `[u32 count]{[u32 name_len][name][u64 data_len][data]}`
+/// payload of a [`EventType::ClipboardFile`] event
+fn decode_clipboard_files(mut data: &[u8]) -> Result<Vec<ClipboardFile>, ProtocolError> {
+    if data.len() < 4 {
+        return Err(ProtocolError::BufferTooSmall);
+    }
+    let count = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+    data = &data[4..];
+    let mut files = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        if data.len() < 4 {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        let name_len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
+        data = &data[4..];
+        if data.len() < name_len + 8 {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        let name = String::from_utf8(data[..name_len].to_vec())?;
+        data = &data[name_len..];
+        let data_len = u64::from_be_bytes(data[..8].try_into().unwrap()) as usize;
+        data = &data[8..];
+        if data.len() < data_len {
+            return Err(ProtocolError::BufferTooSmall);
+        }
+        let file_data = data[..data_len].to_vec();
+        data = &data[data_len..];
+        files.push(ClipboardFile {
+            name,
+            data: file_data,
+        });
+    }
+    Ok(files)
+}
+
 /// whether an event type byte is one of the variable-length clipboard types
 pub fn is_clipboard_event_type(event_type: u8) -> bool {
-    event_type == EventType::ClipboardText as u8 || event_type == EventType::ClipboardImage as u8
+    event_type == EventType::ClipboardText as u8
+        || event_type == EventType::ClipboardImage as u8
+        || event_type == EventType::ClipboardFile as u8
 }
 
 #[cfg(test)]
@@ -603,7 +865,7 @@ mod tests {
     #[test]
     fn clipboard_rejects_oversize_and_truncated() {
         let big = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Text(
-            "x".repeat(MAX_CLIPBOARD_SIZE + 1),
+            "x".repeat(MAX_CLIPBOARD_TRANSFER_SIZE + 1),
         )));
         assert!(matches!(
             encode_clipboard_event(&big),
@@ -647,12 +909,149 @@ mod tests {
     fn clipboard_image_rejects_oversize() {
         let big = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(vec![
             0u8;
-            MAX_CLIPBOARD_SIZE
+            MAX_CLIPBOARD_TRANSFER_SIZE
                 + 1
         ])));
         assert!(matches!(
             encode_clipboard_event(&big),
             Err(ProtocolError::ClipboardTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn clipboard_files_roundtrip() {
+        let event = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(vec![
+            ClipboardFile {
+                name: "报告.txt".to_string(),
+                data: b"hello".to_vec(),
+            },
+            ClipboardFile {
+                name: "a.bin".to_string(),
+                data: vec![0u8; 3000],
+            },
+        ])));
+        let buf = encode_clipboard_event(&event).expect("encode");
+        assert_eq!(buf[0], EventType::ClipboardFile as u8);
+        assert!(is_clipboard_event_type(buf[0]));
+        match decode_clipboard_event(&buf).expect("decode") {
+            ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(files))) => {
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0].name, "报告.txt");
+                assert_eq!(files[0].data, b"hello");
+                assert_eq!(files[1].name, "a.bin");
+                assert_eq!(files[1].data.len(), 3000);
+            }
+            other => panic!("expected clipboard files, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clipboard_files_reject_truncated() {
+        // count=1 then a name_len that overruns the payload
+        let mut data = vec![];
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&100u32.to_be_bytes());
+        data.extend_from_slice(b"x");
+        let mut buf = vec![EventType::ClipboardFile as u8];
+        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&data);
+        assert!(matches!(
+            decode_clipboard_event(&buf),
+            Err(ProtocolError::BufferTooSmall)
+        ));
+    }
+
+    fn fragment_event(data: Vec<u8>) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let event = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(data)));
+        let encoded = encode_clipboard_event(&event).expect("encode");
+        let fragments = ClipboardFragmenter::new(&encoded).collect();
+        (encoded, fragments)
+    }
+
+    #[test]
+    fn fragmenter_splits_to_payload_size() {
+        let (encoded, fragments) = fragment_event(vec![0u8; 10_000]);
+        assert_eq!(
+            fragments.len(),
+            encoded.len().div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD)
+        );
+        for f in &fragments {
+            assert_eq!(f[0], EventType::ClipboardFragment as u8);
+            assert!(is_clipboard_fragment_type(f[0]));
+            assert!(f.len() <= CLIPBOARD_FRAGMENT_HEADER + CLIPBOARD_FRAGMENT_PAYLOAD);
+            let total = u32::from_be_bytes(f[1..5].try_into().unwrap());
+            let num = u32::from_be_bytes(f[9..13].try_into().unwrap());
+            assert_eq!(total as usize, encoded.len());
+            assert_eq!(num as usize, fragments.len());
+        }
+    }
+
+    #[test]
+    fn reassembler_reassembles_out_of_order_and_dups() {
+        let (encoded, fragments) = fragment_event(vec![7u8; 5000]);
+        let mut reasm = ClipboardReassembler::new();
+        // feed all but the first fragment in reverse order, each twice
+        // (duplicates must be ignored)
+        for f in fragments.iter().skip(1).rev() {
+            assert!(reasm.push(f).unwrap().is_none());
+            assert!(reasm.push(f).unwrap().is_none());
+        }
+        let done = reasm.push(&fragments[0]).unwrap().expect("complete");
+        assert_eq!(done, encoded);
+    }
+
+    #[test]
+    fn reassembler_reassembles_in_order() {
+        let (encoded, fragments) = fragment_event(vec![1u8; 3000]);
+        let mut reasm = ClipboardReassembler::new();
+        let mut out = None;
+        for f in &fragments {
+            out = reasm.push(f).unwrap();
+        }
+        assert_eq!(out.as_deref(), Some(encoded.as_slice()));
+    }
+
+    #[test]
+    fn reassembler_new_transfer_resets_partial() {
+        let (_, frags_a) = fragment_event(vec![1u8; 3000]);
+        let (enc_b, frags_b) = fragment_event(vec![2u8; 3000]);
+        let mut reasm = ClipboardReassembler::new();
+        // half of transfer A, then a different transfer's header
+        assert!(reasm.push(&frags_a[0]).unwrap().is_none());
+        assert!(reasm.progress().is_some());
+        for f in &frags_b {
+            if let Some(done) = reasm.push(f).unwrap() {
+                assert_eq!(done, enc_b);
+                return;
+            }
+        }
+        panic!("transfer B never completed");
+    }
+
+    #[test]
+    fn reassembler_rejects_malformed() {
+        let mut reasm = ClipboardReassembler::new();
+        // wrong event type
+        assert!(reasm.push(&[0u8; 20]).is_err());
+        // too short
+        assert!(
+            reasm
+                .push(&[EventType::ClipboardFragment as u8, 1, 2])
+                .is_err()
+        );
+        // seq >= num
+        let mut bad = vec![EventType::ClipboardFragment as u8];
+        bad.extend_from_slice(&100u32.to_be_bytes());
+        bad.extend_from_slice(&5u32.to_be_bytes());
+        bad.extend_from_slice(&2u32.to_be_bytes());
+        bad.extend_from_slice(&[0u8; 10]);
+        assert!(reasm.push(&bad).is_err());
+        // oversized total
+        let mut bad = vec![EventType::ClipboardFragment as u8];
+        bad.extend_from_slice(&(u32::MAX).to_be_bytes());
+        bad.extend_from_slice(&0u32.to_be_bytes());
+        bad.extend_from_slice(&1u32.to_be_bytes());
+        bad.extend_from_slice(&[0u8; 10]);
+        assert!(reasm.push(&bad).is_err());
     }
 }

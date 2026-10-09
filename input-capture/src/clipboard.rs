@@ -1,5 +1,5 @@
 use arboard::Clipboard;
-use input_event::{ClipboardEvent, Event, encode_image_rgba};
+use input_event::{ClipboardEvent, ClipboardFile, Event, encode_image_rgba};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -12,18 +12,42 @@ use crate::{CaptureError, CaptureEvent};
 pub struct ClipboardMonitor {
     event_rx: Receiver<CaptureEvent>,
     _event_tx: Sender<CaptureEvent>,
-    last_content: Arc<Mutex<Option<ClipboardEvent>>>,
+    last_sig: Arc<Mutex<Option<ContentSig>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
 }
 
-/// Read the current clipboard content: text first, then images.
+/// identity of the current clipboard payload. Files compare by the
+/// set of file names only — contents are read just once per change,
+/// and a file list this host put on the clipboard after a received
+/// transfer (same names, different directory) still matches.
+#[derive(Debug, PartialEq)]
+enum ContentSig {
+    Text(String),
+    Image(Vec<u8>),
+    Files(Vec<String>),
+}
+
+fn file_name(path: &std::path::Path) -> Option<String> {
+    path.file_name()?.to_str().map(|s| s.to_string())
+}
+
+/// read the clipboard's signature: file list first (a copied file may
+/// also offer its path as text), then text, then images.
 /// Returns `None` for empty or unsupported content.
-fn read_clipboard_content(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
+fn read_clipboard_sig(clipboard: &mut Clipboard) -> Option<ContentSig> {
+    match clipboard.get().file_list() {
+        Ok(paths) if !paths.is_empty() => {
+            return Some(ContentSig::Files(
+                paths.iter().filter_map(|p| file_name(p)).collect(),
+            ));
+        }
+        _ => {}
+    }
     match clipboard.get_text() {
         Ok(text) => {
             log::trace!("Clipboard text read: {} bytes", text.len());
-            return Some(ClipboardEvent::Text(text));
+            return Some(ContentSig::Text(text));
         }
         Err(e) => log::trace!("No clipboard text: {}", e),
     }
@@ -39,17 +63,53 @@ fn read_clipboard_content(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
                         height,
                         png.len()
                     );
-                    Some(ClipboardEvent::Image(png))
+                    return Some(ContentSig::Image(png));
                 }
-                None => {
-                    log::warn!("Failed to PNG-encode clipboard image");
-                    None
-                }
+                None => log::warn!("Failed to PNG-encode clipboard image"),
             }
         }
-        Err(e) => {
-            log::trace!("No clipboard image: {}", e);
-            None
+        Err(e) => log::trace!("No clipboard image: {}", e),
+    }
+    None
+}
+
+/// load the payload a signature refers to; for files this is when the
+/// file contents are actually read (regular files only)
+fn event_from_sig(clipboard: &mut Clipboard, sig: &ContentSig) -> Option<ClipboardEvent> {
+    match sig {
+        ContentSig::Text(t) => Some(ClipboardEvent::Text(t.clone())),
+        ContentSig::Image(png) => Some(ClipboardEvent::Image(png.clone())),
+        ContentSig::Files(names) => {
+            let paths = clipboard.get().file_list().ok()?;
+            let mut files = Vec::with_capacity(names.len());
+            for path in paths {
+                let Some(name) = file_name(&path) else {
+                    continue;
+                };
+                if !path.is_file() {
+                    log::info!("skipping non-file clipboard entry {}", path.display());
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(data) => files.push(ClipboardFile { name, data }),
+                    Err(e) => log::warn!("cannot read clipboard file {}: {e}", path.display()),
+                }
+            }
+            if files.is_empty() {
+                None
+            } else {
+                Some(ClipboardEvent::Files(files))
+            }
+        }
+    }
+}
+
+fn sig_of(event: &ClipboardEvent) -> ContentSig {
+    match event {
+        ClipboardEvent::Text(t) => ContentSig::Text(t.clone()),
+        ClipboardEvent::Image(png) => ContentSig::Image(png.clone()),
+        ClipboardEvent::Files(files) => {
+            ContentSig::Files(files.iter().map(|f| f.name.clone()).collect())
         }
     }
 }
@@ -57,11 +117,11 @@ fn read_clipboard_content(clipboard: &mut Clipboard) -> Option<ClipboardEvent> {
 impl ClipboardMonitor {
     pub fn new() -> Result<Self, CaptureError> {
         let (event_tx, event_rx) = mpsc::channel(16);
-        let last_content: Arc<Mutex<Option<ClipboardEvent>>> = Arc::new(Mutex::new(None));
+        let last_sig: Arc<Mutex<Option<ContentSig>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
-        let last_content_clone = last_content.clone();
+        let last_sig_clone = last_sig.clone();
         let last_change_clone = last_change.clone();
         let enabled_clone = enabled.clone();
         let event_tx_clone = event_tx.clone();
@@ -84,7 +144,7 @@ impl ClipboardMonitor {
                 }
 
                 // Read clipboard in blocking task
-                let last_content_clone2 = last_content_clone.clone();
+                let last_sig_clone2 = last_sig_clone.clone();
                 let last_change_clone2 = last_change_clone.clone();
                 let event_tx_clone2 = event_tx_clone.clone();
 
@@ -98,19 +158,20 @@ impl ClipboardMonitor {
                         }
                     };
 
-                    // Get current clipboard content (text or image)
-                    let Some(current_content) = read_clipboard_content(&mut clipboard) else {
+                    // Get current clipboard signature (files compare by
+                    // name — contents are read only on real changes)
+                    let Some(sig) = read_clipboard_sig(&mut clipboard) else {
                         // Clipboard might be empty or contain non-shareable data
                         return;
                     };
 
                     // Check if content changed
-                    let mut last_content = last_content_clone2.lock().unwrap();
+                    let mut last_sig = last_sig_clone2.lock().unwrap();
                     let mut last_change = last_change_clone2.lock().unwrap();
 
-                    let content_changed = match last_content.as_ref() {
+                    let content_changed = match last_sig.as_ref() {
                         None => true,
-                        Some(last) => last != &current_content,
+                        Some(last) => last != &sig,
                     };
 
                     if content_changed {
@@ -122,12 +183,15 @@ impl ClipboardMonitor {
                         };
 
                         if should_emit {
+                            let Some(current_content) = event_from_sig(&mut clipboard, &sig) else {
+                                return;
+                            };
                             log::info!(
                                 "Clipboard changed: {} ({} bytes)",
                                 current_content,
                                 current_content.content_len()
                             );
-                            *last_content = Some(current_content.clone());
+                            *last_sig = Some(sig);
                             *last_change = Some(Instant::now());
 
                             // Send event
@@ -145,7 +209,7 @@ impl ClipboardMonitor {
         Ok(Self {
             event_rx,
             _event_tx: event_tx,
-            last_content,
+            last_sig,
             last_change,
             enabled,
         })
@@ -173,9 +237,9 @@ impl ClipboardMonitor {
     /// Update the last known clipboard content (called when we set the clipboard)
     /// This prevents detecting our own clipboard changes as external changes
     pub fn update_last_content(&self, content: ClipboardEvent) {
-        let mut last_content = self.last_content.lock().unwrap();
+        let mut last_sig = self.last_sig.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
-        *last_content = Some(content);
+        *last_sig = Some(sig_of(&content));
         *last_change = Some(Instant::now());
     }
 }

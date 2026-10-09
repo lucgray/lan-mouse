@@ -17,7 +17,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::connect::{IncomingEvent, LanMouseConnection};
 use crate::remap::KeyRemap;
 use crate::scroll::ScrollInvert;
 
@@ -52,6 +52,8 @@ pub(crate) enum ICaptureEvent {
     ClientLeft(u64),
     /// clipboard data received from remote
     ClipboardReceived(input_event::ClipboardEvent),
+    /// fragment progress of an in-flight clipboard transfer
+    ClipboardProgress { received: u64, total: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,7 +387,16 @@ impl CaptureTask {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
-                (handle, event) = self.conn.recv() => {
+                (handle, incoming) = self.conn.recv() => {
+                    let event = match incoming {
+                        IncomingEvent::Event(event) => event,
+                        IncomingEvent::ClipboardProgress { received, total } => {
+                            self.event_tx
+                                .send(ICaptureEvent::ClipboardProgress { received, total })
+                                .expect("channel closed");
+                            continue;
+                        }
+                    };
                     // clipboard events are accepted from any client
                     if let ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event)) = &event {
                         self.event_tx.send(ICaptureEvent::ClipboardReceived(clipboard_event.clone())).expect("channel closed");

@@ -88,6 +88,11 @@ pub(crate) enum ListenEvent {
     Rejected {
         fingerprint: String,
     },
+    /// fragment progress of a clipboard transfer the peer is sending us
+    ClipboardProgress {
+        received: u64,
+        total: u64,
+    },
 }
 
 pub(crate) struct LanMouseListener {
@@ -256,7 +261,12 @@ impl LanMouseListener {
         }
     }
 
-    pub(crate) async fn reply_clipboard(&self, addr: SocketAddr, event: ProtoEvent) {
+    pub(crate) async fn reply_clipboard(
+        &self,
+        addr: SocketAddr,
+        event: ProtoEvent,
+        progress: Option<&Sender<(u64, u64)>>,
+    ) {
         use lan_mouse_proto::encode_clipboard_event;
 
         let buf = match encode_clipboard_event(&event) {
@@ -276,7 +286,7 @@ impl LanMouseListener {
         let conns = self.conns.lock().await;
         for (a, conn) in conns.iter() {
             if *a == addr {
-                match conn.send(&buf).await {
+                match crate::connect::send_clipboard_datagrams(conn, &buf, progress).await {
                     Ok(_) => log::debug!("Clipboard sent successfully to {}", addr),
                     Err(e) => log::error!("Failed to send clipboard to {}: {:?}", addr, e),
                 }
@@ -321,11 +331,16 @@ async fn read_loop(
     conn: ArcConn,
     dtls_tx: Sender<ListenEvent>,
 ) -> Result<(), Error> {
-    use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, decode_clipboard_event, is_clipboard_event_type};
+    use lan_mouse_proto::{
+        ClipboardReassembler, MAX_CLIPBOARD_SIZE, decode_clipboard_event, is_clipboard_event_type,
+        is_clipboard_fragment_type,
+    };
 
-    // Buffer needs to be large enough for clipboard data
-    // Use Vec instead of array for large buffers to avoid stack overflow
+    // Buffer needs to be large enough for a single legacy-format clipboard
+    // datagram or one clipboard fragment. Use Vec instead of array for
+    // large buffers to avoid stack overflow
     let mut b = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
+    let mut reassembler = ClipboardReassembler::new();
 
     loop {
         // Read first byte to determine event type
@@ -345,7 +360,27 @@ async fn read_loop(
 
         // Check if this is a clipboard event (variable length)
         let event_type = b[0];
-        let event = if is_clipboard_event_type(event_type) {
+        let event = if is_clipboard_fragment_type(event_type) {
+            match reassembler.push(&b[..n]) {
+                Ok(Some(encoded)) => match decode_clipboard_event(&encoded) {
+                    Ok(event) => event,
+                    Err(e) => {
+                        log::warn!("error decoding clipboard event: {e}");
+                        continue;
+                    }
+                },
+                Ok(None) => {
+                    if let Some((received, total)) = reassembler.progress() {
+                        let _ = dtls_tx.send(ListenEvent::ClipboardProgress { received, total });
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("bad clipboard fragment from {addr}: {e}");
+                    continue;
+                }
+            }
+        } else if is_clipboard_event_type(event_type) {
             // This is a clipboard event - need to read full message
             if n < 5 {
                 log::warn!("Clipboard event too short: {} bytes", n);
@@ -355,6 +390,9 @@ async fn read_loop(
             // Parse length from bytes 1-4
             let length = u32::from_be_bytes([b[1], b[2], b[3], b[4]]) as usize;
 
+            // payloads larger than MAX_CLIPBOARD_SIZE always arrive as
+            // fragments; a bigger length in the single-datagram format
+            // can only come from a broken peer
             if length > MAX_CLIPBOARD_SIZE {
                 log::warn!("Clipboard data too large: {} bytes", length);
                 break;

@@ -541,6 +541,25 @@ impl Window {
         self.imp().fingerprint_row.set_subtitle(fingerprint);
     }
 
+    /// show / update / hide the clipboard transfer progress bar
+    pub(super) fn update_clipboard_progress(&self, incoming: bool, received: u64, total: u64) {
+        let imp = self.imp();
+        if total == 0 || received >= total {
+            imp.transfer_revealer.set_reveal_child(false);
+            return;
+        }
+        imp.transfer_label.set_label(if incoming {
+            "Receiving…"
+        } else {
+            "Sending…"
+        });
+        let fraction = received as f64 / total as f64;
+        imp.transfer_bar.set_fraction(fraction);
+        imp.transfer_bar
+            .set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+        imp.transfer_revealer.set_reveal_child(true);
+    }
+
     /// store the settings state pushed by the daemon and apply it to an
     /// open settings window, if any
     pub(super) fn update_settings(

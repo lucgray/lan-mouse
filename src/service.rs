@@ -80,6 +80,9 @@ pub struct Service {
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
     window_identifier: Arc<Mutex<Option<input_capture::WindowIdentifier>>>,
+    /// outgoing clipboard transfer progress (fed by send loops)
+    clipboard_progress_tx: local_channel::mpsc::Sender<(u64, u64)>,
+    clipboard_progress_rx: local_channel::mpsc::Receiver<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -147,6 +150,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let (clipboard_progress_tx, clipboard_progress_rx) = local_channel::mpsc::channel();
         let service = Self {
             config,
             capture,
@@ -169,6 +173,8 @@ impl Service {
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
             window_identifier,
+            clipboard_progress_tx,
+            clipboard_progress_rx,
         };
         Ok(service)
     }
@@ -211,6 +217,15 @@ impl Service {
                 _ = async { shutdown.as_mut().unwrap().recv().await }, if shutdown.is_some() => {
                     log::info!("Shutdown signal received");
                     break;
+                },
+                progress = self.clipboard_progress_rx.recv() => {
+                    if let Some((received, total)) = progress {
+                        self.notify_frontend(FrontendEvent::ClipboardProgress {
+                            incoming: false,
+                            received,
+                            total,
+                        });
+                    }
                 },
             }
         }
@@ -429,6 +444,13 @@ impl Service {
                     self.broadcast_client(handle);
                 }
             }
+            EmulationEvent::ClipboardProgress { received, total } => {
+                self.notify_frontend(FrontendEvent::ClipboardProgress {
+                    incoming: true,
+                    received,
+                    total,
+                });
+            }
             EmulationEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
                 if self.clipboard_enabled {
@@ -474,6 +496,13 @@ impl Service {
                 log::info!("leaving client {handle} ...");
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
+            ICaptureEvent::ClipboardProgress { received, total } => {
+                self.notify_frontend(FrontendEvent::ClipboardProgress {
+                    incoming: true,
+                    received,
+                    total,
+                });
+            }
             ICaptureEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
                 if self.clipboard_enabled {
@@ -500,7 +529,9 @@ impl Service {
         use input_event::Event;
 
         if let Some(CaptureEvent::Input(Event::Clipboard(clipboard_event))) = event {
-            use lan_mouse_proto::{MAX_CLIPBOARD_SIZE, ProtocolError, encode_clipboard_event};
+            use lan_mouse_proto::{
+                MAX_CLIPBOARD_TRANSFER_SIZE, ProtocolError, encode_clipboard_event,
+            };
 
             let proto_event = lan_mouse_proto::ProtoEvent::Input(input_event::Event::Clipboard(
                 clipboard_event.clone(),
@@ -513,11 +544,11 @@ impl Service {
                     log::warn!(
                         "clipboard content too large to share: {} bytes ({} byte limit)",
                         bytes,
-                        MAX_CLIPBOARD_SIZE
+                        MAX_CLIPBOARD_TRANSFER_SIZE
                     );
                     self.notify_frontend(FrontendEvent::ClipboardTooLarge {
                         bytes,
-                        limit: MAX_CLIPBOARD_SIZE,
+                        limit: MAX_CLIPBOARD_TRANSFER_SIZE,
                     });
                     return;
                 }
@@ -537,7 +568,11 @@ impl Service {
             for handle in active_clients {
                 if let Err(e) = self
                     .conn_sender
-                    .send_clipboard(proto_event.clone(), handle)
+                    .send_clipboard(
+                        proto_event.clone(),
+                        handle,
+                        Some(&self.clipboard_progress_tx),
+                    )
                     .await
                 {
                     log::warn!("Failed to send clipboard to client {}: {}", handle, e);
@@ -555,7 +590,11 @@ impl Service {
 
             for addr in incoming_addrs {
                 log::info!("Sending clipboard to incoming connection {}", addr);
-                self.emulation.send_clipboard(addr, clipboard_event.clone());
+                self.emulation.send_clipboard(
+                    addr,
+                    clipboard_event.clone(),
+                    Some(self.clipboard_progress_tx.clone()),
+                );
                 shared = true;
             }
 

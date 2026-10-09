@@ -242,6 +242,15 @@ pub enum FrontendEvent {
     },
     /// local clipboard content was dropped because it exceeds the wire limit
     ClipboardTooLarge { bytes: usize, limit: usize },
+    /// progress of a fragmented clipboard transfer (large images / files)
+    ClipboardProgress {
+        /// true when receiving from a peer, false when sending to one
+        incoming: bool,
+        /// payload bytes transferred so far
+        received: u64,
+        /// total payload bytes
+        total: u64,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]

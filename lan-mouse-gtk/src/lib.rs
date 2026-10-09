@@ -478,12 +478,20 @@ fn build_ui(app: &Application) {
                         let kind = match kind {
                             ClipboardContentKind::Text => "text",
                             ClipboardContentKind::Image => "image",
+                            ClipboardContentKind::Files => "files (saved to Downloads)",
                         };
                         let direction = if received { "received" } else { "shared" };
                         window.show_toast(
                             format!("clipboard {kind} {direction} ({})", human_bytes(bytes))
                                 .as_str(),
                         );
+                    }
+                    FrontendEvent::ClipboardProgress {
+                        incoming,
+                        received,
+                        total,
+                    } => {
+                        window.update_clipboard_progress(incoming, received, total);
                     }
                     FrontendEvent::ClipboardTooLarge { bytes, limit } => {
                         window.show_toast(

@@ -1858,6 +1858,7 @@ dependencies = [
  "core-foundation",
  "core-foundation-sys",
  "core-graphics",
+ "dirs",
  "evdev",
  "futures",
  "input-event",
