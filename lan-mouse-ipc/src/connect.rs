@@ -89,29 +89,35 @@ fn make_connection(
 }
 
 /// wait for the lan-mouse socket to come online
+/// bound the startup wait so a wedged daemon surfaces as a Timeout
+/// instead of hanging the frontend forever (≈60s worst case)
+const WAIT_ATTEMPTS: u32 = 64;
+
 #[cfg(unix)]
 fn wait_for_service() -> Result<UnixStream, ConnectionError> {
     let socket_path = crate::default_socket_path()?;
     let mut duration = Duration::from_millis(10);
-    loop {
+    for _ in 0..WAIT_ATTEMPTS {
         if let Ok(stream) = UnixStream::connect(&socket_path) {
-            break Ok(stream);
+            return Ok(stream);
         }
         // a signaling mechanism or inotify could be used to
         // improve this
         thread::sleep(exponential_back_off(&mut duration));
     }
+    Err(ConnectionError::Timeout)
 }
 
 #[cfg(windows)]
 fn wait_for_service() -> Result<TcpStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
-    loop {
+    for _ in 0..WAIT_ATTEMPTS {
         if let Ok(stream) = TcpStream::connect("127.0.0.1:5252") {
-            break Ok(stream);
+            return Ok(stream);
         }
         thread::sleep(exponential_back_off(&mut duration));
     }
+    Err(ConnectionError::Timeout)
 }
 
 fn exponential_back_off(duration: &mut Duration) -> Duration {

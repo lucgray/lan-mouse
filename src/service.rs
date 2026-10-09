@@ -24,7 +24,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -109,7 +109,12 @@ struct PendingSendBatch {
     expected: u32,
     done: u32,
     ok: u32,
+    started: Instant,
 }
+
+/// a peer that never finishes receiving leaves the batch (and its
+/// "shared/failed" toast) pending forever — expire stale batches
+const CLIPBOARD_BATCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 struct Incoming {
@@ -285,6 +290,7 @@ impl Service {
                         log::error!("dns resolver task exited, shutting down");
                         break;
                     }
+                    self.expire_clipboard_batches();
                 },
                 r = self.config.changed() => match r {
                     Ok(()) => self.handle_config_change(),
@@ -789,8 +795,45 @@ impl Service {
                         expected,
                         done: 0,
                         ok: 0,
+                        started: Instant::now(),
                     },
                 );
+            }
+        }
+    }
+
+    /// drop sends whose peers stopped reporting; unresolved batches
+    /// count as failed so the user can retry the same content
+    fn expire_clipboard_batches(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<u64> = self
+            .pending_clipboard_batches
+            .iter()
+            .filter(|(_, b)| now.duration_since(b.started) > CLIPBOARD_BATCH_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let mut cleared_sig = false;
+        for id in stale {
+            let Some(b) = self.pending_clipboard_batches.remove(&id) else {
+                continue;
+            };
+            log::warn!(
+                "clipboard batch {id} timed out: {}/{} sends reported",
+                b.done,
+                b.expected
+            );
+            cleared_sig = true;
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "clipboard share timed out — {}/{} peer(s) responded",
+                b.done, b.expected
+            )));
+        }
+        if cleared_sig {
+            if let Some(ref monitor) = self.clipboard_monitor {
+                monitor.clear_last_sig();
             }
         }
     }

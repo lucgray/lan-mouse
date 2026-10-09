@@ -567,7 +567,9 @@ impl EmulationProxy {
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         let _ = self.request_tx.send(ProxyRequest::Terminate);
-        let _ = (&mut self.task).await;
+        if let Err(e) = (&mut self.task).await {
+            log::warn!("emulation task join failed during terminate: {e}");
+        }
     }
 }
 

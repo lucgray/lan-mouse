@@ -457,8 +457,8 @@ impl Config {
             .unwrap_or(default_path()?.join(CONFIG_FILE_NAME));
         let config_dir = config_path
             .parent()
-            .expect("config directory")
-            .to_path_buf();
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
 
         // Ensure the config directory exists and write a default config file
         // if none is present. Runs on every Config::new(), regardless of which

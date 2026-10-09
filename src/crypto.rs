@@ -30,8 +30,10 @@ pub fn generate_fingerprint(cert: &[u8]) -> String {
 }
 
 pub fn certificate_fingerprint(cert: &Certificate) -> String {
-    let certificate = cert.certificate.first().expect("certificate missing");
-    generate_fingerprint(certificate)
+    cert.certificate
+        .first()
+        .map(|c| generate_fingerprint(c))
+        .unwrap_or_default()
 }
 
 /// load certificate from file
@@ -55,7 +57,7 @@ pub(crate) fn load_or_generate_key_and_cert(path: &Path) -> Result<Certificate, 
 pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
     let cert = Certificate::generate_self_signed(["ignored".to_owned()])?;
     let serialized = cert.serialize_pem();
-    let parent = path.parent().expect("is a path");
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
     fs::create_dir_all(parent)?;
     let f = File::create(path)?;
     #[cfg(unix)]
