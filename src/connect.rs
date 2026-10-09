@@ -107,9 +107,14 @@ pub(crate) async fn send_clipboard_datagrams(
     progress: Option<&Sender<(u64, u64)>>,
 ) -> Result<(), webrtc_util::Error> {
     use lan_mouse_proto::ClipboardFragmenter;
-    // largest message that still fits one UDP datagram (65535 minus
-    // IPv4/UDP headers); anything bigger is sent as fragments
-    const MAX_CLIPBOARD_DATAGRAM: usize = 65_507;
+    // largest message that still fits a single datagram without
+    // IP fragmentation: the same size budget as a fragment datagram.
+    // A bigger single datagram gets sliced by the IP layer and one
+    // lost slice drops the whole transfer with no retransmit, so
+    // anything that doesn't fit is sent via the reliable fragment
+    // path instead.
+    const MAX_CLIPBOARD_DATAGRAM: usize = lan_mouse_proto::CLIPBOARD_FRAGMENT_PAYLOAD
+        + lan_mouse_proto::CLIPBOARD_FRAGMENT_HEADER;
     if encoded.len() <= MAX_CLIPBOARD_DATAGRAM {
         conn.send(encoded).await?;
         return Ok(());
