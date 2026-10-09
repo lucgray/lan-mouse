@@ -34,7 +34,7 @@ pub const CLIPBOARD_FRAGMENT_HEADER: usize = 17;
 /// FNV-1a over the encoded event — identifies a transfer so a new
 /// clipboard payload with the same total/fragment count cannot be
 /// merged into an in-flight reassembly
-fn transfer_id(encoded: &[u8]) -> u32 {
+pub fn transfer_id(encoded: &[u8]) -> u32 {
     let mut h: u32 = 0x811c9dc5;
     for b in encoded {
         h = (h ^ *b as u32).wrapping_mul(0x01000193);
@@ -170,6 +170,11 @@ pub enum EventType {
     /// one or more files copied in a file manager. Payload:
     /// `[u32 count]{[u32 name_len][name][u64 data_len][data]}`
     ClipboardFile,
+    /// request retransmission of fragments the sender dropped on the
+    /// wire. Not a [`ProtoEvent`] variant — the sending side answers
+    /// with another burst of [`ClipboardFragment`] datagrams.
+    /// Payload: `[u32 transfer_id][u16 count]{u32 seq}*`
+    ClipboardFragmentRequest,
 }
 
 impl ProtoEvent {
@@ -265,7 +270,8 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::ClipboardText
             | EventType::ClipboardImage
             | EventType::ClipboardFile
-            | EventType::ClipboardFragment => {
+            | EventType::ClipboardFragment
+            | EventType::ClipboardFragmentRequest => {
                 // Clipboard events use variable-length encoding
                 // This path should not be reached for fixed-size buffer decoding
                 Err(ProtocolError::BufferTooSmall)
@@ -434,11 +440,75 @@ pub fn is_clipboard_fragment_type(event_type: u8) -> bool {
     event_type == EventType::ClipboardFragment as u8
 }
 
+/// whether an event type byte is a fragment retransmit request
+pub fn is_clipboard_fragment_request_type(event_type: u8) -> bool {
+    event_type == EventType::ClipboardFragmentRequest as u8
+}
+
+/// `[type][u32 transfer_id][u16 count]` — seq list follows
+pub const FRAGMENT_REQUEST_HEADER: usize = 7;
+
+/// max seqs in one request datagram so it stays well under MTU
+pub const FRAGMENT_REQUEST_MAX_SEQS: usize = 290;
+
+/// encode a [`EventType::ClipboardFragmentRequest`] datagram
+pub fn encode_fragment_request(transfer_id: u32, seqs: &[u32]) -> Vec<u8> {
+    let mut dgram = Vec::with_capacity(FRAGMENT_REQUEST_HEADER + seqs.len() * 4);
+    dgram.push(EventType::ClipboardFragmentRequest as u8);
+    dgram.extend_from_slice(&transfer_id.to_be_bytes());
+    dgram.extend_from_slice(&(seqs.len() as u16).to_be_bytes());
+    for seq in seqs {
+        dgram.extend_from_slice(&seq.to_be_bytes());
+    }
+    dgram
+}
+
+/// decode a [`EventType::ClipboardFragmentRequest`] datagram
+pub fn decode_fragment_request(dgram: &[u8]) -> Option<(u32, Vec<u32>)> {
+    if dgram.len() < FRAGMENT_REQUEST_HEADER
+        || dgram[0] != EventType::ClipboardFragmentRequest as u8
+    {
+        return None;
+    }
+    let id = u32::from_be_bytes(dgram[1..5].try_into().ok()?);
+    let count = u16::from_be_bytes(dgram[5..7].try_into().ok()?) as usize;
+    if dgram.len() != FRAGMENT_REQUEST_HEADER + count * 4 {
+        return None;
+    }
+    let seqs = (0..count)
+        .map(|i| {
+            let off = FRAGMENT_REQUEST_HEADER + i * 4;
+            u32::from_be_bytes(dgram[off..off + 4].try_into().unwrap())
+        })
+        .collect();
+    Some((id, seqs))
+}
+
+/// build the fragment datagram for one `seq` of an encoded payload,
+/// reusing the `id`/`num` of the transfer it belongs to. Used to
+/// answer retransmit requests without re-walking the payload.
+pub fn clipboard_fragment_at(encoded: &[u8], id: u32, seq: u32) -> Option<Vec<u8>> {
+    let num = encoded.len().div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD) as u32;
+    if seq >= num {
+        return None;
+    }
+    let start = seq as usize * CLIPBOARD_FRAGMENT_PAYLOAD;
+    let end = (start + CLIPBOARD_FRAGMENT_PAYLOAD).min(encoded.len());
+    let mut dgram = Vec::with_capacity(CLIPBOARD_FRAGMENT_HEADER + end - start);
+    dgram.push(EventType::ClipboardFragment as u8);
+    dgram.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+    dgram.extend_from_slice(&seq.to_be_bytes());
+    dgram.extend_from_slice(&num.to_be_bytes());
+    dgram.extend_from_slice(&id.to_be_bytes());
+    dgram.extend_from_slice(&encoded[start..end]);
+    Some(dgram)
+}
+
 /// Split an encoded clipboard event into self-describing fragment
-/// datagrams: `[type][u32 total_len][u32 seq][u32 num][payload]`.
+/// datagrams: `[type][u32 total_len][u32 seq][u32 num][u32 transfer_id][payload]`.
 /// Each datagram carries its position, so input events may interleave
-/// and datagrams may arrive out of order or be dropped (the transfer
-/// simply never completes; the next clipboard change resets state).
+/// and datagrams may arrive out of order. Lost fragments are
+/// re-requested via [`EventType::ClipboardFragmentRequest`].
 pub struct ClipboardFragmenter<'a> {
     encoded: &'a [u8],
     num: u32,
@@ -475,17 +545,9 @@ impl Iterator for ClipboardFragmenter<'_> {
         if self.next >= self.num {
             return None;
         }
-        let start = self.next as usize * CLIPBOARD_FRAGMENT_PAYLOAD;
-        let end = (start + CLIPBOARD_FRAGMENT_PAYLOAD).min(self.encoded.len());
-        let mut dgram = Vec::with_capacity(CLIPBOARD_FRAGMENT_HEADER + end - start);
-        dgram.push(EventType::ClipboardFragment as u8);
-        dgram.extend_from_slice(&(self.encoded.len() as u32).to_be_bytes());
-        dgram.extend_from_slice(&self.next.to_be_bytes());
-        dgram.extend_from_slice(&self.num.to_be_bytes());
-        dgram.extend_from_slice(&self.id.to_be_bytes());
-        dgram.extend_from_slice(&self.encoded[start..end]);
+        let seq = self.next;
         self.next += 1;
-        Some(dgram)
+        clipboard_fragment_at(self.encoded, self.id, seq)
     }
 }
 
@@ -513,12 +575,16 @@ pub struct ClipboardReassembler {
 /// drop an incomplete reassembly after this much silence
 const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// no new fragment for this long mid-transfer → request retransmits
+const REQUEST_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl ClipboardReassembler {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn reset(&mut self) {
+    /// drop all in-flight state; see [`Self::stalled`]
+    pub fn reset(&mut self) {
         self.id = 0;
         self.num = 0;
         self.got = 0;
@@ -526,6 +592,17 @@ impl ClipboardReassembler {
         self.seen.clear();
         self.data.clear();
         self.last_fragment = None;
+    }
+
+    /// a transfer that saw no fragment for [`REASSEMBLY_TIMEOUT`]:
+    /// some fragments were lost on the wire and it will never
+    /// complete. Callers should [`Self::reset`] and surface a cleared
+    /// progress state.
+    pub fn stalled(&self) -> bool {
+        self.num != 0
+            && self
+                .last_fragment
+                .is_some_and(|t| t.elapsed() > REASSEMBLY_TIMEOUT)
     }
 
     /// (transferred, total) payload bytes while a transfer is in
@@ -536,6 +613,35 @@ impl ClipboardReassembler {
         } else {
             Some((self.got_bytes, self.total as u64))
         }
+    }
+
+    /// id of the in-flight transfer (needed to ask for retransmits)
+    pub fn transfer_id(&self) -> u32 {
+        self.id
+    }
+
+    /// the transfer is incomplete and went quiet — time to ask the
+    /// sender to retransmit the missing fragments
+    pub fn wants_request(&self) -> bool {
+        self.num != 0
+            && self.got < self.num
+            && self
+                .last_fragment
+                .is_some_and(|t| t.elapsed() > REQUEST_QUIET)
+    }
+
+    /// seq numbers of fragments not yet received (up to `max` entries)
+    pub fn missing_seqs(&self, max: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        for seq in 0..self.num {
+            if self.seen[(seq / 64) as usize] & (1u64 << (seq % 64)) == 0 {
+                out.push(seq);
+                if out.len() >= max {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// feed one received datagram; Ok(Some(encoded)) once the full
@@ -1053,5 +1159,46 @@ mod tests {
         bad.extend_from_slice(&1u32.to_be_bytes());
         bad.extend_from_slice(&[0u8; 10]);
         assert!(reasm.push(&bad).is_err());
+    }
+
+    #[test]
+    fn fragment_request_roundtrip() {
+        let req = encode_fragment_request(0xdeadbeef, &[1, 5, 700, 90000]);
+        assert!(is_clipboard_fragment_request_type(req[0]));
+        let (id, seqs) = decode_fragment_request(&req).unwrap();
+        assert_eq!(id, 0xdeadbeef);
+        assert_eq!(seqs, vec![1, 5, 700, 90000]);
+        // truncated / garbage / wrong type rejected
+        assert!(decode_fragment_request(&req[..req.len() - 2]).is_none());
+        assert!(decode_fragment_request(&[1, 2, 3]).is_none());
+        assert!(decode_fragment_request(&req).is_some());
+        let mut wrong = req.clone();
+        wrong[0] = EventType::ClipboardFragment as u8;
+        assert!(decode_fragment_request(&wrong).is_none());
+    }
+
+    #[test]
+    fn fragment_at_regenerates_identical_datagrams() {
+        let encoded = vec![42u8; CLIPBOARD_FRAGMENT_PAYLOAD * 3 + 17];
+        let frags: Vec<Vec<u8>> = ClipboardFragmenter::new(&encoded).collect();
+        let id = transfer_id(&encoded);
+        for (seq, f) in frags.iter().enumerate() {
+            assert_eq!(&clipboard_fragment_at(&encoded, id, seq as u32).unwrap(), f);
+        }
+        // out-of-range seq rejected
+        assert!(clipboard_fragment_at(&encoded, id, frags.len() as u32).is_none());
+    }
+
+    #[test]
+    fn reassembler_reports_missing_seqs() {
+        let mut reasm = ClipboardReassembler::new();
+        let encoded = vec![7u8; CLIPBOARD_FRAGMENT_PAYLOAD * 4];
+        let frags: Vec<Vec<u8>> = ClipboardFragmenter::new(&encoded).collect();
+        // deliver seq 0 and 2 only — 1 and 3 are missing
+        assert!(reasm.push(&frags[0]).unwrap().is_none());
+        assert!(reasm.push(&frags[2]).unwrap().is_none());
+        assert_eq!(reasm.missing_seqs(10), vec![1, 3]);
+        assert_eq!(reasm.missing_seqs(1), vec![1]);
+        assert!(reasm.wants_request() == false); // no quiet period yet
     }
 }

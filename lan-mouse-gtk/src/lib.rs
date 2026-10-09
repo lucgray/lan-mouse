@@ -74,8 +74,13 @@ pub(crate) fn local_commit_str() -> String {
 
 /// human-readable byte size for toast hints (e.g. `512 B`, `4 KB`)
 fn human_bytes(bytes: usize) -> String {
-    if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+    let b = bytes as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else if b >= 1024.0 {
+        format!("{:.1} KB", b / 1024.0)
     } else {
         format!("{bytes} B")
     }
@@ -427,6 +432,7 @@ fn build_ui(app: &Application) {
         async move {
             loop {
                 let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
+                log::trace!("frontend event: {notify:?}");
                 match notify {
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)

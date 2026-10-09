@@ -43,6 +43,58 @@ pub(crate) enum LanMouseConnectionError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+// encoded clipboard payloads retained briefly after sending so the
+// peer can ask for retransmission of fragments lost on the wire,
+// keyed by `transfer_id`. Tasks all live on one single-threaded
+// runtime, so a thread_local map is enough.
+thread_local! {
+    static PENDING_TRANSFERS: RefCell<HashMap<u32, (Vec<u8>, std::time::Instant)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// how long a sent payload stays available for retransmit requests
+const PENDING_TTL: Duration = Duration::from_secs(30);
+
+/// total payload bytes retained across all pending transfers
+const PENDING_MAX_BYTES: usize = 512 * 1024 * 1024;
+
+fn pending_store(encoded: &[u8], id: u32) {
+    PENDING_TRANSFERS.with(|p| {
+        let mut m = p.borrow_mut();
+        m.insert(id, (encoded.to_vec(), std::time::Instant::now()));
+        m.retain(|_, (_, t)| t.elapsed() < PENDING_TTL);
+        let mut bytes: usize = m.values().map(|(v, _)| v.len()).sum();
+        while bytes > PENDING_MAX_BYTES && m.len() > 1 {
+            let Some(oldest) = m
+                .iter()
+                .max_by_key(|(_, (_, t))| t.elapsed())
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            if let Some((v, _)) = m.remove(&oldest) {
+                bytes -= v.len();
+            }
+        }
+    });
+}
+
+/// fragment datagrams answering a peer's retransmit request
+pub(crate) fn pending_resends(id: u32, seqs: &[u32]) -> Vec<Vec<u8>> {
+    PENDING_TRANSFERS.with(|p| {
+        let mut m = p.borrow_mut();
+        match m.get_mut(&id) {
+            Some((encoded, touched)) => {
+                *touched = std::time::Instant::now();
+                seqs.iter()
+                    .filter_map(|s| lan_mouse_proto::clipboard_fragment_at(encoded, id, *s))
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    })
+}
+
 /// send an encoded clipboard event over `conn`. Payloads that fit the
 /// legacy single-datagram format go out as one message; larger ones are
 /// split into [`lan_mouse_proto::EventType::ClipboardFragment`] datagrams
@@ -63,17 +115,32 @@ pub(crate) async fn send_clipboard_datagrams(
         return Ok(());
     }
     let total = encoded.len() as u64;
+    let mut last_reported = 0u64;
     for (i, dgram) in ClipboardFragmenter::new(encoded).enumerate() {
         conn.send(&dgram).await?;
-        if let Some(progress) = progress {
-            let done =
-                ((i as u64 + 1) * lan_mouse_proto::CLIPBOARD_FRAGMENT_PAYLOAD as u64).min(total);
-            let _ = progress.send((done, total));
+        if i % 64 == 63 {
+            // pace the burst: flooding the receiver's socket buffer
+            // faster than its DTLS read loop drains it drops datagrams
+            // and a single missing fragment kills the whole transfer.
+            // ~10MB/s wire rate - comfortably below even debug-build
+            // decrypt speed, and the transfer bar wants to be seen anyway.
+            if let Some(progress) = progress {
+                let done = ((i as u64 + 1) * lan_mouse_proto::CLIPBOARD_FRAGMENT_PAYLOAD as u64)
+                    .min(total);
+                // throttle to ~1% steps: every fragment would flood the
+                // frontend channel and bury the bar under stale events
+                if done - last_reported >= (total / 100).max(1) {
+                    last_reported = done;
+                    let _ = progress.send((done, total));
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
         }
-        if i % 256 == 255 {
-            // keep the single-threaded runtime responsive mid-transfer
-            tokio::task::yield_now().await;
-        }
+    }
+    // keep the payload so dropped fragments can be re-sent on request
+    pending_store(encoded, lan_mouse_proto::transfer_id(encoded));
+    if let Some(progress) = progress {
+        let _ = progress.send((total, total));
     }
     Ok(())
 }
@@ -396,24 +463,93 @@ async fn receive_loop(
     // Use Vec instead of array for large buffers to avoid stack overflow.
     let mut buf = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
     let mut reassembler = ClipboardReassembler::new();
-    while let Ok(n) = conn.recv(&mut buf).await {
+    let mut last_reported = 0u64;
+    loop {
+        let n = tokio::select! {
+            r = conn.recv(&mut buf) => match r {
+                Ok(n) => n,
+                Err(_) => break,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if reassembler.wants_request() {
+                    let id = reassembler.transfer_id();
+                    let missing = reassembler.missing_seqs(
+                        lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS * 20,
+                    );
+                    for chunk in
+                        missing.chunks(lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS)
+                    {
+                        let _ = conn
+                            .send(&lan_mouse_proto::encode_fragment_request(id, chunk))
+                            .await;
+                    }
+                }
+                if reassembler.stalled() {
+                    let (got, want) = reassembler.progress().unwrap_or((0, 0));
+                    log::warn!(
+                        "clipboard transfer from {addr} stalled at {got}/{want} bytes - aborting"
+                    );
+                    reassembler.reset();
+                    let _ = tx.send((
+                        handle,
+                        IncomingEvent::ClipboardProgress {
+                            received: 0,
+                            total: 0,
+                        },
+                    ));
+                }
+                continue;
+            }
+        };
         if n == 0 {
             break;
+        }
+        // a peer asking for dropped fragments of a transfer we sent
+        if lan_mouse_proto::is_clipboard_fragment_request_type(buf[0]) {
+            if let Some((id, seqs)) = lan_mouse_proto::decode_fragment_request(&buf[..n]) {
+                for dgram in pending_resends(id, &seqs) {
+                    if conn.send(&dgram).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            continue;
         }
         // Clipboard events use variable-length encoding
         let event = if is_clipboard_fragment_type(buf[0]) {
             match reassembler.push(&buf[..n]) {
-                Ok(Some(encoded)) => match decode_clipboard_event(&encoded) {
-                    Ok(event) => event,
-                    Err(e) => {
-                        log::warn!("Failed to decode clipboard from {addr}: {e:?}");
-                        continue;
+                Ok(Some(encoded)) => {
+                    last_reported = 0;
+                    // full payload — tell the frontend the bar can hide
+                    let _ = tx.send((
+                        handle,
+                        IncomingEvent::ClipboardProgress {
+                            received: encoded.len() as u64,
+                            total: encoded.len() as u64,
+                        },
+                    ));
+                    match decode_clipboard_event(&encoded) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            log::warn!("Failed to decode clipboard from {addr}: {e:?}");
+                            continue;
+                        }
                     }
-                },
+                }
                 Ok(None) => {
                     if let Some((received, total)) = reassembler.progress() {
-                        let _ =
-                            tx.send((handle, IncomingEvent::ClipboardProgress { received, total }));
+                        // a smaller `received` means a new transfer started
+                        if received < last_reported {
+                            last_reported = 0;
+                        }
+                        // ~1% steps only — the frontend channel is small
+                        if received - last_reported >= (total / 100).max(1) {
+                            last_reported = received;
+                            let _ = tx.send((
+                                handle,
+                                IncomingEvent::ClipboardProgress { received, total },
+                            ));
+                        }
                     }
                     continue;
                 }

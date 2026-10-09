@@ -566,19 +566,21 @@ impl Service {
 
             let mut shared = false;
             for handle in active_clients {
-                if let Err(e) = self
-                    .conn_sender
-                    .send_clipboard(
-                        proto_event.clone(),
-                        handle,
-                        Some(&self.clipboard_progress_tx),
-                    )
-                    .await
-                {
-                    log::warn!("Failed to send clipboard to client {}: {}", handle, e);
-                } else {
-                    shared = true;
-                }
+                // large payloads take seconds on the wire — run each
+                // send detached so the service loop (and the progress
+                // events it reports) keeps running
+                let sender = self.conn_sender.clone();
+                let progress_tx = self.clipboard_progress_tx.clone();
+                let event = proto_event.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = sender
+                        .send_clipboard(event, handle, Some(&progress_tx))
+                        .await
+                    {
+                        log::warn!("Failed to send clipboard to client {}: {}", handle, e);
+                    }
+                });
+                shared = true;
             }
 
             // Also send clipboard to all incoming connections (machines controlling us)

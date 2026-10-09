@@ -341,14 +341,42 @@ async fn read_loop(
     // large buffers to avoid stack overflow
     let mut b = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
     let mut reassembler = ClipboardReassembler::new();
+    let mut last_reported = 0u64;
 
     loop {
         // Read first byte to determine event type
-        let n = match conn.recv(&mut b).await {
-            Ok(n) => n,
-            Err(e) => {
-                log::warn!("recv error from {}: {:?}", addr, e);
-                break;
+        let n = tokio::select! {
+            r = conn.recv(&mut b) => match r {
+                Ok(n) => n,
+                Err(e) => {
+                    log::warn!("recv error from {}: {:?}", addr, e);
+                    break;
+                }
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if reassembler.wants_request() {
+                    let id = reassembler.transfer_id();
+                    let missing = reassembler
+                        .missing_seqs(lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS * 20);
+                    for chunk in missing.chunks(lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS)
+                    {
+                        let _ = conn
+                            .send(&lan_mouse_proto::encode_fragment_request(id, chunk))
+                            .await;
+                    }
+                }
+                if reassembler.stalled() {
+                    let (got, want) = reassembler.progress().unwrap_or((0, 0));
+                    log::warn!(
+                        "clipboard transfer from {addr} stalled at {got}/{want} bytes - aborting"
+                    );
+                    reassembler.reset();
+                    let _ = dtls_tx.send(ListenEvent::ClipboardProgress {
+                        received: 0,
+                        total: 0,
+                    });
+                }
+                continue;
             }
         };
 
@@ -358,20 +386,48 @@ async fn read_loop(
 
         log::trace!("Received {} bytes from {}", n, addr);
 
+        // a peer asking for dropped fragments of a transfer we sent
+        if lan_mouse_proto::is_clipboard_fragment_request_type(b[0]) {
+            if let Some((id, seqs)) = lan_mouse_proto::decode_fragment_request(&b[..n]) {
+                for dgram in crate::connect::pending_resends(id, &seqs) {
+                    if conn.send(&dgram).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
         // Check if this is a clipboard event (variable length)
         let event_type = b[0];
         let event = if is_clipboard_fragment_type(event_type) {
             match reassembler.push(&b[..n]) {
-                Ok(Some(encoded)) => match decode_clipboard_event(&encoded) {
-                    Ok(event) => event,
-                    Err(e) => {
-                        log::warn!("error decoding clipboard event: {e}");
-                        continue;
+                Ok(Some(encoded)) => {
+                    last_reported = 0;
+                    let _ = dtls_tx.send(ListenEvent::ClipboardProgress {
+                        received: encoded.len() as u64,
+                        total: encoded.len() as u64,
+                    });
+                    match decode_clipboard_event(&encoded) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            log::warn!("error decoding clipboard event: {e}");
+                            continue;
+                        }
                     }
-                },
+                }
                 Ok(None) => {
                     if let Some((received, total)) = reassembler.progress() {
-                        let _ = dtls_tx.send(ListenEvent::ClipboardProgress { received, total });
+                        // a smaller `received` means a new transfer started
+                        if received < last_reported {
+                            last_reported = 0;
+                        }
+                        // ~1% steps only — the frontend channel is small
+                        if received - last_reported >= (total / 100).max(1) {
+                            last_reported = received;
+                            let _ =
+                                dtls_tx.send(ListenEvent::ClipboardProgress { received, total });
+                        }
                     }
                     continue;
                 }

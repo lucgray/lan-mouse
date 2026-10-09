@@ -77,6 +77,18 @@ reassembly. `ClipboardReassembler` on the receiver deduplicates by
 progress used by the GTK transfer bar. Old peers skip the unknown
 event types and keep the connection alive.
 
+Dropped fragments are recovered with `ClipboardFragmentRequest`
+datagrams sent back over the same connection:
+
+`[u8 type][u32 transfer_id][u16 count]{u32 seq}*`
+
+When the receiver sees ~250ms of silence mid-transfer it asks for the
+missing `seq`s (up to 290 per datagram). The sender keeps each
+fragmented payload for 30s and answers with another burst of
+`ClipboardFragment` datagrams; requests arriving for an expired or
+unknown `transfer_id` are ignored. Old peers never send requests — for
+them the transfer just never completes, same as before.
+
 ## Problems
 The general Idea is to have a bidirectional connection by default, meaning
 any connected device can not only receive events but also send events back.
