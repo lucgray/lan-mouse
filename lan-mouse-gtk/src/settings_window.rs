@@ -6,7 +6,7 @@ use adw::prelude::*;
 use glib::Object;
 use gtk::{gio, glib, subclass::prelude::ObjectSubclassIsExt};
 
-use gettextrs::gettext;
+use crate::i18n::gettext;
 
 glib::wrapper! {
     pub struct SettingsWindow(ObjectSubclass<imp::SettingsWindow>)

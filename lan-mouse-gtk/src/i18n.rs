@@ -17,12 +17,12 @@ use std::{env, fs, path::PathBuf};
 /// GtkBuilder's translation registry); elsewhere a minimal in-crate
 /// .mo parser — gettext-sys cannot build under MSVC.
 #[cfg(unix)]
-fn gettext(msgid: &str) -> String {
+pub(crate) fn gettext(msgid: &str) -> String {
     platform_gettext(msgid)
 }
 
 #[cfg(not(unix))]
-fn gettext(msgid: &str) -> String {
+pub(crate) fn gettext(msgid: &str) -> String {
     catalog()
         .get(msgid)
         .cloned()

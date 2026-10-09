@@ -10,7 +10,7 @@ use gtk::{
     glib::{self, closure_local},
 };
 
-use gettextrs::gettext;
+use crate::i18n::gettext;
 
 use lan_mouse_ipc::{
     ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
