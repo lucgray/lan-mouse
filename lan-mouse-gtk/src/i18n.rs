@@ -17,34 +17,52 @@ use std::{env, fs, path::PathBuf};
 /// GtkBuilder's translation registry); elsewhere a minimal in-crate
 /// .mo parser — gettext-sys cannot build under MSVC.
 #[cfg(unix)]
-fn gettext(msgid: &str) -> String {
+pub(crate) fn gettext(msgid: &str) -> String {
     platform_gettext(msgid)
 }
 
 #[cfg(not(unix))]
-fn gettext(msgid: &str) -> String {
-    catalog()
+pub(crate) fn gettext(msgid: &str) -> String {
+    catalog_for(&ui_language())
         .get(msgid)
         .cloned()
         .unwrap_or_else(|| msgid.to_string())
 }
 
+/// LANGUAGE env (set by tests or `apply_configured_language`), then
+/// the config.toml `language` key, else the empty "system" value.
 #[cfg(not(unix))]
-fn catalog() -> &'static std::collections::HashMap<String, String> {
-    static CATALOG: std::sync::OnceLock<std::collections::HashMap<String, String>> =
-        std::sync::OnceLock::new();
-    CATALOG.get_or_init(|| {
-        let lang = env::var("LANGUAGE")
-            .ok()
-            .filter(|l| !l.is_empty())
-            .or_else(configured_language)
-            .unwrap_or_default();
-        LANGUAGES
-            .iter()
-            .find(|(l, _)| *l == lang)
-            .and_then(|(_, bytes)| parse_mo(bytes))
-            .unwrap_or_default()
-    })
+fn ui_language() -> String {
+    env::var("LANGUAGE")
+        .ok()
+        .filter(|l| !l.is_empty())
+        .or_else(configured_language)
+        .unwrap_or_default()
+}
+
+/// Per-language parsed catalogs — resolved lazily so a runtime
+/// language change (or a test setting LANGUAGE after first use) is
+/// honored instead of pinning whatever ran first.
+#[cfg(not(unix))]
+fn catalog_for(lang: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CATALOGS: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    let cache = CATALOGS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cat) = guard.get(lang) {
+            return cat.clone();
+        }
+    }
+    let cat = LANGUAGES
+        .iter()
+        .find(|(l, _)| *l == lang)
+        .and_then(|(_, bytes)| parse_mo(bytes))
+        .unwrap_or_default();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(lang.to_string(), cat.clone());
+    }
+    cat
 }
 
 /// Minimal GNU .mo reader: header (magic, count, msgid/msgstr table
@@ -74,6 +92,9 @@ fn parse_mo(b: &[u8]) -> Option<std::collections::HashMap<String, String>> {
 
 include!(concat!(env!("OUT_DIR"), "/languages.rs"));
 
+/// textdomain name — only libintl consumes it (unix); the in-crate
+/// catalog lookup keys off LANGUAGES directly
+#[cfg(unix)]
 pub const DOMAIN: &str = "lan-mouse";
 
 /// Initialize gettext: apply the language configured in config.toml,

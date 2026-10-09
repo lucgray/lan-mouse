@@ -40,9 +40,11 @@ fn compile_translations() {
             let mo_path = i18n_dir.join(format!("{lang}.mo"));
             polib::mo_file::write(&catalog, &mo_path)
                 .unwrap_or_else(|e| panic!("failed to compile {}: {e}", path.display()));
+            // emit forward slashes: a Windows path in a normal string
+            // literal is a syntax error (\a, \i, ... are escapes)
             code.push_str(&format!(
                 "    (\"{lang}\", include_bytes!(\"{}\")),\n",
-                mo_path.display()
+                mo_path.display().to_string().replace('\\', "/")
             ));
         }
     }

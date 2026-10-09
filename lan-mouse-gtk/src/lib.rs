@@ -513,22 +513,22 @@ fn build_ui(app: &Application) {
                         bytes,
                     } => {
                         let kind = match kind {
-                            ClipboardContentKind::Text => gettextrs::gettext("text"),
-                            ClipboardContentKind::Image => gettextrs::gettext("image"),
+                            ClipboardContentKind::Text => i18n::gettext("text"),
+                            ClipboardContentKind::Image => i18n::gettext("image"),
                             ClipboardContentKind::Files if received => {
                                 let dir = window.download_dir();
                                 if dir.is_empty() {
-                                    gettextrs::gettext("files")
+                                    i18n::gettext("files")
                                 } else {
                                     i18n::tr("files (saved to {dir})", &[("dir", &dir)])
                                 }
                             }
-                            ClipboardContentKind::Files => gettextrs::gettext("files"),
+                            ClipboardContentKind::Files => i18n::gettext("files"),
                         };
                         let direction = if received {
-                            gettextrs::gettext("received")
+                            i18n::gettext("received")
                         } else {
-                            gettextrs::gettext("shared")
+                            i18n::gettext("shared")
                         };
                         window.show_toast(
                             i18n::tr(
