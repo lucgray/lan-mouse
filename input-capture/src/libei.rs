@@ -192,10 +192,12 @@ fn get_token_file_path() -> PathBuf {
     let cache_dir = env::var("XDG_CACHE_HOME")
         .ok()
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".cache")
-        });
+        .or_else(|| {
+            env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".cache"))
+        })
+        .unwrap_or_else(env::temp_dir);
 
     cache_dir.join("lan-mouse").join("input-capture.token")
 }

@@ -3,7 +3,7 @@ use input_event::{ClipboardEvent, ClipboardFile, Event, encode_image_rgba};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::spawn_blocking;
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::interval;
 
 use crate::{CaptureError, CaptureEvent};
@@ -15,6 +15,9 @@ pub struct ClipboardMonitor {
     last_sig: Arc<Mutex<Option<ContentSig>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
     enabled: Arc<Mutex<bool>>,
+    /// the polling task — kept so the service can supervise it with
+    /// [`Self::is_alive`] instead of waiting on channel state alone
+    task: JoinHandle<()>,
 }
 
 /// identity of the current clipboard payload. Files compare by the
@@ -129,7 +132,7 @@ impl ClipboardMonitor {
         let event_tx_clone = event_tx.clone();
 
         // Spawn monitoring task
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut check_interval = interval(Duration::from_millis(500));
 
             loop {
@@ -214,7 +217,16 @@ impl ClipboardMonitor {
             last_sig,
             last_change,
             enabled,
+            task,
         })
+    }
+
+    /// whether the polling task is still running — polled by the
+    /// service liveness tick; `recv()` returning `None` already
+    /// detects death, this exists so supervision does not depend on
+    /// which channel arm happens to fire first
+    pub fn is_alive(&self) -> bool {
+        !self.task.is_finished()
     }
 
     /// Receive the next clipboard event

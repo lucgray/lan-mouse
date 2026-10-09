@@ -347,6 +347,9 @@ pub struct Config {
     watcher: notify::RecommendedWatcher,
     // channel for filesystem events
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
+    /// set once the watcher channel dies or reports an error —
+    /// `changed()` pends forever afterwards instead of spinning
+    watch_failed: bool,
 }
 
 pub struct ConfigClient {
@@ -454,8 +457,8 @@ impl Config {
             .unwrap_or(default_path()?.join(CONFIG_FILE_NAME));
         let config_dir = config_path
             .parent()
-            .expect("config directory")
-            .to_path_buf();
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
 
         // Ensure the config directory exists and write a default config file
         // if none is present. Runs on every Config::new(), regardless of which
@@ -489,7 +492,9 @@ impl Config {
         let (tx, watch_rx) = tokio::sync::mpsc::channel(16);
         let watcher = RecommendedWatcher::new(
             move |res| {
-                let _ = tx.blocking_send(res);
+                if tx.blocking_send(res).is_err() {
+                    log::warn!("config watch event dropped: channel full or closed");
+                }
             },
             notify::Config::default(),
         )?;
@@ -501,6 +506,7 @@ impl Config {
             config_toml,
             watcher,
             watch_rx,
+            watch_failed: false,
         };
         config.watch()?;
         Ok(config)
@@ -517,10 +523,23 @@ impl Config {
         Ok(())
     }
 
+    /// Resolves once a watched change to the config file has been
+    /// reloaded, or with an error when the watcher is gone or reports
+    /// errors. After a watcher failure this pends forever — a dead
+    /// watcher must not spin or crash the service loop.
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
+        if self.watch_failed {
+            return std::future::pending().await;
+        }
         loop {
-            let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let Some(event) = self.watch_rx.recv().await else {
+                self.watch_failed = true;
+                return Err(notify::Error::generic("config watcher channel closed"));
+            };
+            let Ok(event) = event else {
+                self.watch_failed = true;
+                return Err(event.unwrap_err());
+            };
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
@@ -789,7 +808,9 @@ impl Config {
          * For now we just override the config file.
          */
 
-        let _ = self.unwatch();
+        if let Err(e) = self.unwatch() {
+            log::warn!("failed to unwatch config directory: {e}");
+        }
         /* write new config to file */
         if let Some(p) = self.config_path().parent() {
             fs::create_dir_all(p)?;
@@ -800,7 +821,11 @@ impl Config {
             f.sync_all()?;
         }
 
-        let _ = self.watch();
+        if let Err(e) = self.watch() {
+            // losing the watcher silently disables config hot-reload
+            self.watch_failed = true;
+            log::error!("failed to re-watch config directory: {e}");
+        }
 
         Ok(())
     }

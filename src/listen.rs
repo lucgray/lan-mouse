@@ -126,22 +126,16 @@ impl LanMouseListener {
             let connection_attempts = connection_attempts.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
+                    let fingerprint = peer_cert_fingerprint(certs)?;
+                    // a poisoned lock still holds valid data — recover the
+                    // guard rather than panicking inside the DTLS handshake
+                    let authorized = authorized.read().unwrap_or_else(|e| e.into_inner());
+                    if authorized.contains_key(&fingerprint) {
                         Ok(())
                     } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
                         connection_attempts
                             .lock()
-                            .expect("lock")
+                            .unwrap_or_else(|e| e.into_inner())
                             .push_back(fingerprint);
                         Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
                     }
@@ -176,11 +170,24 @@ impl LanMouseListener {
                                 log::info!("dtls client connected, ip: {addr}");
                                 let mut conns = conns_clone.lock().await;
                                 conns.push((addr, conn.clone()));
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-                                let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
+                                drop(conns);
+                                // the listener only accepts DTLS connections, but
+                                // keep these graceful — a panic here kills the
+                                // accept loop while the daemon keeps running
+                                let Some(dtls_conn) = conn.as_any().downcast_ref::<DTLSConn>() else {
+                                    log::error!("accepted connection is not a DTLS conn, dropping {addr}");
+                                    continue;
+                                };
+                                let peer_certs = dtls_conn.connection_state().await.peer_certificates;
+                                let Some(cert) = peer_certs.first() else {
+                                    log::warn!("peer {addr} presented no certificate, dropping");
+                                    continue;
+                                };
                                 let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
+                                if listen_tx.send(ListenEvent::Accept { addr, fingerprint }).is_err() {
+                                    log::error!("service event channel closed, listener exiting");
+                                    return;
+                                }
                                 spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
                             },
                             Err(e) => {
@@ -188,8 +195,15 @@ impl LanMouseListener {
                                     if let Some(e) = e.0.downcast_ref::<webrtc_dtls::Error>() {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
-                                                if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
+                                                let fingerprint = connection_attempts
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner())
+                                                    .pop_front();
+                                                if let Some(fingerprint) = fingerprint {
+                                                    if listen_tx.send(ListenEvent::Rejected { fingerprint }).is_err() {
+                                                        log::error!("service event channel closed, listener exiting");
+                                                        return;
+                                                    }
                                                 }
                                             }
                                             _ => log::warn!("accept: {e}"),
@@ -203,18 +217,27 @@ impl LanMouseListener {
                             }
                         },
                         port = request_port_change_rx.recv() => {
-                            let port = port.expect("channel closed");
+                            let Some(port) = port else {
+                                log::error!("service request channel closed, listener exiting");
+                                return;
+                            };
                             match bind_dtls(port, &cfg).await {
                                 Ok(new_listeners) => {
                                     for l in &listeners {
                                         let _ = l.close().await;
                                     }
                                     listeners = new_listeners;
-                                    port_changed_tx.send(Ok(port)).expect("channel closed");
+                                    if port_changed_tx.send(Ok(port)).is_err() {
+                                        log::error!("service channel closed, listener exiting");
+                                        return;
+                                    }
                                 }
                                 Err(e) => {
                                     log::warn!("unable to change port: {e}");
-                                    port_changed_tx.send(Err(e)).expect("channel closed");
+                                    if port_changed_tx.send(Err(e)).is_err() {
+                                        log::error!("service channel closed, listener exiting");
+                                        return;
+                                    }
                                 }
                             };
                         },
@@ -234,11 +257,22 @@ impl LanMouseListener {
     }
 
     pub(crate) fn request_port_change(&mut self, port: u16) {
-        self.request_port_change.send(port).expect("channel closed");
+        if self.request_port_change.send(port).is_err() {
+            log::error!("listener task gone, cannot request port change");
+        }
     }
 
-    pub(crate) async fn port_changed(&mut self) -> Result<u16, ListenerCreationError> {
-        self.port_changed.recv().await.expect("channel closed")
+    /// `None` when the listener task exited without answering.
+    pub(crate) async fn port_changed(&mut self) -> Option<Result<u16, ListenerCreationError>> {
+        self.port_changed.recv().await
+    }
+
+    /// whether the DTLS accept task is still running — polled by the
+    /// listen task's tick since the event channel stays open on death
+    /// (`listen_tx` is a field of this struct, so sender drop never
+    /// happens) and task death would otherwise be invisible
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.listen_task.is_finished()
     }
 
     pub(crate) async fn terminate(&mut self) {
@@ -252,11 +286,14 @@ impl LanMouseListener {
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
+        let event_str = format!("{event}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conns = self.conns.lock().await;
         for (a, conn) in conns.iter() {
             if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+                if let Err(e) = conn.send(&buf[..len]).await {
+                    log::warn!("reply {event_str} to {addr} failed: {e}");
+                }
             }
         }
     }
@@ -315,8 +352,11 @@ impl LanMouseListener {
             .find(|(a, _)| *a == addr)
             .map(|(_, c)| c.clone())
         {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
-            let certs = conn.connection_state().await.peer_certificates;
+            let Some(dtls_conn) = conn.as_any().downcast_ref::<DTLSConn>() else {
+                log::error!("connection for {addr} is not a DTLS conn");
+                return None;
+            };
+            let certs = dtls_conn.connection_state().await.peer_certificates;
             let cert = certs.first()?;
             let fingerprint = crypto::generate_fingerprint(cert);
             Some(fingerprint)
@@ -538,17 +578,81 @@ async fn read_loop(
             }
         };
 
-        dtls_tx
-            .send(ListenEvent::Msg { event, addr })
-            .expect("channel closed");
+        if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+            log::error!("service event channel closed, dropping message from {addr}");
+            break;
+        }
     }
 
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    let index = conns
-        .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+    if let Some(index) = conns.iter().position(|(a, _)| *a == addr) {
+        conns.remove(index);
+    } else {
+        log::warn!("{addr} was not registered in conns on disconnect");
+    }
     Ok(())
+}
+
+/// fingerprint of the single certificate a peer must present — any
+/// other count is a malformed handshake and gets a controlled
+/// rejection instead of panicking on the DTLS callback thread
+fn peer_cert_fingerprint(certs: &[Vec<u8>]) -> Result<String, webrtc_dtls::Error> {
+    if certs.len() != 1 {
+        log::warn!(
+            "rejecting peer: expected 1 certificate, got {}",
+            certs.len()
+        );
+        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+    }
+    Ok(crypto::generate_fingerprint(&certs[0]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_cert_fingerprint_rejects_invalid_counts() {
+        // zero certificates
+        assert!(matches!(
+            peer_cert_fingerprint(&[]),
+            Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+        ));
+        // multiple certificates — the old code panicked here
+        let cert = vec![7u8; 32];
+        assert!(matches!(
+            peer_cert_fingerprint(&[cert.clone(), cert]),
+            Err(webrtc_dtls::Error::ErrVerifyDataMismatch)
+        ));
+    }
+
+    #[test]
+    fn peer_cert_fingerprint_accepts_single_cert() {
+        let cert = vec![7u8; 32];
+        let fp = peer_cert_fingerprint(std::slice::from_ref(&cert)).expect("single cert");
+        assert_eq!(fp, crypto::generate_fingerprint(&cert));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn listener_is_alive_reflects_task_death() {
+        // fault injection: the accept task dying must be observable —
+        // the event channel stays open (listen_tx lives on the
+        // listener struct) so is_alive is the only detection path
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()])
+                    .expect("self-signed cert");
+                let listener = LanMouseListener::new(0, cert, keys)
+                    .await
+                    .expect("listener");
+                assert!(listener.is_alive());
+                listener.listen_task.abort();
+                // the abort is only acted on once the executor runs
+                tokio::task::yield_now().await;
+                assert!(!listener.is_alive());
+            })
+            .await;
+    }
 }

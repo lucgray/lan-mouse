@@ -4,6 +4,7 @@ use input_event::{
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
+    collections::HashMap,
     fmt::{Debug, Display, Formatter},
     mem::size_of,
 };
@@ -60,6 +61,10 @@ pub enum ProtocolError {
     /// buffer too small for clipboard data
     #[error("buffer too small for clipboard data")]
     BufferTooSmall,
+    /// malformed or inconsistent fragment header — the values a
+    /// peer sent cannot describe a valid transfer
+    #[error("invalid clipboard fragment header")]
+    InvalidFragment,
 }
 
 /// Position of a client
@@ -568,7 +573,10 @@ pub struct ClipboardReassembler {
     got_bytes: u64,
     /// seq bitmap; num <= 445k for the size cap so this stays small
     seen: Vec<u64>,
-    data: Vec<u8>,
+    /// seq → payload, sparse on purpose: allocation tracks bytes
+    /// actually received instead of the peer-declared `total`, so a
+    /// forged header cannot force a 256MiB buffer into existence
+    fragments: HashMap<u32, Vec<u8>>,
     last_fragment: Option<std::time::Instant>,
 }
 
@@ -590,7 +598,9 @@ impl ClipboardReassembler {
         self.got = 0;
         self.got_bytes = 0;
         self.seen.clear();
-        self.data.clear();
+        // assign a fresh map — clear() keeps the allocated capacity
+        // and a forged transfer must not pin hundreds of MiB
+        self.fragments = HashMap::new();
         self.last_fragment = None;
     }
 
@@ -657,26 +667,39 @@ impl ClipboardReassembler {
         let seq = u32::from_be_bytes(dgram[5..9].try_into().unwrap());
         let num = u32::from_be_bytes(dgram[9..13].try_into().unwrap());
         let id = u32::from_be_bytes(dgram[13..17].try_into().unwrap());
+        // `num` must match the sender's fragment count exactly —
+        // `clipboard_fragment_at`/`ClipboardFragmenter` derive it as
+        // `total.div_ceil(PAYLOAD)`, so any other value is a forged
+        // header. An oversized `num` would blow up `seen` (~536MB per
+        // u32::MAX) and index `data` out of bounds; an undersized one
+        // truncates the transfer.
         if total == 0
             || num == 0
             || seq >= num
             || total as usize > MAX_CLIPBOARD_TRANSFER_SIZE
-            || (num as u64) < (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64)
+            || (num as u64) != (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64)
             || dgram.len() - CLIPBOARD_FRAGMENT_HEADER > CLIPBOARD_FRAGMENT_PAYLOAD
         {
             self.reset();
-            return Err(ProtocolError::BufferTooSmall);
+            return Err(ProtocolError::InvalidFragment);
         }
         let stale = self
             .last_fragment
             .is_some_and(|t| t.elapsed() > REASSEMBLY_TIMEOUT);
+        // every fragment except the tail must carry a full payload —
+        // that is exactly what the sender emits, and a short middle
+        // fragment would just leave a hole the length check below
+        // rejects anyway
+        if seq != num - 1 && dgram.len() - CLIPBOARD_FRAGMENT_HEADER != CLIPBOARD_FRAGMENT_PAYLOAD {
+            self.reset();
+            return Err(ProtocolError::InvalidFragment);
+        }
         if stale || self.id != id || self.num != num || self.total != total {
             self.reset();
             self.id = id;
             self.total = total;
             self.num = num;
             self.seen.resize(num.div_ceil(64) as usize, 0);
-            self.data.resize(total as usize, 0);
         }
         let word = (seq / 64) as usize;
         let bit = 1u64 << (seq % 64);
@@ -687,19 +710,24 @@ impl ClipboardReassembler {
         }
         self.seen[word] |= bit;
         self.got += 1;
-        let start = seq as usize * CLIPBOARD_FRAGMENT_PAYLOAD;
         let payload = &dgram[CLIPBOARD_FRAGMENT_HEADER..];
-        let end = (start + payload.len()).min(self.data.len());
-        self.data[start..end].copy_from_slice(&payload[..end - start]);
-        self.got_bytes += (end - start) as u64;
+        self.got_bytes += payload.len() as u64;
+        self.fragments.insert(seq, payload.to_vec());
         self.last_fragment = Some(std::time::Instant::now());
         if self.got == self.num {
-            self.num = 0;
-            self.got = 0;
-            self.got_bytes = 0;
-            self.seen.clear();
-            self.last_fragment = None;
-            return Ok(Some(std::mem::take(&mut self.data)));
+            let mut out = Vec::with_capacity(self.total as usize);
+            for seq in 0..self.num {
+                // every seq is present: seen marks all num bits
+                if let Some(frag) = self.fragments.remove(&seq) {
+                    out.extend_from_slice(&frag);
+                }
+            }
+            let assembled_ok = out.len() == self.total as usize;
+            self.reset();
+            if !assembled_ok {
+                return Err(ProtocolError::InvalidFragment);
+            }
+            return Ok(Some(out));
         }
         Ok(None)
     }
@@ -1200,5 +1228,168 @@ mod tests {
         assert_eq!(reasm.missing_seqs(10), vec![1, 3]);
         assert_eq!(reasm.missing_seqs(1), vec![1]);
         assert!(!reasm.wants_request()); // no quiet period yet
+    }
+
+    /// craft a fragment datagram with arbitrary header values
+    fn forged_fragment(total: u32, seq: u32, num: u32, id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut dgram = Vec::with_capacity(CLIPBOARD_FRAGMENT_HEADER + payload.len());
+        dgram.push(EventType::ClipboardFragment as u8);
+        dgram.extend_from_slice(&total.to_be_bytes());
+        dgram.extend_from_slice(&seq.to_be_bytes());
+        dgram.extend_from_slice(&num.to_be_bytes());
+        dgram.extend_from_slice(&id.to_be_bytes());
+        dgram.extend_from_slice(payload);
+        dgram
+    }
+
+    #[test]
+    fn reassembler_rejects_oversized_num() {
+        // a peer-controlled `num` bigger than ceil(total/PAYLOAD) used
+        // to resize `seen` to ~536MB for u32::MAX and allowed seq
+        // values that indexed `data` out of bounds — must be rejected
+        let mut reasm = ClipboardReassembler::new();
+        let dgram = forged_fragment(1200, 0, u32::MAX, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+        // huge but plausible-looking num is rejected equally
+        let dgram = forged_fragment(1200, 0, 1_000_000, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+    }
+
+    #[test]
+    fn reassembler_rejects_undersized_num_and_seq_out_of_range() {
+        let mut reasm = ClipboardReassembler::new();
+        // num too small to hold `total`
+        let dgram = forged_fragment(10_000, 0, 1, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+        // seq >= num
+        let dgram = forged_fragment(2400, 2, 2, 1, &[0u8; 16]);
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+        // total above the transfer cap
+        let dgram = forged_fragment(
+            MAX_CLIPBOARD_TRANSFER_SIZE as u32 + 1200,
+            0,
+            218_455,
+            1,
+            &[0u8; 16],
+        );
+        assert!(matches!(
+            reasm.push(&dgram),
+            Err(ProtocolError::InvalidFragment)
+        ));
+    }
+
+    #[test]
+    fn reassembler_valid_transfer_unaffected() {
+        // a transfer produced by the real fragmenter must still pass —
+        // the tightened `num` check uses the same formula as the sender
+        let mut reasm = ClipboardReassembler::new();
+        let encoded = vec![9u8; CLIPBOARD_FRAGMENT_PAYLOAD * 2 + 5];
+        let frags: Vec<Vec<u8>> = ClipboardFragmenter::new(&encoded).collect();
+        assert_eq!(frags.len(), 3);
+        assert!(reasm.push(&frags[0]).unwrap().is_none());
+        assert!(reasm.push(&frags[1]).unwrap().is_none());
+        // exact-boundary tail: total % PAYLOAD != 0
+        let out = reasm.push(&frags[2]).unwrap().expect("complete");
+        assert_eq!(out, encoded);
+    }
+
+    #[test]
+    fn reassembler_valid_transfer_exact_multiple() {
+        // total is an exact multiple of PAYLOAD — last fragment index
+        // must not trip the bounds arithmetic
+        let mut reasm = ClipboardReassembler::new();
+        let encoded = vec![9u8; CLIPBOARD_FRAGMENT_PAYLOAD * 2];
+        let frags: Vec<Vec<u8>> = ClipboardFragmenter::new(&encoded).collect();
+        assert!(reasm.push(&frags[0]).unwrap().is_none());
+        let out = reasm.push(&frags[1]).unwrap().expect("complete");
+        assert_eq!(out, encoded);
+    }
+
+    #[test]
+    fn reassembler_no_premature_allocation() {
+        // a legal header claiming the 256MiB cap but carrying only a
+        // small tail fragment must not allocate anywhere near `total` —
+        // storage is sparse and tracks received bytes
+        let mut reasm = ClipboardReassembler::new();
+        let total = MAX_CLIPBOARD_TRANSFER_SIZE as u32;
+        let num = (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64) as u32;
+        let frag = forged_fragment(total, num - 1, num, 7, &[0xAB; 100]);
+        assert!(matches!(reasm.push(&frag), Ok(None)));
+        assert_eq!(reasm.progress(), Some((100, total as u64)));
+        reasm.reset();
+        assert!(reasm.progress().is_none());
+    }
+
+    #[test]
+    fn reassembler_rejects_short_middle_fragment() {
+        // every non-tail fragment must carry a full payload — the real
+        // sender pads all but the last; anything else is forged
+        let mut reasm = ClipboardReassembler::new();
+        let frag = forged_fragment(2400, 0, 2, 9, &[0xAB; 100]);
+        assert!(matches!(
+            reasm.push(&frag),
+            Err(ProtocolError::InvalidFragment)
+        ));
+    }
+
+    mod peak_memory {
+        use super::*;
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// counts live allocated bytes so tests can assert the
+        /// reassembler's footprint tracks received data, not the
+        /// peer-declared total
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        struct Counting;
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                LIVE.fetch_add(l.size(), Ordering::SeqCst);
+                unsafe { System.alloc(l) }
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                LIVE.fetch_sub(l.size(), Ordering::SeqCst);
+                unsafe { System.dealloc(p, l) }
+            }
+        }
+        #[global_allocator]
+        static A: Counting = Counting;
+
+        /// N concurrent transfers, each with a legal 256MiB header and
+        /// a single small tail fragment: peak memory must stay in the
+        /// kilobytes, not gigabytes
+        #[test]
+        fn concurrent_transfers_stay_sparse() {
+            let total = MAX_CLIPBOARD_TRANSFER_SIZE as u32;
+            let num = (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64) as u32;
+            let baseline = LIVE.load(Ordering::SeqCst);
+            let mut reasms: Vec<ClipboardReassembler> =
+                (0..8).map(|_| ClipboardReassembler::new()).collect();
+            for (i, r) in reasms.iter_mut().enumerate() {
+                let frag = forged_fragment(total, num - 1, num, i as u32, &[0xAB; 100]);
+                assert!(matches!(r.push(&frag), Ok(None)));
+            }
+            let delta = LIVE.load(Ordering::SeqCst) - baseline;
+            // 8 × (~100B payload + ~28KB seq bitmap + map overhead);
+            // the old design would have allocated 8 × 256MiB here
+            assert!(
+                delta < 2 * 1024 * 1024,
+                "peak allocation {delta} bytes — reassembly is not sparse"
+            );
+            // progress still reports the declared totals
+            assert_eq!(reasms[0].progress(), Some((100, total as u64)));
+        }
     }
 }

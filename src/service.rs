@@ -24,7 +24,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -39,6 +39,11 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    /// a subsystem died on its own — the daemon exits nonzero so a
+    /// supervisor (Restart=on-failure) brings it back instead of
+    /// treating the death as a clean shutdown
+    #[error("subsystem exited: {0}")]
+    SubsystemExited(&'static str),
 }
 
 pub struct Service {
@@ -109,7 +114,12 @@ struct PendingSendBatch {
     expected: u32,
     done: u32,
     ok: u32,
+    started: Instant,
 }
+
+/// a peer that never finishes receiving leaves the batch (and its
+/// "shared/failed" toast) pending forever — expire stale batches
+const CLIPBOARD_BATCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 struct Incoming {
@@ -237,21 +247,111 @@ impl Service {
             self.activate_client(handle);
         }
 
+        let mut liveness_tick = tokio::time::interval(Duration::from_secs(1));
+        // set when the loop exits because a subsystem died rather than
+        // via a normal shutdown signal — turns the exit into Err so a
+        // supervisor can tell a crash from a requested stop
+        let mut fatal: Option<&'static str> = None;
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => match request {
+                    Some(_) => self.handle_frontend_request(request),
+                    None => {
+                        log::error!("frontend listener channel closed, shutting down");
+                        fatal = Some("frontend listener");
+                        break;
+                    }
+                },
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                event = self.emulation.event() => self.handle_emulation_event(event).await,
-                event = self.capture.event() => self.handle_capture_event(event),
-                event = self.resolver.event() => self.handle_resolver_event(event),
-                _ = self.config.changed() => self.handle_config_change(),
+                event = self.emulation.event() => match event {
+                    Some(event) => self.handle_emulation_event(event).await,
+                    None => {
+                        log::error!("emulation task exited, shutting down");
+                        fatal = Some("emulation");
+                        break;
+                    }
+                },
+                event = self.capture.event() => match event {
+                    Some(event) => self.handle_capture_event(event),
+                    None => {
+                        log::error!("capture task exited, shutting down");
+                        fatal = Some("capture");
+                        break;
+                    }
+                },
+                event = self.resolver.event() => match event {
+                    Some(event) => self.handle_resolver_event(event),
+                    None => {
+                        log::error!("dns resolver task exited, shutting down");
+                        fatal = Some("dns resolver");
+                        break;
+                    }
+                },
+                // watch the subsystem tasks themselves: a dead task is a
+                // dead subsystem even if a spawned child keeps an event
+                // channel sender alive and the None arms never fire
+                _ = liveness_tick.tick() => {
+                    if !self.emulation.is_alive() {
+                        log::error!("emulation task exited, shutting down");
+                        fatal = Some("emulation");
+                        break;
+                    }
+                    if !self.capture.is_alive() {
+                        log::error!("capture task exited, shutting down");
+                        fatal = Some("capture");
+                        break;
+                    }
+                    if !self.resolver.is_alive() {
+                        log::error!("dns resolver task exited, shutting down");
+                        fatal = Some("dns resolver");
+                        break;
+                    }
+                    // the clipboard monitor is degraded, not fatal:
+                    // its death disables clipboard sharing but input
+                    // keeps working
+                    if let Some(monitor) = self.clipboard_monitor.as_ref() {
+                        if !monitor.is_alive() {
+                            log::error!("clipboard monitor exited, clipboard sharing disabled");
+                            self.clipboard_monitor = None;
+                            self.notify_frontend(FrontendEvent::Error(
+                                "clipboard monitor stopped, clipboard sharing disabled".to_string(),
+                            ));
+                        }
+                    }
+                    self.expire_clipboard_batches();
+                },
+                r = self.config.changed() => match r {
+                    Ok(()) => self.handle_config_change(),
+                    Err(e) => {
+                        log::error!("config watcher failed: {e}");
+                    }
+                },
                 event = async {
                     match &mut self.clipboard_monitor {
                         Some(monitor) => monitor.recv().await,
                         None => std::future::pending().await,
                     }
-                } => self.handle_clipboard_event(event).await,
-                r = signal::ctrl_c(), if shutdown.is_none() => break r.expect("failed to wait for CTRL+C"),
+                } => match event {
+                    Some(_) => self.handle_clipboard_event(event).await,
+                    None => {
+                        // the monitor thread died (e.g. a panic inside
+                        // it) - without this arm the recv keeps returning
+                        // None instantly and spins the loop at 100% CPU
+                        log::error!("clipboard monitor exited, clipboard sharing disabled");
+                        self.clipboard_monitor = None;
+                        self.notify_frontend(FrontendEvent::Error(
+                            "clipboard monitor stopped, clipboard sharing disabled".to_string(),
+                        ));
+                    }
+                },
+                r = signal::ctrl_c(), if shutdown.is_none() => match r {
+                    Ok(()) => break,
+                    Err(e) => {
+                        log::error!("failed to wait for CTRL+C: {e}");
+                        fatal = Some("signal handling");
+                        break;
+                    }
+                },
                 _ = async { shutdown.as_mut().unwrap().recv().await }, if shutdown.is_some() => {
                     log::info!("Shutdown signal received");
                     break;
@@ -296,11 +396,17 @@ impl Service {
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
 
-        Ok(())
+        match fatal {
+            Some(subsystem) => Err(ServiceError::SubsystemExited(subsystem)),
+            None => Ok(()),
+        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
-        let request = match request.expect("frontend listener closed") {
+        let Some(request) = request else {
+            return;
+        };
+        let request = match request {
             Ok(r) => r,
             Err(e) => return log::error!("error receiving request: {e}"),
         };
@@ -371,7 +477,7 @@ impl Service {
                 log::info!("xdg-foreign handle: {handle:?}");
                 self.window_identifier
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .replace(match handle {
                         lan_mouse_ipc::WindowIdentifier::Wayland(handle) => {
                             input_capture::WindowIdentifier::Wayland(handle)
@@ -399,7 +505,11 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
-        let authorized_keys = self.authorized_keys.read().expect("lock").clone();
+        let authorized_keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
@@ -413,7 +523,10 @@ impl Service {
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
-            let (c, s) = self.client_manager.get_state(handle).unwrap();
+            let Some((c, s)) = self.client_manager.get_state(handle) else {
+                log::error!("client {handle} missing after registration");
+                continue;
+            };
             if s.active {
                 self.client_manager.deactivate_client(handle);
                 self.activate_client(handle);
@@ -439,7 +552,7 @@ impl Service {
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .clone_from(&authorized_keys);
         self.sync_frontend();
     }
@@ -517,7 +630,9 @@ impl Service {
                 });
             }
             EmulationEvent::ClipboardReceived(clipboard_event) => {
-                // Received clipboard data from a remote machine - set it locally
+                // Received clipboard data from a remote machine - set it locally.
+                // Same detached path as ICaptureEvent::ClipboardReceived:
+                // writing a large file must not stall the service loop.
                 if self.clipboard_enabled {
                     if let Some(ref monitor) = self.clipboard_monitor {
                         // record the incoming content so our own monitor
@@ -525,14 +640,21 @@ impl Service {
                         monitor.update_last_content(clipboard_event.clone());
                     }
                     if let Some(ref clipboard_emulation) = self.clipboard_emulation {
-                        if let Err(e) = clipboard_emulation.set(clipboard_event.clone()).await {
-                            log::warn!("Failed to set clipboard: {}", e);
-                            self.notify_frontend(FrontendEvent::Error(format!(
-                                "failed to apply received clipboard: {e}"
-                            )));
-                        } else {
-                            self.notify_clipboard_shared(&clipboard_event, true);
-                        }
+                        let clipboard_emulation = clipboard_emulation.clone();
+                        let applied_tx = self.clipboard_applied_tx.clone();
+                        tokio::task::spawn_local(async move {
+                            let result =
+                                match clipboard_emulation.set(clipboard_event.clone()).await {
+                                    Ok(()) => {
+                                        Ok((clipboard_event.kind(), clipboard_event.content_len()))
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to set clipboard: {}", e);
+                                        Err(format!("failed to apply received clipboard: {e}"))
+                                    }
+                                };
+                            let _ = applied_tx.send(result);
+                        });
                     }
                 }
             }
@@ -573,6 +695,12 @@ impl Service {
                     received,
                     total,
                 });
+            }
+            ICaptureEvent::ConnectFailed { handle, error } => {
+                log::warn!("connection to client {handle} failed: {error}");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "could not connect to client {handle}: {error}"
+                )));
             }
             ICaptureEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
@@ -699,8 +827,45 @@ impl Service {
                         expected,
                         done: 0,
                         ok: 0,
+                        started: Instant::now(),
                     },
                 );
+            }
+        }
+    }
+
+    /// drop sends whose peers stopped reporting; unresolved batches
+    /// count as failed so the user can retry the same content
+    fn expire_clipboard_batches(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<u64> = self
+            .pending_clipboard_batches
+            .iter()
+            .filter(|(_, b)| now.duration_since(b.started) > CLIPBOARD_BATCH_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let mut cleared_sig = false;
+        for id in stale {
+            let Some(b) = self.pending_clipboard_batches.remove(&id) else {
+                continue;
+            };
+            log::warn!(
+                "clipboard batch {id} timed out: {}/{} sends reported",
+                b.done,
+                b.expected
+            );
+            cleared_sig = true;
+            self.notify_frontend(FrontendEvent::Error(format!(
+                "clipboard share timed out — {}/{} peer(s) responded",
+                b.done, b.expected
+            )));
+        }
+        if cleared_sig {
+            if let Some(ref monitor) = self.clipboard_monitor {
+                monitor.clear_last_sig();
             }
         }
     }
@@ -772,7 +937,11 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        let keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_settings();
     }
@@ -795,12 +964,18 @@ impl Service {
     }
 
     fn update_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
-        let incoming = self
+        // incoming_conns and incoming_conn_info can desync — e.g. a
+        // destroy raced a re-Enter — so a missing entry is a warn,
+        // not a panic
+        let Some(incoming) = self
             .incoming_conn_info
             .iter_mut()
             .find(|(_, i)| i.addr == addr)
             .map(|(_, i)| i)
-            .expect("no such client");
+        else {
+            log::warn!("update_incoming: {addr} not registered, ignoring");
+            return;
+        };
         let mut changed = false;
         if incoming.fingerprint != fingerprint {
             incoming.fingerprint = fingerprint.clone();
@@ -846,14 +1021,28 @@ impl Service {
     }
 
     fn add_authorized_key(&mut self, desc: String, fp: String) {
-        self.authorized_keys.write().expect("lock").insert(fp, desc);
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.authorized_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fp, desc);
+        let keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
     fn remove_authorized_key(&mut self, fp: String) {
-        self.authorized_keys.write().expect("lock").remove(&fp);
-        let keys = self.authorized_keys.read().expect("lock").clone();
+        self.authorized_keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&fp);
+        let keys = self
+            .authorized_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
 
@@ -865,7 +1054,10 @@ impl Service {
     fn add_client(&mut self) {
         let handle = self.client_manager.add_client();
         log::info!("added client {handle}");
-        let (c, s) = self.client_manager.get_state(handle).unwrap();
+        let Some((c, s)) = self.client_manager.get_state(handle) else {
+            log::error!("client {handle} missing after registration");
+            return;
+        };
         self.notify_frontend(FrontendEvent::Created(handle, c, s));
     }
 
@@ -1135,15 +1327,6 @@ impl Service {
         self.config
             .notification_mode()
             .unwrap_or_else(|| "app".to_string())
-    }
-
-    /// let the frontend know clipboard content travelled in either direction
-    fn notify_clipboard_shared(&mut self, event: &input_event::ClipboardEvent, received: bool) {
-        self.notify_frontend(FrontendEvent::ClipboardShared {
-            received,
-            kind: event.kind(),
-            bytes: event.content_len(),
-        });
     }
 
     fn spawn_hook_command(&self, handle: ClientHandle, kind: HookKind) {

@@ -200,9 +200,14 @@ async fn connect_any(
     loop {
         match joinset.join_next().await {
             None => return Err(LanMouseConnectionError::NotConnected),
-            Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
-                Err((a, e)) => {
+            Some(r) => match r {
+                Err(e) => {
+                    // a panicked connection attempt loses one address
+                    // but must not kill the whole join set
+                    log::warn!("connection attempt task failed: {e}");
+                }
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err((a, e))) => {
                     log::warn!("failed to connect to {a}: `{e}`")
                 }
             },
@@ -218,6 +223,9 @@ pub(crate) enum IncomingEvent {
         received: u64,
         total: u64,
     },
+    /// an outgoing connection attempt failed — surfaced so the
+    /// frontend can tell the user instead of silently retrying
+    ConnectFailed(String),
 }
 
 #[derive(Clone)]
@@ -253,8 +261,10 @@ impl LanMouseConnection {
         self.sender.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, IncomingEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+    /// `None` once every event sender is gone — the task that owns
+    /// this connection treats that as its shutdown signal
+    pub(crate) async fn recv(&mut self) -> Option<(ClientHandle, IncomingEvent)> {
+        self.recv_rx.recv().await
     }
 
     pub(crate) async fn send(
@@ -289,6 +299,7 @@ impl LanMouseConnectionSender {
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        return Err(LanMouseConnectionError::Webrtc(e));
                     }
                 }
                 log::trace!("{event_str} >->->->->- {addr}");
@@ -342,18 +353,17 @@ impl LanMouseConnectionSender {
                 if let Err(e) = send_clipboard_datagrams(&conn, &buf, progress).await {
                     log::warn!("client {handle} failed to send clipboard: {e}");
                     disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    return Err(LanMouseConnectionError::Webrtc(e));
                 }
                 log::trace!("{event} >->->->->- {addr}");
                 return Ok(());
             }
         }
 
-        // Not connected yet - clipboard will sync when connection is established
-        log::debug!(
-            "Client {} not connected, clipboard will sync when connection is established",
-            handle
-        );
-        Ok(())
+        // not connected: there is no resend mechanism, so report the
+        // failure instead of letting callers count it as shared
+        log::debug!("client {handle} not connected, clipboard not sent");
+        Err(LanMouseConnectionError::NotConnected)
     }
 }
 
@@ -367,6 +377,12 @@ async fn connect_to_handle(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
+    // clears the `connecting` flag on every exit path — error returns
+    // and panics alike — so a failed attempt can't wedge the handle
+    let _connecting_guard = ConnectingGuard {
+        connecting: &connecting,
+        handle,
+    };
     // sending did not work, figure out active conn.
     if let Some(addrs) = client_manager.get_ips(handle) {
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
@@ -379,14 +395,13 @@ async fn connect_to_handle(
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
-                connecting.lock().await.remove(&handle);
+                let _ = tx.send((handle, IncomingEvent::ConnectFailed(e.to_string())));
                 return Err(e);
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
         conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
 
         // Best-effort version handshake. Send our commit hash once
         // immediately after the DTLS handshake; the listen side
@@ -416,8 +431,23 @@ async fn connect_to_handle(
         ));
         return Ok(());
     }
-    connecting.lock().await.remove(&handle);
     Err(LanMouseConnectionError::NotConnected)
+}
+
+/// drops the "connecting" marker for a handle even if the task
+/// unwinds — inside the single-threaded executor a blocking lock
+/// in Drop is not an option, so this is best-effort
+struct ConnectingGuard<'a> {
+    connecting: &'a Rc<Mutex<HashSet<ClientHandle>>>,
+    handle: ClientHandle,
+}
+
+impl Drop for ConnectingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut connecting) = self.connecting.try_lock() {
+            connecting.remove(&self.handle);
+        }
+    }
 }
 
 async fn ping_pong(
@@ -469,11 +499,15 @@ async fn receive_loop(
     let mut buf = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
     let mut reassembler = ClipboardReassembler::new();
     let mut last_reported = 0u64;
+    let mut recv_err = None;
     loop {
         let n = tokio::select! {
             r = conn.recv(&mut buf) => match r {
                 Ok(n) => n,
-                Err(_) => break,
+                Err(e) => {
+                    recv_err = Some(e);
+                    break;
+                }
             },
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                 if reassembler.wants_request() {
@@ -599,13 +633,19 @@ async fn receive_loop(
             ProtoEvent::Hello { commit } => {
                 client_manager.set_peer_commit(handle, Some(commit));
             }
-            event => tx
-                .send((handle, IncomingEvent::Event(event)))
-                .expect("channel closed"),
+            event => {
+                if tx.send((handle, IncomingEvent::Event(event))).is_err() {
+                    log::debug!("service channel closed, receive loop for {addr} exiting");
+                    return;
+                }
+            }
         }
     }
 
-    log::warn!("recv error");
+    match recv_err {
+        Some(e) => log::warn!("recv error from {addr}: {e}"),
+        None => log::info!("connection from {addr} closed"),
+    }
     disconnect(&client_manager, handle, addr, &conns).await;
 }
 
@@ -626,6 +666,8 @@ async fn disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigClient;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn bind_addr_matches_target_family() {
@@ -633,6 +675,114 @@ mod tests {
         assert!(bind_addr_for(v4).is_ipv4());
         let v6: SocketAddr = "[fe80::1]:4242".parse().unwrap();
         assert!(bind_addr_for(v6).is_ipv6());
+    }
+
+    /// a conn whose sends always fail — drives the send-error path
+    /// without a real socket or peer
+    struct FailConn;
+
+    #[async_trait::async_trait]
+    impl Conn for FailConn {
+        async fn connect(&self, _addr: SocketAddr) -> webrtc_util::Result<()> {
+            Err(webrtc_util::Error::ErrUseClosedNetworkConn)
+        }
+        async fn recv(&self, _buf: &mut [u8]) -> webrtc_util::Result<usize> {
+            Err(webrtc_util::Error::ErrUseClosedNetworkConn)
+        }
+        async fn recv_from(&self, _buf: &mut [u8]) -> webrtc_util::Result<(usize, SocketAddr)> {
+            Err(webrtc_util::Error::ErrUseClosedNetworkConn)
+        }
+        async fn send(&self, _buf: &[u8]) -> webrtc_util::Result<usize> {
+            Err(webrtc_util::Error::ErrUseClosedNetworkConn)
+        }
+        async fn send_to(&self, _buf: &[u8], _target: SocketAddr) -> webrtc_util::Result<usize> {
+            Err(webrtc_util::Error::ErrUseClosedNetworkConn)
+        }
+        fn local_addr(&self) -> webrtc_util::Result<SocketAddr> {
+            Err(webrtc_util::Error::ErrLocAddr)
+        }
+        fn remote_addr(&self) -> Option<SocketAddr> {
+            None
+        }
+        async fn close(&self) -> webrtc_util::Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+            self
+        }
+    }
+
+    fn test_cert() -> webrtc_dtls::crypto::Certificate {
+        webrtc_dtls::crypto::Certificate::generate_self_signed(["ignored".to_owned()])
+            .expect("self-signed cert")
+    }
+
+    /// register a client whose active addr has a connection that fails
+    /// on every send
+    async fn failing_sender() -> (LanMouseConnectionSender, ClientHandle) {
+        let client_manager = ClientManager::default();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242);
+        let handle = client_manager.add_with_config(ConfigClient {
+            ips: [IpAddr::V4(Ipv4Addr::LOCALHOST)].into_iter().collect(),
+            hostname: None,
+            port: 4242,
+            pos: lan_mouse_ipc::Position::Right,
+            active: true,
+            enter_hook: None,
+            leave_hook: None,
+        });
+        client_manager.set_active_addr(handle, Some(addr));
+        client_manager.set_alive(handle, true);
+        let conn = LanMouseConnection::new(test_cert(), client_manager);
+        let sender = conn.sender();
+        sender
+            .conns
+            .lock()
+            .await
+            .insert(addr, std::sync::Arc::new(FailConn));
+        (sender, handle)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_returns_err_on_transport_failure() {
+        let (sender, handle) = failing_sender().await;
+        let r = sender.send(ProtoEvent::Ping, handle).await;
+        // used to fall through to Ok(()) after a failed datagram write,
+        // letting callers count a lost event as sent
+        assert!(matches!(r, Err(LanMouseConnectionError::Webrtc(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_clipboard_returns_err_on_transport_failure() {
+        let (sender, handle) = failing_sender().await;
+        let event = ProtoEvent::Input(input_event::Event::Clipboard(
+            input_event::ClipboardEvent::Text("hello".to_string()),
+        ));
+        let r = sender.send_clipboard(event, handle, None).await;
+        assert!(matches!(r, Err(LanMouseConnectionError::Webrtc(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_clipboard_returns_err_when_not_connected() {
+        let client_manager = ClientManager::default();
+        let handle = client_manager.add_with_config(ConfigClient {
+            ips: Default::default(),
+            hostname: None,
+            port: 4242,
+            pos: lan_mouse_ipc::Position::Right,
+            active: false,
+            enter_hook: None,
+            leave_hook: None,
+        });
+        let conn = LanMouseConnection::new(test_cert(), client_manager);
+        let event = ProtoEvent::Input(input_event::Event::Clipboard(
+            input_event::ClipboardEvent::Text("hello".to_string()),
+        ));
+        // no connection to the peer — used to return Ok(()) with a
+        // "will sync later" comment (there is no sync), reporting a
+        // dropped clipboard as shared
+        let r = conn.sender().send_clipboard(event, handle, None).await;
+        assert!(matches!(r, Err(LanMouseConnectionError::NotConnected)));
     }
 
     /// payloads above the single-datagram budget must travel as

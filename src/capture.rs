@@ -54,6 +54,9 @@ pub(crate) enum ICaptureEvent {
     ClipboardReceived(input_event::ClipboardEvent),
     /// fragment progress of an in-flight clipboard transfer
     ClipboardProgress { received: u64, total: u64 },
+    /// an outgoing connection attempt failed — the frontend
+    /// should surface this instead of retrying silently
+    ConnectFailed { handle: u64, error: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,9 +136,9 @@ impl Capture {
     }
 
     pub(crate) fn reenable(&self) {
-        self.request_tx
-            .send(CaptureRequest::Reenable)
-            .expect("channel closed");
+        if self.request_tx.send(CaptureRequest::Reenable).is_err() {
+            log::error!("capture task gone, dropping Reenable");
+        }
     }
 
     pub(crate) async fn terminate(&mut self) {
@@ -153,54 +156,95 @@ impl Capture {
         capture_type: CaptureType,
     ) {
         let pos = to_capture_pos(pos);
-        self.request_tx
+        if self
+            .request_tx
             .send(CaptureRequest::Create(handle, pos, capture_type))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("capture task gone, dropping Create({handle})");
+        }
     }
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
-        self.request_tx
+        if self
+            .request_tx
             .send(CaptureRequest::Destroy(handle))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("capture task gone, dropping Destroy({handle})");
+        }
     }
 
     pub(crate) fn release(&self) {
-        self.request_tx
-            .send(CaptureRequest::Release)
-            .expect("channel closed");
+        if self.request_tx.send(CaptureRequest::Release).is_err() {
+            log::error!("capture task gone, dropping Release");
+        }
     }
 
-    pub(crate) async fn event(&mut self) -> ICaptureEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// `None` once the capture task has exited (its event sender is
+    /// dropped) — the service treats this as a subsystem death.
+    pub(crate) async fn event(&mut self) -> Option<ICaptureEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// whether the spawned task is still running — polled by the
+    /// service liveness tick to catch task death even when an event
+    /// channel clone outlives it
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.task.is_finished()
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
-        let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+        if self
+            .request_tx
+            .send(CaptureRequest::SetReleaseBind(bind))
+            .is_err()
+        {
+            log::error!("capture task gone, dropping SetReleaseBind");
+        }
     }
 
     pub(crate) fn set_jail_bind(&mut self, bind: Vec<scancode::Linux>) {
-        self.request_tx
+        if self
+            .request_tx
             .send(CaptureRequest::SetJailBind(bind))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("capture task gone, dropping SetJailBind");
+        }
     }
 
     pub(crate) fn set_enter_binds(
         &mut self,
         binds: HashMap<lan_mouse_ipc::Position, Vec<scancode::Linux>>,
     ) {
-        let _ = self.request_tx.send(CaptureRequest::SetEnterBinds(binds));
+        if self
+            .request_tx
+            .send(CaptureRequest::SetEnterBinds(binds))
+            .is_err()
+        {
+            log::error!("capture task gone, dropping SetEnterBinds");
+        }
     }
 
     pub(crate) fn set_remap(&mut self, remap: KeyRemap) {
-        let _ = self
+        if self
             .request_tx
-            .send(CaptureRequest::SetRemap(Box::new(remap)));
+            .send(CaptureRequest::SetRemap(Box::new(remap)))
+            .is_err()
+        {
+            log::error!("capture task gone, dropping SetRemap");
+        }
     }
 
     pub(crate) fn set_scroll_invert(&mut self, scroll_invert: ScrollInvert) {
-        let _ = self
+        if self
             .request_tx
-            .send(CaptureRequest::SetScrollInvert(scroll_invert));
+            .send(CaptureRequest::SetScrollInvert(scroll_invert))
+            .is_err()
+        {
+            log::error!("capture task gone, dropping SetScrollInvert");
+        }
     }
 }
 
@@ -267,12 +311,11 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    fn get_pos(&self, handle: CaptureHandle) -> Option<Position> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
+            .map(|c| c.1)
     }
 
     fn capture_enter_binds(&self) -> HashMap<Position, Vec<scancode::Linux>> {
@@ -282,12 +325,11 @@ impl CaptureTask {
             .collect()
     }
 
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
+    fn get_type(&self, handle: CaptureHandle) -> Option<CaptureType> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|c| c.2)
     }
 
     async fn create_backend_capture(
@@ -310,20 +352,22 @@ impl CaptureTask {
             }
             loop {
                 tokio::select! {
-                    r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
-                        CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
+                    r = self.request_rx.recv() => match r {
+                        // service channel closed: shut the task down
+                        None => return,
+                        Some(CaptureRequest::Reenable) => break,
+                        Some(CaptureRequest::Create(h, p, t)) => self.add_capture(h, p, t),
+                        Some(CaptureRequest::Destroy(h)) => self.remove_capture(h),
+                        Some(CaptureRequest::Release) => { /* nothing to do */ }
+                        Some(CaptureRequest::SetReleaseBind(bind)) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
-                        CaptureRequest::SetJailBind(bind) => {
+                        Some(CaptureRequest::SetJailBind(bind)) => {
                             *self.jail_bind.borrow_mut() = bind;
                         }
-                        CaptureRequest::SetEnterBinds(binds) => self.enter_binds = binds,
-                        CaptureRequest::SetRemap(remap) => self.remap = *remap,
-                        CaptureRequest::SetScrollInvert(scroll_invert) => {
+                        Some(CaptureRequest::SetEnterBinds(binds)) => self.enter_binds = binds,
+                        Some(CaptureRequest::SetRemap(remap)) => self.remap = *remap,
+                        Some(CaptureRequest::SetScrollInvert(scroll_invert)) => {
                             self.scroll_invert = scroll_invert
                         }
                     },
@@ -387,19 +431,41 @@ impl CaptureTask {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
-                (handle, incoming) = self.conn.recv() => {
+                incoming = self.conn.recv() => {
+                    let (handle, incoming) = match incoming {
+                        // the event channel is closed — shut the session down
+                        None => return Ok(()),
+                        Some(i) => i,
+                    };
                     let event = match incoming {
                         IncomingEvent::Event(event) => event,
+                        IncomingEvent::ConnectFailed(error) => {
+                            if self.event_tx
+                                .send(ICaptureEvent::ConnectFailed { handle, error })
+                                .is_err()
+                            {
+                                log::error!("service channel closed, capture exiting");
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         IncomingEvent::ClipboardProgress { received, total } => {
-                            self.event_tx
+                            if self.event_tx
                                 .send(ICaptureEvent::ClipboardProgress { received, total })
-                                .expect("channel closed");
+                                .is_err()
+                            {
+                                log::error!("service channel closed, capture exiting");
+                                return Ok(());
+                            }
                             continue;
                         }
                     };
                     // clipboard events are accepted from any client
                     if let ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event)) = &event {
-                        self.event_tx.send(ICaptureEvent::ClipboardReceived(clipboard_event.clone())).expect("channel closed");
+                        if self.event_tx.send(ICaptureEvent::ClipboardReceived(clipboard_event.clone())).is_err() {
+                            log::error!("service channel closed, capture exiting");
+                            return Ok(());
+                        }
                         continue;
                     }
                     if let Some(active) = self.active_client {
@@ -416,10 +482,13 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             if let Some(mods) = self.pending_modifiers.take() {
-                                let _ = self
+                                if let Err(e) = self
                                     .conn
                                     .send(ProtoEvent::Input(Event::Keyboard(mods)), handle)
-                                    .await;
+                                    .await
+                                {
+                                    log::warn!("failed to send pending modifiers to client {handle}: {e}");
+                                }
                             }
                         }
                         // client disconnected
@@ -430,14 +499,17 @@ impl CaptureTask {
                         _ => {}
                     }
                 },
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture, None).await?,
-                    CaptureRequest::Create(h, p, t) => {
+                e = self.request_rx.recv() => match e {
+                    // service channel closed: end the session so the
+                    // task can shut down in run()
+                    None => return Ok(()),
+                    Some(CaptureRequest::Reenable) => { /* already active */ },
+                    Some(CaptureRequest::Release) => self.release_capture(capture, None).await?,
+                    Some(CaptureRequest::Create(h, p, t)) => {
                         self.add_capture(h, p, t);
                         Self::create_backend_capture(capture, h, p, t).await?;
                     }
-                    CaptureRequest::Destroy(h) => {
+                    Some(CaptureRequest::Destroy(h)) => {
                         // If the capture we're tearing down is the
                         // currently-active one, treat this as a
                         // release for hook purposes. The release_capture
@@ -451,18 +523,18 @@ impl CaptureTask {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
-                    CaptureRequest::SetReleaseBind(bind) => {
+                    Some(CaptureRequest::SetReleaseBind(bind)) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    CaptureRequest::SetJailBind(bind) => {
+                    Some(CaptureRequest::SetJailBind(bind)) => {
                         *self.jail_bind.borrow_mut() = bind;
                     }
-                    CaptureRequest::SetEnterBinds(binds) => {
+                    Some(CaptureRequest::SetEnterBinds(binds)) => {
                         self.enter_binds = binds;
                         capture.set_enter_binds(self.capture_enter_binds());
                     }
-                    CaptureRequest::SetRemap(remap) => self.remap = *remap,
-                    CaptureRequest::SetScrollInvert(scroll_invert) => {
+                    Some(CaptureRequest::SetRemap(remap)) => self.remap = *remap,
+                    Some(CaptureRequest::SetScrollInvert(scroll_invert)) => {
                         self.scroll_invert = scroll_invert
                     }
                 },
@@ -508,8 +580,16 @@ impl CaptureTask {
             return self.release_capture(capture, None).await;
         }
 
-        let capture_type = self.get_type(handle);
-        let pos = self.get_pos(handle);
+        // a backend event for a handle that was just destroyed is
+        // stale — drop it rather than panicking on a racing destroy
+        let Some(capture_type) = self.get_type(handle) else {
+            log::warn!("capture event for unknown handle {handle}, dropping");
+            return Ok(());
+        };
+        let Some(pos) = self.get_pos(handle) else {
+            log::warn!("capture event for unknown handle {handle}, dropping");
+            return Ok(());
+        };
 
         // arm/disarm the mouse jail whenever the jail bind is engaged (see
         // update_jail_from_bind).
@@ -521,9 +601,14 @@ impl CaptureTask {
         }
 
         if let CaptureEvent::Begin(t) = event {
-            self.event_tx
+            if self
+                .event_tx
                 .send(ICaptureEvent::CaptureBegin(handle, t))
-                .expect("channel closed");
+                .is_err()
+            {
+                log::error!("service channel closed, capture exiting");
+                return Ok(());
+            }
         }
 
         // enter only capture (for incoming connections)
@@ -548,12 +633,17 @@ impl CaptureTask {
         if matches!(event, CaptureEvent::Begin(_)) && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
-            self.event_tx
+            if self
+                .event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+                .is_err()
+            {
+                log::error!("service channel closed, capture exiting");
+                return Ok(());
+            }
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let events: Vec<ProtoEvent> = match event {
             CaptureEvent::Begin(t) => {
@@ -623,9 +713,13 @@ impl CaptureTask {
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer
             // disappearing.
-            self.event_tx
+            if self
+                .event_tx
                 .send(ICaptureEvent::ClientLeft(handle))
-                .expect("channel closed");
+                .is_err()
+            {
+                log::error!("service channel closed, capture exiting");
+            }
             if !notify_peer {
                 capture.take_pressed_keys();
                 return match warp_to {
@@ -741,7 +835,7 @@ struct DropGuard<T> {
 
 impl<T> DropGuard<T> {
     fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
+        let _ = tx.send(on_new);
         let on_drop = Some(on_drop);
         Self { tx, on_drop }
     }
@@ -749,9 +843,11 @@ impl<T> DropGuard<T> {
 
 impl<T> Drop for DropGuard<T> {
     fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
+        // a panic in Drop during unwinding aborts the process, so a
+        // dead receiver must stay a lost notification, not a panic
+        if let Some(item) = self.on_drop.take() {
+            let _ = self.tx.send(item);
+        }
     }
 }
 
