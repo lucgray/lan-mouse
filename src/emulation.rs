@@ -130,9 +130,13 @@ impl Emulation {
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr, t: f64) {
-        self.request_tx
+        if self
+            .request_tx
             .send(EmulationRequest::Release(addr, t))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping Release({addr})");
+        }
     }
 
     pub(crate) fn send_clipboard(
@@ -142,53 +146,80 @@ impl Emulation {
         progress: Option<Sender<(u64, u64)>>,
         batch: u64,
     ) {
-        self.request_tx
+        if self
+            .request_tx
             .send(EmulationRequest::SendClipboard(
                 addr, clipboard, progress, batch,
             ))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping SendClipboard({addr})");
+        }
     }
 
     pub(crate) fn reenable(&self) {
-        self.request_tx
-            .send(EmulationRequest::Reenable)
-            .expect("channel closed");
+        if self.request_tx.send(EmulationRequest::Reenable).is_err() {
+            log::error!("emulation task gone, dropping Reenable");
+        }
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
-        self.request_tx
+        if self
+            .request_tx
             .send(EmulationRequest::ChangePort(port))
-            .expect("channel closed")
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping ChangePort({port})");
+        }
     }
 
     pub(crate) fn request_scrolling_inversion(&self, invert_scroll: bool) {
-        self.request_tx
+        if self
+            .request_tx
             .send(EmulationRequest::UpdateScrollingInversion(invert_scroll))
-            .expect("channel closed")
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping UpdateScrollingInversion");
+        }
     }
 
     pub(crate) fn request_key_repeat(&self, delay: Duration, interval: Duration) {
-        self.request_tx
+        if self
+            .request_tx
             .send(EmulationRequest::SetKeyRepeat(delay, interval))
-            .expect("channel closed")
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping SetKeyRepeat");
+        }
     }
 
     pub(crate) fn request_mouse_sensitivity_change(&self, mouse_sensitivity: f64) {
-        self.request_tx
+        if self
+            .request_tx
             .send(EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity))
-            .expect("channel closed")
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping UpdateMouseSensitivity");
+        }
     }
 
-    pub(crate) async fn event(&mut self) -> EmulationEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// `None` once the emulation task has exited (its event sender is
+    /// dropped) — the service treats this as a subsystem death.
+    pub(crate) async fn event(&mut self) -> Option<EmulationEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// whether the spawned task is still running — polled by the
+    /// service liveness tick to catch task death even when an event
+    /// channel clone outlives it
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.task.is_finished()
     }
 
     /// wait for termination
     pub(crate) async fn terminate(&mut self) {
         log::debug!("terminating emulation");
-        self.request_tx
-            .send(EmulationRequest::Terminate)
-            .expect("channel closed");
+        let _ = self.request_tx.send(EmulationRequest::Terminate);
         if let Err(e) = (&mut self.task).await {
             log::warn!("{e}");
         }
@@ -226,22 +257,32 @@ impl ListenTask {
                         if dormant.remove(&addr) && !matches!(&event, ProtoEvent::Enter(..)) {
                             if let Some((pos, fingerprint)) = entered_clients.get(&addr) {
                                 log::info!("incoming connection resumed: {addr}");
-                                self.event_tx.send(EmulationEvent::Entered {
+                                if self.event_tx.send(EmulationEvent::Entered {
                                     addr,
                                     pos: to_ipc_pos(*pos),
                                     fingerprint: fingerprint.clone(),
-                                }).expect("channel closed");
+                                }).is_err() {
+                                    log::error!("service channel closed, listen task exiting");
+                                    break;
+                                }
                             }
                         }
                         match event {
                             ProtoEvent::Enter(pos, t) => {
-                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    log::info!("releasing capture: {addr} entered this device");
-                                    entered_clients.insert(addr, (pos, fingerprint.clone()));
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                match self.listener.get_certificate_fingerprint(addr).await {
+                                    Some(fingerprint) => {
+                                        log::info!("releasing capture: {addr} entered this device");
+                                        entered_clients.insert(addr, (pos, fingerprint.clone()));
+                                        if self.event_tx.send(EmulationEvent::ReleaseNotify).is_err()
+                                            || self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).is_err()
+                                        {
+                                            log::error!("service channel closed, listen task exiting");
+                                            break;
+                                        }
+                                        self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                        self.emulation_proxy.warp(addr, to_emulation_pos(pos), t);
+                                    }
+                                    None => log::warn!("ignoring Enter from {addr}: no peer certificate"),
                                 }
                             }
                             ProtoEvent::Leave(..) => {
@@ -256,11 +297,15 @@ impl ListenTask {
                                 // clipboard emulation module instead.
                                 match input_event {
                                     input_event::Event::Clipboard(clipboard_event) => {
-                                        self.event_tx
+                                        if self.event_tx
                                             .send(EmulationEvent::ClipboardReceived(
                                                 clipboard_event,
                                             ))
-                                            .expect("channel closed");
+                                            .is_err()
+                                        {
+                                            log::error!("service channel closed, listen task exiting");
+                                            break;
+                                        }
                                     }
                                     _ => {
                                         self.emulation_proxy.consume(input_event, addr);
@@ -281,63 +326,94 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                if self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).is_err() {
+                                    log::error!("service channel closed, listen task exiting");
+                                    break;
+                                }
                             }
                             _ => {}
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
-                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                        if self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).is_err() {
+                            log::error!("service channel closed, listen task exiting");
+                            break;
+                        }
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
-                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
-                            }
+                            .is_none_or(|i| i.elapsed() >= Duration::from_secs(2))
+                            && self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).is_err() {
+                                log::error!("service channel closed, listen task exiting");
+                                break;
+                        }
                     }
                     Some(ListenEvent::ClipboardProgress { received, total }) => {
-                        self.event_tx.send(EmulationEvent::ClipboardProgress { received, total }).expect("channel closed");
+                        if self.event_tx.send(EmulationEvent::ClipboardProgress { received, total }).is_err() {
+                            log::error!("service channel closed, listen task exiting");
+                            break;
+                        }
                     }
                     None => break
                 }}
-                event = self.emulation_proxy.event() => {
-                    self.event_tx.send(event).expect("channel closed");
-                }
-                request = self.request_rx.recv() => match request.expect("channel closed") {
+                event = self.emulation_proxy.event() => match event {
+                    Some(event) => {
+                        if self.event_tx.send(event).is_err() {
+                            log::error!("service channel closed, listen task exiting");
+                            break;
+                        }
+                    }
+                    // emulation task exited - nothing left to proxy for
+                    None => break,
+                },
+                request = self.request_rx.recv() => match request {
+                    // service gone: exit through the cleanup path
+                    None => break,
                     // reenable emulation
-                    EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    Some(EmulationRequest::Reenable) => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr, t) => self.listener.reply(addr, ProtoEvent::Leave(0, t)).await,
-                    EmulationRequest::UpdateScrollingInversion(invert_scroll) => {
+                    Some(EmulationRequest::Release(addr, t)) => self.listener.reply(addr, ProtoEvent::Leave(0, t)).await,
+                    Some(EmulationRequest::UpdateScrollingInversion(invert_scroll)) => {
                         self.emulation_proxy.input_config.invert_scroll = invert_scroll;
                         self.emulation_proxy.update_config();
                     }
-                    EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity) => {
+                    Some(EmulationRequest::UpdateMouseSensitivity(mouse_sensitivity)) => {
                         self.emulation_proxy.input_config.mouse_sensitivity = mouse_sensitivity;
                         self.emulation_proxy.update_config();
                     }
-                    EmulationRequest::SetKeyRepeat(delay, interval) => {
+                    Some(EmulationRequest::SetKeyRepeat(delay, interval)) => {
                         self.emulation_proxy.set_key_repeat(delay, interval);
                     }
                     // send clipboard to a specific address
-                    EmulationRequest::SendClipboard(addr, clipboard_event, progress, batch) => {
+                    Some(EmulationRequest::SendClipboard(addr, clipboard_event, progress, batch)) => {
                         let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
                         let ok = self
                             .listener
                             .reply_clipboard(addr, proto_event, progress.as_ref())
                             .await;
-                        self.event_tx
+                        if self.event_tx
                             .send(EmulationEvent::ClipboardSendDone { batch, ok })
-                            .expect("channel closed");
+                            .is_err()
+                        {
+                            log::error!("service channel closed, listen task exiting");
+                            break;
+                        }
                     }
-                    EmulationRequest::ChangePort(port) => {
+                    Some(EmulationRequest::ChangePort(port)) => {
                         self.listener.request_port_change(port);
-                        let result = self.listener.port_changed().await;
-                        self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                        let Some(result) = self.listener.port_changed().await else {
+                            log::error!("listener exited during port change, listen task exiting");
+                            break;
+                        };
+                        if self.event_tx.send(EmulationEvent::PortChanged(result)).is_err() {
+                            log::error!("service channel closed, listen task exiting");
+                            break;
+                        }
                     }
-                    EmulationRequest::Terminate => break,
+                    Some(EmulationRequest::Terminate) => break,
                 },
                 _ = interval.tick() => {
+                    let mut channel_dead = false;
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
@@ -347,12 +423,16 @@ impl ListenTask {
                             if entered_clients.contains_key(&addr) {
                                 dormant.insert(addr);
                             }
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            channel_dead |= self.event_tx.send(EmulationEvent::Disconnected { addr }).is_err();
                             false
                         } else {
                             true
                         }
                     });
+                    if channel_dead {
+                        log::error!("service channel closed, listen task exiting");
+                        break;
+                    }
                 }
             }
         }
@@ -414,23 +494,27 @@ impl EmulationProxy {
         }
     }
 
-    async fn event(&mut self) -> EmulationEvent {
-        let event = self.event_rx.recv().await.expect("channel closed");
+    async fn event(&mut self) -> Option<EmulationEvent> {
+        let event = self.event_rx.recv().await?;
         if let EmulationEvent::EmulationEnabled = event {
             self.emulation_active.replace(true);
         }
         if let EmulationEvent::EmulationDisabled = event {
             self.emulation_active.replace(false);
         }
-        event
+        Some(event)
     }
 
     fn consume(&self, event: Event, addr: SocketAddr) {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
-            self.request_tx
+            if self
+                .request_tx
                 .send(ProxyRequest::Input(event, addr))
-                .expect("channel closed");
+                .is_err()
+            {
+                log::error!("emulation task gone, dropping input event");
+            }
         } else {
             log::warn!("emulation inactive, dropping event: {:?}", event);
         }
@@ -438,42 +522,51 @@ impl EmulationProxy {
 
     fn warp(&self, addr: SocketAddr, pos: input_emulation::Position, t: f64) {
         // ignore if emulation is currently disabled
-        if self.emulation_active.get() {
-            self.request_tx
+        if self.emulation_active.get()
+            && self
+                .request_tx
                 .send(ProxyRequest::Warp(addr, pos, t))
-                .expect("channel closed");
+                .is_err()
+        {
+            log::error!("emulation task gone, dropping warp");
         }
     }
 
     fn remove(&self, addr: SocketAddr) {
-        self.request_tx
-            .send(ProxyRequest::Remove(addr))
-            .expect("channel closed");
+        if self.request_tx.send(ProxyRequest::Remove(addr)).is_err() {
+            log::error!("emulation task gone, dropping remove");
+        }
     }
 
     fn reenable(&self) {
-        self.request_tx
-            .send(ProxyRequest::Reenable)
-            .expect("channel closed");
+        if self.request_tx.send(ProxyRequest::Reenable).is_err() {
+            log::error!("emulation task gone, dropping reenable");
+        }
     }
 
     fn update_config(&self) {
-        self.request_tx
+        if self
+            .request_tx
             .send(ProxyRequest::UpdateConfig(self.input_config))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping config update");
+        }
     }
 
     fn set_key_repeat(&self, delay: Duration, interval: Duration) {
-        self.request_tx
+        if self
+            .request_tx
             .send(ProxyRequest::SetKeyRepeat(delay, interval))
-            .expect("channel closed");
+            .is_err()
+        {
+            log::error!("emulation task gone, dropping key repeat update");
+        }
     }
 
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
-        self.request_tx
-            .send(ProxyRequest::Terminate)
-            .expect("channel closed");
+        let _ = self.request_tx.send(ProxyRequest::Terminate);
         let _ = (&mut self.task).await;
     }
 }
@@ -500,16 +593,18 @@ impl EmulationTask {
             }
             // wait for reenable request
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
-                    ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Warp(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::UpdateConfig(input_config) => {
+                match self.request_rx.recv().await {
+                    // service channel closed: shut the task down
+                    None => return,
+                    Some(ProxyRequest::Reenable) => break,
+                    Some(ProxyRequest::Terminate) => return,
+                    Some(ProxyRequest::Input(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::Warp(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::Remove(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::UpdateConfig(input_config)) => {
                         self.input_config = input_config;
                     }
-                    ProxyRequest::SetKeyRepeat(delay, interval) => {
+                    Some(ProxyRequest::SetKeyRepeat(delay, interval)) => {
                         self.options.key_repeat_delay = delay;
                         self.options.key_repeat_interval = interval;
                     }
@@ -523,7 +618,7 @@ impl EmulationTask {
         let mut emulation = tokio::select! {
             r = InputEmulation::new(self.backend, self.options, self.input_config) => r?,
             // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+            _ = self.wait_for_termination() => return Ok(()),
         };
 
         // used to send enabled and disabled events
@@ -549,13 +644,35 @@ impl EmulationTask {
         &mut self,
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
-        for handle in self.handles.values() {
+        let handles: Vec<EmulationHandle> = self.handles.values().copied().collect();
+        for handle in handles {
             tokio::select! {
-                _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                _ = emulation.create(handle) => {},
+                _ = self.wait_for_termination() => return Ok(()),
             }
         }
         Ok(())
+    }
+
+    /// Wait for the Terminate request while a blocking init step runs.
+    /// Config updates arriving during the wait are applied rather than
+    /// discarded so settings changed during backend (re)creation are
+    /// not lost.
+    async fn wait_for_termination(&mut self) {
+        loop {
+            match self.request_rx.recv().await {
+                Some(ProxyRequest::Terminate) | None => return,
+                Some(ProxyRequest::UpdateConfig(input_config)) => {
+                    self.input_config = input_config;
+                }
+                Some(ProxyRequest::SetKeyRepeat(delay, interval)) => {
+                    self.options.key_repeat_delay = delay;
+                    self.options.key_repeat_interval = interval;
+                }
+                // input/warp/remove/reenable have no live session to act on
+                _ => continue,
+            }
+        }
     }
 
     async fn do_emulation_session(
@@ -564,31 +681,32 @@ impl EmulationTask {
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
+                e = self.request_rx.recv() => match e {
+                    None => break Ok(()),
+                    Some(ProxyRequest::Input(event, addr)) => {
                         let handle = self.handle_for(emulation, addr).await;
                         emulation.consume(event, handle).await?;
                     },
-                    ProxyRequest::Warp(addr, pos, t) => {
+                    Some(ProxyRequest::Warp(addr, pos, t)) => {
                         let handle = self.handle_for(emulation, addr).await;
                         emulation.warp(handle, pos, t).await;
                     },
-                    ProxyRequest::Remove(addr) => {
+                    Some(ProxyRequest::Remove(addr)) => {
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
                     }
-                    ProxyRequest::UpdateConfig(input_config) => {
+                    Some(ProxyRequest::UpdateConfig(input_config)) => {
                         self.input_config = input_config;
                         emulation.update_config(input_config);
                     }
-                    ProxyRequest::SetKeyRepeat(delay, interval) => {
+                    Some(ProxyRequest::SetKeyRepeat(delay, interval)) => {
                         self.options.key_repeat_delay = delay;
                         self.options.key_repeat_interval = interval;
                         emulation.set_key_repeat(delay, interval);
                     }
-                    ProxyRequest::Terminate => break Ok(()),
-                    ProxyRequest::Reenable => continue,
+                    Some(ProxyRequest::Terminate) => break Ok(()),
+                    Some(ProxyRequest::Reenable) => continue,
                 },
             }
         }
@@ -629,20 +747,6 @@ fn to_emulation_pos(pos: Position) -> input_emulation::Position {
     }
 }
 
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
-    loop {
-        match rx.recv().await.expect("channel closed") {
-            ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Warp(_, _, _) => continue,
-            ProxyRequest::Remove(_) => continue,
-            ProxyRequest::Reenable => continue,
-            ProxyRequest::UpdateConfig(_) => continue,
-            ProxyRequest::SetKeyRepeat(_, _) => continue,
-        }
-    }
-}
-
 struct DropGuard<T> {
     tx: Sender<T>,
     on_drop: Option<T>,
@@ -650,7 +754,9 @@ struct DropGuard<T> {
 
 impl<T> DropGuard<T> {
     fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
+        // the receiver may already be gone (shutdown) - the guard is
+        // best-effort notification, never a panic
+        let _ = tx.send(on_new);
         let on_drop = Some(on_drop);
         Self { tx, on_drop }
     }
@@ -658,8 +764,9 @@ impl<T> DropGuard<T> {
 
 impl<T> Drop for DropGuard<T> {
     fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
+        // runs during unwind too - panicking here would abort the process
+        if let Some(item) = self.on_drop.take() {
+            let _ = self.tx.send(item);
+        }
     }
 }

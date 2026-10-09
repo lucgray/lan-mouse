@@ -54,16 +54,31 @@ impl DnsResolver {
 
     pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
         let request = DnsRequest { handle, hostname };
-        self.request_tx.send(request).expect("channel closed");
+        if self.request_tx.send(request).is_err() {
+            log::error!("dns resolver task gone, dropping request for client {handle}");
+        }
     }
 
-    pub(crate) async fn event(&mut self) -> DnsEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// `None` once every event sender has been dropped — i.e. the
+    /// resolver task exited.
+    pub(crate) async fn event(&mut self) -> Option<DnsEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// whether the spawned task is still running — polled by the
+    /// service liveness tick (children of the resolver hold event
+    /// channel clones, so the channel alone can't detect its death)
+    pub(crate) fn is_alive(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
     }
 
     pub(crate) async fn terminate(&mut self) {
         self.cancellation_token.cancel();
-        self.task.take().expect("task").await.expect("join error");
+        if let Some(task) = self.task.take() {
+            if let Err(e) = task.await {
+                log::warn!("dns resolver task exited with error: {e}");
+            }
+        }
     }
 }
 
@@ -88,9 +103,10 @@ impl DnsTask {
                 }
             }
 
-            self.event_tx
-                .send(DnsEvent::Resolving(handle))
-                .expect("channel closed");
+            if self.event_tx.send(DnsEvent::Resolving(handle)).is_err() {
+                log::error!("service channel closed, dns resolver exiting");
+                return;
+            }
 
             /* spawn task for dns request */
             let event_tx = self.event_tx.clone();
@@ -99,9 +115,12 @@ impl DnsTask {
             let task = tokio::task::spawn_local(async move {
                 tokio::select! {
                     result = resolve_hostname(&hostname) => {
-                       event_tx
-                           .send(DnsEvent::Resolved(handle, hostname, result))
-                           .expect("channel closed");
+                        if event_tx
+                            .send(DnsEvent::Resolved(handle, hostname, result))
+                            .is_err()
+                        {
+                            log::error!("service channel closed, dropping dns result");
+                        }
                     }
                     _ = cancellation_token.cancelled() => {},
                 }
