@@ -5,9 +5,72 @@
 //! cache directory at startup so libintl can serve them. This keeps the app a
 //! self-contained binary — no installed locale files required.
 
+#[cfg(unix)]
 use gettextrs::LocaleCategory;
-use gettextrs::{bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain};
+#[cfg(unix)]
+use gettextrs::gettext as platform_gettext;
+#[cfg(unix)]
+use gettextrs::{bind_textdomain_codeset, bindtextdomain, setlocale, textdomain};
 use std::{env, fs, path::PathBuf};
+
+/// Message lookup: on unix this is the platform libintl (shared with
+/// GtkBuilder's translation registry); elsewhere a minimal in-crate
+/// .mo parser — gettext-sys cannot build under MSVC.
+#[cfg(unix)]
+fn gettext(msgid: &str) -> String {
+    platform_gettext(msgid)
+}
+
+#[cfg(not(unix))]
+fn gettext(msgid: &str) -> String {
+    catalog()
+        .get(msgid)
+        .cloned()
+        .unwrap_or_else(|| msgid.to_string())
+}
+
+#[cfg(not(unix))]
+fn catalog() -> &'static std::collections::HashMap<String, String> {
+    static CATALOG: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let lang = env::var("LANGUAGE")
+            .ok()
+            .filter(|l| !l.is_empty())
+            .or_else(configured_language)
+            .unwrap_or_default();
+        LANGUAGES
+            .iter()
+            .find(|(l, _)| *l == lang)
+            .and_then(|(_, bytes)| parse_mo(bytes))
+            .unwrap_or_default()
+    })
+}
+
+/// Minimal GNU .mo reader: header (magic, count, msgid/msgstr table
+/// offsets) followed by length/offset pairs pointing at NUL-free
+/// string bodies.
+#[cfg(not(unix))]
+fn parse_mo(b: &[u8]) -> Option<std::collections::HashMap<String, String>> {
+    let u32le = |o: usize| -> Option<usize> {
+        Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?) as usize)
+    };
+    if u32le(0)? != 0x9504_12de {
+        return None;
+    }
+    let (n, o_tab, t_tab) = (u32le(8)?, u32le(12)?, u32le(16)?);
+    let mut map = std::collections::HashMap::new();
+    for i in 0..n {
+        let (ol, oo) = (u32le(o_tab + i * 8)?, u32le(o_tab + i * 8 + 4)?);
+        let (tl, to) = (u32le(t_tab + i * 8)?, u32le(t_tab + i * 8 + 4)?);
+        let orig = std::str::from_utf8(b.get(oo..oo + ol)?).ok()?;
+        let trans = std::str::from_utf8(b.get(to..to + tl)?).ok()?;
+        if !orig.is_empty() {
+            map.insert(orig.to_string(), trans.to_string());
+        }
+    }
+    Some(map)
+}
 
 include!(concat!(env!("OUT_DIR"), "/languages.rs"));
 
@@ -17,6 +80,7 @@ pub const DOMAIN: &str = "lan-mouse";
 /// extract the embedded catalogs, and bind the text domain.
 /// Call before any UI is built so `translatable` strings in `.ui` files
 /// resolve through the bound domain.
+#[cfg(unix)]
 pub fn init() {
     let configured = apply_configured_language();
 
@@ -24,11 +88,7 @@ pub fn init() {
     // gettext — the standard early-init pattern for setlocale.
     unsafe {
         if configured {
-            // gettext only honors LANGUAGE outside the "C" locale, and
-            // the configured language may not be installed as a system
-            // locale. C.UTF-8 exists on virtually every system, so it
-            // serves as a neutral non-"C" base locale.
-            setlocale(LocaleCategory::LcAll, "C.UTF-8");
+            apply_language_base_locale();
         } else {
             setlocale(LocaleCategory::LcAll, "");
         }
@@ -45,6 +105,14 @@ pub fn init() {
     if let Err(e) = textdomain(DOMAIN) {
         log::warn!("failed to set gettext domain: {e}");
     }
+}
+
+/// Non-unix: catalogs resolve in-process via `catalog()`; nothing to
+/// bind. `.ui` translatable strings stay untranslated there (no libintl
+/// for GtkBuilder) — runtime strings still translate via `tr`.
+#[cfg(not(unix))]
+pub fn init() {
+    apply_configured_language();
 }
 
 /// `gettext` with named `{arg}` substitution.
@@ -70,6 +138,65 @@ fn apply_configured_language() -> bool {
     log::info!("ui language from config: {lang}");
     env::set_var("LANGUAGE", &lang);
     true
+}
+
+/// Pick a non-"C" base locale so gettext honors `LANGUAGE`.
+///
+/// gettext only consults LANGUAGE outside the "C"/"POSIX" locale, and
+/// since glibc 2.36 "C.UTF-8" counts as "C", so it cannot serve as the
+/// neutral base on current systems. When the environment already
+/// resolves to a real locale we keep it; otherwise probe common UTF-8
+/// locales — the configured language's own first — ending on C.UTF-8,
+/// which still works as a base on older glibc. On a system with no
+/// generated UTF-8 locale at all and glibc >= 2.36, the override is
+/// unreachable (documented limitation).
+#[cfg(unix)]
+unsafe fn apply_language_base_locale() {
+    let env_locale = env::var("LC_ALL")
+        .or_else(|_| env::var("LC_MESSAGES"))
+        .or_else(|_| env::var("LANG"))
+        .unwrap_or_default();
+    let c_like = env_locale.is_empty()
+        || env_locale == "C"
+        || env_locale == "POSIX"
+        || env_locale.starts_with("C.");
+    if !c_like {
+        // environment already gives a non-C base — honor it
+        setlocale(LocaleCategory::LcAll, "");
+        return;
+    }
+    for cand in candidate_locales() {
+        if setlocale(LocaleCategory::LcAll, cand.as_str()).is_some() {
+            return;
+        }
+    }
+    log::warn!("no usable non-C locale found; language override may not apply");
+}
+
+/// Candidate base locales: the configured language's own UTF-8 locale
+/// first (matches LANGUAGE exactly), then widely installed UTF-8
+/// locales, C.UTF-8 last for older glibc where it still counts non-C.
+#[cfg(unix)]
+fn candidate_locales() -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    if let Some(lang) = configured_language() {
+        v.push(format!("{lang}.UTF-8"));
+    }
+    for c in [
+        "en_US.UTF-8",
+        "en_US.utf8",
+        "de_DE.UTF-8",
+        "fr_FR.UTF-8",
+        "zh_CN.UTF-8",
+        "zh_CN.utf8",
+        "C.UTF-8",
+    ] {
+        let s = c.to_string();
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    }
+    v
 }
 
 /// Read the top-level `language` key from the daemon's config.toml.
@@ -110,6 +237,7 @@ fn config_file_path() -> Option<PathBuf> {
 
 /// Write the embedded `.mo` catalogs to `<temp>/lan-mouse/locale/<lang>/
 /// LC_MESSAGES/lan-mouse.mo` and return the locale root for bindtextdomain.
+#[cfg(unix)]
 fn extract_translations() -> PathBuf {
     let root = env::temp_dir().join("lan-mouse").join("locale");
     for (lang, bytes) in LANGUAGES {
@@ -132,12 +260,18 @@ mod tests {
 
     #[test]
     fn zh_cn_catalog_loads() {
+        // exercise the same base-locale path as production: glibc >=
+        // 2.36 treats C.UTF-8 as "C" and would silently ignore
+        // LANGUAGE — the test caught this on ubuntu-24.04
         env::set_var("LANGUAGE", "zh_CN");
-        unsafe { setlocale(LocaleCategory::LcAll, "C.UTF-8") };
-        let dir = extract_translations();
-        bindtextdomain(DOMAIN, &dir).unwrap();
-        bind_textdomain_codeset(DOMAIN, "UTF-8").unwrap();
-        textdomain(DOMAIN).unwrap();
+        #[cfg(unix)]
+        unsafe {
+            apply_language_base_locale();
+            let dir = extract_translations();
+            bindtextdomain(DOMAIN, &dir).unwrap();
+            bind_textdomain_codeset(DOMAIN, "UTF-8").unwrap();
+            textdomain(DOMAIN).unwrap();
+        }
         assert_eq!(gettext("Connections"), "连接");
         assert_eq!(
             tr("{addr} disconnected", &[("addr", "1.2.3.4")]),
