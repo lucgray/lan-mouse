@@ -55,6 +55,8 @@
                 <property name="subtitle" translatable="yes">Restart Lan Mouse to apply</property>
                 <property name="model">language_model</property>
               </object>
+            </child>
+            <child>
               <object class="AdwComboRow" id="notification_row">
                 <property name="title" translatable="yes">Notifications</property>
                 <property name="subtitle" translatable="yes">Where hints like &quot;clipboard shared&quot; are shown</property>
