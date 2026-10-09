@@ -267,6 +267,14 @@ impl LanMouseListener {
         self.port_changed.recv().await
     }
 
+    /// whether the DTLS accept task is still running — polled by the
+    /// listen task's tick since the event channel stays open on death
+    /// (`listen_tx` is a field of this struct, so sender drop never
+    /// happens) and task death would otherwise be invisible
+    pub(crate) fn is_alive(&self) -> bool {
+        !self.listen_task.is_finished()
+    }
+
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
         let conns = self.conns.lock().await;
@@ -624,5 +632,27 @@ mod tests {
         let cert = vec![7u8; 32];
         let fp = peer_cert_fingerprint(std::slice::from_ref(&cert)).expect("single cert");
         assert_eq!(fp, crypto::generate_fingerprint(&cert));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn listener_is_alive_reflects_task_death() {
+        // fault injection: the accept task dying must be observable —
+        // the event channel stays open (listen_tx lives on the
+        // listener struct) so is_alive is the only detection path
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+                let cert = Certificate::generate_self_signed(["ignored".to_owned()])
+                    .expect("self-signed cert");
+                let listener = LanMouseListener::new(0, cert, keys)
+                    .await
+                    .expect("listener");
+                assert!(listener.is_alive());
+                listener.listen_task.abort();
+                // the abort is only acted on once the executor runs
+                tokio::task::yield_now().await;
+                assert!(!listener.is_alive());
+            })
+            .await;
     }
 }

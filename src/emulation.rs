@@ -413,6 +413,14 @@ impl ListenTask {
                     Some(EmulationRequest::Terminate) => break,
                 },
                 _ = interval.tick() => {
+                    // the DTLS accept task's death cannot propagate
+                    // through its own channel — `listen_tx` lives on
+                    // the listener struct, so the event stream just
+                    // pends forever. Poll the JoinHandle directly.
+                    if !self.listener.is_alive() {
+                        log::error!("DTLS listener task exited, listen task exiting");
+                        break;
+                    }
                     let mut channel_dead = false;
                     last_response.retain(|&addr,instant| {
                         if instant.elapsed() > Duration::from_secs(1) {

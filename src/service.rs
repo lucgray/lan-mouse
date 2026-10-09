@@ -306,6 +306,18 @@ impl Service {
                         fatal = Some("dns resolver");
                         break;
                     }
+                    // the clipboard monitor is degraded, not fatal:
+                    // its death disables clipboard sharing but input
+                    // keeps working
+                    if let Some(monitor) = self.clipboard_monitor.as_ref() {
+                        if !monitor.is_alive() {
+                            log::error!("clipboard monitor exited, clipboard sharing disabled");
+                            self.clipboard_monitor = None;
+                            self.notify_frontend(FrontendEvent::Error(
+                                "clipboard monitor stopped, clipboard sharing disabled".to_string(),
+                            ));
+                        }
+                    }
                     self.expire_clipboard_batches();
                 },
                 r = self.config.changed() => match r {

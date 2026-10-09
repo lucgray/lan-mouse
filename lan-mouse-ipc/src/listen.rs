@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::LinesStream;
 
 #[cfg(unix)]
@@ -55,30 +55,21 @@ pub struct AsyncFrontendListener {
     /// read stream — removed together on EOF or error so
     /// `frontend_connected` cannot stay stuck on a dead stream
     tx_streams: HashMap<u64, mpsc::Sender<String>>,
+    /// per-connection kill switch — resolves the tagged read stream
+    /// (via take_until) so a dropped client releases reader, writer
+    /// and socket, not just its outbound queue
+    kill: HashMap<u64, oneshot::Sender<()>>,
     next_conn_id: u64,
 }
 
 impl AsyncFrontendListener {
     pub async fn new() -> Result<Self, IpcListenerCreationError> {
         #[cfg(unix)]
-        let (socket_path, listener) = {
-            let socket_path = crate::default_socket_path()?;
+        return Self::new_with_path(crate::default_socket_path()?).await;
 
-            log::debug!("remove socket: {socket_path:?}");
-            if socket_path.exists() {
-                // try to connect to see if some other instance
-                // of lan-mouse is already running
-                match UnixStream::connect(&socket_path).await {
-                    // connected -> lan-mouse is already running
-                    Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
-                    // lan-mouse is not running but a socket was left behind
-                    Err(e) => {
-                        log::debug!("{socket_path:?}: {e} - removing left behind socket");
-                        let _ = std::fs::remove_file(&socket_path);
-                    }
-                }
-            }
-            let listener = match UnixListener::bind(&socket_path) {
+        #[cfg(windows)]
+        {
+            let listener = match TcpListener::bind("127.0.0.1:5252").await {
                 Ok(ls) => ls,
                 // some other lan-mouse instance has bound the socket in the meantime
                 Err(e) if e.kind() == ErrorKind::AddrInUse => {
@@ -86,11 +77,35 @@ impl AsyncFrontendListener {
                 }
                 Err(e) => return Err(IpcListenerCreationError::Bind(e)),
             };
-            (socket_path, listener)
-        };
+            Ok(Self {
+                listener,
+                line_streams: SelectAll::new(),
+                tx_streams: HashMap::new(),
+                kill: HashMap::new(),
+                next_conn_id: 0,
+            })
+        }
+    }
 
-        #[cfg(windows)]
-        let listener = match TcpListener::bind("127.0.0.1:5252").await {
+    /// bind a unix socket at an explicit path — `new()` uses the
+    /// platform default; tests pass their own
+    #[cfg(unix)]
+    async fn new_with_path(socket_path: PathBuf) -> Result<Self, IpcListenerCreationError> {
+        log::debug!("remove socket: {socket_path:?}");
+        if socket_path.exists() {
+            // try to connect to see if some other instance
+            // of lan-mouse is already running
+            match UnixStream::connect(&socket_path).await {
+                // connected -> lan-mouse is already running
+                Ok(_) => return Err(IpcListenerCreationError::AlreadyRunning),
+                // lan-mouse is not running but a socket was left behind
+                Err(e) => {
+                    log::debug!("{socket_path:?}: {e} - removing left behind socket");
+                    let _ = std::fs::remove_file(&socket_path);
+                }
+            }
+        }
+        let listener = match UnixListener::bind(&socket_path) {
             Ok(ls) => ls,
             // some other lan-mouse instance has bound the socket in the meantime
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
@@ -98,17 +113,14 @@ impl AsyncFrontendListener {
             }
             Err(e) => return Err(IpcListenerCreationError::Bind(e)),
         };
-
-        let adapter = Self {
+        Ok(Self {
             listener,
-            #[cfg(unix)]
             socket_path,
             line_streams: SelectAll::new(),
             tx_streams: HashMap::new(),
+            kill: HashMap::new(),
             next_conn_id: 0,
-        };
-
-        Ok(adapter)
+        })
     }
 
     /// whether any frontend is currently connected — used to decide
@@ -143,7 +155,18 @@ impl AsyncFrontendListener {
             }
         }
         for id in failed {
-            self.tx_streams.remove(&id);
+            self.drop_conn(id);
+        }
+    }
+
+    /// release every resource of one connection: the outbound queue
+    /// (sender drop ends the writer task, which drops the write half)
+    /// and the read stream (kill resolves take_until, which drops the
+    /// read half) — the client's socket fully closes
+    fn drop_conn(&mut self, id: u64) {
+        self.tx_streams.remove(&id);
+        if let Some(kill) = self.kill.remove(&id) {
+            let _ = kill.send(());
         }
     }
 }
@@ -164,11 +187,11 @@ impl Stream for AsyncFrontendListener {
         while let Poll::Ready(Some((id, msg))) = self.line_streams.poll_next_unpin(cx) {
             match msg {
                 ConnMsg::Closed => {
-                    self.tx_streams.remove(&id);
+                    self.drop_conn(id);
                 }
                 ConnMsg::Line(Err(e)) => {
                     log::warn!("frontend connection lost: {e}");
-                    self.tx_streams.remove(&id);
+                    self.drop_conn(id);
                 }
                 ConnMsg::Line(Ok(l)) => {
                     let request = serde_json::from_str(l.as_str()).map_err(|e| e.into());
@@ -184,10 +207,13 @@ impl Stream for AsyncFrontendListener {
             let lines = LinesStream::new(lines);
             let id = self.next_conn_id;
             self.next_conn_id += 1;
+            let (kill_tx, kill_rx) = oneshot::channel::<()>();
+            self.kill.insert(id, kill_tx);
             let tagged: TaggedStream = Box::pin(
                 lines
                     .map(ConnMsg::Line)
                     .chain(futures::stream::once(async { ConnMsg::Closed }))
+                    .take_until(kill_rx)
                     .map(move |m| (id, m)),
             );
             self.line_streams.push(tagged);
@@ -211,5 +237,104 @@ impl Stream for AsyncFrontendListener {
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// unique socket path per test so parallel tests don't collide
+    fn test_socket_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("lan-mouse-test-{name}-{}.sock", std::process::id()))
+    }
+
+    /// a dropped frontend must release reader, writer, queue and the
+    /// socket itself — the client observes a full close (EOF), not a
+    /// half-dead connection that blocks nothing but also delivers
+    /// nothing
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_conn_releases_all_resources() {
+        let path = test_socket_path("drop-conn");
+        let mut listener = AsyncFrontendListener::new_with_path(path.clone())
+            .await
+            .expect("listener");
+        let mut client = UnixStream::connect(&path).await.expect("connect");
+
+        // accept emits the Sync request for the new connection
+        let item = listener.next().await.expect("stream ended");
+        assert!(matches!(item, Ok(FrontendRequest::Sync)));
+        assert!(listener.frontend_connected());
+
+        listener.drop_conn(0);
+        assert!(!listener.frontend_connected());
+        assert!(listener.tx_streams.is_empty());
+        assert!(listener.kill.is_empty());
+        // a kill only takes effect once the SelectAll drains the ended
+        // stream — in production the service loop polls continuously
+        futures::future::poll_fn(|cx| {
+            let _ = listener.poll_next_unpin(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        // once both halves drop the client sees EOF
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("client read timed out — socket not fully closed")
+            .expect("client read");
+        assert_eq!(n, 0, "expected EOF after disconnect");
+    }
+
+    /// a queue overflow drops only that client — others still receive
+    /// events and the loop is not blocked
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_client_dropped_others_unaffected() {
+        let path = test_socket_path("slow-client");
+        let mut listener = AsyncFrontendListener::new_with_path(path.clone())
+            .await
+            .expect("listener");
+        // client 1 reads; client 2 never does — one next() drains all
+        // pending accepts, so a second call would pend forever
+        let mut good = UnixStream::connect(&path).await.expect("connect good");
+        let _stuck = UnixStream::connect(&path).await.expect("connect stuck");
+        let _ = listener.next().await;
+        assert_eq!(listener.tx_streams.len(), 2);
+
+        // flood: messages bigger than any reasonable socket buffer so
+        // the stuck client's writer blocks, its queue fills, and it
+        // gets dropped — the healthy client must keep receiving.
+        // try_read keeps good's own queue draining so only the truly
+        // stuck client hits the cap
+        let big = FrontendEvent::Error("x".repeat(64 * 1024));
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut dropped_at = None;
+        for i in 0..512 {
+            listener.broadcast(big.clone()).await;
+            tokio::task::yield_now().await;
+            while good.try_read(&mut buf).is_ok() {}
+            if listener.tx_streams.len() == 1 {
+                dropped_at = Some(i);
+                break;
+            }
+        }
+        assert!(
+            dropped_at.is_some(),
+            "stuck client was never dropped (queue or socket buffers too large?)"
+        );
+        assert!(listener.frontend_connected());
+
+        // the surviving connection still gets events end to end —
+        // send one last event since the loop drained everything prior
+        listener
+            .broadcast(FrontendEvent::Error("still alive".to_string()))
+            .await;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), good.read(&mut buf))
+            .await
+            .expect("good client read timed out")
+            .expect("read");
+        assert!(n > 0);
     }
 }

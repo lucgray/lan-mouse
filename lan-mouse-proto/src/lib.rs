@@ -1343,4 +1343,53 @@ mod tests {
             Err(ProtocolError::InvalidFragment)
         ));
     }
+
+    mod peak_memory {
+        use super::*;
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// counts live allocated bytes so tests can assert the
+        /// reassembler's footprint tracks received data, not the
+        /// peer-declared total
+        static LIVE: AtomicUsize = AtomicUsize::new(0);
+        struct Counting;
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                LIVE.fetch_add(l.size(), Ordering::SeqCst);
+                unsafe { System.alloc(l) }
+            }
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                LIVE.fetch_sub(l.size(), Ordering::SeqCst);
+                unsafe { System.dealloc(p, l) }
+            }
+        }
+        #[global_allocator]
+        static A: Counting = Counting;
+
+        /// N concurrent transfers, each with a legal 256MiB header and
+        /// a single small tail fragment: peak memory must stay in the
+        /// kilobytes, not gigabytes
+        #[test]
+        fn concurrent_transfers_stay_sparse() {
+            let total = MAX_CLIPBOARD_TRANSFER_SIZE as u32;
+            let num = (total as u64).div_ceil(CLIPBOARD_FRAGMENT_PAYLOAD as u64) as u32;
+            let baseline = LIVE.load(Ordering::SeqCst);
+            let mut reasms: Vec<ClipboardReassembler> =
+                (0..8).map(|_| ClipboardReassembler::new()).collect();
+            for (i, r) in reasms.iter_mut().enumerate() {
+                let frag = forged_fragment(total, num - 1, num, i as u32, &[0xAB; 100]);
+                assert!(matches!(r.push(&frag), Ok(None)));
+            }
+            let delta = LIVE.load(Ordering::SeqCst) - baseline;
+            // 8 × (~100B payload + ~28KB seq bitmap + map overhead);
+            // the old design would have allocated 8 × 256MiB here
+            assert!(
+                delta < 2 * 1024 * 1024,
+                "peak allocation {delta} bytes — reassembly is not sparse"
+            );
+            // progress still reports the declared totals
+            assert_eq!(reasms[0].progress(), Some((100, total as u64)));
+        }
+    }
 }
