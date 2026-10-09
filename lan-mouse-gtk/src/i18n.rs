@@ -57,7 +57,7 @@ fn catalog_for(lang: &str) -> std::collections::HashMap<String, String> {
     let cat = LANGUAGES
         .iter()
         .find(|(l, _)| *l == lang)
-        .and_then(|(_, bytes)| parse_mo(*bytes))
+        .and_then(|(_, bytes)| parse_mo(bytes))
         .unwrap_or_default();
     if let Ok(mut guard) = cache.lock() {
         guard.insert(lang.to_string(), cat.clone());
