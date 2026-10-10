@@ -229,7 +229,7 @@ fn bind_platform_domain(root: &PathBuf) {
         }
         if codeset != 0 {
             let f: Codeset = unsafe { std::mem::transmute(codeset) };
-            unsafe { f(domain_mb.as_ptr(), c"UTF-8".as_ptr().cast()) };
+            unsafe { f(domain_mb.as_ptr().cast(), c"UTF-8".as_ptr().cast()) };
         }
         if bound {
             log::info!("bound gettext domain in {dll}");
