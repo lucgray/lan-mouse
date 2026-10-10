@@ -11,7 +11,10 @@ use gettextrs::LocaleCategory;
 use gettextrs::gettext as platform_gettext;
 #[cfg(unix)]
 use gettextrs::{bind_textdomain_codeset, bindtextdomain, setlocale, textdomain};
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 /// Message lookup: on unix this is the platform libintl (shared with
 /// GtkBuilder's translation registry); elsewhere a minimal in-crate
@@ -179,7 +182,7 @@ fn extract_translations() -> PathBuf {
 /// bound domain, `.ui` translatable strings fall back to the untranslated
 /// msgid even though the `.mo` file exists.
 #[cfg(windows)]
-fn bind_platform_domain(root: &PathBuf) {
+fn bind_platform_domain(root: &Path) {
     use std::ffi::{OsStr, OsString};
     use std::os::windows::ffi::OsStrExt;
 
@@ -244,7 +247,7 @@ fn bind_platform_domain(root: &PathBuf) {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn bind_platform_domain(_root: &PathBuf) {}
+fn bind_platform_domain(_root: &Path) {}
 
 /// `gettext` with named `{arg}` substitution.
 ///
