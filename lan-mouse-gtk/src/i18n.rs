@@ -194,7 +194,7 @@ fn bind_platform_domain(root: &PathBuf) {
 
     let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
     let domain_wide = wide(OsStr::new("lan-mouse"));
-    let domain_mb = b"lan-mouse\0";
+    let domain_mb = c"lan-mouse";
 
     // intl providers GTK4 windows builds may carry: proxy-libintl is
     // compiled into libglib by gvsbuild, but standalone intl dlls exist
@@ -211,9 +211,9 @@ fn bind_platform_domain(root: &PathBuf) {
         if handle == 0 {
             continue;
         }
-        let wbind = unsafe { GetProcAddress(handle, b"wbindtextdomain\0".as_ptr()) };
-        let bind = unsafe { GetProcAddress(handle, b"bindtextdomain\0".as_ptr()) };
-        let codeset = unsafe { GetProcAddress(handle, b"bind_textdomain_codeset\0".as_ptr()) };
+        let wbind = unsafe { GetProcAddress(handle, c"wbindtextdomain".as_ptr().cast()) };
+        let bind = unsafe { GetProcAddress(handle, c"bindtextdomain".as_ptr().cast()) };
+        let codeset = unsafe { GetProcAddress(handle, c"bind_textdomain_codeset".as_ptr().cast()) };
         if wbind != 0 {
             let f: BindTextdomain = unsafe { std::mem::transmute(wbind) };
             unsafe { f(domain_wide.as_ptr(), wide(root.as_os_str()).as_ptr()) };
@@ -224,12 +224,12 @@ fn bind_platform_domain(root: &PathBuf) {
             let f: BindTextdomainMb = unsafe { std::mem::transmute(bind) };
             let mut dir = root.to_string_lossy().into_owned().into_bytes();
             dir.push(0);
-            unsafe { f(domain_mb.as_ptr(), dir.as_ptr()) };
+            unsafe { f(domain_mb.as_ptr().cast(), dir.as_ptr()) };
             bound = true;
         }
         if codeset != 0 {
             let f: Codeset = unsafe { std::mem::transmute(codeset) };
-            unsafe { f(domain_mb.as_ptr(), b"UTF-8\0".as_ptr()) };
+            unsafe { f(domain_mb.as_ptr(), c"UTF-8".as_ptr().cast()) };
         }
         if bound {
             log::info!("bound gettext domain in {dll}");
