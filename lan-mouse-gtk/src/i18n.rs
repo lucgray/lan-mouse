@@ -128,13 +128,123 @@ pub fn init() {
     }
 }
 
-/// Non-unix: catalogs resolve in-process via `catalog()`; nothing to
-/// bind. `.ui` translatable strings stay untranslated there (no libintl
-/// for GtkBuilder) — runtime strings still translate via `tr`.
+/// Non-unix: runtime strings resolve through the in-crate catalog.
+/// `.ui` translatable strings go through GTK's own intl
+/// (proxy-libintl inside libglib, or a standalone libintl dll), which
+/// only looks in a real locale directory — so extract the embedded
+/// catalogs and bind the domain in that intl too.
 #[cfg(not(unix))]
 pub fn init() {
     apply_configured_language();
+    let root = extract_translations();
+    bind_platform_domain(&root);
 }
+
+/// Extract embedded `.mo` catalogs next to the executable
+/// (`<exe>/share/locale/...` — the default localedir GTK's intl
+/// resolves relative to its dll) when writable, and always to a
+/// per-user data dir (`LOCALAPPDATA`/`USERPROFILE`). Returns the data
+/// dir to bind.
+#[cfg(not(unix))]
+fn extract_translations() -> PathBuf {
+    let base = env::var("LOCALAPPDATA")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| env::temp_dir().to_string_lossy().into_owned());
+    let data_root = PathBuf::from(base).join("lan-mouse").join("locale");
+    let exe_root = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("share").join("locale")));
+    for (lang, bytes) in LANGUAGES {
+        let rel = PathBuf::from(lang).join("LC_MESSAGES").join("lan-mouse.mo");
+        for root in [Some(&data_root), exe_root.as_ref()].into_iter().flatten() {
+            let path = root.join(&rel);
+            // skip only when the bytes on disk already match — a stale
+            // catalog from an older version must be overwritten
+            if fs::read(&path).is_ok_and(|existing| existing == *bytes) {
+                continue;
+            }
+            match fs::create_dir_all(path.parent().unwrap_or(root))
+                .and_then(|_| fs::write(&path, bytes))
+            {
+                Ok(()) => log::info!("extracted translation catalog to {}", path.display()),
+                Err(e) => log::debug!("cannot extract catalog to {path:?}: {e}"),
+            }
+        }
+    }
+    data_root
+}
+
+/// Register `lan-mouse` (and UTF-8 codeset) with the intl implementation
+/// GTK actually uses — found by probing the dlls GTK links. Without a
+/// bound domain, `.ui` translatable strings fall back to the untranslated
+/// msgid even though the `.mo` file exists.
+#[cfg(windows)]
+fn bind_platform_domain(root: &PathBuf) {
+    use std::ffi::{OsStr, OsString};
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> isize;
+        fn GetProcAddress(module: isize, name: *const u8) -> usize;
+    }
+    type BindTextdomain = unsafe extern "C" fn(*const u16, *const u16) -> usize;
+    type BindTextdomainMb = unsafe extern "C" fn(*const u8, *const u8) -> usize;
+    type Codeset = unsafe extern "C" fn(*const u8, *const u8) -> usize;
+
+    let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
+    let domain_wide = wide(OsStr::new("lan-mouse"));
+    let domain_mb = b"lan-mouse\0";
+
+    // intl providers GTK4 windows builds may carry: proxy-libintl is
+    // compiled into libglib by gvsbuild, but standalone intl dlls exist
+    // in other distributions — probe every candidate, binding in each
+    // one that exports the symbol (harmless if unused).
+    let mut bound = false;
+    for dll in [
+        "libglib-2.0-0.dll",
+        "libintl-8.dll",
+        "intl.dll",
+        "libintl.dll",
+    ] {
+        let handle = unsafe { LoadLibraryW(wide(&OsString::from(dll)).as_ptr()) };
+        if handle == 0 {
+            continue;
+        }
+        let wbind = unsafe { GetProcAddress(handle, b"wbindtextdomain\0".as_ptr()) };
+        let bind = unsafe { GetProcAddress(handle, b"bindtextdomain\0".as_ptr()) };
+        let codeset = unsafe { GetProcAddress(handle, b"bind_textdomain_codeset\0".as_ptr()) };
+        if wbind != 0 {
+            let f: BindTextdomain = unsafe { std::mem::transmute(wbind) };
+            unsafe { f(domain_wide.as_ptr(), wide(root.as_os_str()).as_ptr()) };
+            bound = true;
+        } else if bind != 0 {
+            // bindtextdomain takes the dir in the platform encoding —
+            // UTF-8 in proxy-libintl
+            let f: BindTextdomainMb = unsafe { std::mem::transmute(bind) };
+            let mut dir = root.to_string_lossy().into_owned().into_bytes();
+            dir.push(0);
+            unsafe { f(domain_mb.as_ptr(), dir.as_ptr()) };
+            bound = true;
+        }
+        if codeset != 0 {
+            let f: Codeset = unsafe { std::mem::transmute(codeset) };
+            unsafe { f(domain_mb.as_ptr(), b"UTF-8\0".as_ptr()) };
+        }
+        if bound {
+            log::info!("bound gettext domain in {dll}");
+        }
+    }
+    if !bound {
+        log::warn!(
+            "no libintl provider found — .ui strings stay untranslated; \
+             runtime strings still translate via the embedded catalog"
+        );
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn bind_platform_domain(_root: &PathBuf) {}
 
 /// `gettext` with named `{arg}` substitution.
 ///
