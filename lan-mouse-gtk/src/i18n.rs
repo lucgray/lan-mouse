@@ -194,47 +194,74 @@ fn bind_platform_domain(root: &Path) {
     type BindTextdomainMb = unsafe extern "C" fn(*const u8, *const u8) -> usize;
     type Codeset = unsafe extern "C" fn(*const u8, *const u8) -> usize;
 
+    use std::ffi::CStr;
+
     let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
     let domain_wide = wide(OsStr::new("lan-mouse"));
     let domain_mb = c"lan-mouse";
 
-    // intl providers GTK4 windows builds may carry: proxy-libintl is
-    // compiled into libglib by gvsbuild, but standalone intl dlls exist
-    // in other distributions — probe every candidate, binding in each
-    // one that exports the symbol (harmless if unused).
-    let mut bound = false;
-    for dll in [
+    // intl providers GTK4 windows builds may carry: gvsbuild ships the
+    // proxy-libintl inside glib-2.0-0.dll / intl-8.dll exporting
+    // `g_libintl_*` prefixed symbols; MinGW distributions ship
+    // libglib-2.0-0.dll / libintl-8.dll with the unprefixed names.
+    // Probe every dll × symbol-name combination, binding wherever the
+    // export exists (binding an unused provider is harmless).
+    const DLLS: &[&str] = &[
+        "intl-8.dll",
+        "glib-2.0-0.dll",
         "libglib-2.0-0.dll",
-        "libintl-8.dll",
         "intl.dll",
         "libintl.dll",
-    ] {
-        let handle = unsafe { LoadLibraryW(wide(&OsString::from(dll)).as_ptr()) };
+        "libintl-8.dll",
+    ];
+    const W_BIND: &[&CStr] = &[c"g_libintl_wbindtextdomain", c"wbindtextdomain"];
+    const MB_BIND: &[&CStr] = &[c"g_libintl_bindtextdomain", c"bindtextdomain"];
+    const CODESET: &[&CStr] = &[
+        c"g_libintl_bind_textdomain_codeset",
+        c"bind_textdomain_codeset",
+    ];
+
+    let sym = |handle: isize, names: &[&CStr]| -> Option<(&'static CStr, usize)> {
+        names.iter().copied().find_map(|name| {
+            let addr = unsafe { GetProcAddress(handle, name.as_ptr().cast()) };
+            (addr != 0).then_some((name, addr))
+        })
+    };
+
+    let mut bound = false;
+    for dll in DLLS {
+        let handle = unsafe { LoadLibraryW(wide(&OsString::from(*dll)).as_ptr()) };
         if handle == 0 {
             continue;
         }
-        let wbind = unsafe { GetProcAddress(handle, c"wbindtextdomain".as_ptr().cast()) };
-        let bind = unsafe { GetProcAddress(handle, c"bindtextdomain".as_ptr().cast()) };
-        let codeset = unsafe { GetProcAddress(handle, c"bind_textdomain_codeset".as_ptr().cast()) };
-        if wbind != 0 {
-            let f: BindTextdomain = unsafe { std::mem::transmute(wbind) };
+        if let Some((name, addr)) = sym(handle, W_BIND) {
+            let f: BindTextdomain = unsafe { std::mem::transmute(addr) };
             unsafe { f(domain_wide.as_ptr(), wide(root.as_os_str()).as_ptr()) };
             bound = true;
-        } else if bind != 0 {
+            log::info!(
+                "bound gettext domain in {dll} via {}",
+                name.to_string_lossy()
+            );
+        } else if let Some((name, addr)) = sym(handle, MB_BIND) {
             // bindtextdomain takes the dir in the platform encoding —
             // UTF-8 in proxy-libintl
-            let f: BindTextdomainMb = unsafe { std::mem::transmute(bind) };
+            let f: BindTextdomainMb = unsafe { std::mem::transmute(addr) };
             let mut dir = root.to_string_lossy().into_owned().into_bytes();
             dir.push(0);
             unsafe { f(domain_mb.as_ptr().cast(), dir.as_ptr()) };
             bound = true;
+            log::info!(
+                "bound gettext domain in {dll} via {}",
+                name.to_string_lossy()
+            );
         }
-        if codeset != 0 {
-            let f: Codeset = unsafe { std::mem::transmute(codeset) };
+        if let Some((name, addr)) = sym(handle, CODESET) {
+            let f: Codeset = unsafe { std::mem::transmute(addr) };
             unsafe { f(domain_mb.as_ptr().cast(), c"UTF-8".as_ptr().cast()) };
-        }
-        if bound {
-            log::info!("bound gettext domain in {dll}");
+            log::debug!(
+                "set gettext codeset in {dll} via {}",
+                name.to_string_lossy()
+            );
         }
     }
     if !bound {
