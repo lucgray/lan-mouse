@@ -11,10 +11,9 @@ use gettextrs::LocaleCategory;
 use gettextrs::gettext as platform_gettext;
 #[cfg(unix)]
 use gettextrs::{bind_textdomain_codeset, bindtextdomain, setlocale, textdomain};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+#[cfg(not(unix))]
+use std::path::Path;
+use std::{env, fs, path::PathBuf};
 
 /// Message lookup: on unix this is the platform libintl (shared with
 /// GtkBuilder's translation registry); elsewhere a minimal in-crate
