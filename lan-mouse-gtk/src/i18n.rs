@@ -221,7 +221,7 @@ fn bind_platform_domain(root: &Path) {
         c"bind_textdomain_codeset",
     ];
 
-    let sym = |handle: isize, names: &[&CStr]| -> Option<(&'static CStr, usize)> {
+    let sym = |handle: isize, names: &[&'static CStr]| -> Option<(&'static CStr, usize)> {
         names.iter().copied().find_map(|name| {
             let addr = unsafe { GetProcAddress(handle, name.as_ptr().cast()) };
             (addr != 0).then_some((name, addr))
