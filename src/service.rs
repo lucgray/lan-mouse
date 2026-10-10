@@ -697,10 +697,10 @@ impl Service {
                 });
             }
             ICaptureEvent::ConnectFailed { handle, error } => {
+                // log only — an unreachable peer is a routine condition
+                // (firewall, peer asleep/offline) and edge touches keep
+                // retrying, so a toast per attempt is pure noise
                 log::warn!("connection to client {handle} failed: {error}");
-                self.notify_frontend(FrontendEvent::Error(format!(
-                    "could not connect to client {handle}: {error}"
-                )));
             }
             ICaptureEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
