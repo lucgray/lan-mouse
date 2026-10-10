@@ -456,8 +456,22 @@ impl Window {
     /// user-facing hint — routed by the configured notification mode:
     /// "app" shows the in-window banner, "system" an OS notification
     /// (which still reaches the user while the window is hidden to the
-    /// tray), "both" shows both.
+    /// tray), "both" shows both. Identical texts are suppressed inside
+    /// a dedup window: a persistent failure (e.g. an unreachable peer)
+    /// would otherwise pile up toasts the user cannot dismiss fast
+    /// enough.
     pub(super) fn show_toast(&self, msg: &str) {
+        {
+            let mut recent = self.imp().recent_toasts.borrow_mut();
+            let now = std::time::Instant::now();
+            if recent
+                .get(msg)
+                .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_secs(10))
+            {
+                return;
+            }
+            recent.insert(msg.to_string(), now);
+        }
         let mode = self.imp().settings.borrow().notification_mode.clone();
         let mode = if mode.is_empty() {
             "app"
