@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "lan-mouse-intl",
     "input-capture",
     "input-emulation",
     "input-event",

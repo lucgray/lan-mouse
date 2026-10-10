@@ -27,6 +27,11 @@ ksni = { version = "0.3.5", features = ["blocking"] }
 # is unreachable behind this windows-only target dependency
 tray-icon = { version = "0.24.1", default-features = false }
 
+# shared .mo catalog parser — also the implementation of the intl-8.dll
+# shipped in the Windows bundle
+[target.'cfg(not(unix))'.dependencies]
+lan-mouse-intl = { path = "../lan-mouse-intl" }
+
 [build-dependencies]
 glib-build-tools = { version = "0.20.0" }
 polib = "0.3.0"

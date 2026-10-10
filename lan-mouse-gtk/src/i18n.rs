@@ -26,8 +26,7 @@ pub(crate) fn gettext(msgid: &str) -> String {
 #[cfg(not(unix))]
 pub(crate) fn gettext(msgid: &str) -> String {
     catalog_for(&ui_language())
-        .get(msgid)
-        .cloned()
+        .and_then(|cat| cat.gettext(msgid).map(str::to_string))
         .unwrap_or_else(|| msgid.to_string())
 }
 
@@ -46,10 +45,11 @@ fn ui_language() -> String {
 /// language change (or a test setting LANGUAGE after first use) is
 /// honored instead of pinning whatever ran first.
 #[cfg(not(unix))]
-fn catalog_for(lang: &str) -> std::collections::HashMap<String, String> {
+fn catalog_for(lang: &str) -> Option<std::sync::Arc<lan_mouse_intl::Catalog>> {
     use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CATALOGS: OnceLock<Mutex<HashMap<String, HashMap<String, String>>>> = OnceLock::new();
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CATALOGS: OnceLock<Mutex<HashMap<String, Option<Arc<lan_mouse_intl::Catalog>>>>> =
+        OnceLock::new();
     let cache = CATALOGS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
         if let Some(cat) = guard.get(lang) {
@@ -59,37 +59,12 @@ fn catalog_for(lang: &str) -> std::collections::HashMap<String, String> {
     let cat = LANGUAGES
         .iter()
         .find(|(l, _)| *l == lang)
-        .and_then(|(_, bytes)| parse_mo(bytes))
-        .unwrap_or_default();
+        .and_then(|(_, bytes)| lan_mouse_intl::parse_mo(bytes))
+        .map(Arc::new);
     if let Ok(mut guard) = cache.lock() {
         guard.insert(lang.to_string(), cat.clone());
     }
     cat
-}
-
-/// Minimal GNU .mo reader: header (magic, count, msgid/msgstr table
-/// offsets) followed by length/offset pairs pointing at NUL-free
-/// string bodies.
-#[cfg(not(unix))]
-fn parse_mo(b: &[u8]) -> Option<std::collections::HashMap<String, String>> {
-    let u32le = |o: usize| -> Option<usize> {
-        Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?) as usize)
-    };
-    if u32le(0)? != 0x9504_12de {
-        return None;
-    }
-    let (n, o_tab, t_tab) = (u32le(8)?, u32le(12)?, u32le(16)?);
-    let mut map = std::collections::HashMap::new();
-    for i in 0..n {
-        let (ol, oo) = (u32le(o_tab + i * 8)?, u32le(o_tab + i * 8 + 4)?);
-        let (tl, to) = (u32le(t_tab + i * 8)?, u32le(t_tab + i * 8 + 4)?);
-        let orig = std::str::from_utf8(b.get(oo..oo + ol)?).ok()?;
-        let trans = std::str::from_utf8(b.get(to..to + tl)?).ok()?;
-        if !orig.is_empty() {
-            map.insert(orig.to_string(), trans.to_string());
-        }
-    }
-    Some(map)
 }
 
 include!(concat!(env!("OUT_DIR"), "/languages.rs"));
@@ -190,14 +165,16 @@ fn bind_platform_domain(root: &Path) {
         fn LoadLibraryW(name: *const u16) -> isize;
         fn GetProcAddress(module: isize, name: *const u8) -> usize;
     }
-    type BindTextdomain = unsafe extern "C" fn(*const u16, *const u16) -> usize;
+    // proxy-libintl's wbindtextdomain keeps the domain narrow — only
+    // the directory argument is UTF-16
+    type BindTextdomainW = unsafe extern "C" fn(*const u8, *const u16) -> usize;
     type BindTextdomainMb = unsafe extern "C" fn(*const u8, *const u8) -> usize;
     type Codeset = unsafe extern "C" fn(*const u8, *const u8) -> usize;
 
     use std::ffi::CStr;
 
     let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
-    let domain_wide = wide(OsStr::new("lan-mouse"));
+    let dir_wide = wide(root.as_os_str());
     let domain_mb = c"lan-mouse";
 
     // intl providers GTK4 windows builds may carry: gvsbuild ships the
@@ -235,8 +212,8 @@ fn bind_platform_domain(root: &Path) {
             continue;
         }
         if let Some((name, addr)) = sym(handle, W_BIND) {
-            let f: BindTextdomain = unsafe { std::mem::transmute(addr) };
-            unsafe { f(domain_wide.as_ptr(), wide(root.as_os_str()).as_ptr()) };
+            let f: BindTextdomainW = unsafe { std::mem::transmute(addr) };
+            unsafe { f(domain_mb.as_ptr().cast(), dir_wide.as_ptr()) };
             bound = true;
             log::info!(
                 "bound gettext domain in {dll} via {}",

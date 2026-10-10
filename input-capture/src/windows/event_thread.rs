@@ -22,11 +22,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetCursorPos,
-    GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT,
-    PostThreadMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW, TranslateMessage,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
+    GetMessageW, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
+    PeekMessageW, PostThreadMessageW, RegisterClassW, SetCursorPos, SetWindowsHookExW,
+    TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
@@ -89,7 +89,14 @@ impl EventThread {
 
     fn signal(&self, event_type: RequestType) {
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        // the capture thread may already be dead — PostThreadMessageW
+        // then fails with ERROR_INVALID_THREAD_ID; the request stays
+        // queued for the next successful signal
+        if let Err(e) =
+            unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) }
+        {
+            log::warn!("failed to signal capture thread {id}: {e}");
+        }
     }
 }
 
@@ -192,6 +199,13 @@ fn start_routine(
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
+    /* force creation of the thread's message queue before publishing
+     * the id: PostThreadMessageW fails with ERROR_INVALID_THREAD_ID
+     * until the first message function runs */
+    unsafe {
+        let mut msg = std::mem::zeroed::<MSG>();
+        let _ = PeekMessageW(addr_of_mut!(msg), None, WM_USER, WM_USER, PM_NOREMOVE);
+    }
     /* communicate thread id */
     {
         let (cnd, mtx) = &*ready;
