@@ -204,7 +204,7 @@ fn start_routine(
      * until the first message function runs */
     unsafe {
         let mut msg = std::mem::zeroed::<MSG>();
-        PeekMessageW(addr_of_mut!(msg), None, WM_USER, WM_USER, PM_NOREMOVE);
+        let _ = PeekMessageW(addr_of_mut!(msg), None, WM_USER, WM_USER, PM_NOREMOVE);
     }
     /* communicate thread id */
     {
