@@ -64,6 +64,9 @@ pub struct Window {
     pub settings_window: RefCell<Option<SettingsWindow>>,
     /// last settings state received from the daemon
     pub settings: RefCell<crate::settings_window::SettingsValues>,
+    /// recently shown toast texts — a persistent failure should not
+    /// pile up identical toasts faster than the user can dismiss them
+    pub recent_toasts: RefCell<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 #[glib::object_subclass]

@@ -865,7 +865,7 @@ impl Service {
         }
         if cleared_sig {
             if let Some(ref monitor) = self.clipboard_monitor {
-                monitor.clear_last_sig();
+                monitor.mark_share_failed();
             }
         }
     }
@@ -895,7 +895,7 @@ impl Service {
             // every send failed — forget the recorded signature so the
             // user can retry by copying the same content again
             if let Some(ref monitor) = self.clipboard_monitor {
-                monitor.clear_last_sig();
+                monitor.mark_share_failed();
             }
             self.notify_frontend(FrontendEvent::Error(format!(
                 "clipboard share failed — could not reach any of {} peer(s)",

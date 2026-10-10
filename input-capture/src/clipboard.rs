@@ -14,11 +14,21 @@ pub struct ClipboardMonitor {
     _event_tx: Sender<CaptureEvent>,
     last_sig: Arc<Mutex<Option<ContentSig>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
+    /// signature whose last share attempt failed, with the failure
+    /// time — suppresses automatic re-emits for [`FAILED_RETRY`] so an
+    /// unreachable peer does not produce a send (and a failure toast)
+    /// on every poll tick
+    failed_sig: Arc<Mutex<Option<(ContentSig, Instant)>>>,
     enabled: Arc<Mutex<bool>>,
     /// the polling task — kept so the service can supervise it with
     /// [`Self::is_alive`] instead of waiting on channel state alone
     task: JoinHandle<()>,
 }
+
+/// minimum gap between automatic re-emits of a signature whose share
+/// attempt failed — bounds resend churn while still letting "copy the
+/// same content again" work as a retry
+const FAILED_RETRY: Duration = Duration::from_secs(5);
 
 /// identity of the current clipboard payload. Files compare by the
 /// set of file names only — contents are read just once per change,
@@ -124,10 +134,12 @@ impl ClipboardMonitor {
         let (event_tx, event_rx) = mpsc::channel(16);
         let last_sig: Arc<Mutex<Option<ContentSig>>> = Arc::new(Mutex::new(None));
         let last_change: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let failed_sig: Arc<Mutex<Option<(ContentSig, Instant)>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
         let last_sig_clone = last_sig.clone();
         let last_change_clone = last_change.clone();
+        let failed_sig_clone = failed_sig.clone();
         let enabled_clone = enabled.clone();
         let event_tx_clone = event_tx.clone();
 
@@ -153,6 +165,7 @@ impl ClipboardMonitor {
                 let last_change_clone2 = last_change_clone.clone();
                 let event_tx_clone2 = event_tx_clone.clone();
 
+                let failed_sig_clone2 = failed_sig_clone.clone();
                 let _ = spawn_blocking(move || {
                     // Create clipboard instance
                     let mut clipboard = match Clipboard::new() {
@@ -169,6 +182,18 @@ impl ClipboardMonitor {
                         // Clipboard might be empty or contain non-shareable data
                         return;
                     };
+
+                    // a signature whose share just failed may only
+                    // re-emit after FAILED_RETRY — an unreachable peer
+                    // would otherwise retry (and error) every tick
+                    let retry_suppressed = failed_sig_clone2
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|(fs, at)| *fs == sig && at.elapsed() < FAILED_RETRY);
+                    if retry_suppressed {
+                        return;
+                    }
 
                     // Check if content changed
                     let mut last_sig = last_sig_clone2.lock().unwrap();
@@ -216,6 +241,7 @@ impl ClipboardMonitor {
             _event_tx: event_tx,
             last_sig,
             last_change,
+            failed_sig,
             enabled,
             task,
         })
@@ -248,20 +274,57 @@ impl ClipboardMonitor {
         log::info!("Clipboard monitoring disabled");
     }
 
-    /// Update the last known clipboard content (called when we set the clipboard)
-    /// forget the recorded signature so the next identical clipboard
-    /// content is treated as a fresh change — used when a share attempt
-    /// failed and the user may copy the same content again to retry.
-    pub fn clear_last_sig(&self) {
-        let mut last_sig = self.last_sig.lock().unwrap();
-        *last_sig = None;
+    /// record that sharing the current signature failed: forget it so
+    /// a re-copy of the same content can retry, but suppress automatic
+    /// re-emits for [`FAILED_RETRY`] — without that an unreachable peer
+    /// produces a send attempt and a failure toast on every poll tick.
+    pub fn mark_share_failed(&self) {
+        let sig = self.last_sig.lock().unwrap().take();
+        *self.failed_sig.lock().unwrap() = sig.map(|s| (s, Instant::now()));
     }
 
+    /// Update the last known clipboard content (called when we set the clipboard).
     /// This prevents detecting our own clipboard changes as external changes
     pub fn update_last_content(&self, content: ClipboardEvent) {
         let mut last_sig = self.last_sig.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
         *last_sig = Some(sig_of(&content));
         *last_change = Some(Instant::now());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a failed share used to clear the signature every
+    /// time, so the very next poll re-emitted the same content —
+    /// an unreachable peer produced a send + an error toast per 500ms
+    /// tick forever. mark_share_failed must both forget the signature
+    /// (retry on re-copy works) and record it for suppression.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mark_share_failed_records_signature_for_suppression() {
+        let monitor = ClipboardMonitor {
+            event_rx: mpsc::channel(1).1,
+            _event_tx: mpsc::channel(1).0,
+            last_sig: Arc::new(Mutex::new(Some(ContentSig::Text("x".into())))),
+            last_change: Arc::new(Mutex::new(None)),
+            failed_sig: Arc::new(Mutex::new(None)),
+            enabled: Arc::new(Mutex::new(true)),
+            task: tokio::spawn(async {}),
+        };
+        monitor.mark_share_failed();
+        assert!(monitor.last_sig.lock().unwrap().is_none());
+        let failed = monitor.failed_sig.lock().unwrap();
+        assert!(
+            matches!(failed.as_ref(), Some((ContentSig::Text(t), _)) if t == "x"),
+            "failed signature must be recorded for retry suppression"
+        );
+        // a second failure refreshes the suppression window
+        drop(failed);
+        *monitor.last_sig.lock().unwrap() = Some(ContentSig::Text("y".into()));
+        monitor.mark_share_failed();
+        let failed = monitor.failed_sig.lock().unwrap();
+        assert!(matches!(failed.as_ref(), Some((ContentSig::Text(t), _)) if t == "y"));
     }
 }
