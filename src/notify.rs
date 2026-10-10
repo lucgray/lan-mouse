@@ -93,7 +93,12 @@ pub(crate) fn notify_for_event(event: &FrontendEvent) {
     let Some((summary, body)) = text_for_event(event) else {
         return;
     };
-    send(&summary, &body);
+    // `send` blocks on DBus via notify-rust → zbus, whose `block_on`
+    // (tokio feature) panics when called from a thread inside a tokio
+    // runtime context ("Cannot start a runtime from within a runtime").
+    // Blocking pool threads carry no runtime context, so the nested
+    // `Runtime::block_on` is legal there.
+    tokio::task::spawn_blocking(move || send(&summary, &body));
 }
 
 fn human_bytes(b: usize) -> String {
