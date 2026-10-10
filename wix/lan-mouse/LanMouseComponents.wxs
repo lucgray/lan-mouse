@@ -1,9 +1,21 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+	 xmlns:firewall="http://wixtoolset.org/schemas/v4/wxs/firewall">
 	<Fragment>
 		<ComponentGroup Id="LanMouseComponents" Directory="INSTALLFOLDER" Subdirectory="bin">
 			<Component Guid="{ECB52D3E-28AD-4BEC-B9DF-E01CCAB356BE}">
 				<!-- the main binary -->
 				<File Source="..\..\target\release\lan-mouse.exe"/>
+
+				<!-- inbound UDP/4242 allow rule, port-scoped rather than
+				     exe-scoped so it keeps working across upgrades that
+				     change the install path -->
+				<firewall:FirewallException
+					Name="lan-mouse (UDP 4242)"
+					Protocol="udp"
+					Port="4242"
+					Direction="in"
+					Action="allow"
+					Profile="any"/>
 
 				<!-- visual c runtime dll -->
 				<!--<File Source="C:\windows\system32\VCRUNTIME140.dll"/>-->

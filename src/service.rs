@@ -2,7 +2,7 @@ use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
     config::{Config, ConfigClient},
-    connect::{LanMouseConnection, LanMouseConnectionSender},
+    connect::{LanMouseConnection, LanMouseConnectionError, LanMouseConnectionSender},
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
@@ -105,6 +105,13 @@ pub struct Service {
         local_channel::mpsc::Sender<Result<(input_event::ClipboardContentKind, usize), String>>,
     clipboard_applied_rx:
         local_channel::mpsc::Receiver<Result<(input_event::ClipboardContentKind, usize), String>>,
+    /// notification texts already shown once this session — identical
+    /// errors (a peer that stays unreachable, a share that keeps
+    /// timing out) notify once instead of on every recurrence
+    notified_once: HashSet<String>,
+    /// last "device disconnected" notification per addr — flapping
+    /// inbound connections produce a stream of identical toasts
+    disconnect_notified: HashMap<SocketAddr, Instant>,
 }
 
 /// one local clipboard change fanned out to N peers
@@ -171,6 +178,7 @@ impl Service {
             config.emulation_options(),
             listener,
             (config.invert_scroll(), config.mouse_sensitivity()),
+            client_manager.clone(),
         );
 
         // clipboard monitor + emulation
@@ -223,6 +231,8 @@ impl Service {
             next_clipboard_batch: 0,
             clipboard_applied_tx,
             clipboard_applied_rx,
+            notified_once: HashSet::new(),
+            disconnect_notified: HashMap::new(),
         };
         Ok(service)
     }
@@ -502,6 +512,8 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                send_only: c.send_only,
+                receive_only: c.receive_only,
             })
             .collect();
         self.config.set_clients(clients);
@@ -698,9 +710,24 @@ impl Service {
             }
             ICaptureEvent::ConnectFailed { handle, error } => {
                 log::warn!("connection to client {handle} failed: {error}");
-                self.notify_frontend(FrontendEvent::Error(format!(
-                    "could not connect to client {handle}: {error}"
-                )));
+                // asymmetric connectivity: the peer's inbound
+                // connection is alive while our outbound connect
+                // times out — its firewall almost certainly drops
+                // inbound UDP. Tell the user where to look instead
+                // of a bare "timed out"; notify_frontend dedups
+                // repeats per session.
+                let asymmetric = matches!(error, LanMouseConnectionError::Timeout)
+                    && self.client_has_incoming(handle);
+                if asymmetric {
+                    let name = self
+                        .client_manager
+                        .get_hostname(handle)
+                        .unwrap_or_else(|| format!("client {handle}"));
+                    self.notify_frontend(FrontendEvent::Error(format!(
+                        "{name} can reach this device but outbound connects to it time out — \
+                         check the peer's firewall for inbound UDP/4242"
+                    )));
+                }
             }
             ICaptureEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
@@ -1010,7 +1037,29 @@ impl Service {
             .map(|incoming| incoming.addr)
     }
 
+    /// Sends an event to the frontend, falling back to an OS
+    /// notification when no frontend is connected.
+    ///
+    /// Repeated identical `Error` texts notify once per session and
+    /// repeated `IncomingDisconnected` for the same addr are throttled
+    /// to one toast per minute — a persistently unreachable peer or a
+    /// flapping inbound connection must not produce a toast storm.
     fn notify_frontend(&mut self, event: FrontendEvent) {
+        let suppress = match &event {
+            FrontendEvent::Error(e) => !self.notified_once.insert(e.clone()),
+            FrontendEvent::IncomingDisconnected(addr) => self
+                .disconnect_notified
+                .get(addr)
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(60)),
+            _ => false,
+        };
+        if let FrontendEvent::IncomingDisconnected(addr) = &event {
+            self.disconnect_notified.insert(*addr, Instant::now());
+        }
+        if suppress {
+            log::debug!("suppressing repeat notification: {event:?}");
+            return;
+        }
         // headless fallback: without a frontend there is no window to
         // host a banner — surface user-facing events as OS notifications
         if !self.frontend_listener.frontend_connected() {
@@ -1078,8 +1127,31 @@ impl Service {
         }
     }
 
+    /// an inbound connection exists from any of the client's
+    /// configured/resolved IPs — i.e. the peer can reach us
+    fn client_has_incoming(&self, handle: ClientHandle) -> bool {
+        let Some(ips) = self.client_manager.get_ips(handle) else {
+            return false;
+        };
+        self.incoming_conns
+            .iter()
+            .any(|addr| ips.contains(&addr.ip()))
+    }
+
     fn activate_client(&mut self, handle: ClientHandle) {
         log::debug!("activating client {handle}");
+
+        /* receive_only clients stay passive: never activated, never
+         * connected to (e.g. peer's firewall drops our outbound
+         * anyway) — they can only push input to us */
+        if self
+            .client_manager
+            .get_state(handle)
+            .is_some_and(|(c, _)| c.receive_only)
+        {
+            log::info!("client {handle} is receive_only — not activating");
+            return;
+        }
 
         /* resolve dns on activate */
         self.resolve(handle);

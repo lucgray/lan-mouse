@@ -34,6 +34,8 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            send_only: config_client.send_only,
+            receive_only: config_client.receive_only,
         };
         let state = ClientState {
             active: config_client.active,
@@ -89,6 +91,17 @@ impl ClientManager {
             }
             _ => false,
         }
+    }
+
+    /// find the configured client owning an ip, regardless of its
+    /// active state — used by the listen side to look up direction
+    /// flags for peers that were never activated locally
+    pub(crate) fn client_for_ip(&self, ip: IpAddr) -> Option<(ClientHandle, ClientConfig)> {
+        self.clients
+            .borrow()
+            .iter()
+            .find(|(_, (c, s))| s.ips.contains(&ip) || c.fix_ips.contains(&ip))
+            .map(|(h, (c, _))| (h as ClientHandle, c.clone()))
     }
 
     /// find a client by its address

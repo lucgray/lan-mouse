@@ -12,6 +12,9 @@
 		<PackageReference Include="WixToolset.Heat">
 		  <Version>5.0.2</Version>
 		</PackageReference>
+		<PackageReference Include="WixToolset.Firewall">
+		  <Version>5.0.2</Version>
+		</PackageReference>
 	</ItemGroup>
 	<ItemGroup>
 		<HarvestDirectory Include="C:\gtk-build\gtk\x64\release\bin">

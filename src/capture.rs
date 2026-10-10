@@ -54,9 +54,13 @@ pub(crate) enum ICaptureEvent {
     ClipboardReceived(input_event::ClipboardEvent),
     /// fragment progress of an in-flight clipboard transfer
     ClipboardProgress { received: u64, total: u64 },
-    /// an outgoing connection attempt failed — the frontend
-    /// should surface this instead of retrying silently
-    ConnectFailed { handle: u64, error: String },
+    /// an outgoing connection attempt failed — the service decides
+    /// whether it is user-facing (e.g. asymmetric connectivity) or
+    /// just a routine log entry
+    ConnectFailed {
+        handle: u64,
+        error: crate::connect::LanMouseConnectionError,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
