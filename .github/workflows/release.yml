@@ -111,6 +111,13 @@ jobs:
     - uses: actions/checkout@v6
     - name: Release Build
       run: cargo build --release
+    - name: Replace proxy-libintl stub with the real intl-8.dll
+      # gvsbuild ships a STUB_ONLY proxy-libintl whose dgettext returns
+      # the msgid — replacing it in the GTK bin dir fixes both the zip
+      # (dll copy below) and the MSI (heat harvests this directory)
+      run: |
+        cargo build --release -p lan-mouse-intl
+        Copy-Item -Path "target\release\lan_mouse_intl.dll" -Destination "C:\gtk-build\gtk\x64\release\bin\intl-8.dll" -Force
     - name: Create Archive
       run: |
         mkdir "lan-mouse-windows"

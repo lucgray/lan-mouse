@@ -2233,6 +2233,7 @@ dependencies = [
  "hostname",
  "input-event",
  "ksni",
+ "lan-mouse-intl",
  "lan-mouse-ipc",
  "libadwaita",
  "log",
@@ -2240,6 +2241,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tray-icon",
 ]
+
+[[package]]
+name = "lan-mouse-intl"
+version = "0.1.0"
 
 [[package]]
 name = "lan-mouse-ipc"

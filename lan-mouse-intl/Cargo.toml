@@ -1,0 +1,11 @@
+[package]
+name = "lan-mouse-intl"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Minimal gettext implementation for the Windows GTK bundle — shipped as intl-8.dll replacing gvsbuild's proxy-libintl stub"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
