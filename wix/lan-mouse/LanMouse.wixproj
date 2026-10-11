@@ -12,7 +12,7 @@
 		<PackageReference Include="WixToolset.Heat">
 		  <Version>5.0.2</Version>
 		</PackageReference>
-		<PackageReference Include="WixToolset.Firewall">
+		<PackageReference Include="WixToolset.Firewall.wixext">
 		  <Version>5.0.2</Version>
 		</PackageReference>
 	</ItemGroup>
