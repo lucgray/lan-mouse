@@ -8,14 +8,16 @@
 
 				<!-- inbound UDP/4242 allow rule, port-scoped rather than
 				     exe-scoped so it keeps working across upgrades that
-				     change the install path -->
+				     change the install path. Omitting Outbound keeps the
+				     rule inbound; IgnoreFailure so a registration error
+				     cannot roll back the whole install -->
 				<firewall:FirewallException
+					Id="LanMouseFirewallUdp4242"
 					Name="lan-mouse (UDP 4242)"
+					Description="Allow inbound UDP 4242 for lan-mouse peer connections"
 					Protocol="udp"
 					Port="4242"
-					Direction="in"
-					Action="allow"
-					Profile="any"/>
+					IgnoreFailure="yes"/>
 
 				<!-- visual c runtime dll -->
 				<!--<File Source="C:\windows\system32\VCRUNTIME140.dll"/>-->
