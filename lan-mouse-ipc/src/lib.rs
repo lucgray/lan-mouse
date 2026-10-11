@@ -142,6 +142,12 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// only send input to this client — input it sends us is ignored
+    pub send_only: bool,
+    /// only receive input from this client — never activated and
+    /// never connected to, e.g. when its firewall blocks inbound
+    /// connections anyway ("barrier server mode")
+    pub receive_only: bool,
 }
 
 impl Default for ClientConfig {
@@ -153,6 +159,8 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            send_only: Default::default(),
+            receive_only: Default::default(),
         }
     }
 }

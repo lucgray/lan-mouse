@@ -1,3 +1,4 @@
+use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
@@ -107,6 +108,7 @@ impl Emulation {
         options: EmulationOptions,
         listener: LanMouseListener,
         input_config: (bool, f64),
+        client_manager: ClientManager,
     ) -> Self {
         let input_config = InputConfig {
             invert_scroll: input_config.0,
@@ -120,6 +122,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            client_manager,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -231,6 +234,19 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    client_manager: ClientManager,
+}
+
+impl ListenTask {
+    /// input-control messages from a client flagged `send_only` are
+    /// dropped — the flag means "we send to it", not the reverse.
+    /// Ping/Hello/clipboard traffic still flows so the connection
+    /// stays healthy and clipboard sync keeps working both ways.
+    fn input_blocked(&self, addr: SocketAddr) -> bool {
+        self.client_manager
+            .client_for_ip(addr.ip())
+            .is_some_and(|(_, c)| c.send_only)
+    }
 }
 
 impl ListenTask {
@@ -244,12 +260,34 @@ impl ListenTask {
         let mut entered_clients: HashMap<SocketAddr, (Position, String)> = HashMap::new();
         // addrs whose emulation session timed out while entered
         let mut dormant: HashSet<SocketAddr> = HashSet::new();
+        // addrs already reported as send_only-blocked (log once per conn)
+        let mut send_only_logged: HashSet<SocketAddr> = HashSet::new();
         loop {
             select! {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
+                        // input-control events from a send_only client
+                        // are ignored; pings still get replies so the
+                        // connection does not flap
+                        let input_blocked = self.input_blocked(addr)
+                            && matches!(
+                                &event,
+                                ProtoEvent::Enter(..) | ProtoEvent::Leave(..) | ProtoEvent::Input(_)
+                            )
+                            && !matches!(
+                                &event,
+                                ProtoEvent::Input(input_event::Event::Clipboard(_))
+                            );
+                        if input_blocked {
+                            if send_only_logged.insert(addr) {
+                                log::warn!(
+                                    "ignoring input from {addr}: client is send_only"
+                                );
+                            }
+                            continue;
+                        }
                         // a sender whose session timed out may resume without
                         // repeating Enter — restore its incoming registration
                         // so the return edge still works. Enter re-registers

@@ -141,6 +141,11 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    /// only send input to this client — input it sends us is ignored
+    send_only: Option<bool>,
+    /// only receive input from this client — never activated and
+    /// never connected to
+    receive_only: Option<bool>,
 }
 
 impl ConfigToml {
@@ -360,6 +365,8 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    pub send_only: bool,
+    pub receive_only: bool,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -379,6 +386,8 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            send_only: toml.send_only.unwrap_or(false),
+            receive_only: toml.receive_only.unwrap_or(false),
         }
     }
 }
@@ -408,6 +417,8 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            send_only: client.send_only.then_some(true),
+            receive_only: client.receive_only.then_some(true),
         }
     }
 }
@@ -988,5 +999,44 @@ mod tests {
         // #501: config keys must accept the spellings users actually type
         let c = parse(r#"release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]"#);
         assert_eq!(c.release_bind, Some(vec![KeyA, KeyS, KeyD, KeyF]));
+    }
+
+    #[test]
+    fn client_direction_flags_parse_and_survive_save() {
+        let c = parse(
+            r#"
+            [[clients]]
+            position = "right"
+            receive_only = true
+
+            [[clients]]
+            position = "left"
+            send_only = true
+
+            [[clients]]
+            position = "top"
+            "#,
+        );
+        let clients = c.clients.expect("clients");
+        assert_eq!(clients[0].receive_only, Some(true));
+        assert_eq!(clients[0].send_only, None);
+        assert_eq!(clients[1].send_only, Some(true));
+        assert_eq!(clients[2].send_only, None);
+        assert_eq!(clients[2].receive_only, None);
+
+        // ConfigClient round-trips the flags back to toml so a
+        // save_config() rewrite does not silently drop them
+        let cfg = ConfigClient::from(clients[0].clone());
+        assert!(cfg.receive_only && !cfg.send_only);
+        let back = TomlClient::from(cfg);
+        assert_eq!(back.receive_only, Some(true));
+        assert_eq!(back.send_only, None);
+
+        // unset flags stay absent in the written toml — a `false`
+        // serialization would flip a send_only into a documented default
+        let cfg = ConfigClient::from(clients[2].clone());
+        let back = TomlClient::from(cfg);
+        assert_eq!(back.send_only, None);
+        assert_eq!(back.receive_only, None);
     }
 }

@@ -224,8 +224,8 @@ pub(crate) enum IncomingEvent {
         total: u64,
     },
     /// an outgoing connection attempt failed — surfaced so the
-    /// frontend can tell the user instead of silently retrying
-    ConnectFailed(String),
+    /// service can react (log, asymmetric-connectivity diagnostics)
+    ConnectFailed(LanMouseConnectionError),
 }
 
 #[derive(Clone)]
@@ -395,8 +395,8 @@ async fn connect_to_handle(
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send((handle, IncomingEvent::ConnectFailed(e.to_string())));
-                return Err(e);
+                let _ = tx.send((handle, IncomingEvent::ConnectFailed(e)));
+                return Err(LanMouseConnectionError::NotConnected);
             }
         };
         log::info!("client ({handle}) connected @ {addr}");
@@ -730,6 +730,8 @@ mod tests {
             active: true,
             enter_hook: None,
             leave_hook: None,
+            send_only: false,
+            receive_only: false,
         });
         client_manager.set_active_addr(handle, Some(addr));
         client_manager.set_alive(handle, true);
@@ -773,6 +775,8 @@ mod tests {
             active: false,
             enter_hook: None,
             leave_hook: None,
+            send_only: false,
+            receive_only: false,
         });
         let conn = LanMouseConnection::new(test_cert(), client_manager);
         let event = ProtoEvent::Input(input_event::Event::Clipboard(
