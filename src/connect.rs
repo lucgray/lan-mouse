@@ -226,6 +226,14 @@ pub(crate) enum IncomingEvent {
     /// an outgoing connection attempt failed — surfaced so the
     /// service can react (log, asymmetric-connectivity diagnostics)
     ConnectFailed(LanMouseConnectionError),
+    /// an outgoing DTLS connection was established — the service
+    /// re-arms the edge barrier it disarmed while the peer was
+    /// unreachable
+    Connected,
+    /// an established outgoing connection was lost — the service
+    /// disarms the edge barrier so a dead peer stops grabbing the
+    /// pointer on every edge hit
+    Disconnected,
 }
 
 #[derive(Clone)]
@@ -282,7 +290,9 @@ impl LanMouseConnectionSender {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let event_str = format!("{event}");
+        // formatting is skipped unless trace logging is on — Motion
+        // events arrive per packet and must not stringify eagerly
+        let event_str = log::log_enabled!(log::Level::Trace).then(|| format!("{event}"));
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let buf = &buf[..len];
         if let Some(addr) = self.client_manager.active_addr(handle) {
@@ -298,31 +308,53 @@ impl LanMouseConnectionSender {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.recv_tx,
+                        )
+                        .await;
                         return Err(LanMouseConnectionError::Webrtc(e));
                     }
                 }
-                log::trace!("{event_str} >->->->->- {addr}");
+                log::trace!("{} >->->->->- {addr}", event_str.as_deref().unwrap_or(""));
                 return Ok(());
             }
         }
 
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
-        }
+        self.spawn_connect(handle).await;
         Err(LanMouseConnectionError::NotConnected)
+    }
+
+    /// kick off a background connect attempt unless one is already
+    /// in flight — used for scheduled retries so a dead peer is
+    /// probed without an edge crossing
+    pub(crate) async fn reconnect(&self, handle: ClientHandle) {
+        if self.client_manager.active_addr(handle).is_some() {
+            return;
+        }
+        self.spawn_connect(handle).await;
+    }
+
+    /// spawn a `connect_to_handle` task if the handle is not already
+    /// being connected (the connecting set dedups concurrent callers)
+    async fn spawn_connect(&self, handle: ClientHandle) {
+        let mut connecting = self.connecting.lock().await;
+        if !connecting.insert(handle) {
+            return;
+        }
+        drop(connecting);
+        spawn_local(connect_to_handle(
+            self.client_manager.clone(),
+            self.cert.clone(),
+            handle,
+            self.conns.clone(),
+            self.connecting.clone(),
+            self.recv_tx.clone(),
+            self.ping_response.clone(),
+        ));
     }
 
     /// Send clipboard event with variable-length encoding.
@@ -352,7 +384,14 @@ impl LanMouseConnectionSender {
                 }
                 if let Err(e) = send_clipboard_datagrams(&conn, &buf, progress).await {
                     log::warn!("client {handle} failed to send clipboard: {e}");
-                    disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    disconnect(
+                        &self.client_manager,
+                        handle,
+                        addr,
+                        &self.conns,
+                        &self.recv_tx,
+                    )
+                    .await;
                     return Err(LanMouseConnectionError::Webrtc(e));
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -402,6 +441,7 @@ async fn connect_to_handle(
         log::info!("client ({handle}) connected @ {addr}");
         client_manager.set_active_addr(handle, Some(addr));
         conns.lock().await.insert(addr, conn.clone());
+        let _ = tx.send((handle, IncomingEvent::Connected));
 
         // Best-effort version handshake. Send our commit hash once
         // immediately after the DTLS handshake; the listen side
@@ -646,7 +686,7 @@ async fn receive_loop(
         Some(e) => log::warn!("recv error from {addr}: {e}"),
         None => log::info!("connection from {addr} closed"),
     }
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &tx).await;
 }
 
 async fn disconnect(
@@ -654,11 +694,13 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    tx: &Sender<(ClientHandle, IncomingEvent)>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    let _ = tx.send((handle, IncomingEvent::Disconnected));
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
