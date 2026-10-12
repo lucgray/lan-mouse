@@ -461,14 +461,20 @@ impl ListenTask {
                     }
                     let mut channel_dead = false;
                     last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
-                            log::warn!("releasing keys: {addr} not responding!");
-                            self.emulation_proxy.remove(addr);
-                            // remember a timed-out entered peer so its return
-                            // edge can be rebuilt if it starts sending again
+                        // senders ping every 500ms — 10s of silence is
+                        // ~20 lost pings, well clear of UDP flap; the
+                        // 1s threshold used to flap (and warn) on any
+                        // half-dead link thousands of times a day
+                        if instant.elapsed() > Duration::from_secs(10) {
                             if entered_clients.contains_key(&addr) {
+                                log::warn!("releasing keys: {addr} not responding!");
+                                // remember a timed-out entered peer so its return
+                                // edge can be rebuilt if it starts sending again
                                 dormant.insert(addr);
+                            } else {
+                                log::debug!("removing silent peer {addr}");
                             }
+                            self.emulation_proxy.remove(addr);
                             channel_dead |= self.event_tx.send(EmulationEvent::Disconnected { addr }).is_err();
                             false
                         } else {
