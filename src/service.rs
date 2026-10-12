@@ -112,6 +112,39 @@ pub struct Service {
     /// last "device disconnected" notification per addr — flapping
     /// inbound connections produce a stream of identical toasts
     disconnect_notified: HashMap<SocketAddr, Instant>,
+    /// active clients whose edge barrier was taken down because the
+    /// outgoing connection is unreachable — maps to the instant the
+    /// next background reconnect attempt should run. The barrier
+    /// stays down until `ICaptureEvent::Connected` reports a live
+    /// connection again, so a dead peer stops grabbing the pointer
+    /// on every edge hit.
+    conn_disarmed: HashMap<ClientHandle, Instant>,
+}
+
+/// first probe after a connection loss — a transient drop should
+/// re-arm the edge quickly when the peer is actually still there
+const CONN_RETRY_FIRST: Duration = Duration::from_secs(5);
+/// backoff between reconnect attempts after failures — bounds the
+/// "connecting … / failed to connect" churn for a peer that stays
+/// dead for hours
+const CONN_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// handles whose reconnect deadline has passed — each due entry is
+/// rescheduled `backoff` out so the next liveness tick does not
+/// fire another connect attempt while the first is still running
+fn due_reconnects(
+    disarmed: &mut HashMap<ClientHandle, Instant>,
+    now: Instant,
+    backoff: Duration,
+) -> Vec<ClientHandle> {
+    let mut due = Vec::new();
+    for (handle, deadline) in disarmed.iter_mut() {
+        if *deadline <= now {
+            *deadline = now + backoff;
+            due.push(*handle);
+        }
+    }
+    due
 }
 
 /// one local clipboard change fanned out to N peers
@@ -233,6 +266,7 @@ impl Service {
             clipboard_applied_rx,
             notified_once: HashSet::new(),
             disconnect_notified: HashMap::new(),
+            conn_disarmed: HashMap::new(),
         };
         Ok(service)
     }
@@ -329,6 +363,17 @@ impl Service {
                         }
                     }
                     self.expire_clipboard_batches();
+                    // probe dead connections in the background: the
+                    // edge barrier stays down while `conn_disarmed`
+                    // holds the client, so nothing else triggers a
+                    // reconnect
+                    for handle in due_reconnects(
+                        &mut self.conn_disarmed,
+                        Instant::now(),
+                        CONN_RETRY_BACKOFF,
+                    ) {
+                        self.conn_sender.reconnect(handle).await;
+                    }
                 },
                 r = self.config.changed() => match r {
                     Ok(()) => self.handle_config_change(),
@@ -646,25 +691,30 @@ impl Service {
                 // Same detached path as ICaptureEvent::ClipboardReceived:
                 // writing a large file must not stall the service loop.
                 if self.clipboard_enabled {
-                    if let Some(ref monitor) = self.clipboard_monitor {
-                        // record the incoming content so our own monitor
-                        // does not echo it right back to the peer
-                        monitor.update_last_content(clipboard_event.clone());
-                    }
                     if let Some(ref clipboard_emulation) = self.clipboard_emulation {
                         let clipboard_emulation = clipboard_emulation.clone();
                         let applied_tx = self.clipboard_applied_tx.clone();
+                        let recorder = self.clipboard_monitor.as_ref().map(|m| m.recorder());
+                        let kind = clipboard_event.kind();
+                        let len = clipboard_event.content_len();
                         tokio::task::spawn_local(async move {
-                            let result =
-                                match clipboard_emulation.set(clipboard_event.clone()).await {
-                                    Ok(()) => {
-                                        Ok((clipboard_event.kind(), clipboard_event.content_len()))
+                            let result = match clipboard_emulation.set(clipboard_event).await {
+                                Ok(applied) => {
+                                    // record the signature as it
+                                    // actually landed — a renamed
+                                    // file must not be read back by
+                                    // the monitor as a local change
+                                    // and echoed to the peer
+                                    if let Some(recorder) = recorder {
+                                        recorder.update(&applied);
                                     }
-                                    Err(e) => {
-                                        log::warn!("Failed to set clipboard: {}", e);
-                                        Err(format!("failed to apply received clipboard: {e}"))
-                                    }
-                                };
+                                    Ok((kind, len))
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to set clipboard: {}", e);
+                                    Err(format!("failed to apply received clipboard: {e}"))
+                                }
+                            };
                             let _ = applied_tx.send(result);
                         });
                     }
@@ -710,6 +760,7 @@ impl Service {
             }
             ICaptureEvent::ConnectFailed { handle, error } => {
                 log::warn!("connection to client {handle} failed: {error}");
+                self.disarm_client(handle, CONN_RETRY_BACKOFF);
                 // asymmetric connectivity: the peer's inbound
                 // connection is alive while our outbound connect
                 // times out — its firewall almost certainly drops
@@ -729,28 +780,36 @@ impl Service {
                     )));
                 }
             }
+            ICaptureEvent::Disconnected { handle } => {
+                self.disarm_client(handle, CONN_RETRY_FIRST);
+            }
+            ICaptureEvent::Connected { handle } => {
+                self.rearm_client(handle);
+            }
             ICaptureEvent::ClipboardReceived(clipboard_event) => {
                 // Received clipboard data from a remote machine - set it locally
                 if self.clipboard_enabled {
-                    if let Some(ref monitor) = self.clipboard_monitor {
-                        monitor.update_last_content(clipboard_event.clone());
-                    }
                     if let Some(ref clipboard_emulation) = self.clipboard_emulation {
                         // the "received" hint fires when the write task
                         // reports back — before that, success is unknown
                         let clipboard_emulation = clipboard_emulation.clone();
                         let applied_tx = self.clipboard_applied_tx.clone();
+                        let recorder = self.clipboard_monitor.as_ref().map(|m| m.recorder());
+                        let kind = clipboard_event.kind();
+                        let len = clipboard_event.content_len();
                         tokio::task::spawn_local(async move {
-                            let result =
-                                match clipboard_emulation.set(clipboard_event.clone()).await {
-                                    Ok(()) => {
-                                        Ok((clipboard_event.kind(), clipboard_event.content_len()))
+                            let result = match clipboard_emulation.set(clipboard_event).await {
+                                Ok(applied) => {
+                                    if let Some(recorder) = recorder {
+                                        recorder.update(&applied);
                                     }
-                                    Err(e) => {
-                                        log::warn!("Failed to set clipboard: {}", e);
-                                        Err(format!("failed to apply received clipboard: {e}"))
-                                    }
-                                };
+                                    Ok((kind, len))
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to set clipboard: {}", e);
+                                    Err(format!("failed to apply received clipboard: {e}"))
+                                }
+                            };
                             let _ = applied_tx.send(result);
                         });
                     }
@@ -1120,11 +1179,50 @@ impl Service {
 
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
+        self.conn_disarmed.remove(&handle);
         if self.client_manager.deactivate_client(handle) {
             self.capture.destroy(handle);
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
+    }
+
+    /// take down the edge barrier of an active client whose outgoing
+    /// connection is unreachable — without it every edge hit grabs
+    /// the pointer, sends `Enter` into the void, waits for a timeout
+    /// and releases, which reads as a stuck cursor. The barrier is
+    /// re-armed by [`Self::rearm_client`] when a connection lands
+    /// again; until then a background retry fires every
+    /// [`CONN_RETRY_BACKOFF`] (first probe earlier).
+    fn disarm_client(&mut self, handle: ClientHandle, retry_in: Duration) {
+        if self
+            .client_manager
+            .get_state(handle)
+            .is_none_or(|(_, s)| !s.active)
+        {
+            return;
+        }
+        if self
+            .conn_disarmed
+            .insert(handle, Instant::now() + retry_in)
+            .is_none()
+        {
+            log::info!("edge to unreachable client {handle} disarmed");
+            self.capture.destroy(handle);
+        }
+    }
+
+    /// put the edge barrier back once the outgoing connection is
+    /// live again
+    fn rearm_client(&mut self, handle: ClientHandle) {
+        if self.conn_disarmed.remove(&handle).is_none() {
+            return;
+        }
+        let Some(pos) = self.client_manager.get_pos(handle) else {
+            return;
+        };
+        log::info!("client {handle} reachable again, edge re-armed");
+        self.capture.create(handle, pos, CaptureType::Default);
     }
 
     /// an inbound connection exists from any of the client's
@@ -1170,6 +1268,7 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
+            self.conn_disarmed.remove(&handle);
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
@@ -1185,6 +1284,7 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
+        self.conn_disarmed.remove(&handle);
         if self
             .client_manager
             .remove_client(handle)
@@ -1442,5 +1542,28 @@ impl std::fmt::Display for HookKind {
             HookKind::Enter => f.write_str("enter"),
             HookKind::Leave => f.write_str("leave"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the reconnect scheduler must report a client once its deadline
+    /// passes and reschedule it — refiring every tick would flood the
+    /// connecting-set churn the map exists to bound
+    #[test]
+    fn due_reconnects_reschedules_due_entries() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        map.insert(1, now - Duration::from_secs(1)); // overdue
+        map.insert(2, now + Duration::from_secs(60)); // not due
+        map.insert(3, now); // exactly due
+        let due = due_reconnects(&mut map, now, Duration::from_secs(30));
+        assert_eq!(due.len(), 2);
+        assert!(due.contains(&1) && due.contains(&3));
+        assert_eq!(map[&1], now + Duration::from_secs(30));
+        assert_eq!(map[&3], now + Duration::from_secs(30));
+        assert_eq!(map[&2], now + Duration::from_secs(60));
     }
 }
