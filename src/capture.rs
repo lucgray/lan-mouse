@@ -61,6 +61,10 @@ pub(crate) enum ICaptureEvent {
         handle: u64,
         error: crate::connect::LanMouseConnectionError,
     },
+    /// an outgoing DTLS connection to this handle was established
+    Connected { handle: u64 },
+    /// an outgoing connection to this handle was lost
+    Disconnected { handle: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +450,28 @@ impl CaptureTask {
                         IncomingEvent::ConnectFailed(error) => {
                             if self.event_tx
                                 .send(ICaptureEvent::ConnectFailed { handle, error })
+                                .is_err()
+                            {
+                                log::error!("service channel closed, capture exiting");
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        IncomingEvent::Connected => {
+                            if self
+                                .event_tx
+                                .send(ICaptureEvent::Connected { handle })
+                                .is_err()
+                            {
+                                log::error!("service channel closed, capture exiting");
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        IncomingEvent::Disconnected => {
+                            if self
+                                .event_tx
+                                .send(ICaptureEvent::Disconnected { handle })
                                 .is_err()
                             {
                                 log::error!("service channel closed, capture exiting");
