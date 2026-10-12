@@ -6,7 +6,6 @@ use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -35,6 +34,7 @@ use input_event::{
     scancode::{self, Linux},
 };
 
+use super::event_queue::Sender;
 use super::{CaptureEvent, Position, display_util};
 use crate::enter_bind::EnterBindTracker;
 
@@ -45,10 +45,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(
-        event_tx: Sender<(Position, CaptureEvent)>,
-        stopped: Arc<Mutex<Option<Position>>>,
-    ) -> Self {
+    pub(crate) fn new(event_tx: Sender, stopped: Arc<Mutex<Option<Position>>>) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer), stopped);
         Self {
@@ -133,7 +130,6 @@ fn send_critical_event(pos: Position, event: CaptureEvent) {
             *slot.as_ref().expect("stop notification").lock().unwrap() = Some(pos)
         });
         release_capture(None);
-        PENDING_MOTION.take();
     }
 }
 
@@ -150,14 +146,12 @@ thread_local! {
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    static EVENT_TX: RefCell<Option<Sender>> = const { RefCell::new(None) };
     static STOPPED: RefCell<Option<Arc<Mutex<Option<Position>>>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
-    /// motion that could not be sent yet because the event channel was full
-    static PENDING_MOTION: Cell<(f64, f64)> = const { Cell::new((0., 0.)) };
     /// displays and generation counter
     static DISPLAYS: RefCell<(Vec<RECT>, i32)> = const { RefCell::new((Vec::new(), 0)) };
     /// binds that enter a client without crossing a screen edge
@@ -190,7 +184,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
     stopped: Arc<Mutex<Option<Position>>>,
 ) -> (thread::JoinHandle<()>, u32) {
@@ -211,7 +205,7 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
     stopped: Arc<Mutex<Option<Position>>>,
 ) {
@@ -362,7 +356,6 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* keys held now stop being observed for the duration of the
      * capture, so they must not still count as held afterwards */
     ENTER_BINDS.with_borrow_mut(|binds| binds.clear());
-    PENDING_MOTION.take();
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
@@ -429,7 +422,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    /* notify mainthread (motion is deferred, other events dropped if sending too fast) */
+    /* adjacent motion is coalesced in the consumer-visible queue */
     send_pointer_event(pos, pointer_event);
 
     /* don't pass event to applications */
@@ -455,7 +448,6 @@ fn enter_via_bind(pos: Position) {
     ACTIVE_CLIENT.replace(Some(pos));
     ENTRY_POINT.replace(entry_point);
     PREV_POS.replace(Some(entry_point));
-    PENDING_MOTION.take();
     log::info!("entering client @ {pos}: enter-bind pressed");
     let t = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::cross_axis_position(displays, entry_point, entry_point, pos)
@@ -489,35 +481,9 @@ fn check_enter_bind(wparam: WPARAM, lparam: LPARAM) -> bool {
     true
 }
 
-/// Sends a pointer event without blocking the hook.
-///
-/// Motion deltas are relative to the entry point, so a dropped motion event
-/// loses that movement for good. Motion that does not fit into the channel is
-/// therefore accumulated and sent along with the next event instead.
+/// Enqueue input without waiting for channel capacity or network transmission.
+/// Adjacent motion is merged by the queue without passing buttons or keys.
 fn send_pointer_event(pos: Position, event: PointerEvent) {
-    let event = match event {
-        PointerEvent::Motion { time, dx, dy } => {
-            let (pdx, pdy) = PENDING_MOTION.take();
-            let (dx, dy) = (dx + pdx, dy + pdy);
-            let motion = PointerEvent::Motion { time, dx, dy };
-            if try_send_event(pos, CaptureEvent::Input(Event::Pointer(motion))).is_err() {
-                log::debug!("event channel full, deferring motion ({dx}, {dy})");
-                PENDING_MOTION.set((dx, dy));
-            }
-            return;
-        }
-        event => event,
-    };
-
-    /* flush deferred motion first, so buttons and scrolling happen at the right position */
-    let (dx, dy) = PENDING_MOTION.take();
-    if dx != 0. || dy != 0. {
-        let motion = PointerEvent::Motion { time: 0, dx, dy };
-        if try_send_event(pos, CaptureEvent::Input(Event::Pointer(motion))).is_err() {
-            PENDING_MOTION.set((dx, dy));
-        }
-    }
-
     send_critical_event(pos, CaptureEvent::Input(Event::Pointer(event)));
 }
 
@@ -700,30 +666,6 @@ fn process_request(request: ThreadRequest) {
     }
 }
 
-#[cfg(test)]
-mod overload_tests {
-    use super::*;
-
-    #[test]
-    fn full_critical_queue_releases_local_input_and_notifies_consumer() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send((Position::Right, CaptureEvent::Begin(0.5)))
-            .unwrap();
-        let stopped = Arc::new(Mutex::new(None));
-        EVENT_TX.replace(Some(tx));
-        STOPPED.replace(Some(stopped.clone()));
-        ACTIVE_CLIENT.set(Some(Position::Right));
-        PENDING_MOTION.set((3.0, 4.0));
-        send_critical_event(Position::Right, CaptureEvent::Begin(0.5));
-        assert_eq!(ACTIVE_CLIENT.get(), None);
-        assert_eq!(*stopped.lock().unwrap(), Some(Position::Right));
-        assert_eq!(PENDING_MOTION.get(), (0.0, 0.0));
-        assert!(rx.try_recv().is_ok());
-        EVENT_TX.take();
-        STOPPED.take();
-    }
-}
-
 fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     let kybrdllhookstruct: KBDLLHOOKSTRUCT = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
     let mut scan_code = kybrdllhookstruct.scanCode;
@@ -851,5 +793,27 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+
+    #[test]
+    fn full_critical_queue_releases_local_input_and_notifies_consumer() {
+        let (tx, mut rx) = super::super::event_queue::channel(1);
+        tx.try_send((Position::Right, CaptureEvent::Begin(0.5)))
+            .unwrap();
+        let stopped = Arc::new(Mutex::new(None));
+        EVENT_TX.replace(Some(tx));
+        STOPPED.replace(Some(stopped.clone()));
+        ACTIVE_CLIENT.set(Some(Position::Right));
+        send_critical_event(Position::Right, CaptureEvent::Begin(0.5));
+        assert_eq!(ACTIVE_CLIENT.get(), None);
+        assert_eq!(*stopped.lock().unwrap(), Some(Position::Right));
+        assert!(rx.try_recv().is_ok());
+        EVENT_TX.take();
+        STOPPED.take();
     }
 }

@@ -114,6 +114,7 @@ struct OutputInfo {
 
 struct State {
     active_positions: HashSet<Position>,
+    passthrough_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
@@ -148,6 +149,7 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    size: (i32, i32),
 }
 
 impl Window {
@@ -204,6 +206,7 @@ impl Window {
         surface.commit();
         Window {
             pos,
+            size,
             buffer,
             surface,
             layer_surface,
@@ -218,6 +221,17 @@ impl Drop for Window {
         self.surface.destroy();
         self.buffer.destroy();
     }
+}
+
+fn cross_axis_position(pos: Position, size: (i32, i32), x: f64, y: f64) -> f64 {
+    let (coordinate, extent) = match pos {
+        Position::Left | Position::Right => (y, size.1),
+        Position::Top | Position::Bottom => (x, size.0),
+    };
+    if extent <= 0 || !coordinate.is_finite() {
+        return 0.5;
+    }
+    (coordinate / f64::from(extent)).clamp(0.0, 1.0)
 }
 
 fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
@@ -312,6 +326,7 @@ impl LayerShellInputCapture {
 
         let mut state = State {
             active_positions: Default::default(),
+            passthrough_positions: Default::default(),
             pointer: None,
             keyboard: None,
             global_list,
@@ -367,6 +382,7 @@ impl LayerShellInputCapture {
     fn delete_client(&mut self, pos: Position) {
         let inner = self.0.get_mut();
         inner.state.active_positions.remove(&pos);
+        inner.state.passthrough_positions.remove(&pos);
         // remove all windows corresponding to this client
         while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
             inner.state.active_windows.remove(i);
@@ -624,6 +640,15 @@ impl Capture for LayerShellInputCapture {
         Ok(())
     }
 
+    fn set_passthrough(&mut self, pos: Position, enabled: bool) {
+        let positions = &mut self.0.get_mut().state.passthrough_positions;
+        if enabled {
+            positions.insert(pos);
+        } else {
+            positions.remove(&pos);
+        }
+    }
+
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
@@ -729,26 +754,27 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
-                // get client corresponding to the focused surface
-                {
-                    if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-                        app.focused = Some(window.clone());
-                        app.grab(&surface, pointer, serial, qh);
-                    } else {
-                        return;
-                    }
-                }
-                let pos = app
+                let Some(window) = app
                     .active_windows
                     .iter()
                     .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
-                app.pending_events
-                    .push_back((pos, CaptureEvent::Begin(0.5)));
+                    .cloned()
+                else {
+                    return;
+                };
+                let pos = window.pos;
+                let t = cross_axis_position(pos, window.size, surface_x, surface_y);
+                app.focused = Some(window);
+                // Incoming-only return edges notify the sender without hiding
+                // or locking the local cursor. Otherwise release leaves an
+                // invisible cursor on the one-pixel surface until it moves out.
+                if !app.passthrough_positions.contains(&pos) {
+                    app.grab(&surface, pointer, serial, qh);
+                }
+                app.pending_events.push_back((pos, CaptureEvent::Begin(t)));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -1028,3 +1054,44 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod edge_position_tests {
+    use super::*;
+
+    #[test]
+    fn return_position_uses_logical_output_size_and_actual_crossing() {
+        assert_eq!(
+            cross_axis_position(Position::Left, (1600, 900), 0., 225.),
+            0.25
+        );
+        assert_eq!(
+            cross_axis_position(Position::Right, (1600, 900), 0., 675.),
+            0.75
+        );
+        assert_eq!(
+            cross_axis_position(Position::Top, (1600, 900), 1200., 0.),
+            0.75
+        );
+        assert_eq!(
+            cross_axis_position(Position::Bottom, (1600, 900), 400., 0.),
+            0.25
+        );
+    }
+
+    #[test]
+    fn return_position_is_bounded() {
+        assert_eq!(
+            cross_axis_position(Position::Left, (1600, 900), 0., -1.),
+            0.
+        );
+        assert_eq!(
+            cross_axis_position(Position::Left, (1600, 900), 0., 901.),
+            1.
+        );
+        assert_eq!(
+            cross_axis_position(Position::Left, (1600, 900), 0., f64::NAN),
+            0.5
+        );
+    }
+}

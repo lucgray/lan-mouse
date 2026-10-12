@@ -90,6 +90,20 @@ unknown `transfer_id` are ignored. Old peers never send requests — for
 them the transfer just never completes, same as before.
 
 ## Problems
+### Pointer capture under load and return edges
+
+Windows capture coalesces adjacent relative movements in its bounded input
+queue. The consumer can drain the final movement after the mouse stops; a
+later physical event is not required to flush it. Buttons, keys, capture
+boundaries and different edges are never merged. Critical queue exhaustion
+still releases local control rather than blocking the Windows input hook.
+
+The layer-shell backend treats edges with only incoming return handles as
+passive: crossing them notifies the sender without hiding or locking the
+receiving cursor. An outgoing handle at the same edge retains normal capture.
+Return messages carry the actual position along the logical screen edge
+instead of always returning to its midpoint.
+
 ### Windows clipboard access
 
 `input_event::clipboard_access()` provides a process-wide guard for native
