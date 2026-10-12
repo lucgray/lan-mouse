@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::{
     net::UdpSocket,
     sync::Mutex,
-    task::{JoinSet, spawn_local},
+    task::{JoinHandle, JoinSet, spawn_local},
 };
 use webrtc_dtls::{
     config::{Config, ExtendedMasterSecretType},
@@ -50,6 +50,8 @@ const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 thread_local! {
     static PENDING_TRANSFERS: RefCell<HashMap<u32, (Vec<u8>, std::time::Instant)>> =
         RefCell::new(HashMap::new());
+    // One expiry worker per local runtime thread, not one task per payload.
+    static PENDING_CLEANUP: RefCell<Option<JoinHandle<()>>> = const { RefCell::new(None) };
 }
 
 /// how long a sent payload stays available for retransmit requests
@@ -77,18 +79,47 @@ fn pending_store(encoded: &[u8], id: u32) {
             }
         }
     });
+    PENDING_CLEANUP.with(|cleanup| {
+        let mut cleanup = cleanup.borrow_mut();
+        if cleanup.as_ref().is_none_or(|task| task.is_finished()) {
+            *cleanup = Some(spawn_local(expire_pending_transfers()));
+        }
+    });
+}
+
+async fn expire_pending_transfers() {
+    loop {
+        let deadline = PENDING_TRANSFERS.with(|p| {
+            p.borrow()
+                .values()
+                .map(|(_, touched)| *touched + PENDING_TTL)
+                .min()
+        });
+        let Some(deadline) = deadline else { return };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        PENDING_TRANSFERS.with(|p| p.borrow_mut().retain(|_, (_, t)| t.elapsed() < PENDING_TTL));
+    }
 }
 
 /// fragment datagrams answering a peer's retransmit request
 pub(crate) fn pending_resends(id: u32, seqs: &[u32]) -> Vec<Vec<u8>> {
     PENDING_TRANSFERS.with(|p| {
         let mut m = p.borrow_mut();
+        // A request must not revive expired data before the worker next runs.
+        if m.get(&id).is_some_and(|(_, t)| t.elapsed() >= PENDING_TTL) {
+            m.remove(&id);
+            return Vec::new();
+        }
         match m.get_mut(&id) {
             Some((encoded, touched)) => {
-                *touched = std::time::Instant::now();
-                seqs.iter()
+                let datagrams: Vec<_> = seqs
+                    .iter()
                     .filter_map(|s| lan_mouse_proto::clipboard_fragment_at(encoded, id, *s))
-                    .collect()
+                    .collect();
+                if !datagrams.is_empty() {
+                    *touched = std::time::Instant::now();
+                }
+                datagrams
             }
             None => Vec::new(),
         }
@@ -540,6 +571,10 @@ async fn receive_loop(
     let mut reassembler = ClipboardReassembler::new();
     let mut last_reported = 0u64;
     let mut recv_err = None;
+    // Incoming motion must not restart the fragment-maintenance deadline.
+    let period = Duration::from_millis(500);
+    let mut maintenance = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let n = tokio::select! {
             r = conn.recv(&mut buf) => match r {
@@ -549,7 +584,7 @@ async fn receive_loop(
                     break;
                 }
             },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+            _ = maintenance.tick() => {
                 if reassembler.wants_request() {
                     let id = reassembler.transfer_id();
                     let missing = reassembler.missing_seqs(
@@ -558,9 +593,12 @@ async fn receive_loop(
                     for chunk in
                         missing.chunks(lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS)
                     {
-                        let _ = conn
+                        if let Err(e) = conn
                             .send(&lan_mouse_proto::encode_fragment_request(id, chunk))
-                            .await;
+                            .await
+                        {
+                            log::warn!("failed to request clipboard fragments from {addr}: {e}");
+                        }
                     }
                 }
                 if reassembler.stalled() {
@@ -711,6 +749,84 @@ mod tests {
     use crate::config::ConfigClient;
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn regression_idle_retransmit_cache_expires() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                PENDING_TRANSFERS.with(|p| p.borrow_mut().clear());
+                pending_store(&vec![7; 4096], 42);
+                // Use the production TTL and real clock, with no next send to trigger cleanup.
+                tokio::time::sleep(PENDING_TTL + Duration::from_secs(1)).await;
+                let remaining = PENDING_TRANSFERS.with(|p| {
+                    let mut map = p.borrow_mut();
+                    let remaining: usize = map.values().map(|(bytes, _)| bytes.len()).sum();
+                    map.clear();
+                    remaining
+                });
+                assert_eq!(remaining, 0, "idle cache retained expired payload bytes");
+            })
+            .await;
+    }
+
+    #[test]
+    fn regression_expired_retransmit_is_not_revived() {
+        PENDING_TRANSFERS.with(|p| {
+            p.borrow_mut().insert(
+                43,
+                (
+                    vec![7; 4096],
+                    std::time::Instant::now() - PENDING_TTL - Duration::from_secs(1),
+                ),
+            );
+        });
+        let response = pending_resends(43, &[0]);
+        PENDING_TRANSFERS.with(|p| p.borrow_mut().clear());
+        assert!(
+            response.is_empty(),
+            "expired cached content was returned and its age reset"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regression_connect_retries_missing_fragments_during_motion() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (conn, peer) = crate::listen::test_support::datagram_pair().await;
+                let addr = peer.local_addr().unwrap();
+                let manager = ClientManager::default();
+                let handle = manager.add_with_config(ConfigClient {
+                    ips: Default::default(),
+                    hostname: None,
+                    port: addr.port(),
+                    pos: lan_mouse_ipc::Position::Right,
+                    active: false,
+                    enter_hook: None,
+                    leave_hook: None,
+                    send_only: false,
+                    receive_only: false,
+                });
+                let (tx, _rx) = channel();
+                let conns = Rc::new(Mutex::new(HashMap::from([(addr, conn.clone())])));
+                let task = spawn_local(receive_loop(
+                    manager,
+                    handle,
+                    addr,
+                    conn,
+                    conns,
+                    tx,
+                    Default::default(),
+                ));
+                let requested =
+                    crate::listen::test_support::missing_fragment_during_motion(&peer).await;
+                task.abort();
+                assert!(
+                    requested,
+                    "continuous input starved the outgoing connection's retransmit check"
+                );
+            })
+            .await;
+    }
+
     #[test]
     fn bind_addr_matches_target_family() {
         let v4: SocketAddr = "192.168.1.1:4242".parse().unwrap();
@@ -844,26 +960,31 @@ mod tests {
         let max_dgram = CLIPBOARD_FRAGMENT_PAYLOAD + CLIPBOARD_FRAGMENT_HEADER;
 
         async fn send_and_collect(payload_len: usize) -> Vec<Vec<u8>> {
-            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            sender
-                .connect(receiver.local_addr().unwrap())
-                .await
-                .unwrap();
-            let conn: Arc<dyn Conn + Send + Sync> = Arc::new(sender);
-            let encoded = vec![0xABu8; payload_len];
-            send_clipboard_datagrams(&conn, &encoded, None)
-                .await
-                .unwrap();
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    sender
+                        .connect(receiver.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                    let conn: Arc<dyn Conn + Send + Sync> = Arc::new(sender);
+                    let encoded = vec![0xABu8; payload_len];
+                    send_clipboard_datagrams(&conn, &encoded, None)
+                        .await
+                        .unwrap();
 
-            let mut datagrams = Vec::new();
-            let mut buf = vec![0u8; 66_000];
-            while let Ok(Ok(n)) =
-                tokio::time::timeout(Duration::from_millis(200), receiver.recv(&mut buf)).await
-            {
-                datagrams.push(buf[..n].to_vec());
-            }
-            datagrams
+                    let mut datagrams = Vec::new();
+                    let mut buf = vec![0u8; 66_000];
+                    while let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_millis(200), receiver.recv(&mut buf))
+                            .await
+                    {
+                        datagrams.push(buf[..n].to_vec());
+                    }
+                    datagrams
+                })
+                .await
         }
 
         // a small payload goes out as a single legacy datagram

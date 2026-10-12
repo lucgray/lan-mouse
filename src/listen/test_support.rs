@@ -87,3 +87,50 @@ pub(crate) fn listener_with_conn(
         listen_tx,
     )
 }
+
+pub(crate) async fn datagram_pair() -> (ArcConn, tokio::net::UdpSocket) {
+    let conn = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    conn.connect(peer.local_addr().unwrap()).await.unwrap();
+    peer.connect(conn.local_addr().unwrap()).await.unwrap();
+    (Arc::new(conn), peer)
+}
+
+/// Real loopback datagrams reach the production receive loops. Only the first
+/// clipboard fragment arrives; continuous motion must not suppress its retry.
+pub(crate) async fn missing_fragment_during_motion(peer: &tokio::net::UdpSocket) -> bool {
+    let clipboard = ProtoEvent::Input(input_event::Event::Clipboard(
+        input_event::ClipboardEvent::Text("x".repeat(4096)),
+    ));
+    let encoded = lan_mouse_proto::encode_clipboard_event(&clipboard).unwrap();
+    let first = lan_mouse_proto::ClipboardFragmenter::new(&encoded)
+        .next()
+        .unwrap();
+    peer.send(&first).await.unwrap();
+    let expected_id = lan_mouse_proto::transfer_id(&encoded);
+    let motion = ProtoEvent::Input(input_event::Event::Pointer(
+        input_event::PointerEvent::Motion {
+            time: 1,
+            dx: 1.0,
+            dy: 1.0,
+        },
+    ));
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = motion.into();
+    let mut motion_ticks = tokio::time::interval(Duration::from_millis(20));
+    motion_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let deadline = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(deadline);
+    let mut reply = [0u8; 2048];
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return false,
+            _ = motion_ticks.tick() => { peer.send(&buf[..len]).await.unwrap(); }
+            result = peer.recv(&mut reply) => {
+                let n = result.unwrap();
+                if let Some((id, seqs)) = lan_mouse_proto::decode_fragment_request(&reply[..n]) {
+                    if id == expected_id && seqs.contains(&1) { return true; }
+                }
+            }
+        }
+    }
+}
