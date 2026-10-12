@@ -192,23 +192,23 @@ impl ClipboardEmulation {
                         return Err(ClipboardError::Set("no files to write".into()));
                     }
                     // advertise the written files on our own clipboard
-                    // so they can be pasted straight into a file manager
+                    // so they can be pasted straight into a file manager.
+                    // Best-effort: on a headless host there is no clipboard,
+                    // but the files landed on disk either way
                     let mut clipboard_guard = clipboard_arc.lock().unwrap();
-                    let clipboard = match clipboard_guard.as_mut() {
-                        Some(c) => c,
+                    if let Some(clipboard) = match clipboard_guard.as_mut() {
+                        Some(c) => Some(c),
                         None => match Clipboard::new() {
-                            Ok(c) => {
-                                *clipboard_guard = Some(c);
-                                clipboard_guard.as_mut().unwrap()
-                            }
+                            Ok(c) => Some(clipboard_guard.insert(c)),
                             Err(e) => {
-                                return Err(ClipboardError::Access(format!("{}", e)));
+                                log::warn!("no clipboard available, files not advertised: {e}");
+                                None
                             }
                         },
-                    };
-                    if let Err(e) = clipboard.set().file_list(&written) {
-                        // the files are on disk either way
-                        log::warn!("could not set clipboard file list: {e}");
+                    } {
+                        if let Err(e) = clipboard.set().file_list(&written) {
+                            log::warn!("could not set clipboard file list: {e}");
+                        }
                     }
                     log::debug!(
                         "Clipboard file list set: {} file(s) in {}",
