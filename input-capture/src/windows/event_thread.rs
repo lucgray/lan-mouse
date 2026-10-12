@@ -45,9 +45,12 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(
+        event_tx: Sender<(Position, CaptureEvent)>,
+        stopped: Arc<Mutex<Option<Position>>>,
+    ) -> Self {
         let request_buffer = Default::default();
-        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
+        let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer), stopped);
         Self {
             request_buffer,
             thread: Some(thread),
@@ -120,7 +123,18 @@ enum ThreadRequest {
 }
 
 fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
+    send_critical_event(pos, event);
+}
+
+fn send_critical_event(pos: Position, event: CaptureEvent) {
+    if let Err(error) = try_send_event(pos, event) {
+        log::warn!("input forwarding stopped; returning local control: {error}");
+        STOPPED.with_borrow(|slot| {
+            *slot.as_ref().expect("stop notification").lock().unwrap() = Some(pos)
+        });
+        release_capture(None);
+        PENDING_MOTION.take();
+    }
 }
 
 fn try_send_event(
@@ -137,6 +151,7 @@ thread_local! {
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    static STOPPED: RefCell<Option<Arc<Mutex<Option<Position>>>>> = const { RefCell::new(None) };
     /// position of barrier entry
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
@@ -177,12 +192,13 @@ fn get_msg() -> Option<MSG> {
 fn start(
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
+    stopped: Arc<Mutex<Option<Position>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
     let thread_id = Arc::new((Condvar::new(), Mutex::new(None)));
     let thread_id_ = Arc::clone(&thread_id);
 
-    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer));
+    let msg_thread = thread::spawn(|| start_routine(thread_id_, event_tx, request_buffer, stopped));
 
     /* wait for thread to set its id */
     let (cond, thread_id) = &*thread_id;
@@ -197,8 +213,10 @@ fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ThreadRequest>>>,
+    stopped: Arc<Mutex<Option<Position>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
+    STOPPED.replace(Some(stopped));
     /* force creation of the thread's message queue before publishing
      * the id: PostThreadMessageW fails with ERROR_INVALID_THREAD_ID
      * until the first message function runs */
@@ -391,6 +409,9 @@ fn send_lock_state(pos: Position) {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -497,12 +518,13 @@ fn send_pointer_event(pos: Position, event: PointerEvent) {
         }
     }
 
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(event))) {
-        log::warn!("e: {e}");
-    }
+    send_critical_event(pos, CaptureEvent::Input(Event::Pointer(event)));
 }
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode < 0 {
+        return CallNextHookEx(None, ncode, wparam, lparam);
+    }
     /* get active client if any */
     let Some(client) = ACTIVE_CLIENT.get() else {
         /* no client active: the keys belong to this machine, unless
@@ -543,9 +565,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
             key: Linux::KeyLeftCtrl as u32,
             state: 0,
         }));
-        if let Err(e) = try_send_event(client, lctrl_up) {
-            log::warn!("e: {e}");
-        }
+        send_critical_event(client, lctrl_up);
     } else if is_up && (vk == VK_LCONTROL || vk == VK_CONTROL) {
         LCTRL_FORWARDED.take();
         if FAKE_LCTRL.take() {
@@ -560,9 +580,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
-    }
+    send_critical_event(client, CaptureEvent::Input(Event::Keyboard(key_event)));
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -679,6 +697,30 @@ fn process_request(request: ThreadRequest) {
         ThreadRequest::SetEnterBinds(binds) => {
             ENTER_BINDS.with_borrow_mut(|tracker| tracker.set_binds(binds));
         }
+    }
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+
+    #[test]
+    fn full_critical_queue_releases_local_input_and_notifies_consumer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send((Position::Right, CaptureEvent::Begin(0.5)))
+            .unwrap();
+        let stopped = Arc::new(Mutex::new(None));
+        EVENT_TX.replace(Some(tx));
+        STOPPED.replace(Some(stopped.clone()));
+        ACTIVE_CLIENT.set(Some(Position::Right));
+        PENDING_MOTION.set((3.0, 4.0));
+        send_critical_event(Position::Right, CaptureEvent::Begin(0.5));
+        assert_eq!(ACTIVE_CLIENT.get(), None);
+        assert_eq!(*stopped.lock().unwrap(), Some(Position::Right));
+        assert_eq!(PENDING_MOTION.get(), (0.0, 0.0));
+        assert!(rx.try_recv().is_ok());
+        EVENT_TX.take();
+        STOPPED.take();
     }
 }
 

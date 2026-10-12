@@ -90,6 +90,14 @@ unknown `transfer_id` are ignored. Old peers never send requests — for
 them the transfer just never completes, same as before.
 
 ## Problems
+### Windows clipboard access
+
+`input_event::clipboard_access()` provides a process-wide guard for native
+clipboard access on Windows. Capture and emulation must retain it while reading
+or writing the clipboard, and release it before sending events or waiting on a
+channel. This prevents one clipboard handle from closing another thread's native
+clipboard session. It does not reserve the clipboard against other applications.
+
 The general Idea is to have a bidirectional connection by default, meaning
 any connected device can not only receive events but also send events back.
 

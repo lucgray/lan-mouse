@@ -3,6 +3,17 @@ use std::fmt::{self, Display};
 pub mod error;
 pub mod scancode;
 
+/// Windows permits separate clipboard handles to interfere within one process.
+/// Share one guard between the monitor and incoming clipboard writer.
+#[cfg(windows)]
+pub fn clipboard_access() -> std::sync::MutexGuard<'static, ()> {
+    static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ACCESS.lock().unwrap_or_else(|error| {
+        log::error!("clipboard access guard was poisoned: {error}");
+        error.into_inner()
+    })
+}
+
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 

@@ -469,6 +469,9 @@ impl CaptureTask {
                             continue;
                         }
                         IncomingEvent::Disconnected => {
+                            if self.active_client == Some(handle) {
+                                self.release_capture_with(capture, false, None).await?;
+                            }
                             if self
                                 .event_tx
                                 .send(ICaptureEvent::Disconnected { handle })
@@ -498,17 +501,18 @@ impl CaptureTask {
                         }
                         continue;
                     }
-                    if let Some(active) = self.active_client {
-                        if handle != active {
+                    if self.active_client != Some(handle) {
                             // we only care about events coming from the client we are currently connected to
                             // only `Ack` and `Leave` are relevant
                             continue
-                        }
                     }
 
                     match event {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
+                            if !matches!(self.state, State::WaitingForAck) {
+                                continue;
+                            }
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             if let Some(mods) = self.pending_modifiers.take() {
@@ -604,6 +608,13 @@ impl CaptureTask {
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
+        if matches!(event, CaptureEvent::End) {
+            if self.active_client == Some(handle) {
+                log::warn!("releasing capture: input backend stopped forwarding");
+                return self.release_capture(capture, None).await;
+            }
+            return Ok(());
+        }
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
             log::info!("releasing capture: release-bind pressed");
@@ -676,6 +687,7 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(pos.opposite());
 
         let events: Vec<ProtoEvent> = match event {
+            CaptureEvent::End => Vec::new(),
             CaptureEvent::Begin(t) => {
                 self.enter_t = t;
                 vec![ProtoEvent::Enter(opposite_pos, t)]

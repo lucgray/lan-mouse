@@ -5,6 +5,7 @@ use futures::Stream;
 use input_event::scancode;
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
@@ -17,6 +18,7 @@ mod event_thread;
 pub struct WindowsInputCapture {
     event_rx: Receiver<(Position, CaptureEvent)>,
     event_thread: EventThread,
+    stopped: Arc<Mutex<Option<Position>>>,
 }
 
 #[async_trait]
@@ -57,10 +59,12 @@ impl Capture for WindowsInputCapture {
 impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
         let (event_tx, event_rx) = channel(10);
-        let event_thread = EventThread::new(event_tx);
+        let stopped = Arc::new(Mutex::new(None));
+        let event_thread = EventThread::new(event_tx, stopped.clone());
         Self {
             event_thread,
             event_rx,
+            stopped,
         }
     }
 }
@@ -68,6 +72,11 @@ impl WindowsInputCapture {
 impl Stream for WindowsInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let stopped = self.stopped.lock().unwrap().take();
+        if let Some(pos) = stopped {
+            while self.event_rx.try_recv().is_ok() {}
+            return Poll::Ready(Some(Ok((pos, CaptureEvent::End))));
+        }
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
             Some(e) => Poll::Ready(Some(Ok(e))),

@@ -46,6 +46,8 @@ pub enum CaptureEvent {
     /// receiving side can warp its cursor to the matching spot. Backends
     /// that can't determine it report `0.5` (the edge's midpoint).
     Begin(f64),
+    /// The backend stopped capture, for example because critical input could not be queued.
+    End,
     /// input event coming from capture handle
     Input(Event),
 }
@@ -54,6 +56,7 @@ impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureEvent::Begin(t) => write!(f, "begin capture ({t:.2})"),
+            CaptureEvent::End => write!(f, "end capture"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -179,36 +182,45 @@ impl InputCapture {
         pos: Position,
         enter_only: bool,
     ) -> Result<(), CaptureError> {
-        assert!(!self.id_map.contains_key(&id));
+        if let Some(&previous_pos) = self.id_map.get(&id) {
+            if previous_pos == pos && self.enter_only_handles.contains(&id) == enter_only {
+                log::debug!("capture {id} already exists at {pos}");
+                return Ok(());
+            }
+            self.destroy(id).await?;
+        }
 
+        let new_position = !self.position_map.contains_key(&pos);
+        if new_position {
+            self.capture.create(pos).await?;
+        }
+        if enter_only && !self.enter_only_positions.contains_key(&pos) {
+            if let Err(error) = self.capture.set_enter_only(pos, true).await {
+                if new_position {
+                    if let Err(cleanup_error) = self.capture.destroy(pos).await {
+                        log::error!("failed to clean up capture {id}: {cleanup_error}");
+                    }
+                }
+                return Err(error);
+            }
+        }
         self.id_map.insert(id, pos);
-
-        let result = if let Some(v) = self.position_map.get_mut(&pos) {
-            v.push(id);
-            Ok(())
-        } else {
-            self.position_map.insert(pos, vec![id]);
-            self.capture.create(pos).await
-        };
-        result?;
-
+        self.position_map.entry(pos).or_default().push(id);
         if enter_only {
             self.enter_only_handles.insert(id);
-            let count = self.enter_only_positions.entry(pos).or_default();
-            *count += 1;
-            if *count == 1 {
-                self.capture.set_enter_only(pos, true).await?;
-            }
+            *self.enter_only_positions.entry(pos).or_default() += 1;
         }
         Ok(())
     }
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
-            .id_map
-            .remove(&id)
-            .expect("no position for this handle");
+        let Some(pos) = self.id_map.remove(&id) else {
+            log::debug!("capture {id} already removed");
+            return Ok(());
+        };
+        // Events queued before removal must not reach a deleted or reused handle.
+        self.pending.retain(|(handle, _)| *handle != id);
 
         if self.enter_only_handles.remove(&id) {
             let count = self
@@ -587,6 +599,52 @@ mod tests {
             route_handles(&[1, 2], &enter_only, &CaptureEvent::Begin(0.5), false),
             vec![1, 2]
         );
+    }
+
+    fn empty_capture() -> InputCapture {
+        InputCapture {
+            capture: Box::new(QueuedCapture {
+                events: VecDeque::new(),
+                last_event_requires_enter_only: false,
+            }),
+            enter_only_handles: HashSet::new(),
+            enter_only_positions: HashMap::new(),
+            pressed_keys: HashSet::new(),
+            id_map: HashMap::new(),
+            pending: VecDeque::new(),
+            position_map: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_then_deactivate_or_delete_is_safe() {
+        let mut capture = empty_capture();
+        capture.create(7, Position::Right).await.unwrap();
+        capture.pending.push_back((7, CaptureEvent::Begin(0.5)));
+        capture.destroy(7).await.unwrap(); // connection failed
+        capture.destroy(7).await.unwrap(); // disable or delete after failure
+        capture.destroy(999).await.unwrap(); // late notification for removed peer
+        assert!(capture.pending.is_empty());
+        assert!(capture.id_map.is_empty());
+        assert!(capture.position_map.is_empty());
+        capture.create(7, Position::Left).await.unwrap(); // reconnect/reuse
+        assert_eq!(capture.id_map[&7], Position::Left);
+    }
+
+    #[tokio::test]
+    async fn repeated_create_and_incoming_cleanup_preserve_other_handles() {
+        let mut capture = empty_capture();
+        capture.create(7, Position::Right).await.unwrap();
+        capture.create(7, Position::Right).await.unwrap();
+        capture.create_enter_only(8, Position::Right).await.unwrap();
+        capture.destroy(8).await.unwrap();
+        capture.destroy(8).await.unwrap();
+        assert_eq!(capture.position_map[&Position::Right], vec![7]);
+        assert!(capture.enter_only_handles.is_empty());
+        assert!(capture.enter_only_positions.is_empty());
+        capture.create(7, Position::Left).await.unwrap();
+        assert!(!capture.position_map.contains_key(&Position::Right));
+        assert_eq!(capture.position_map[&Position::Left], vec![7]);
     }
 
     #[test]
