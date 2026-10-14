@@ -1,5 +1,6 @@
 use std::fmt::{self, Display};
 
+pub mod diagnostics;
 pub mod error;
 pub mod scancode;
 

@@ -273,6 +273,12 @@ impl ListenTask {
             select! {
                 e = self.listener.next() => {match e {
                     Some(ListenEvent::Msg { event, addr }) => {
+                        match &event {
+                            ProtoEvent::Input(input) => input_event::diagnostics::event(input_event::diagnostics::Stage::Receive, addr, input),
+                            ProtoEvent::Enter(_, t) => input_event::diagnostics::control(input_event::diagnostics::Stage::Receive, addr, input_event::diagnostics::Control::Enter, *t),
+                            ProtoEvent::Leave(_, t) => input_event::diagnostics::control(input_event::diagnostics::Stage::Receive, addr, input_event::diagnostics::Control::Leave, *t),
+                            _ => {},
+                        }
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         // input-control events from a send_only client

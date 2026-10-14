@@ -159,3 +159,45 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+# Optional input timing diagnostics
+
+To investigate intermittent repeated keys, stalls, or unexpected screen returns,
+place `input-diagnostics.json` beside the daemon's `config.toml` and restart it.
+Without this file, recording is disabled. All limits are explicitly configured:
+
+```json
+{
+  "path": "/absolute/private/directory/input-timing.log",
+  "max_file_bytes": 8388608,
+  "queue_capacity": 4096,
+  "sample_interval_ms": 1000
+}
+```
+
+The directory must already exist. The writer keeps the active file and one `.1`
+file, each limited to `max_file_bytes`. In this example the total is 16 MiB.
+Delete the configuration file and restart the daemon to stop recording.
+
+Keyboard records contain timestamps, down/up state and a random process-local
+token for pairing transitions. Tokens change on restart and differ across hosts.
+No characters, raw key codes, clipboard contents, mouse button identifiers or
+per-motion coordinates are recorded. Timing and repeated-key patterns are still
+private metadata; keep these files local. Do not enable full trace logging for
+this purpose, because existing trace messages can include input payloads.
+
+Stages are Native, Capture, Send, Sent, Receive, Apply, Applied and Suppressed.
+Sent means the local send operation completed, not that the other host received
+the event. Applied means the input backend accepted the event, not that an
+application displayed it. Edge markers record the normalized crossing position.
+The existing normal log provides connection failures and release reasons.
+Motion samples list counts in the stage order above, not individual movements;
+Windows coalesces motion, so Native and Capture counts may legitimately differ.
+
+Disk writes run on a separate thread. The input path never waits for that writer;
+a full diagnostic queue increments `dropped`, reported in the next sample and
+normal log. A nonzero value means the record is incomplete. Samples are flushed
+at the configured interval; a process crash may lose the unflushed tail. The
+sample duration also exposes delays in scheduling the writer. Invalid settings
+or an unwritable output path are reported at startup. These records help locate
+the failure but do not themselves change forwarding or key-repeat behavior.
+

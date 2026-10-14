@@ -124,7 +124,16 @@ fn blocking_send_event(pos: Position, event: CaptureEvent) {
 }
 
 fn send_critical_event(pos: Position, event: CaptureEvent) {
+    if let CaptureEvent::Input(ref input) = event {
+        input_event::diagnostics::event(input_event::diagnostics::Stage::Native, pos, input);
+    }
     if let Err(error) = try_send_event(pos, event) {
+        input_event::diagnostics::control(
+            input_event::diagnostics::Stage::Native,
+            pos,
+            input_event::diagnostics::Control::QueueFull,
+            0.0,
+        );
         log::warn!("input forwarding stopped; returning local control: {error}");
         STOPPED.with_borrow(|slot| {
             *slot.as_ref().expect("stop notification").lock().unwrap() = Some(pos)

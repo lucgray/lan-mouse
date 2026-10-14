@@ -59,6 +59,22 @@ fn main() {
     let command = config.command();
     init_logging(&command);
 
+    if matches!(command, Some(Command::Daemon)) {
+        let path = config
+            .config_path()
+            .with_file_name("input-diagnostics.json");
+        if path.exists() {
+            let result = std::fs::read(path).and_then(|bytes| {
+                let settings = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                input_event::diagnostics::init(settings)
+            });
+            if let Err(error) = result {
+                log::error!("failed to initialize requested input diagnostics: {error}");
+                process::exit(1);
+            }
+        }
+    }
+
     if let Err(e) = run(config, command) {
         log::error!("{e}");
         process::exit(1);

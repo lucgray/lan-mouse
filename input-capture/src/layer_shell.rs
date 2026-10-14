@@ -767,6 +767,12 @@ impl Dispatch<WlPointer, ()> for State {
                 };
                 let pos = window.pos;
                 let t = cross_axis_position(pos, window.size, surface_x, surface_y);
+                input_event::diagnostics::control(
+                    input_event::diagnostics::Stage::Native,
+                    pos,
+                    input_event::diagnostics::Control::Edge,
+                    t,
+                );
                 app.focused = Some(window);
                 // Incoming-only return edges notify the sender without hiding
                 // or locking the local cursor. Otherwise release leaves an
