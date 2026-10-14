@@ -131,7 +131,7 @@ fn send_critical_event(pos: Position, event: CaptureEvent) {
         input_event::diagnostics::control(
             input_event::diagnostics::Stage::Native,
             pos,
-            input_event::diagnostics::Control::QueueFull,
+            input_event::diagnostics::Control::ForwardingStopped,
             0.0,
         );
         log::warn!("input forwarding stopped; returning local control: {error}");
