@@ -53,7 +53,7 @@ pub enum Control {
     Release,
     Enter,
     Leave,
-    QueueFull,
+    ForwardingStopped,
 }
 
 #[derive(Debug)]
