@@ -6,6 +6,25 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::{CaptureError, CaptureEvent};
 
+#[cfg(windows)]
+fn native_sequence() -> u32 {
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+#[cfg(not(windows))]
+fn native_sequence() -> u32 {
+    input_event::clipboard_selection_sequence()
+}
+struct RefreshDone(Option<tokio::sync::oneshot::Sender<()>>);
+impl Drop for RefreshDone {
+    fn drop(&mut self) {
+        if let Some(reply) = self.0.take() {
+            if reply.send(()).is_err() {
+                log::debug!("clipboard refresh request cancelled");
+            }
+        }
+    }
+}
+
 /// Clipboard monitor that watches for clipboard changes
 pub struct ClipboardMonitor {
     event_rx: Receiver<CaptureEvent>,
@@ -20,6 +39,7 @@ pub struct ClipboardMonitor {
     /// the polling thread — kept so the service can supervise it with
     /// [`Self::is_alive`] instead of waiting on channel state alone
     task: std::thread::JoinHandle<()>,
+    refresh_tx: std::sync::mpsc::Sender<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// records which clipboard signature this host placed itself, so a
@@ -31,6 +51,9 @@ pub struct ClipboardMonitor {
 pub struct ClipboardSigRecorder {
     last_sig: Arc<Mutex<Option<ContentSig>>>,
     last_change: Arc<Mutex<Option<Instant>>>,
+    remote_sig: Arc<Mutex<Option<ContentSig>>>,
+    sequence: Arc<Mutex<u32>>,
+    remote_echo: Arc<Mutex<Option<u32>>>,
 }
 
 impl ClipboardSigRecorder {
@@ -44,7 +67,16 @@ impl ClipboardSigRecorder {
     pub fn update(&self, content: &ClipboardEvent) {
         let mut last_sig = self.last_sig.lock().unwrap();
         let mut last_change = self.last_change.lock().unwrap();
-        *last_sig = Some(sig_of(content));
+        let sig = sig_of(content);
+        *self.remote_sig.lock().unwrap() = Some(sig.clone());
+        let now = native_sequence();
+        let mut sequence = self.sequence.lock().unwrap();
+        #[cfg(not(windows))]
+        {
+            *self.remote_echo.lock().unwrap() = (*sequence == now).then_some(now.wrapping_add(1));
+        }
+        *sequence = now;
+        *last_sig = Some(sig);
         *last_change = Some(Instant::now());
     }
     /// Inspect and publish one observation. Closures keep native clipboard access
@@ -52,6 +84,7 @@ impl ClipboardSigRecorder {
     fn capture_change(
         &self,
         sig: ContentSig,
+        force: bool,
         read_content: impl FnOnce(&ContentSig) -> Option<ClipboardEvent>,
         send_event: impl FnOnce(CaptureEvent),
     ) {
@@ -64,7 +97,7 @@ impl ClipboardSigRecorder {
             Some(last) => last != &sig,
         };
 
-        if content_changed {
+        if content_changed || force {
             // Debounce: ignore changes within 200ms of last change
             // This prevents infinite loops when both sides update clipboard
             let should_emit = match *last_change {
@@ -72,7 +105,7 @@ impl ClipboardSigRecorder {
                 Some(instant) => instant.elapsed() > Duration::from_millis(200),
             };
 
-            if should_emit {
+            if should_emit || force {
                 let Some(current_content) = read_content(&sig) else {
                     return;
                 };
@@ -81,6 +114,8 @@ impl ClipboardSigRecorder {
                     current_content,
                     current_content.content_len()
                 );
+                *self.remote_sig.lock().unwrap() = None;
+                *self.sequence.lock().unwrap() = native_sequence();
                 *last_sig = Some(sig);
                 *last_change = Some(Instant::now());
 
@@ -101,19 +136,18 @@ impl ClipboardSigRecorder {
 /// same content again" work as a retry
 const FAILED_RETRY: Duration = Duration::from_secs(5);
 
-/// identity of the current clipboard payload. Files compare by the
-/// set of file names only — contents are read just once per change,
-/// and a file list this host put on the clipboard after a received
-/// transfer (same names, different directory) still matches. Images
+/// Identity of the current clipboard payload. Files include their local
+/// path and captured version. Received files are recorded with the actual
+/// completed paths, so another directory with the same names is distinct. Images
 /// compare by a hash of the raw pixels — PNG-encoding a screenshot
 /// every poll tick just for change detection costs real CPU, and the
 /// PNG is only needed once an actual change is detected.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 enum ContentSig {
     Text(String),
     /// hash of width, height and the raw RGBA bytes
     Image(u64),
-    Files(Vec<String>),
+    Files(Vec<ClipboardFile>),
 }
 
 fn image_sig(width: usize, height: usize, rgba: &[u8]) -> ContentSig {
@@ -126,10 +160,6 @@ fn image_sig(width: usize, height: usize, rgba: &[u8]) -> ContentSig {
     ContentSig::Image(hasher.finish())
 }
 
-fn file_name(path: &std::path::Path) -> Option<String> {
-    path.file_name()?.to_str().map(|s| s.to_string())
-}
-
 /// read the clipboard's signature: file list first (a copied file may
 /// also offer its path as text), then images, then text. An image wins
 /// over text because applications that copy an image commonly also offer
@@ -138,9 +168,7 @@ fn file_name(path: &std::path::Path) -> Option<String> {
 fn read_clipboard_sig(clipboard: &mut Clipboard) -> Option<ContentSig> {
     match clipboard.get().file_list() {
         Ok(paths) if !paths.is_empty() => {
-            return Some(ContentSig::Files(
-                paths.iter().filter_map(|p| file_name(p)).collect(),
-            ));
+            return read_clipboard_files(paths).map(|event| sig_of(&event));
         }
         _ => {}
     }
@@ -199,16 +227,8 @@ fn event_from_sig(clipboard: &mut Clipboard, sig: &ContentSig) -> Option<Clipboa
 fn read_clipboard_files(paths: Vec<std::path::PathBuf>) -> Option<ClipboardEvent> {
     let mut files = Vec::new();
     for path in paths {
-        let Some(name) = file_name(&path) else {
-            continue;
-        };
-        match path.metadata() {
-            Ok(metadata) if metadata.is_file() => files.push(ClipboardFile {
-                name,
-                path,
-                size: metadata.len(),
-            }),
-            Ok(_) => log::info!("skipping non-file clipboard entry"),
+        match ClipboardFile::from_path(path) {
+            Ok(file) => files.push(file),
             Err(error) => log::warn!("cannot inspect clipboard file: {error}"),
         }
     }
@@ -225,9 +245,7 @@ fn sig_of(event: &ClipboardEvent) -> ContentSig {
             Some((w, h, rgba)) => image_sig(w as usize, h as usize, &rgba),
             None => ContentSig::Image(0),
         },
-        ClipboardEvent::Files(files) => {
-            ContentSig::Files(files.iter().map(|f| f.name.clone()).collect())
-        }
+        ClipboardEvent::Files(files) => ContentSig::Files(files.clone()),
     }
 }
 
@@ -237,10 +255,14 @@ impl ClipboardMonitor {
         let recorder = ClipboardSigRecorder {
             last_sig: Arc::new(Mutex::new(None)),
             last_change: Arc::new(Mutex::new(None)),
+            remote_sig: Arc::new(Mutex::new(None)),
+            sequence: Arc::new(Mutex::new(0)),
+            remote_echo: Arc::new(Mutex::new(None)),
         };
         let failed_sig: Arc<Mutex<Option<(ContentSig, Instant)>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
+        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
         let recorder_clone = recorder.clone();
         let failed_sig_clone = failed_sig.clone();
         let enabled_clone = enabled.clone();
@@ -254,7 +276,13 @@ impl ClipboardMonitor {
         let task = std::thread::spawn(move || {
             let mut clipboard: Option<Clipboard> = None;
             loop {
-                std::thread::sleep(Duration::from_millis(500));
+                let refresh = match refresh_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(reply) => Some(reply),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let refreshing = refresh.is_some();
+                let _refresh_done = RefreshDone(refresh);
 
                 if !*enabled_clone.lock().unwrap() {
                     continue;
@@ -271,7 +299,6 @@ impl ClipboardMonitor {
                 }
                 let cb = clipboard.as_mut().unwrap();
 
-                #[cfg(windows)]
                 let clipboard_access = input_event::clipboard_access();
 
                 // Get current clipboard signature (files compare by
@@ -294,11 +321,23 @@ impl ClipboardMonitor {
                 }
 
                 let mut channel_closed = false;
+                let remote = recorder_clone.remote_sig.lock().unwrap().as_ref() == Some(&sig);
+                let sequence = native_sequence();
+                let repeated = sequence != *recorder_clone.sequence.lock().unwrap();
+                let own_echo = remote
+                    && repeated
+                    && *recorder_clone.remote_echo.lock().unwrap() == Some(sequence);
+                if own_echo {
+                    *recorder_clone.sequence.lock().unwrap() = sequence;
+                    recorder_clone.remote_echo.lock().unwrap().take();
+                }
+                let force = matches!(sig, ContentSig::Files(_))
+                    && ((refreshing && !remote) || (repeated && !own_echo));
                 recorder_clone.capture_change(
                     sig,
+                    force,
                     |sig| event_from_sig(cb, sig),
                     |event| {
-                        #[cfg(windows)]
                         drop(clipboard_access);
                         if event_tx_clone.blocking_send(event).is_err() {
                             log::error!("clipboard event receiver closed, stopping monitor");
@@ -319,6 +358,7 @@ impl ClipboardMonitor {
             failed_sig,
             enabled,
             task,
+            refresh_tx,
         })
     }
 
@@ -343,6 +383,17 @@ impl ClipboardMonitor {
     }
 
     /// Enable clipboard monitoring
+    pub fn refresh(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.refresh_tx.send(tx).is_err() {
+            log::warn!("clipboard refresh worker stopped");
+        }
+        rx
+    }
+    pub fn try_recv(&mut self) -> Option<CaptureEvent> {
+        self.event_rx.try_recv().ok()
+    }
+
     pub fn enable(&self) {
         let mut enabled = self.enabled.lock().unwrap();
         *enabled = true;
@@ -379,14 +430,9 @@ mod tests {
         let Some(ClipboardEvent::Files(files)) = read_clipboard_files(vec![path.clone()]) else {
             panic!("expected files")
         };
-        assert_eq!(
-            files,
-            vec![ClipboardFile {
-                name: "large.zip".into(),
-                path,
-                size
-            }]
-        );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, path);
+        assert_eq!(files[0].size, size);
     }
 
     #[test]
@@ -394,6 +440,9 @@ mod tests {
         let recorder = ClipboardSigRecorder {
             last_sig: Arc::new(Mutex::new(None)),
             last_change: Arc::new(Mutex::new(None)),
+            remote_sig: Arc::new(Mutex::new(None)),
+            sequence: Arc::new(Mutex::new(0)),
+            remote_echo: Arc::new(Mutex::new(None)),
         };
         // A full queue reproduces the consumer falling behind. The test drains
         // it before asserting, so even the broken version cannot hang the suite.
@@ -407,6 +456,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             worker_recorder.capture_change(
                 ContentSig::Text("next".into()),
+                false,
                 |_| Some(ClipboardEvent::Text("next".into())),
                 |event| {
                     entered_tx.send(()).unwrap();
@@ -448,6 +498,9 @@ mod tests {
         let recorder = ClipboardSigRecorder {
             last_sig: Arc::new(Mutex::new(None)),
             last_change: Arc::new(Mutex::new(None)),
+            remote_sig: Arc::new(Mutex::new(None)),
+            sequence: Arc::new(Mutex::new(0)),
+            remote_echo: Arc::new(Mutex::new(None)),
         };
         recorder.update(&event);
         assert_eq!(
@@ -469,10 +522,14 @@ mod tests {
             recorder: ClipboardSigRecorder {
                 last_sig: Arc::new(Mutex::new(Some(ContentSig::Text("x".into())))),
                 last_change: Arc::new(Mutex::new(None)),
+                remote_sig: Arc::new(Mutex::new(None)),
+                sequence: Arc::new(Mutex::new(0)),
+                remote_echo: Arc::new(Mutex::new(None)),
             },
             failed_sig: Arc::new(Mutex::new(None)),
             enabled: Arc::new(Mutex::new(true)),
             task: std::thread::spawn(|| {}),
+            refresh_tx: std::sync::mpsc::channel().0,
         };
         monitor.mark_share_failed();
         assert!(monitor.recorder.last_sig.lock().unwrap().is_none());

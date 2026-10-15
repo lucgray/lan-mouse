@@ -72,6 +72,40 @@ fn send(summary: &str, body: &str) {
 fn text_for_event(event: &FrontendEvent) -> Option<(String, String)> {
     use FrontendEvent::*;
     match event {
+        FileTransfer(record) => {
+            use lan_mouse_ipc::FilePhase;
+            let title = match record.phase {
+                FilePhase::Connecting => {
+                    if record.incoming {
+                        "Receiving files"
+                    } else {
+                        "Sending files"
+                    }
+                }
+                FilePhase::Complete => {
+                    if record.advertised {
+                        "Files ready to paste"
+                    } else {
+                        "Files saved; newer clipboard preserved"
+                    }
+                }
+                FilePhase::Failed => "File transfer failed",
+                _ => return None,
+            };
+            let body = record.error.clone().unwrap_or_else(|| {
+                format!(
+                    "{} file(s), {} bytes{}",
+                    record.count,
+                    record.total,
+                    if record.reused {
+                        "; existing files reused"
+                    } else {
+                        ""
+                    }
+                )
+            });
+            Some((title.into(), body))
+        }
         ClipboardShared {
             received,
             kind,

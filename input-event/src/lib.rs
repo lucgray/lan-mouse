@@ -3,10 +3,16 @@ use std::fmt::{self, Display};
 pub mod diagnostics;
 pub mod error;
 pub mod scancode;
+static CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub fn clipboard_selection_changed() {
+    CLIPBOARD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn clipboard_selection_sequence() -> u32 {
+    CLIPBOARD_SEQUENCE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Windows permits separate clipboard handles to interfere within one process.
 /// Share one guard between the monitor and incoming clipboard writer.
-#[cfg(windows)]
 pub fn clipboard_access() -> std::sync::MutexGuard<'static, ()> {
     static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     ACCESS.lock().unwrap_or_else(|error| {
@@ -74,6 +80,33 @@ pub struct ClipboardFile {
     /// Local source or completed download; never included in network messages.
     pub path: std::path::PathBuf,
     pub size: u64,
+    pub modified_ns: u128,
+}
+
+impl ClipboardFile {
+    /// Snapshot a file version without reading its contents.
+    pub fn from_path(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let metadata = path.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other("clipboard entry is not a file"));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| std::io::Error::other("invalid clipboard file name"))?
+            .to_owned();
+        let modified_ns = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        Ok(Self {
+            name,
+            path,
+            size: metadata.len(),
+            modified_ns,
+        })
+    }
 }
 
 /// Maximum encoded text/image payload. Files use a separate stream.

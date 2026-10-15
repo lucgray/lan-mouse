@@ -10,6 +10,11 @@ use std::{
     task::{Context, Poll, ready},
 };
 use tokio::io::unix::AsyncFd;
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
+    zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
+    zwlr_data_control_offer_v1::ZwlrDataControlOfferV1,
+};
 
 use std::{
     fs::File,
@@ -113,6 +118,7 @@ struct OutputInfo {
 }
 
 struct State {
+    _clipboard_device: Option<ZwlrDataControlDeviceV1>,
     active_positions: HashSet<Position>,
     passthrough_positions: HashSet<Position>,
     pointer: Option<WlPointer>,
@@ -324,7 +330,16 @@ impl LayerShellInputCapture {
         }
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
 
+        let clipboard_device =
+            match global_list.bind::<ZwlrDataControlManagerV1, _, _>(&qh, 1..=2, ()) {
+                Ok(manager) => Some(manager.get_data_device(&seat, &qh, ())),
+                Err(error) => {
+                    log::warn!("native clipboard change notifications unavailable: {error}");
+                    None
+                }
+            };
         let mut state = State {
+            _clipboard_device: clipboard_device,
             active_positions: Default::default(),
             passthrough_positions: Default::default(),
             pointer: None,
@@ -1060,6 +1075,34 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlDeviceV1,
+        event: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_device_v1::Event::Selection { id: Some(offer) } => {
+                input_event::clipboard_selection_changed();
+                offer.destroy();
+            }
+            zwlr_data_control_device_v1::Event::PrimarySelection { id: Some(offer) } => {
+                offer.destroy()
+            }
+            zwlr_data_control_device_v1::Event::Finished => {
+                log::warn!("native clipboard change notifications stopped")
+            }
+            _ => {}
+        }
+    }
+    wayland_client::event_created_child!(State,ZwlrDataControlDeviceV1,[0=>(ZwlrDataControlOfferV1,())]);
+}
+delegate_noop!(State:ignore ZwlrDataControlOfferV1);
+delegate_noop!(State:ignore ZwlrDataControlManagerV1);
 
 #[cfg(test)]
 mod edge_position_tests {

@@ -135,18 +135,7 @@ async fn run(p: &Probe) -> Result<serde_json::Value> {
         let files = p
             .files
             .iter()
-            .map(|path| {
-                Ok(ClipboardFile {
-                    name: path
-                        .file_name()
-                        .ok_or("file name")?
-                        .to_str()
-                        .ok_or("UTF-8 file name")?
-                        .into(),
-                    path: path.clone(),
-                    size: fs::metadata(path)?.len(),
-                })
-            })
+            .map(|path| Ok(ClipboardFile::from_path(path.clone())?))
             .collect::<Result<Vec<_>>>()?;
         let total: u64 = files.iter().map(|f| f.size).sum();
         let sender = conn.clone();
@@ -157,9 +146,9 @@ async fn run(p: &Probe) -> Result<serde_json::Value> {
         let mut sequence = 0u32;
         let mut rtt = Vec::new();
         let mut buf = [0; MAX_EVENT_SIZE];
-        loop {
+        let completed = loop {
             tokio::select! {
-             result=&mut transfer=>{result??;break;},
+             result=&mut transfer=>{break result??;},
              _=tokio::time::sleep(Duration::from_millis(20))=> {
               sequence+=1;
               let input=if sequence.is_multiple_of(2) {Event::Pointer(PointerEvent::Motion{time:sequence,dx:1.0,dy:1.0})}
@@ -170,14 +159,14 @@ async fn run(p: &Probe) -> Result<serde_json::Value> {
               rtt.push(sent.elapsed().as_secs_f64()*1000.0);
              }
             }
-        }
+        };
         packet(&conn, ProtoEvent::Leave(sequence, 0.5)).await?;
         let n = tokio::time::timeout(Duration::from_secs(5), conn.recv(&mut buf)).await??;
         if !matches!(decode(&buf[..n])?,ProtoEvent::Ack(n) if n==sequence) {
             return Err("final ACK mismatch".into());
         }
         rtt.sort_by(f64::total_cmp);
-        json!({"mode":"send","bytes":total,"duration_secs":start.elapsed().as_secs_f64(),"input_acks":sequence,"rtt_ms":{
+        json!({"mode":"send","bytes":total,"reused":completed.reused,"advertised":completed.advertised,"duration_secs":start.elapsed().as_secs_f64(),"input_acks":sequence,"rtt_ms":{
    "mean":rtt.iter().sum::<f64>()/rtt.len().max(1) as f64,"p95":rtt.get(rtt.len()*95/100),"max":rtt.last()}})
     } else {
         let mut buf = vec![0; lan_mouse_proto::MAX_CLIPBOARD_SIZE];
@@ -214,9 +203,10 @@ async fn run(p: &Probe) -> Result<serde_json::Value> {
                 _ => return Err("unexpected input message".into()),
             }
         }
-        let files = transfer.ok_or("missing file transfer")?.await??;
+        let receipt = transfer.ok_or("missing file transfer")?.await??;
+        let files = receipt.files;
         let elapsed = start.elapsed().as_secs_f64();
-        json!({"mode":"receive","duration_secs":elapsed,"mouse_events":mouse,"key_events":keys,"files":hashes(files)?})
+        json!({"mode":"receive","reused":receipt.reused,"advertised":receipt.advertised,"duration_secs":elapsed,"mouse_events":mouse,"key_events":keys,"files":hashes(files)?})
     };
     conn.close().await?;
     if let Some(listener) = listener {

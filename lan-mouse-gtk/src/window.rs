@@ -579,6 +579,27 @@ impl Window {
     }
 
     /// show / update / hide the clipboard transfer progress bar
+    pub(super) fn reset_file_transfers(&self, records: Vec<lan_mouse_ipc::FileTransfer>) {
+        self.ensure_file_transfers();
+        if let Some(view) = self.imp().file_transfers.borrow_mut().as_mut() {
+            view.reset(records, self);
+        }
+    }
+    pub(super) fn update_file_transfer(&self, record: lan_mouse_ipc::FileTransfer) {
+        self.ensure_file_transfers();
+        if let Some(view) = self.imp().file_transfers.borrow_mut().as_mut() {
+            view.update(record, self);
+        }
+    }
+    fn ensure_file_transfers(&self) {
+        let mut state = self.imp().file_transfers.borrow_mut();
+        if state.is_none() {
+            let view = crate::file_transfers::FileTransfers::new(self);
+            self.imp().file_transfers_box.append(&view.widget);
+            *state = Some(view);
+        }
+    }
+
     pub(super) fn update_clipboard_progress(&self, incoming: bool, received: u64, total: u64) {
         let imp = self.imp();
         if total == 0 || received >= total {

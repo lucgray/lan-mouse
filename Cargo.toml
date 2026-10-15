@@ -89,6 +89,8 @@ mac-notification-sys = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 windows-service = "0.7.0"
 windows = { version = "0.61.2", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
     "Win32_Security",
     "Win32_System_Services",
     "Win32_System_Registry",

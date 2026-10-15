@@ -17,7 +17,7 @@ use std::{
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use webrtc_util::Conn;
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const OFFER_TYPE: u8 = lan_mouse_proto::EventType::FileStreamOffer as u8;
 const SERVER_NAME: &str = "lan-mouse-files";
 
@@ -25,24 +25,61 @@ const SERVER_NAME: &str = "lan-mouse-files";
 pub struct Offer {
     port: u16,
     token: [u8; 32],
+    selection: [u8; 32],
     certificate: Vec<u8>,
     pub total: u64,
     pub count: u32,
 }
 
+pub struct Receipt {
+    pub files: Vec<ClipboardFile>,
+    pub reused: bool,
+    pub advertised: bool,
+}
+pub struct TransferResult {
+    pub reused: bool,
+    pub advertised: bool,
+}
+
+/// Identity of a captured version; content stays on disk until an actual send.
+pub fn selection_id(files: &[ClipboardFile]) -> [u8; 32] {
+    let mut sorted: Vec<_> = files.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut hash = Sha256::new();
+    for file in sorted {
+        let path = file.path.as_os_str().as_encoded_bytes();
+        hash.update((path.len() as u64).to_be_bytes());
+        hash.update(path);
+        hash.update(file.size.to_be_bytes());
+        hash.update(file.modified_ns.to_be_bytes());
+    }
+    hash.finalize().into()
+}
+pub fn selection_label(files: &[ClipboardFile]) -> String {
+    hex(&selection_id(files))
+}
+fn hex(value: &[u8]) -> String {
+    value.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 impl Offer {
+    pub fn id(&self) -> String {
+        hex(&self.selection)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = vec![OFFER_TYPE, VERSION];
         out.extend_from_slice(&self.port.to_be_bytes());
         out.extend_from_slice(&self.total.to_be_bytes());
         out.extend_from_slice(&self.count.to_be_bytes());
         out.extend_from_slice(&self.token);
+        out.extend_from_slice(&self.selection);
         out.extend_from_slice(&self.certificate);
         out
     }
 
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.len() <= 48
+        if bytes.len() <= 80
             || bytes.len() > lan_mouse_proto::MAX_CLIPBOARD_SIZE
             || bytes[0] != OFFER_TYPE
             || bytes[1] != VERSION
@@ -59,7 +96,8 @@ impl Offer {
             total: u64::from_be_bytes(bytes[4..12].try_into().unwrap()),
             count,
             token: bytes[16..48].try_into().unwrap(),
-            certificate: bytes[48..].to_vec(),
+            selection: bytes[48..80].try_into().unwrap(),
+            certificate: bytes[80..].to_vec(),
         })
     }
 }
@@ -120,7 +158,7 @@ pub async fn send(
     files: Vec<ClipboardFile>,
     port: u16,
     progress: Option<&local_channel::mpsc::Sender<(u64, u64)>>,
-) -> io::Result<()> {
+) -> io::Result<TransferResult> {
     let peer = plain_ip(peer);
     let total = files.iter().try_fold(0u64, |sum, file| {
         sum.checked_add(file.size)
@@ -151,6 +189,7 @@ pub async fn send(
     let offer = Offer {
         port: listener.local_addr()?.port(),
         token,
+        selection: selection_id(&files),
         certificate: certificate.as_ref().to_vec(),
         total,
         count,
@@ -193,14 +232,29 @@ pub async fn send(
                 "invalid file capability",
             ));
         }
-        send_body(&mut stream, &files, &updates)?;
-        let mut ack = [0u8; 1];
+        let mut decision = [0u8; 1];
+        stream.read_exact(&mut decision)?;
+        let reused = match decision[0] {
+            0 => {
+                send_body(&mut stream, &files, &updates)?;
+                false
+            }
+            1 => {
+                updates.send_replace((total, total));
+                true
+            }
+            _ => return Err(invalid("invalid file reuse decision")),
+        };
+        let mut ack = [0u8; 2];
         stream.read_exact(&mut ack)?;
-        if ack != [VERSION] {
+        if ack[0] != VERSION || ack[1] > 1 {
             return Err(invalid("file receiver did not commit transfer"));
         }
-        log::info!("file stream confirmed: files={count} bytes={total}");
-        Ok(())
+        log::info!("file stream confirmed: files={count} bytes={total} reused={reused}");
+        Ok(TransferResult {
+            reused,
+            advertised: ack[1] == 1,
+        })
     });
     relay(worker, rx, progress).await
 }
@@ -210,7 +264,22 @@ pub async fn receive(
     peer: IpAddr,
     directory: PathBuf,
     progress: Option<&local_channel::mpsc::Sender<(u64, u64)>>,
-) -> io::Result<Vec<ClipboardFile>> {
+) -> io::Result<Receipt> {
+    receive_with(offer, peer, directory, progress, |_| async { Ok(false) }).await
+}
+
+/// The final acknowledgement follows native publication, not just the disk write.
+pub async fn receive_with<P, F>(
+    offer: Offer,
+    peer: IpAddr,
+    directory: PathBuf,
+    progress: Option<&local_channel::mpsc::Sender<(u64, u64)>>,
+    publish: P,
+) -> io::Result<Receipt>
+where
+    P: FnOnce(Vec<ClipboardFile>) -> F,
+    F: std::future::Future<Output = io::Result<bool>>,
+{
     let addr = SocketAddr::new(plain_ip(peer), offer.port);
     let socket = tokio::time::timeout(
         crate::connect::DEFAULT_CONNECTION_TIMEOUT,
@@ -223,6 +292,7 @@ pub async fn receive(
     let _close = CloseOnDrop(socket.try_clone()?);
     let (updates, rx) = watch::channel((0, offer.total));
     let worker = tokio::task::spawn_blocking(move || {
+        let cache = receipt_path(&directory, peer, &offer.selection);
         let mut roots = RootCertStore::empty();
         roots
             .add(CertificateDer::from(offer.certificate))
@@ -243,17 +313,45 @@ pub async fn receive(
         );
         stream.write_all(&offer.token)?;
         stream.flush()?;
-        let files = receive_body(&mut stream, &directory, offer.count, offer.total, &updates)?;
-        stream.write_all(&[VERSION])?;
+        let cached = load_receipt(&cache, &directory, offer.count, offer.total)?;
+        let reused = cached.is_some();
+        stream.write_all(&[u8::from(reused)])?;
         stream.flush()?;
-        log::info!(
-            "file stream received: files={} bytes={}",
-            files.len(),
-            offer.total
-        );
-        Ok(files)
+        let files = if let Some(files) = cached {
+            updates.send_replace((offer.total, offer.total));
+            files
+        } else {
+            let files = receive_body(&mut stream, &directory, offer.count, offer.total, &updates)?;
+            if let Err(error) = save_receipt(&cache, &files) {
+                for file in &files {
+                    if let Err(cleanup) = std::fs::remove_file(&file.path) {
+                        log::warn!("file receipt cleanup failed: {cleanup}");
+                    }
+                }
+                return Err(error);
+            }
+            files
+        };
+        Ok((files, reused, stream))
     });
-    relay(worker, rx, progress).await
+    let (files, reused, mut stream) = relay(worker, rx, progress).await?;
+    let advertised = publish(files.clone()).await?;
+    tokio::task::spawn_blocking(move || {
+        stream.write_all(&[VERSION, u8::from(advertised)])?;
+        stream.flush()
+    })
+    .await
+    .map_err(other)??;
+    log::info!(
+        "file stream received: files={} bytes={} reused={reused} clipboard={advertised}",
+        files.len(),
+        files.iter().map(|f| f.size).sum::<u64>()
+    );
+    Ok(Receipt {
+        files,
+        reused,
+        advertised,
+    })
 }
 
 struct Progress {
@@ -314,7 +412,14 @@ fn send_body(
         validate_name(&file.name)?;
         let mut source = File::open(&file.path)?;
         let before = source.metadata()?;
-        if before.len() != file.size {
+        if before.len() != file.size
+            || before
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(other)?
+                .as_nanos()
+                != file.modified_ns
+        {
             return Err(invalid("source size changed since copy"));
         }
         stream.write_all(&(file.name.len() as u32).to_be_bytes())?;
@@ -432,9 +537,88 @@ fn receive_body(
             .and_then(|s| s.to_str())
             .ok_or_else(|| invalid("invalid destination file name"))?
             .to_owned();
-        files.push(ClipboardFile { name, path, size });
+        let mut completed = ClipboardFile::from_path(path)?;
+        completed.name = name;
+        completed.size = size;
+        files.push(completed);
     }
     Ok(files)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedFile {
+    name: String,
+    size: u64,
+    modified_ns: u128,
+}
+
+fn receipt_path(directory: &Path, peer: IpAddr, selection: &[u8; 32]) -> PathBuf {
+    let mut hash = Sha256::new();
+    hash.update(plain_ip(peer).to_string());
+    hash.update(selection);
+    directory
+        .join(".lan-mouse-receipts")
+        .join(format!("{:x}.json", hash.finalize()))
+}
+fn load_receipt(
+    path: &Path,
+    directory: &Path,
+    count: u32,
+    total: u64,
+) -> io::Result<Option<Vec<ClipboardFile>>> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let cached: Vec<CachedFile> = serde_json::from_slice(&data).map_err(other)?;
+    if cached.len() != count as usize {
+        return Err(invalid("file receipt count differs from offer"));
+    }
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    for cached in cached {
+        validate_name(&cached.name)?;
+        let current = match ClipboardFile::from_path(directory.join(&cached.name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                log::info!("received file removed; a new transfer is required");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if current.size != cached.size || current.modified_ns != cached.modified_ns {
+            log::info!("received file changed; a new transfer is required");
+            return Ok(None);
+        }
+        bytes = bytes
+            .checked_add(current.size)
+            .ok_or_else(|| invalid("receipt sizes overflow"))?;
+        files.push(current);
+    }
+    if bytes != total {
+        return Err(invalid("file receipt size differs from offer"));
+    }
+    Ok(Some(files))
+}
+fn save_receipt(path: &Path, files: &[ClipboardFile]) -> io::Result<()> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| invalid("file receipt directory missing"))?;
+    std::fs::create_dir_all(directory)?;
+    let records: Vec<_> = files
+        .iter()
+        .map(|file| CachedFile {
+            name: file.name.clone(),
+            size: file.size,
+            modified_ns: file.modified_ns,
+        })
+        .collect();
+    let mut temp = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(temp.as_file_mut(), &records).map_err(other)?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -457,6 +641,7 @@ mod tests {
         let offer = Offer {
             port: 4242,
             token: [7; 32],
+            selection: [9; 32],
             certificate: vec![1, 2, 3],
             count: 3,
             total: u32::MAX as u64 + 123,
@@ -544,6 +729,7 @@ mod tests {
             name: "a".into(),
             path,
             size: u32::MAX as u64 + 1,
+            modified_ns: 0,
         };
         assert!(send_body(&mut Cursor::new(Vec::new()), &[file], &updates).is_err());
     }
@@ -569,11 +755,7 @@ mod tests {
                     send(
                         send_conn,
                         peer,
-                        vec![ClipboardFile {
-                            name: "data.bin".into(),
-                            path,
-                            size: 2 * 1024 * 1024,
-                        }],
+                        vec![ClipboardFile::from_path(path).unwrap()],
                         0,
                         None,
                     )
@@ -600,8 +782,100 @@ mod tests {
                 }
                 task.await.unwrap().unwrap();
                 let files = receive_task.await.unwrap().unwrap();
-                assert_eq!(std::fs::read(&files[0].path).unwrap(), data);
+                assert_eq!(std::fs::read(&files.files[0].path).unwrap(), data);
             })
             .await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn streaming_repeat_reuses_files_and_waits_for_publication() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let source = tempfile::tempdir().unwrap();
+                let target = tempfile::tempdir().unwrap();
+                let path = source.path().join("repeat.bin");
+                std::fs::write(&path, vec![7; 65536]).unwrap();
+                let files = vec![ClipboardFile::from_path(path).unwrap()];
+                let left = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                let right = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                left.connect(right.local_addr().unwrap()).await.unwrap();
+                right.connect(left.local_addr().unwrap()).await.unwrap();
+                let mut port = 0;
+                let mut received_path = None;
+                for pass in 0..2 {
+                    let conn: Arc<dyn Conn + Send + Sync> = left.clone();
+                    let selection = files.clone();
+                    let sending = tokio::task::spawn_local(async move {
+                        send(conn, "127.0.0.1".parse().unwrap(), selection, port, None).await
+                    });
+                    let mut buf = vec![0; lan_mouse_proto::MAX_CLIPBOARD_SIZE];
+                    let n = right.recv(&mut buf).await.unwrap();
+                    let offer = Offer::decode(&buf[..n]).unwrap();
+                    port = offer.port;
+                    let dir = target.path().to_path_buf();
+                    let (entered, ready) = tokio::sync::oneshot::channel();
+                    let (publish, wait) = tokio::sync::oneshot::channel();
+                    let receiving = tokio::task::spawn_local(async move {
+                        receive_with(
+                            offer,
+                            "127.0.0.1".parse().unwrap(),
+                            dir,
+                            None,
+                            move |_| async move {
+                                entered.send(()).unwrap();
+                                wait.await.unwrap();
+                                Ok(true)
+                            },
+                        )
+                        .await
+                    });
+                    ready.await.unwrap();
+                    tokio::task::yield_now().await;
+                    assert!(
+                        !sending.is_finished(),
+                        "saved files are not yet a paste confirmation"
+                    );
+                    publish.send(()).unwrap();
+                    let sent = sending.await.unwrap().unwrap();
+                    let receipt = receiving.await.unwrap().unwrap();
+                    assert_eq!(sent.reused, pass == 1);
+                    assert_eq!(receipt.reused, pass == 1);
+                    assert!(sent.advertised);
+                    if let Some(path) = &received_path {
+                        assert_eq!(&receipt.files[0].path, path);
+                    } else {
+                        received_path = Some(receipt.files[0].path.clone());
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(target.path())
+                            .unwrap()
+                            .filter_map(Result::ok)
+                            .filter(|e| e.path().is_file())
+                            .count(),
+                        1
+                    );
+                }
+            })
+            .await;
+    }
+    #[test]
+    fn streaming_receipt_does_not_reuse_modified_or_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a");
+        std::fs::write(&path, b"hello").unwrap();
+        let file = ClipboardFile::from_path(path.clone()).unwrap();
+        let key = selection_id(std::slice::from_ref(&file));
+        let receipt = receipt_path(dir.path(), "127.0.0.1".parse().unwrap(), &key);
+        save_receipt(&receipt, std::slice::from_ref(&file)).unwrap();
+        assert!(load_receipt(&receipt, dir.path(), 1, 5).unwrap().is_some());
+        std::fs::write(&path, b"edited file").unwrap();
+        assert!(load_receipt(&receipt, dir.path(), 1, 5).unwrap().is_none());
+        std::fs::remove_file(path).unwrap();
+        assert!(load_receipt(&receipt, dir.path(), 1, 5).unwrap().is_none());
+        let mut changed = file.clone();
+        changed.modified_ns += 1;
+        assert_ne!(key, selection_id(&[changed]));
+        let mut moved = file;
+        moved.path = dir.path().join("another/a");
+        assert_ne!(key, selection_id(&[moved]));
     }
 }

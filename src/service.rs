@@ -46,6 +46,13 @@ pub enum ServiceError {
     SubsystemExited(&'static str),
 }
 
+enum FileEvent {
+    Ready(ClientHandle),
+    Progress(String, u64, u64),
+    Sent(String, Result<crate::file_transfer::TransferResult, String>),
+    Received(String, Result<crate::file_transfer::Receipt, String>),
+}
+
 pub struct Service {
     /// configuration
     config: Config,
@@ -61,15 +68,12 @@ pub struct Service {
     clipboard_enabled: bool,
     pending_files: Option<input_event::ClipboardEvent>,
     outgoing_file_task: Option<tokio::task::JoinHandle<()>>,
-    outgoing_file_batch: Option<u64>,
-    file_progress_tx: local_channel::mpsc::Sender<(u64, u64)>,
-    file_progress_rx: local_channel::mpsc::Receiver<(u64, u64)>,
-    file_received_tx:
-        local_channel::mpsc::Sender<Result<(input_event::ClipboardEvent, bool), String>>,
-    file_received_rx:
-        local_channel::mpsc::Receiver<Result<(input_event::ClipboardEvent, bool), String>>,
+    file_jobs: crate::file_jobs::FileJobs,
+    file_activity: crate::file_activity::FileActivity,
+    file_event_tx: local_channel::mpsc::Sender<FileEvent>,
+    file_event_rx: local_channel::mpsc::Receiver<FileEvent>,
     file_sent: HashSet<ClientHandle>,
-    incoming_file_task: Option<tokio::task::JoinHandle<()>>,
+    incoming_file_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
 
     /// dns resolver
     resolver: DnsResolver,
@@ -243,11 +247,21 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
-        let (file_progress_tx, file_progress_rx) = local_channel::mpsc::channel();
-        let (file_received_tx, file_received_rx) = local_channel::mpsc::channel();
+        let (file_event_tx, file_event_rx) = local_channel::mpsc::channel();
         let (clipboard_progress_tx, clipboard_progress_rx) = local_channel::mpsc::channel();
         let (clipboard_send_done_tx, clipboard_send_done_rx) = local_channel::mpsc::channel();
         let (clipboard_applied_tx, clipboard_applied_rx) = local_channel::mpsc::channel();
+        let history_path = config.config_path().with_file_name("file-transfers.json");
+        let history = crate::file_activity::load(&history_path)?;
+        let file_activity = crate::file_activity::FileActivity::new(
+            history_path,
+            history.clone(),
+            config
+                .language()
+                .is_some_and(|language| language.starts_with("zh")),
+        )?;
+        let file_jobs = crate::file_jobs::FileJobs::restore(history);
+        file_activity.update(file_jobs.snapshot());
         let service = Self {
             config,
             capture,
@@ -257,13 +271,12 @@ impl Service {
             clipboard_enabled,
             pending_files: None,
             outgoing_file_task: None,
-            outgoing_file_batch: None,
-            file_progress_tx,
-            file_progress_rx,
-            file_received_tx,
-            file_received_rx,
+            file_jobs,
+            file_activity,
+            file_event_tx,
+            file_event_rx,
             file_sent: HashSet::new(),
-            incoming_file_task: None,
+            incoming_file_tasks: HashMap::new(),
             frontend_listener,
             resolver,
             authorized_keys,
@@ -434,21 +447,8 @@ impl Service {
                     log::info!("Shutdown signal received");
                     break;
                 },
-                progress = self.file_progress_rx.recv() => {
-                    if let Some((received,total)) = progress { self.notify_frontend(FrontendEvent::ClipboardProgress { incoming:true,received,total }); }
-                },
-                result = self.file_received_rx.recv() => {
-                    match result {
-                        Some(Ok((event,advertised))) => {
-                            if advertised { self.pending_files=None; self.file_sent.clear(); }
-                            self.notify_frontend(FrontendEvent::ClipboardShared { received:true, kind:event.kind(), bytes:event.content_len() });
-                        }
-                        Some(Err(error)) => {
-                            self.notify_frontend(FrontendEvent::ClipboardProgress { incoming:true, received:0, total:0 });
-                            self.notify_frontend(FrontendEvent::Error(error));
-                        },
-                        None => {}
-                    }
+                event=self.file_event_rx.recv()=>{
+                    if let Some(event)=event { self.handle_file_event(event).await; }
                 },
                 progress = self.clipboard_progress_rx.recv() => {
                     if let Some((received, total)) = progress {
@@ -488,7 +488,7 @@ impl Service {
         if let Some(task) = self.outgoing_file_task.take() {
             task.abort();
         }
-        if let Some(task) = self.incoming_file_task.take() {
+        for (_, task) in self.incoming_file_tasks.drain() {
             task.abort();
         }
         log::debug!("terminating capture ...");
@@ -513,6 +513,11 @@ impl Service {
             Err(e) => return log::error!("error receiving request: {e}"),
         };
         match request {
+            FrontendRequest::CancelFileTransfer(id) => self.cancel_file(&id),
+            FrontendRequest::ClearFileTransfers => {
+                self.file_jobs.clear_finished();
+                self.notify_frontend(FrontendEvent::FileTransfers(self.file_jobs.snapshot()));
+            }
             FrontendRequest::Activate(handle, active) => {
                 self.set_client_active(handle, active);
                 self.save_config();
@@ -777,13 +782,13 @@ impl Service {
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
             ICaptureEvent::FileOffer(offer, addr) => self.receive_files(offer, addr),
-            ICaptureEvent::ClientReady(handle) => self.share_files(handle),
+            ICaptureEvent::ClientReady(handle) => self.request_files(handle),
             ICaptureEvent::CaptureBegin(handle, t) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
                     self.emulation.send_leave_event(incoming.addr, t);
-                    self.share_files(handle);
+                    self.request_files(handle);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -877,6 +882,15 @@ impl Service {
             self.file_sent.clear();
             if matches!(clipboard_event, input_event::ClipboardEvent::Files(_)) {
                 log::info!("file selection recorded; awaiting device switch");
+                if let input_event::ClipboardEvent::Files(files) = &clipboard_event {
+                    let mut handles: HashSet<_> =
+                        self.client_manager.active_clients().into_iter().collect();
+                    handles.extend(self.incoming_conn_info.keys().copied());
+                    for handle in handles {
+                        self.file_jobs.stage(handle, files.clone());
+                    }
+                    self.notify_frontend(FrontendEvent::FileTransfers(self.file_jobs.snapshot()));
+                }
                 self.pending_files = Some(clipboard_event);
                 return;
             }
@@ -884,6 +898,10 @@ impl Service {
             use lan_mouse_proto::{
                 MAX_CLIPBOARD_TRANSFER_SIZE, ProtocolError, encode_clipboard_event,
             };
+
+            if self.file_jobs.clear_waiting() {
+                self.notify_frontend(FrontendEvent::FileTransfers(self.file_jobs.snapshot()));
+            }
 
             let proto_event = lan_mouse_proto::ProtoEvent::Input(input_event::Event::Clipboard(
                 clipboard_event.clone(),
@@ -978,81 +996,78 @@ impl Service {
         }
     }
 
+    fn notify_file(&mut self, id: &str) {
+        if let Some(record) = self.file_jobs.records.get(id).cloned() {
+            self.notify_frontend(FrontendEvent::FileTransfer(record));
+        }
+    }
+    fn request_files(&self, handle: ClientHandle) {
+        let Some(monitor) = &self.clipboard_monitor else {
+            return;
+        };
+        let refresh = monitor.refresh();
+        let events = self.file_event_tx.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(error) = refresh.await {
+                log::warn!("file selection refresh failed: {error}");
+                return;
+            }
+            if events.send(FileEvent::Ready(handle)).is_err() {
+                log::debug!("file selection consumer stopped");
+            }
+        });
+    }
     fn share_files(&mut self, handle: ClientHandle) {
-        let Some(event) = self.pending_files.clone() else {
+        let Some(input_event::ClipboardEvent::Files(files)) = self.pending_files.clone() else {
             return;
         };
         if !self.clipboard_enabled || !self.file_sent.insert(handle) {
             return;
         }
-        let batch = self.next_clipboard_batch;
-        self.next_clipboard_batch += 1;
-        if let Some(previous) = self.outgoing_file_batch.replace(batch) {
-            self.pending_clipboard_batches.remove(&previous);
-        }
-        self.pending_clipboard_batches.insert(
-            batch,
-            PendingSendBatch {
-                kind: event.kind(),
-                bytes: event.content_len(),
-                expected: 1,
-                done: 0,
-                ok: 0,
-                started: Instant::now(),
-            },
-        );
+        let id = self.file_jobs.enqueue(handle, files);
+        self.notify_file(&id);
+        self.start_next_file();
+    }
+    fn start_next_file(&mut self) {
+        let Some(job) = self.file_jobs.next() else {
+            return;
+        };
+        self.notify_file(&job.id);
         let incoming = self
             .incoming_conn_info
-            .get(&handle)
+            .get(&job.handle)
             .map(|info| (info.addr, self.emulation.file_connection(info.addr)));
         let previous = self.outgoing_file_task.take();
         let sender = self.conn_sender.clone();
-        let progress = self.clipboard_progress_tx.clone();
-        let done = self.clipboard_send_done_tx.clone();
+        let events = self.file_event_tx.clone();
         let port = self.port;
         self.outgoing_file_task = Some(tokio::task::spawn_local(async move {
             if let Some(previous) = previous {
                 previous.abort();
                 if let Err(error) = previous.await {
-                    log::debug!("previous file stream ended: {error}");
+                    log::debug!("previous file worker ended: {error}");
                 }
             }
-            let conn = match incoming {
-                Some((addr, receiver)) => match receiver.await {
-                    Ok(conn) => conn.map(|conn| (conn, addr)),
-                    Err(error) => {
-                        log::warn!("file connection unavailable: {error}");
-                        None
-                    }
-                },
-                None => sender.file_connection(handle).await,
-            };
-            let input_event::ClipboardEvent::Files(files) = event else {
-                unreachable!("file selection")
-            };
-            let ok = match conn {
-                Some((conn, addr)) => {
-                    match crate::file_transfer::send(conn, addr.ip(), files, port, Some(&progress))
-                        .await
-                    {
-                        Ok(()) => true,
-                        Err(error) => {
-                            log::warn!("file stream to client {handle} failed: {error}");
-                            false
-                        }
-                    }
-                }
-                None => {
-                    log::warn!("file peer disconnected before transfer");
-                    false
-                }
-            };
-            if done.send((batch, ok)).is_err() {
-                log::debug!("file send result receiver closed");
+            let result=async {
+                let conn=match incoming {
+                    Some((addr,receiver))=>receiver.await.map_err(|e|e.to_string())?.map(|conn|(conn,addr)),
+                    None=>sender.file_connection(job.handle).await,
+                }.ok_or_else(||"file peer is not connected".to_string())?;
+                let (progress,mut updates)=local_channel::mpsc::channel();
+                let transfer=crate::file_transfer::send(conn.0,conn.1.ip(),job.files,port,Some(&progress));tokio::pin!(transfer);
+                loop {tokio::select! {
+                    result=&mut transfer=>break result.map_err(|e|e.to_string()),
+                    update=updates.recv()=>if let Some((done,total))=update {if events.send(FileEvent::Progress(job.id.clone(),done,total)).is_err(){log::debug!("file progress consumer stopped");}}
+                }}
+            }.await;
+            if let Err(error) = &result {
+                log::warn!("file job {} failed: {error}", job.id);
+            }
+            if events.send(FileEvent::Sent(job.id, result)).is_err() {
+                log::debug!("file completion consumer stopped");
             }
         }));
     }
-
     fn receive_files(&mut self, offer: crate::file_transfer::Offer, addr: SocketAddr) {
         if !self.clipboard_enabled {
             return;
@@ -1061,53 +1076,107 @@ impl Service {
             return;
         };
         let directory = match emulation.destination_directory() {
-            Ok(directory) => directory,
+            Ok(dir) => dir,
             Err(error) => {
+                log::warn!("file download directory unavailable: {error}");
                 self.notify_frontend(FrontendEvent::Error(error.to_string()));
                 return;
             }
         };
-        if let Some(task) = self.incoming_file_task.take() {
+        let id = format!("receive/{}/{}", addr.ip(), offer.id());
+        if self.incoming_file_tasks.contains_key(&id) {
+            log::info!("duplicate active file offer merged: {id}");
+            self.file_jobs.touch(&id);
+            self.notify_file(&id);
+            return;
+        }
+        self.file_jobs
+            .incoming(id.clone(), offer.count, offer.total);
+        self.notify_file(&id);
+        let recorder = self.clipboard_monitor.as_ref().map(|m| m.recorder());
+        let events = self.file_event_tx.clone();
+        let task_id = id.clone();
+        let task = tokio::task::spawn_local(async move {
+            let result=async {
+                let snapshot=emulation.snapshot().await.map_err(|e|e.to_string())?;
+                let (progress,mut updates)=local_channel::mpsc::channel();
+                let transfer=crate::file_transfer::receive_with(offer,addr.ip(),directory,Some(&progress),move |files| async move {
+                    let event=input_event::ClipboardEvent::Files(files);
+                    let advertised=emulation.set_files_if_unchanged(event,snapshot,move |event| {if let Some(recorder)=recorder {recorder.update(event);}}).await.map_err(io::Error::other)?;
+                    if !advertised {log::info!("file download completed; newer local clipboard preserved");}
+                    Ok(advertised)
+                });tokio::pin!(transfer);
+                loop {tokio::select! {
+                    result=&mut transfer=>break result.map_err(|e|e.to_string()),
+                    update=updates.recv()=>if let Some((done,total))=update {if events.send(FileEvent::Progress(task_id.clone(),done,total)).is_err(){log::debug!("incoming file progress consumer stopped");}}
+                }}
+            }.await;
+            if let Err(error) = &result {
+                log::warn!("incoming file job {task_id} failed: {error}");
+            }
+            if events.send(FileEvent::Received(task_id, result)).is_err() {
+                log::debug!("incoming file completion consumer stopped");
+            }
+        });
+        self.incoming_file_tasks.insert(id, task);
+    }
+    async fn handle_file_event(&mut self, event: FileEvent) {
+        match event {
+            FileEvent::Ready(handle) => {
+                // The refresh response follows publication into the monitor queue.
+                // Drain it before using pending_files, even if select picked this channel first.
+                while let Some(event) = self.clipboard_monitor.as_mut().and_then(|m| m.try_recv()) {
+                    self.handle_clipboard_event(Some(event)).await;
+                }
+                self.share_files(handle);
+            }
+            FileEvent::Progress(id, done, total) => {
+                self.file_jobs.progress(&id, done, total);
+                self.notify_file(&id);
+            }
+            FileEvent::Sent(id, result) => {
+                if self.file_jobs.active.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                if result.is_err() {
+                    self.file_sent.clear();
+                }
+                self.file_jobs
+                    .finish(&id, result.map(|r| (r.reused, r.advertised)));
+                self.notify_file(&id);
+                self.start_next_file();
+            }
+            FileEvent::Received(id, result) => {
+                if self.incoming_file_tasks.remove(&id).is_none() {
+                    return;
+                }
+                let result = result.map(|r| {
+                    if r.advertised {
+                        self.pending_files = None;
+                        self.file_sent.clear();
+                    }
+                    if let Some(record) = self.file_jobs.records.get_mut(&id) {
+                        record.names = r.files.iter().map(|f| f.name.clone()).collect();
+                    }
+                    (r.reused, r.advertised)
+                });
+                self.file_jobs.finish(&id, result);
+                self.notify_file(&id);
+            }
+        }
+    }
+    fn cancel_file(&mut self, id: &str) {
+        let active = self.file_jobs.cancel(id);
+        if active {
+            if let Some(task) = self.outgoing_file_task.as_ref() {
+                task.abort();
+            }
+        }
+        if let Some(task) = self.incoming_file_tasks.remove(id) {
             task.abort();
         }
-        let applied = self.file_received_tx.clone();
-        let progress = self.file_progress_tx.clone();
-        let recorder = self
-            .clipboard_monitor
-            .as_ref()
-            .map(|monitor| monitor.recorder());
-        self.incoming_file_task = Some(tokio::task::spawn_local(async move {
-            let result = async {
-                let snapshot = emulation
-                    .snapshot()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let files =
-                    crate::file_transfer::receive(offer, addr.ip(), directory, Some(&progress))
-                        .await
-                        .map_err(|error| error.to_string())?;
-                let event = input_event::ClipboardEvent::Files(files);
-                let advertised = emulation
-                    .set_files_if_unchanged(event.clone(), snapshot)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if advertised {
-                    if let Some(recorder) = recorder {
-                        recorder.update(&event);
-                    }
-                } else {
-                    log::info!("file download completed; newer local clipboard preserved");
-                }
-                Ok((event, advertised))
-            }
-            .await;
-            if let Err(error) = &result {
-                log::warn!("incoming file stream failed: {error}");
-            }
-            if applied.send(result).is_err() {
-                log::debug!("file receive result receiver closed");
-            }
-        }));
+        self.notify_file(id);
+        self.start_next_file();
     }
 
     /// drop sends whose peers stopped reporting; unresolved batches
@@ -1156,14 +1225,6 @@ impl Service {
         let Some(mut b) = self.pending_clipboard_batches.remove(&batch) else {
             return;
         };
-        if self.outgoing_file_batch == Some(batch) {
-            self.outgoing_file_batch = None;
-            self.notify_frontend(FrontendEvent::ClipboardProgress {
-                incoming: false,
-                received: 0,
-                total: 0,
-            });
-        }
         b.done += 1;
         if ok {
             b.ok += 1;
@@ -1220,6 +1281,7 @@ impl Service {
     }
 
     fn sync_frontend(&mut self) {
+        self.notify_frontend(FrontendEvent::FileTransfers(self.file_jobs.snapshot()));
         self.enumerate();
         self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
         self.notify_frontend(FrontendEvent::CaptureStatus(self.capture_status));
@@ -1308,6 +1370,13 @@ impl Service {
     /// to one toast per minute — a persistently unreachable peer or a
     /// flapping inbound connection must not produce a toast storm.
     fn notify_frontend(&mut self, event: FrontendEvent) {
+        let file_event = matches!(
+            &event,
+            FrontendEvent::FileTransfer(_) | FrontendEvent::FileTransfers(_)
+        );
+        if file_event {
+            self.file_activity.update(self.file_jobs.snapshot());
+        }
         let suppress = match &event {
             FrontendEvent::Error(e) => !self.notified_once.insert(e.clone()),
             FrontendEvent::IncomingDisconnected(addr) => self
@@ -1325,7 +1394,7 @@ impl Service {
         }
         // headless fallback: without a frontend there is no window to
         // host a banner — surface user-facing events as OS notifications
-        if !self.frontend_listener.frontend_connected() {
+        if !file_event && !self.frontend_listener.frontend_connected() {
             crate::notify::notify_for_event(&event);
         }
         self.pending_frontend_events.push_back(event);
@@ -1620,12 +1689,27 @@ impl Service {
             if let Some(task) = self.outgoing_file_task.take() {
                 task.abort();
             }
-            if let Some(task) = self.incoming_file_task.take() {
+            for (_, task) in self.incoming_file_tasks.drain() {
                 task.abort();
             }
-            if let Some(batch) = self.outgoing_file_batch.take() {
-                self.pending_clipboard_batches.remove(&batch);
+            let ids: Vec<_> = self
+                .file_jobs
+                .records
+                .values()
+                .filter(|r| {
+                    !matches!(
+                        r.phase,
+                        lan_mouse_ipc::FilePhase::Complete
+                            | lan_mouse_ipc::FilePhase::Failed
+                            | lan_mouse_ipc::FilePhase::Cancelled
+                    )
+                })
+                .map(|r| r.id.clone())
+                .collect();
+            for id in ids {
+                self.file_jobs.cancel(&id);
             }
+            self.notify_frontend(FrontendEvent::FileTransfers(self.file_jobs.snapshot()));
             self.pending_files = None;
             self.file_sent.clear();
             self.notify_frontend(FrontendEvent::ClipboardProgress {

@@ -43,6 +43,9 @@ pub struct Window {
     #[template_child]
     pub transfer_bar: TemplateChild<ProgressBar>,
     #[template_child]
+    pub file_transfers_box: TemplateChild<gtk::Box>,
+    pub file_transfers: RefCell<Option<crate::file_transfers::FileTransfers>>,
+    #[template_child]
     pub capture_emulation_group: TemplateChild<PreferencesGroup>,
     #[template_child]
     pub capture_status_row: TemplateChild<ActionRow>,

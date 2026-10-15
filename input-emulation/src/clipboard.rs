@@ -101,13 +101,13 @@ impl ClipboardEmulation {
         &self,
         event: ClipboardEvent,
         expected: u64,
+        record: impl FnOnce(&ClipboardEvent) + Send + 'static,
     ) -> Result<bool, ClipboardError> {
         let ClipboardEvent::Files(files) = event else {
             return Err(ClipboardError::Set("expected completed files".into()));
         };
         let clipboard = self.clipboard.clone();
         spawn_blocking(move || {
-            #[cfg(windows)]
             let _access = input_event::clipboard_access();
             let mut guard = clipboard.lock().unwrap();
             let clipboard = guard
@@ -116,11 +116,12 @@ impl ClipboardEmulation {
             if clipboard_signature(clipboard)? != expected {
                 return Ok(false);
             }
-            let paths: Vec<_> = files.into_iter().map(|file| file.path).collect();
+            let paths: Vec<_> = files.iter().map(|file| file.path.clone()).collect();
             clipboard
                 .set()
                 .file_list(&paths)
                 .map_err(|error| ClipboardError::Set(error.to_string()))?;
+            record(&ClipboardEvent::Files(files));
             Ok(true)
         })
         .await

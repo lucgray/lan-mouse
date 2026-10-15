@@ -7,12 +7,12 @@ file contents or change the source clipboard. A completed device switch starts
 sharing the pending selection with that peer. File contents use a separate TLS
 1.3 TCP stream on the configured Lan Mouse port; allow TCP from authorized peers
 in addition to the existing UDP rule. Mouse and keyboard traffic stays on DTLS.
-Both peers must support file stream version 1. Legacy whole-buffer file messages
+Both peers must support file stream version 2. Legacy whole-buffer file messages
 are rejected; files never fall back to the text/image fragment transport.
 
-The authenticated DTLS connection carries `FileStreamOffer`, type 17, version 1:
+The authenticated DTLS connection carries `FileStreamOffer`, type 17, version 2:
 `[u8 type][u8 version][u16 TCP port][u64 total bytes][u32 file count]`
-`[32-byte one-use capability][DER certificate]`. The receiver pins this exact
+`[32-byte one-use capability][32-byte selection version][DER certificate]`. The receiver pins this exact
 certificate and presents the capability over TLS. The sender accepts the input
 peer's IP only. Private keys, capabilities and certificates are not logged.
 
@@ -25,14 +25,57 @@ burst budget. There is no 256 MiB file limit; text and image limits are unchange
 The receiver stages files in its configured download directory, checks every
 length and checksum, and exposes the batch only after all files validate.
 Existing names receive a numbered suffix and are never overwritten. Interrupted
-or invalid transfers remove their temporary files. A final TLS acknowledgement
-confirms that the batch reached disk. Replacing a transfer or shutting down
-closes its socket. File errors are reported without disconnecting input.
+or invalid transfers remove their temporary files. A final TLS acknowledgement follows native clipboard publication and reports
+whether the files are ready to paste or a newer clipboard was preserved.
+Cancelling a task or shutting down closes its socket. File errors are reported
+without disconnecting input.
 
 If the receiving computer's clipboard changed during a download, the completed
 files remain in the download directory and the newer clipboard is preserved.
 Progress and completion logs contain file counts and byte totals, without
 clipboard contents or credentials.
+
+### Transfer records and repeated copy
+
+The main window retains one row per peer and captured file selection, with file
+names, waiting/queued/connecting/transfer/verification/completion/failure states,
+byte progress, cancellation and clearing of finished records. Repeated copies
+move the same row to the top. Tray text reflects active progress. The daemon
+owns persistent history and system notifications, independently of the GTK window.
+Windows uses a per-user Lan Mouse notification identity and one tagged native
+notification per task; Linux replaces the same freedesktop notification ID.
+Progress updates replace the existing notice, while completion or failure shows
+the final result. The OS notification settings still determine visibility.
+`file-transfers.json` beside the active configuration retains records across
+restarts. Unfinished records become interrupted failures on restart; transfers
+are not automatically resumed. A dedicated worker saves history atomically and
+calls the desktop notification service outside the input loop. Slow notification
+delivery retains only the newest pending snapshot, not a growing progress queue.
+
+Distinct requested selections run serially. Repeating an active or queued
+selection does not append another job or abort the running transfer. An older
+selection that has not yet been requested by crossing is superseded when the
+clipboard changes. A fresh file observation is requested on every crossing and
+consumed before scheduling, so the 500 ms monitor interval cannot make the first
+crossing miss a newly copied file. Windows clipboard sequence numbers and the
+Wayland data-control selection notifications recognize repeated copies. Received
+file publication and signature recording share the monitor's access guard to
+avoid treating an incoming file list as a fresh local copy.
+
+The selection version hashes local paths, sizes and modification times without
+reading payload bytes. Local paths are not sent. The receiver stores small
+receipts in `.lan-mouse-receipts` under the download directory, after successful
+stream validation. Repeating the same version checks that each completed local
+file still exists with its recorded size and modification time, then advertises
+those paths without another payload transfer or duplicate file write. Modified
+or missing downloaded files are not reused; a new download preserves any existing
+file. Both receipts and the task history survive restart. Clearing finished
+records does not remove downloaded files or their reuse receipts.
+
+Version 2 adds the selection version, a reuse decision before file contents and
+the clipboard disposition in the final acknowledgement. Both peers must be
+updated together. A clipboard-write error is a failure even when the file reached
+disk; the completed receipt lets a subsequent user request reuse that file.
 
 ### Isolated two-host verification
 

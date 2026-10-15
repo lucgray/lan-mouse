@@ -332,3 +332,45 @@ msgstr "系统通知"
 #. settings_window.ui — notification mode options
 msgid "Banner and system notifications"
 msgstr "横幅和系统通知"
+
+msgid "Clear finished"
+msgstr "清除已结束记录"
+
+msgid "{count} files"
+msgstr "{count} 个文件"
+
+msgid "File transfers · waiting {count}"
+msgstr "文件传输 · 等待 {count} 项"
+
+msgid "Waiting for device switch"
+msgstr "等待切换电脑"
+
+msgid "Queued · current transfer continues"
+msgstr "排队中 · 当前传输继续"
+
+msgid "Connecting · checking existing files"
+msgstr "正在连接并检查已有文件"
+
+msgid "Receiving"
+msgstr "正在接收"
+
+msgid "Sending"
+msgstr "正在发送"
+
+msgid "Verifying files and preparing clipboard"
+msgstr "正在校验文件并准备剪贴板"
+
+msgid "Existing files reused · ready to paste"
+msgstr "已复用原文件 · 可以粘贴"
+
+msgid "Complete · ready to paste"
+msgstr "已完成 · 可以粘贴"
+
+msgid "Files saved · newer clipboard preserved"
+msgstr "文件已保存 · 保留了较新的剪贴板"
+
+msgid "Transfer failed"
+msgstr "传输失败"
+
+msgid "Cancelled"
+msgstr "已取消"
