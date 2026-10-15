@@ -273,6 +273,7 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        let diagnostic_started = input_event::diagnostics::enabled().then(std::time::Instant::now);
         let event = post_process_event(event, self.input_config);
         input_event::diagnostics::event(input_event::diagnostics::Stage::Apply, handle, &event);
         match event {
@@ -287,7 +288,14 @@ impl InputEmulation {
                     return Ok(());
                 }
                 let timing_event = event.clone();
-                self.emulation.consume(event, handle).await?;
+                let result = self.emulation.consume(event, handle).await;
+                if let Some(started) = diagnostic_started {
+                    input_event::diagnostics::duration(
+                        input_event::diagnostics::Stage::Applied,
+                        started.elapsed(),
+                    );
+                }
+                result?;
                 input_event::diagnostics::event(
                     input_event::diagnostics::Stage::Applied,
                     handle,
@@ -299,15 +307,40 @@ impl InputEmulation {
             Event::Pointer(PointerEvent::Button { button, state, .. }) => {
                 // suppress duplicate presses and unmatched releases
                 if !self.track_button(handle, button, state) {
+                    input_event::diagnostics::event(
+                        input_event::diagnostics::Stage::Suppressed,
+                        handle,
+                        &event,
+                    );
                     return Ok(());
                 }
-                self.emulation.consume(event, handle).await?;
+                let timing_event = event.clone();
+                let result = self.emulation.consume(event, handle).await;
+                if let Some(started) = diagnostic_started {
+                    input_event::diagnostics::duration(
+                        input_event::diagnostics::Stage::Applied,
+                        started.elapsed(),
+                    );
+                }
+                result?;
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Applied,
+                    handle,
+                    &timing_event,
+                );
                 self.complete_button_transition(handle, button, state);
                 Ok(())
             }
             Event::Pointer(PointerEvent::Motion { .. }) => {
                 let timing_event = event.clone();
-                self.emulation.consume(event, handle).await?;
+                let result = self.emulation.consume(event, handle).await;
+                if let Some(started) = diagnostic_started {
+                    input_event::diagnostics::duration(
+                        input_event::diagnostics::Stage::Applied,
+                        started.elapsed(),
+                    );
+                }
+                result?;
                 input_event::diagnostics::event(
                     input_event::diagnostics::Stage::Applied,
                     handle,
@@ -539,7 +572,14 @@ impl InputEmulation {
                 button,
                 state: 0,
             });
+            input_event::diagnostics::event(input_event::diagnostics::Stage::Apply, handle, &event);
+            let timing_event = event.clone();
             emulation.consume(event, handle).await?;
+            input_event::diagnostics::event(
+                input_event::diagnostics::Stage::Applied,
+                handle,
+                &timing_event,
+            );
         }
 
         let event = Event::Keyboard(KeyboardEvent::Modifiers {

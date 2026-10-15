@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayDevicesW, EnumDisplaySettingsW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::core::{PCWSTR, w};
 
@@ -131,7 +132,10 @@ fn send_critical_event(pos: Position, event: CaptureEvent) {
         input_event::diagnostics::control(
             input_event::diagnostics::Stage::Native,
             pos,
-            input_event::diagnostics::Control::ForwardingStopped,
+            match &error {
+                TrySendError::Full(_) => input_event::diagnostics::Control::InputQueueFull,
+                TrySendError::Closed(_) => input_event::diagnostics::Control::InputQueueClosed,
+            },
             0.0,
         );
         log::warn!("input forwarding stopped; returning local control: {error}");
@@ -430,6 +434,10 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(pointer_event) = to_mouse_event(wparam, lparam) else {
         return LRESULT(1);
     };
+    if input_event::diagnostics::enabled() {
+        let hook = *(lparam.0 as *const MSLLHOOKSTRUCT);
+        input_event::diagnostics::native_pointer(hook.time, GetTickCount());
+    }
 
     /* adjacent motion is coalesced in the consumer-visible queue */
     send_pointer_event(pos, pointer_event);
@@ -554,6 +562,17 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let Some(key_event) = to_key_event(wparam, lparam) else {
         return LRESULT(1);
     };
+
+    if input_event::diagnostics::enabled() {
+        input_event::diagnostics::native_key(
+            client,
+            &key_event,
+            hook.time,
+            GetTickCount(),
+            hook.flags
+                .contains(windows::Win32::UI::WindowsAndMessaging::LLKHF_INJECTED),
+        );
+    }
 
     send_critical_event(client, CaptureEvent::Input(Event::Keyboard(key_event)));
 
