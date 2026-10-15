@@ -1,15 +1,56 @@
 # General Software Architecture
 
-## Clipboard file size
+## Streaming clipboard files
 
-File selections share the existing 256 MiB encoded clipboard payload limit.
-Capture checks the complete selection, including file names and headers, before
-reading file contents. An oversized selection stays available in the local
-clipboard but is not shared; the rejection is logged once for that selection.
-This avoids loading large files merely because the user pressed Copy. Files
-growing during a read are bounded by the same limit. The encoder also checks
-the limit and writes directly into one output buffer, without a second payload
-copy. The wire format is unchanged.
+Copying files captures names, local paths and 64-bit sizes only. It does not read
+file contents or change the source clipboard. A completed device switch starts
+sharing the pending selection with that peer. File contents use a separate TLS
+1.3 TCP stream on the configured Lan Mouse port; allow TCP from authorized peers
+in addition to the existing UDP rule. Mouse and keyboard traffic stays on DTLS.
+Both peers must support file stream version 1. Legacy whole-buffer file messages
+are rejected; files never fall back to the text/image fragment transport.
+
+The authenticated DTLS connection carries `FileStreamOffer`, type 17, version 1:
+`[u8 type][u8 version][u16 TCP port][u64 total bytes][u32 file count]`
+`[32-byte one-use capability][DER certificate]`. The receiver pins this exact
+certificate and presents the capability over TLS. The sender accepts the input
+peer's IP only. Private keys, capabilities and certificates are not logged.
+
+Each file is streamed as `[u32 UTF-8 name length][name][u64 size][contents]`
+`[32-byte SHA-256]`. Local paths never leave the source. Bounded copy buffers and
+incremental checksums keep memory independent of file size. Disk and TLS work
+run outside the input event loop. Transfer pacing reuses the existing clipboard
+burst budget. There is no 256 MiB file limit; text and image limits are unchanged.
+
+The receiver stages files in its configured download directory, checks every
+length and checksum, and exposes the batch only after all files validate.
+Existing names receive a numbered suffix and are never overwritten. Interrupted
+or invalid transfers remove their temporary files. A final TLS acknowledgement
+confirms that the batch reached disk. Replacing a transfer or shutting down
+closes its socket. File errors are reported without disconnecting input.
+
+If the receiving computer's clipboard changed during a download, the completed
+files remain in the download directory and the newer clipboard is preserved.
+Progress and completion logs contain file counts and byte totals, without
+clipboard contents or credentials.
+
+### Isolated two-host verification
+
+`cargo run --release --example stream_probe -- probe.json` runs the same file
+transport while exchanging synthetic mouse/key packets on a separate DTLS
+connection. It never opens the native clipboard or injects input into desktop
+applications. Its JSON report includes file hashes, event counts and input
+round-trip times. Run `init` once per test host with `certificate`, `report` and
+`timeout_secs`; exchange the reported public `fingerprint` values. Use distinct
+temporary test certificates, never production keys.
+
+For `send` and `receive`, set `mode`, `certificate`, `peer_fingerprint`,
+`control_addr`, `file_port`, `report` and `timeout_secs`. `receive` binds
+`control_addr` and writes into `output`; `send` connects to that address and
+streams the paths in `files`. Allow the test port over UDP and TCP only between
+the test hosts, and remove those temporary rules afterwards. Separately verify
+native clipboard publication and device switching in the installed application;
+the isolated probe does not substitute for those desktop checks.
 
 ## Events
 
@@ -69,10 +110,9 @@ sequenceDiagram
 
 ## Clipboard events
 
-Clipboard events (`ClipboardText`, `ClipboardImage`, `ClipboardFile`)
-travel as regular UDP datagrams: `[u8 type][u32 len][payload]`.
-`ClipboardFile` carries `[u32 count]{[u32 name_len][name][u64 data_len]
-[data]}` per file.
+Text and image clipboard events (`ClipboardText`, `ClipboardImage`)
+travel as regular DTLS datagrams: `[u8 type][u32 len][payload]`.
+File selections use the separate versioned stream described above.
 
 A payload that fits the fragment-sized datagram budget is sent directly
 for compatibility with older peers. Larger payloads up to 256MB are

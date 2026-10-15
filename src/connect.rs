@@ -41,7 +41,7 @@ pub(crate) enum LanMouseConnectionError {
     Timeout,
 }
 
-const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 // encoded clipboard payloads retained briefly after sending so the
 // peer can ask for retransmission of fragments lost on the wire,
@@ -126,6 +126,9 @@ pub(crate) fn pending_resends(id: u32, seqs: &[u32]) -> Vec<Vec<u8>> {
     })
 }
 
+pub(crate) const CLIPBOARD_SEND_BURST: usize = 64;
+pub(crate) const CLIPBOARD_BURST_PAUSE: Duration = Duration::from_millis(8);
+
 /// send an encoded clipboard event over `conn`. Payloads that fit the
 /// legacy single-datagram format go out as one message; larger ones are
 /// split into [`lan_mouse_proto::EventType::ClipboardFragment`] datagrams
@@ -154,7 +157,7 @@ pub(crate) async fn send_clipboard_datagrams(
     let mut last_reported = 0u64;
     for (i, dgram) in ClipboardFragmenter::new(encoded).enumerate() {
         conn.send(&dgram).await?;
-        if i % 64 == 63 {
+        if i % CLIPBOARD_SEND_BURST == CLIPBOARD_SEND_BURST - 1 {
             // pace the burst: flooding the receiver's socket buffer
             // faster than its DTLS read loop drains it drops datagrams
             // and a single missing fragment kills the whole transfer.
@@ -170,7 +173,7 @@ pub(crate) async fn send_clipboard_datagrams(
                     let _ = progress.send((done, total));
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            tokio::time::sleep(CLIPBOARD_BURST_PAUSE).await;
         }
     }
     // keep the payload so dropped fragments can be re-sent on request
@@ -248,6 +251,7 @@ async fn connect_any(
 
 /// messages an outgoing connection produces for the rest of the daemon
 pub(crate) enum IncomingEvent {
+    FileOffer(crate::file_transfer::Offer, SocketAddr),
     Event(ProtoEvent),
     /// fragment progress of a clipboard transfer the peer is sending us
     ClipboardProgress {
@@ -386,6 +390,19 @@ impl LanMouseConnectionSender {
             self.recv_tx.clone(),
             self.ping_response.clone(),
         ));
+    }
+
+    pub(crate) async fn file_connection(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<(Arc<dyn Conn + Send + Sync>, SocketAddr)> {
+        let addr = self.client_manager.active_addr(handle)?;
+        self.conns
+            .lock()
+            .await
+            .get(&addr)
+            .cloned()
+            .map(|conn| (conn, addr))
     }
 
     /// Send clipboard event with variable-length encoding.
@@ -621,6 +638,21 @@ async fn receive_loop(
         if n == 0 {
             break;
         }
+        if buf[0] == crate::file_transfer::OFFER_TYPE {
+            match crate::file_transfer::Offer::decode(&buf[..n]) {
+                Ok(offer) => {
+                    if tx
+                        .send((handle, IncomingEvent::FileOffer(offer, addr)))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => log::warn!("invalid file offer from {addr}: {error}"),
+            }
+            continue;
+        }
+
         // a peer asking for dropped fragments of a transfer we sent
         if lan_mouse_proto::is_clipboard_fragment_request_type(buf[0]) {
             if let Some((id, seqs)) = lan_mouse_proto::decode_fragment_request(&buf[..n]) {

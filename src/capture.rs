@@ -29,6 +29,8 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
+    FileOffer(crate::file_transfer::Offer, std::net::SocketAddr),
+    ClientReady(u64),
     /// a client was entered, at the given normalized cross-axis
     /// position along the edge it was entered at
     CaptureBegin(CaptureHandle, f64),
@@ -53,7 +55,10 @@ pub(crate) enum ICaptureEvent {
     /// clipboard data received from remote
     ClipboardReceived(input_event::ClipboardEvent),
     /// fragment progress of an in-flight clipboard transfer
-    ClipboardProgress { received: u64, total: u64 },
+    ClipboardProgress {
+        received: u64,
+        total: u64,
+    },
     /// an outgoing connection attempt failed — the service decides
     /// whether it is user-facing (e.g. asymmetric connectivity) or
     /// just a routine log entry
@@ -62,9 +67,13 @@ pub(crate) enum ICaptureEvent {
         error: crate::connect::LanMouseConnectionError,
     },
     /// an outgoing DTLS connection to this handle was established
-    Connected { handle: u64 },
+    Connected {
+        handle: u64,
+    },
     /// an outgoing connection to this handle was lost
-    Disconnected { handle: u64 },
+    Disconnected {
+        handle: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +455,10 @@ impl CaptureTask {
                         Some(i) => i,
                     };
                     let event = match incoming {
+                        IncomingEvent::FileOffer(offer,addr) => {
+                            if self.event_tx.send(ICaptureEvent::FileOffer(offer,addr)).is_err() { return Ok(()); }
+                            continue;
+                        }
                         IncomingEvent::Event(event) => event,
                         IncomingEvent::ConnectFailed(error) => {
                             if self.event_tx
@@ -515,6 +528,7 @@ impl CaptureTask {
                             }
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            if self.event_tx.send(ICaptureEvent::ClientReady(handle)).is_err() { return Ok(()); }
                             if let Some(mods) = self.pending_modifiers.take() {
                                 if let Err(e) = self
                                     .conn

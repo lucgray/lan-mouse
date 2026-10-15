@@ -59,6 +59,18 @@ pub struct Service {
     clipboard_emulation: Option<ClipboardEmulation>,
     /// clipboard enabled
     clipboard_enabled: bool,
+    pending_files: Option<input_event::ClipboardEvent>,
+    outgoing_file_task: Option<tokio::task::JoinHandle<()>>,
+    outgoing_file_batch: Option<u64>,
+    file_progress_tx: local_channel::mpsc::Sender<(u64, u64)>,
+    file_progress_rx: local_channel::mpsc::Receiver<(u64, u64)>,
+    file_received_tx:
+        local_channel::mpsc::Sender<Result<(input_event::ClipboardEvent, bool), String>>,
+    file_received_rx:
+        local_channel::mpsc::Receiver<Result<(input_event::ClipboardEvent, bool), String>>,
+    file_sent: HashSet<ClientHandle>,
+    incoming_file_task: Option<tokio::task::JoinHandle<()>>,
+
     /// dns resolver
     resolver: DnsResolver,
     /// frontend listener
@@ -231,6 +243,8 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let (file_progress_tx, file_progress_rx) = local_channel::mpsc::channel();
+        let (file_received_tx, file_received_rx) = local_channel::mpsc::channel();
         let (clipboard_progress_tx, clipboard_progress_rx) = local_channel::mpsc::channel();
         let (clipboard_send_done_tx, clipboard_send_done_rx) = local_channel::mpsc::channel();
         let (clipboard_applied_tx, clipboard_applied_rx) = local_channel::mpsc::channel();
@@ -241,6 +255,15 @@ impl Service {
             clipboard_monitor,
             clipboard_emulation,
             clipboard_enabled,
+            pending_files: None,
+            outgoing_file_task: None,
+            outgoing_file_batch: None,
+            file_progress_tx,
+            file_progress_rx,
+            file_received_tx,
+            file_received_rx,
+            file_sent: HashSet::new(),
+            incoming_file_task: None,
             frontend_listener,
             resolver,
             authorized_keys,
@@ -411,6 +434,22 @@ impl Service {
                     log::info!("Shutdown signal received");
                     break;
                 },
+                progress = self.file_progress_rx.recv() => {
+                    if let Some((received,total)) = progress { self.notify_frontend(FrontendEvent::ClipboardProgress { incoming:true,received,total }); }
+                },
+                result = self.file_received_rx.recv() => {
+                    match result {
+                        Some(Ok((event,advertised))) => {
+                            if advertised { self.pending_files=None; self.file_sent.clear(); }
+                            self.notify_frontend(FrontendEvent::ClipboardShared { received:true, kind:event.kind(), bytes:event.content_len() });
+                        }
+                        Some(Err(error)) => {
+                            self.notify_frontend(FrontendEvent::ClipboardProgress { incoming:true, received:0, total:0 });
+                            self.notify_frontend(FrontendEvent::Error(error));
+                        },
+                        None => {}
+                    }
+                },
                 progress = self.clipboard_progress_rx.recv() => {
                     if let Some((received, total)) = progress {
                         self.notify_frontend(FrontendEvent::ClipboardProgress {
@@ -428,6 +467,8 @@ impl Service {
                 applied = self.clipboard_applied_rx.recv() => {
                     match applied {
                         Some(Ok((kind, bytes))) => {
+                            self.pending_files = None;
+                            self.file_sent.clear();
                             self.notify_frontend(FrontendEvent::ClipboardShared {
                                 received: true,
                                 kind,
@@ -444,6 +485,12 @@ impl Service {
         }
 
         log::info!("terminating service ...");
+        if let Some(task) = self.outgoing_file_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.incoming_file_task.take() {
+            task.abort();
+        }
         log::debug!("terminating capture ...");
         self.capture.terminate().await;
         log::debug!("terminating emulation ...");
@@ -625,6 +672,7 @@ impl Service {
             EmulationEvent::ConnectionAttempt { fingerprint } => {
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
+            EmulationEvent::FileOffer(offer, addr) => self.receive_files(offer, addr),
             EmulationEvent::Entered {
                 addr,
                 pos,
@@ -728,11 +776,14 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::FileOffer(offer, addr) => self.receive_files(offer, addr),
+            ICaptureEvent::ClientReady(handle) => self.share_files(handle),
             ICaptureEvent::CaptureBegin(handle, t) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
                     self.emulation.send_leave_event(incoming.addr, t);
+                    self.share_files(handle);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -823,6 +874,13 @@ impl Service {
         use input_event::Event;
 
         if let Some(CaptureEvent::Input(Event::Clipboard(clipboard_event))) = event {
+            self.file_sent.clear();
+            if matches!(clipboard_event, input_event::ClipboardEvent::Files(_)) {
+                log::info!("file selection recorded; awaiting device switch");
+                self.pending_files = Some(clipboard_event);
+                return;
+            }
+            self.pending_files = None;
             use lan_mouse_proto::{
                 MAX_CLIPBOARD_TRANSFER_SIZE, ProtocolError, encode_clipboard_event,
             };
@@ -920,6 +978,138 @@ impl Service {
         }
     }
 
+    fn share_files(&mut self, handle: ClientHandle) {
+        let Some(event) = self.pending_files.clone() else {
+            return;
+        };
+        if !self.clipboard_enabled || !self.file_sent.insert(handle) {
+            return;
+        }
+        let batch = self.next_clipboard_batch;
+        self.next_clipboard_batch += 1;
+        if let Some(previous) = self.outgoing_file_batch.replace(batch) {
+            self.pending_clipboard_batches.remove(&previous);
+        }
+        self.pending_clipboard_batches.insert(
+            batch,
+            PendingSendBatch {
+                kind: event.kind(),
+                bytes: event.content_len(),
+                expected: 1,
+                done: 0,
+                ok: 0,
+                started: Instant::now(),
+            },
+        );
+        let incoming = self
+            .incoming_conn_info
+            .get(&handle)
+            .map(|info| (info.addr, self.emulation.file_connection(info.addr)));
+        let previous = self.outgoing_file_task.take();
+        let sender = self.conn_sender.clone();
+        let progress = self.clipboard_progress_tx.clone();
+        let done = self.clipboard_send_done_tx.clone();
+        let port = self.port;
+        self.outgoing_file_task = Some(tokio::task::spawn_local(async move {
+            if let Some(previous) = previous {
+                previous.abort();
+                if let Err(error) = previous.await {
+                    log::debug!("previous file stream ended: {error}");
+                }
+            }
+            let conn = match incoming {
+                Some((addr, receiver)) => match receiver.await {
+                    Ok(conn) => conn.map(|conn| (conn, addr)),
+                    Err(error) => {
+                        log::warn!("file connection unavailable: {error}");
+                        None
+                    }
+                },
+                None => sender.file_connection(handle).await,
+            };
+            let input_event::ClipboardEvent::Files(files) = event else {
+                unreachable!("file selection")
+            };
+            let ok = match conn {
+                Some((conn, addr)) => {
+                    match crate::file_transfer::send(conn, addr.ip(), files, port, Some(&progress))
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::warn!("file stream to client {handle} failed: {error}");
+                            false
+                        }
+                    }
+                }
+                None => {
+                    log::warn!("file peer disconnected before transfer");
+                    false
+                }
+            };
+            if done.send((batch, ok)).is_err() {
+                log::debug!("file send result receiver closed");
+            }
+        }));
+    }
+
+    fn receive_files(&mut self, offer: crate::file_transfer::Offer, addr: SocketAddr) {
+        if !self.clipboard_enabled {
+            return;
+        }
+        let Some(emulation) = self.clipboard_emulation.clone() else {
+            return;
+        };
+        let directory = match emulation.destination_directory() {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.notify_frontend(FrontendEvent::Error(error.to_string()));
+                return;
+            }
+        };
+        if let Some(task) = self.incoming_file_task.take() {
+            task.abort();
+        }
+        let applied = self.file_received_tx.clone();
+        let progress = self.file_progress_tx.clone();
+        let recorder = self
+            .clipboard_monitor
+            .as_ref()
+            .map(|monitor| monitor.recorder());
+        self.incoming_file_task = Some(tokio::task::spawn_local(async move {
+            let result = async {
+                let snapshot = emulation
+                    .snapshot()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let files =
+                    crate::file_transfer::receive(offer, addr.ip(), directory, Some(&progress))
+                        .await
+                        .map_err(|error| error.to_string())?;
+                let event = input_event::ClipboardEvent::Files(files);
+                let advertised = emulation
+                    .set_files_if_unchanged(event.clone(), snapshot)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if advertised {
+                    if let Some(recorder) = recorder {
+                        recorder.update(&event);
+                    }
+                } else {
+                    log::info!("file download completed; newer local clipboard preserved");
+                }
+                Ok((event, advertised))
+            }
+            .await;
+            if let Err(error) = &result {
+                log::warn!("incoming file stream failed: {error}");
+            }
+            if applied.send(result).is_err() {
+                log::debug!("file receive result receiver closed");
+            }
+        }));
+    }
+
     /// drop sends whose peers stopped reporting; unresolved batches
     /// count as failed so the user can retry the same content
     fn expire_clipboard_batches(&mut self) {
@@ -927,7 +1117,10 @@ impl Service {
         let stale: Vec<u64> = self
             .pending_clipboard_batches
             .iter()
-            .filter(|(_, b)| now.duration_since(b.started) > CLIPBOARD_BATCH_TIMEOUT)
+            .filter(|(_, b)| {
+                b.kind != input_event::ClipboardContentKind::Files
+                    && now.duration_since(b.started) > CLIPBOARD_BATCH_TIMEOUT
+            })
             .map(|(id, _)| *id)
             .collect();
         if stale.is_empty() {
@@ -963,6 +1156,14 @@ impl Service {
         let Some(mut b) = self.pending_clipboard_batches.remove(&batch) else {
             return;
         };
+        if self.outgoing_file_batch == Some(batch) {
+            self.outgoing_file_batch = None;
+            self.notify_frontend(FrontendEvent::ClipboardProgress {
+                incoming: false,
+                received: 0,
+                total: 0,
+            });
+        }
         b.done += 1;
         if ok {
             b.ok += 1;
@@ -978,6 +1179,9 @@ impl Service {
                 bytes: b.bytes,
             });
         } else {
+            if b.kind == input_event::ClipboardContentKind::Files {
+                self.file_sent.clear();
+            }
             // every send failed — forget the recorded signature so the
             // user can retry by copying the same content again
             if let Some(ref monitor) = self.clipboard_monitor {
@@ -1409,8 +1613,27 @@ impl Service {
             if let Some(monitor) = &self.clipboard_monitor {
                 monitor.enable();
             }
-        } else if let Some(monitor) = &self.clipboard_monitor {
-            monitor.disable();
+        } else {
+            if let Some(monitor) = &self.clipboard_monitor {
+                monitor.disable();
+            }
+            if let Some(task) = self.outgoing_file_task.take() {
+                task.abort();
+            }
+            if let Some(task) = self.incoming_file_task.take() {
+                task.abort();
+            }
+            if let Some(batch) = self.outgoing_file_batch.take() {
+                self.pending_clipboard_batches.remove(&batch);
+            }
+            self.pending_files = None;
+            self.file_sent.clear();
+            self.notify_frontend(FrontendEvent::ClipboardProgress {
+                incoming: false,
+                received: 0,
+                total: 0,
+            });
+            log::info!("active file streams cancelled because clipboard sharing was disabled");
         }
         self.config.set_clipboard_enabled(enabled);
         self.save_config();

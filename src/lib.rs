@@ -7,6 +7,7 @@ mod crypto;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+pub mod file_transfer;
 mod listen;
 mod notify;
 mod remap;
