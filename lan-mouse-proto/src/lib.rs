@@ -21,8 +21,7 @@ pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_
 /// [`EventType::ClipboardFragment`] datagrams instead.
 pub const MAX_CLIPBOARD_SIZE: usize = 64 * 1024;
 
-/// maximum clipboard payload size including fragmented transfers (256MB)
-pub const MAX_CLIPBOARD_TRANSFER_SIZE: usize = 256 * 1024 * 1024;
+pub use input_event::MAX_CLIPBOARD_TRANSFER_SIZE;
 
 /// payload bytes carried by one clipboard fragment datagram.
 /// Kept below the typical LAN MTU so no IP fragmentation is needed.
@@ -413,19 +412,23 @@ pub fn encode_clipboard_event(event: &ProtoEvent) -> Result<Vec<u8>, ProtocolErr
             (EventType::ClipboardImage, png.as_slice())
         }
         ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(files))) => {
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&(files.len() as u32).to_be_bytes());
+            let size = input_event::clipboard_files_payload_size(
+                files.iter().map(|f| (f.name.len(), f.data.len() as u64)),
+            );
+            if size > MAX_CLIPBOARD_TRANSFER_SIZE as u64 {
+                return Err(ProtocolError::ClipboardTooLarge(size as usize));
+            }
+            let mut buf = Vec::with_capacity(5 + size as usize);
+            buf.push(EventType::ClipboardFile as u8);
+            buf.extend_from_slice(&(size as u32).to_be_bytes());
+            buf.extend_from_slice(&(files.len() as u32).to_be_bytes());
             for file in files {
                 let name = file.name.as_bytes();
-                payload.extend_from_slice(&(name.len() as u32).to_be_bytes());
-                payload.extend_from_slice(name);
-                payload.extend_from_slice(&(file.data.len() as u64).to_be_bytes());
-                payload.extend_from_slice(&file.data);
+                buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                buf.extend_from_slice(name);
+                buf.extend_from_slice(&(file.data.len() as u64).to_be_bytes());
+                buf.extend_from_slice(&file.data);
             }
-            let mut buf = Vec::with_capacity(1 + 4 + payload.len());
-            buf.push(EventType::ClipboardFile as u8);
-            buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&payload);
             return Ok(buf);
         }
         _ => panic!("encode_clipboard_event called on non-clipboard event"),

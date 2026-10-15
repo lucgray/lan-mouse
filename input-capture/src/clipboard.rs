@@ -1,10 +1,18 @@
 use arboard::Clipboard;
 use input_event::{ClipboardEvent, ClipboardFile, Event, decode_image_rgba, encode_image_rgba};
+use input_event::{MAX_CLIPBOARD_TRANSFER_SIZE, clipboard_files_payload_size};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::{CaptureError, CaptureEvent};
+
+#[derive(Debug, thiserror::Error)]
+enum ClipboardReadError {
+    #[error("clipboard files exceed transfer limit: {0} bytes")]
+    TooLarge(u64),
+}
 
 /// Clipboard monitor that watches for clipboard changes
 pub struct ClipboardMonitor {
@@ -52,7 +60,7 @@ impl ClipboardSigRecorder {
     fn capture_change(
         &self,
         sig: ContentSig,
-        read_content: impl FnOnce(&ContentSig) -> Option<ClipboardEvent>,
+        read_content: impl FnOnce(&ContentSig) -> Result<Option<ClipboardEvent>, ClipboardReadError>,
         send_event: impl FnOnce(CaptureEvent),
     ) {
         // Check if content changed
@@ -73,8 +81,17 @@ impl ClipboardSigRecorder {
             };
 
             if should_emit {
-                let Some(current_content) = read_content(&sig) else {
-                    return;
+                let current_content = match read_content(&sig) {
+                    Ok(Some(content)) => content,
+                    Ok(None) => return,
+                    Err(ClipboardReadError::TooLarge(bytes)) => {
+                        log::warn!(
+                            "clipboard files exceed transfer limit: {bytes} > {MAX_CLIPBOARD_TRANSFER_SIZE} bytes; keeping local clipboard unchanged"
+                        );
+                        *last_sig = Some(sig);
+                        *last_change = Some(Instant::now());
+                        return;
+                    }
                 };
                 log::info!(
                     "Clipboard changed: {} ({} bytes)",
@@ -168,17 +185,19 @@ fn read_clipboard_sig(clipboard: &mut Clipboard) -> Option<ContentSig> {
 
 /// load the payload a signature refers to; for files this is when the
 /// file contents are actually read (regular files only)
-fn event_from_sig(clipboard: &mut Clipboard, sig: &ContentSig) -> Option<ClipboardEvent> {
-    match sig {
+fn event_from_sig(
+    clipboard: &mut Clipboard,
+    sig: &ContentSig,
+) -> Result<Option<ClipboardEvent>, ClipboardReadError> {
+    Ok(match sig {
         ContentSig::Text(t) => Some(ClipboardEvent::Text(t.clone())),
         ContentSig::Image(_) => {
             // the sig only stored the pixel hash — re-read the image
             // and PNG-encode it now that a real change was detected
             match clipboard.get_image() {
                 Ok(image) => {
-                    let png =
-                        encode_image_rgba(image.width as u32, image.height as u32, &image.bytes)?;
-                    Some(ClipboardEvent::Image(png))
+                    encode_image_rgba(image.width as u32, image.height as u32, &image.bytes)
+                        .map(ClipboardEvent::Image)
                 }
                 Err(e) => {
                     log::warn!("clipboard image vanished between sig and read: {e}");
@@ -186,29 +205,62 @@ fn event_from_sig(clipboard: &mut Clipboard, sig: &ContentSig) -> Option<Clipboa
                 }
             }
         }
-        ContentSig::Files(names) => {
-            let paths = clipboard.get().file_list().ok()?;
-            let mut files = Vec::with_capacity(names.len());
-            for path in paths {
-                let Some(name) = file_name(&path) else {
-                    continue;
-                };
-                if !path.is_file() {
-                    log::info!("skipping non-file clipboard entry {}", path.display());
-                    continue;
-                }
-                match std::fs::read(&path) {
-                    Ok(data) => files.push(ClipboardFile { name, data }),
-                    Err(e) => log::warn!("cannot read clipboard file {}: {e}", path.display()),
-                }
-            }
-            if files.is_empty() {
+        ContentSig::Files(_) => match clipboard.get().file_list() {
+            Ok(paths) => return read_clipboard_files(paths),
+            Err(error) => {
+                log::warn!("cannot read clipboard file list: {error}");
                 None
-            } else {
-                Some(ClipboardEvent::Files(files))
             }
+        },
+    })
+}
+
+/// Reject the whole selection before reading any payload. The size includes the
+/// wire headers and UTF-8 names, and is checked again if files grow while reading.
+fn read_clipboard_files(
+    paths: Vec<std::path::PathBuf>,
+) -> Result<Option<ClipboardEvent>, ClipboardReadError> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let Some(name) = file_name(&path) else {
+            continue;
+        };
+        match path.metadata() {
+            Ok(meta) if meta.is_file() => entries.push((path, name, meta.len())),
+            Ok(_) => log::info!("skipping non-file clipboard entry"),
+            Err(error) => log::warn!("cannot inspect clipboard file: {error}"),
         }
     }
+    let size =
+        clipboard_files_payload_size(entries.iter().map(|(_, name, len)| (name.len(), *len)));
+    if size > MAX_CLIPBOARD_TRANSFER_SIZE as u64 {
+        return Err(ClipboardReadError::TooLarge(size));
+    }
+    let headers = clipboard_files_payload_size(entries.iter().map(|(_, name, _)| (name.len(), 0)));
+    let mut remaining = MAX_CLIPBOARD_TRANSFER_SIZE as u64 - headers;
+    let mut files = Vec::with_capacity(entries.len());
+    for (path, name, expected) in entries {
+        let result = std::fs::File::open(&path).and_then(|file| {
+            let mut data = Vec::new();
+            data.try_reserve_exact(expected as usize)
+                .map_err(std::io::Error::other)?;
+            file.take(remaining + 1).read_to_end(&mut data)?;
+            Ok(data)
+        });
+        match result {
+            Ok(data) => {
+                if data.len() as u64 > remaining {
+                    return Err(ClipboardReadError::TooLarge(
+                        MAX_CLIPBOARD_TRANSFER_SIZE as u64 - remaining + data.len() as u64,
+                    ));
+                }
+                remaining -= data.len() as u64;
+                files.push(ClipboardFile { name, data });
+            }
+            Err(error) => log::warn!("cannot read clipboard file: {error}"),
+        }
+    }
+    Ok((!files.is_empty()).then_some(ClipboardEvent::Files(files)))
 }
 
 fn sig_of(event: &ClipboardEvent) -> ContentSig {
@@ -367,6 +419,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn regression_large_file_selection_is_rejected_before_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for (i, size) in [367_449_096, 88_878_451, 23_995_223]
+            .into_iter()
+            .enumerate()
+        {
+            let path = dir.path().join(format!("{i}.zip"));
+            std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+            paths.push(path);
+        }
+        assert!(matches!(
+            read_clipboard_files(paths),
+            Err(ClipboardReadError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn regression_combined_files_and_headers_respect_transfer_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len((MAX_CLIPBOARD_TRANSFER_SIZE / 2) as u64)
+                    .unwrap();
+                path
+            })
+            .collect();
+        assert!(matches!(
+            read_clipboard_files(paths),
+            Err(ClipboardReadError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn regression_small_files_still_load_without_native_clipboard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, b"test content").unwrap();
+        assert_eq!(
+            read_clipboard_files(vec![path]).unwrap(),
+            Some(ClipboardEvent::Files(vec![ClipboardFile {
+                name: "test.txt".into(),
+                data: b"test content".to_vec()
+            }]))
+        );
+    }
+
+    #[test]
+    fn regression_oversized_selection_is_not_reloaded_each_poll() {
+        let recorder = ClipboardSigRecorder {
+            last_sig: Arc::new(Mutex::new(None)),
+            last_change: Arc::new(Mutex::new(None)),
+        };
+        recorder.capture_change(
+            ContentSig::Files(vec!["large.zip".into()]),
+            |_| {
+                Err(ClipboardReadError::TooLarge(
+                    MAX_CLIPBOARD_TRANSFER_SIZE as u64 + 1,
+                ))
+            },
+            |_| panic!("oversized content must not be sent"),
+        );
+        *recorder.last_change.lock().unwrap() = None;
+        recorder.capture_change(
+            ContentSig::Files(vec!["large.zip".into()]),
+            |_| panic!("same rejected selection must not be read again"),
+            |_| panic!("must not send"),
+        );
+        let mut sent = false;
+        recorder.capture_change(
+            ContentSig::Text("next".into()),
+            |_| Ok(Some(ClipboardEvent::Text("next".into()))),
+            |_| sent = true,
+        );
+        assert!(sent);
+    }
+
+    #[test]
     fn regression_full_queue_does_not_hold_clipboard_state() {
         let recorder = ClipboardSigRecorder {
             last_sig: Arc::new(Mutex::new(None)),
@@ -384,7 +518,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             worker_recorder.capture_change(
                 ContentSig::Text("next".into()),
-                |_| Some(ClipboardEvent::Text("next".into())),
+                |_| Ok(Some(ClipboardEvent::Text("next".into()))),
                 |event| {
                     entered_tx.send(()).unwrap();
                     tx.blocking_send(event).unwrap();
