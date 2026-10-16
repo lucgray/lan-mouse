@@ -57,6 +57,22 @@ pub struct ClipboardSigRecorder {
 }
 
 impl ClipboardSigRecorder {
+    /// A switch refresh reads immediately, but only a new selection is a copy.
+    fn force_file_capture(&self, sig: &ContentSig, sequence: u32, refreshing: bool) -> bool {
+        if !matches!(sig, ContentSig::Files(_)) {
+            return false;
+        }
+        let remote = self.remote_sig.lock().unwrap().as_ref() == Some(sig);
+        let repeated = sequence != *self.sequence.lock().unwrap();
+        let own_echo = remote && repeated && *self.remote_echo.lock().unwrap() == Some(sequence);
+        if own_echo {
+            *self.sequence.lock().unwrap() = sequence;
+            self.remote_echo.lock().unwrap().take();
+        }
+        let changed = self.last_sig.lock().unwrap().as_ref() != Some(sig);
+        (refreshing && changed && !remote) || (repeated && !own_echo)
+    }
+
     /// Update the last known clipboard content (called when we set the
     /// clipboard). This prevents detecting our own clipboard changes
     /// as external changes.
@@ -301,8 +317,7 @@ impl ClipboardMonitor {
 
                 let clipboard_access = input_event::clipboard_access();
 
-                // Get current clipboard signature (files compare by
-                // name — contents are read only on real changes)
+                // Inspect the selected file version without reading file contents.
                 let Some(sig) = read_clipboard_sig(cb) else {
                     // Clipboard might be empty or contain non-shareable data
                     continue;
@@ -321,18 +336,7 @@ impl ClipboardMonitor {
                 }
 
                 let mut channel_closed = false;
-                let remote = recorder_clone.remote_sig.lock().unwrap().as_ref() == Some(&sig);
-                let sequence = native_sequence();
-                let repeated = sequence != *recorder_clone.sequence.lock().unwrap();
-                let own_echo = remote
-                    && repeated
-                    && *recorder_clone.remote_echo.lock().unwrap() == Some(sequence);
-                if own_echo {
-                    *recorder_clone.sequence.lock().unwrap() = sequence;
-                    recorder_clone.remote_echo.lock().unwrap().take();
-                }
-                let force = matches!(sig, ContentSig::Files(_))
-                    && ((refreshing && !remote) || (repeated && !own_echo));
+                let force = recorder_clone.force_file_capture(&sig, native_sequence(), refreshing);
                 recorder_clone.capture_change(
                     sig,
                     force,
@@ -420,6 +424,81 @@ impl ClipboardMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_switch_refresh_is_not_another_copy() {
+        let recorder = ClipboardSigRecorder {
+            last_sig: Arc::new(Mutex::new(None)),
+            last_change: Arc::new(Mutex::new(None)),
+            remote_sig: Arc::new(Mutex::new(None)),
+            sequence: Arc::new(Mutex::new(0)),
+            remote_echo: Arc::new(Mutex::new(None)),
+        };
+        let event = ClipboardEvent::Files(vec![ClipboardFile {
+            path: "file.bin".into(),
+            name: "file.bin".into(),
+            size: 211746,
+            modified_ns: 1,
+        }]);
+        let sig = sig_of(&event);
+        let emitted = std::cell::Cell::new(0);
+        let observe = |sequence, refreshing| {
+            let force = recorder.force_file_capture(&sig, sequence, refreshing);
+            recorder.capture_change(
+                sig.clone(),
+                force,
+                |_| Some(event.clone()),
+                |_| emitted.set(emitted.get() + 1),
+            );
+        };
+        observe(0, true);
+        assert_eq!(emitted.get(), 1);
+        let sequence = *recorder.sequence.lock().unwrap();
+        for _ in 0..100 {
+            observe(sequence, true);
+        }
+        assert_eq!(
+            emitted.get(),
+            1,
+            "crossing alone must not requeue or republish files"
+        );
+        observe(sequence.wrapping_add(1), false);
+        assert_eq!(
+            emitted.get(),
+            2,
+            "an explicit copy of the same files must still work"
+        );
+        let sequence = *recorder.sequence.lock().unwrap();
+        observe(sequence, true);
+        assert_eq!(emitted.get(), 2);
+    }
+
+    #[test]
+    fn streaming_refresh_detects_new_version_but_not_remote_echo() {
+        let file = ClipboardFile {
+            path: "file.bin".into(),
+            name: "file.bin".into(),
+            size: 10,
+            modified_ns: 1,
+        };
+        let sig = ContentSig::Files(vec![file.clone()]);
+        let recorder = ClipboardSigRecorder {
+            last_sig: Arc::new(Mutex::new(Some(sig.clone()))),
+            last_change: Arc::new(Mutex::new(Some(Instant::now()))),
+            remote_sig: Arc::new(Mutex::new(Some(sig.clone()))),
+            sequence: Arc::new(Mutex::new(4)),
+            remote_echo: Arc::new(Mutex::new(Some(5))),
+        };
+        assert!(!recorder.force_file_capture(&sig, 5, true));
+        assert_eq!(*recorder.sequence.lock().unwrap(), 5);
+        assert!(!recorder.force_file_capture(&sig, 5, true));
+        assert!(recorder.force_file_capture(&sig, 6, false));
+        let changed = ContentSig::Files(vec![ClipboardFile {
+            modified_ns: 2,
+            ..file
+        }]);
+        assert!(recorder.force_file_capture(&changed, 5, true));
+    }
 
     #[test]
     fn streaming_capture_keeps_large_files_as_paths() {

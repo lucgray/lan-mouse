@@ -57,10 +57,17 @@ selection does not append another job or abort the running transfer. An older
 selection that has not yet been requested by crossing is superseded when the
 clipboard changes. A fresh file observation is requested on every crossing and
 consumed before scheduling, so the 500 ms monitor interval cannot make the first
-crossing miss a newly copied file. Windows clipboard sequence numbers and the
+crossing miss a newly copied file. An unchanged observation is not a new copy:
+crossing alone does not enqueue another transfer, republish the receiver's
+clipboard, move a completed record, or replay its completion notification.
+Windows clipboard sequence numbers and the
 Wayland data-control selection notifications recognize repeated copies. Received
 file publication and signature recording share the monitor's access guard to
 avoid treating an incoming file list as a fresh local copy.
+
+`cargo run --release --example switch_refresh_probe` checks the current native
+file selection with 100 immediate refreshes. It reads only, never sends files or
+writes the clipboard, and expects no extra clipboard event after the initial one.
 
 The selection version hashes local paths, sizes and modification times without
 reading payload bytes. Local paths are not sent. The receiver stores small
