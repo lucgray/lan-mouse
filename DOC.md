@@ -336,3 +336,28 @@ keyboard hook, elevated input-device read or live reproduction is needed to read
 these fields. Unknown application behavior may still require additional evidence.
 The configured two-file size limit is unchanged; old data is eventually replaced.
 
+### Passive Wayland return edges
+
+On layer-shell, an incoming session calls `InputCapture::remote_enter` after
+releasing outgoing capture. This arms one return notification even if the cursor
+has stayed on the edge surface since the previous session. An unlocked relative
+pointer observes outward motion when absolute coordinates are clamped at the
+screen boundary. It does not hide the cursor or capture keyboard focus.
+Ordinary capture release does not rearm the edge. Leaving/removing the surface
+clears its focus; output changes discard the old observation. Normal bidirectional
+capture keeps its existing pointer lock behavior. Other backends do not need this
+additional session state.
+
+The daemon records `rearmed return edge while pointer remains at` and
+`return edge detected from outward motion at` for this path, alongside existing
+Native Edge and Capture Edge diagnostics. It does not log every movement.
+
+`cargo test -p input-capture edge_position_tests` checks same-surface reentry,
+four edge directions, inactive sessions, and one notification per session.
+The Linux `return_edge_probe --move-pointer` example additionally tests actual
+layer-shell plus evdev delivery. Run it only on an idle desktop with Lan Mouse
+stopped, the cursor away from the left edge, and a wrapper that restores the
+cursor and restarts Lan Mouse even if the probe fails. It moves the pointer to
+the left edge, rearms without leaving, and checks 100 further outward motions
+for duplicate returns. It never presses a key/button or changes the clipboard.
+

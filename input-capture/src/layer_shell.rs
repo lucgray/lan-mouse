@@ -121,6 +121,7 @@ struct State {
     _clipboard_device: Option<ZwlrDataControlDeviceV1>,
     active_positions: HashSet<Position>,
     passthrough_positions: HashSet<Position>,
+    return_edge: ReturnEdge,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
@@ -140,6 +141,40 @@ struct State {
 struct Inner {
     state: State,
     queue: EventQueue<State>,
+}
+
+#[derive(Default)]
+struct ReturnEdge {
+    focused: Option<(Position, f64)>,
+    armed: bool,
+}
+
+impl ReturnEdge {
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+    fn enter(&mut self, pos: Position, t: f64) -> Option<(Position, f64)> {
+        self.focused = Some((pos, t));
+        self.take()
+    }
+    fn take(&mut self) -> Option<(Position, f64)> {
+        if !self.armed {
+            return None;
+        }
+        let focused = self.focused?;
+        self.armed = false;
+        Some(focused)
+    }
+    fn motion(&mut self, dx: f64, dy: f64) -> Option<(Position, f64)> {
+        let (pos, _) = self.focused?;
+        let outward = match pos {
+            Position::Left => dx < 0.,
+            Position::Right => dx > 0.,
+            Position::Top => dy < 0.,
+            Position::Bottom => dy > 0.,
+        };
+        if outward { self.take() } else { None }
+    }
 }
 
 impl AsRawFd for Inner {
@@ -342,6 +377,7 @@ impl LayerShellInputCapture {
             _clipboard_device: clipboard_device,
             active_positions: Default::default(),
             passthrough_positions: Default::default(),
+            return_edge: Default::default(),
             pointer: None,
             keyboard: None,
             global_list,
@@ -398,11 +434,13 @@ impl LayerShellInputCapture {
         let inner = self.0.get_mut();
         inner.state.active_positions.remove(&pos);
         inner.state.passthrough_positions.remove(&pos);
-        // remove all windows corresponding to this client
-        while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
-            inner.state.active_windows.remove(i);
+        if inner.state.focused.as_ref().is_some_and(|w| w.pos == pos) {
+            inner.state.return_edge.focused = None;
+            inner.state.ungrab();
             inner.state.focused = None;
         }
+        // remove all windows corresponding to this client
+        inner.state.active_windows.retain(|w| w.pos != pos);
     }
 }
 
@@ -505,6 +543,26 @@ impl State {
         }
     }
 
+    fn observe_return_motion(&mut self, pointer: &WlPointer) {
+        if self.rel_pointer.is_none() {
+            self.rel_pointer = Some(self.globals.relative_pointer_manager.get_relative_pointer(
+                pointer,
+                &self.qh,
+                (),
+            ));
+        }
+    }
+
+    fn notify_return(&mut self, pos: Position, t: f64) {
+        input_event::diagnostics::control(
+            input_event::diagnostics::Stage::Native,
+            pos,
+            input_event::diagnostics::Control::Edge,
+            t,
+        );
+        self.pending_events.push_back((pos, CaptureEvent::Begin(t)));
+    }
+
     fn ungrab(&mut self) {
         // get focused client
         let window = match self.focused.as_ref() {
@@ -525,9 +583,11 @@ impl State {
         }
 
         // destroy relative input
-        if let Some(rel_pointer) = &self.rel_pointer {
-            rel_pointer.destroy();
-            self.rel_pointer = None;
+        if !(self.return_edge.armed && self.return_edge.focused.is_some()) {
+            if let Some(rel_pointer) = &self.rel_pointer {
+                rel_pointer.destroy();
+                self.rel_pointer = None;
+            }
         }
 
         // destroy shortcut inhibitor
@@ -567,6 +627,10 @@ impl State {
             log::info!(" * {output}");
         }
 
+        if self.return_edge.focused.take().is_some() {
+            self.ungrab();
+            self.focused = None;
+        }
         self.active_windows.clear();
 
         let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
@@ -656,12 +720,29 @@ impl Capture for LayerShellInputCapture {
     }
 
     fn set_passthrough(&mut self, pos: Position, enabled: bool) {
-        let positions = &mut self.0.get_mut().state.passthrough_positions;
+        let state = &mut self.0.get_mut().state;
         if enabled {
-            positions.insert(pos);
+            state.passthrough_positions.insert(pos);
         } else {
-            positions.remove(&pos);
+            state.passthrough_positions.remove(&pos);
+            if state.return_edge.focused.is_some_and(|(p, _)| p == pos) {
+                state.return_edge.focused = None;
+                state.ungrab();
+            }
         }
+    }
+
+    fn remote_enter(&mut self) -> Result<(), CaptureError> {
+        let inner = self.0.get_mut();
+        let state = &mut inner.state;
+        state.return_edge.arm();
+        if let Some((pos, _)) = state.return_edge.focused {
+            log::info!("rearmed return edge while pointer remains at {pos}");
+            if let Some(pointer) = state.pointer.clone() {
+                state.observe_return_motion(&pointer);
+            }
+        }
+        Ok(inner.flush_events()?)
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
@@ -742,6 +823,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         {
             if capabilities.contains(wl_seat::Capability::Pointer) {
                 if let Some(p) = state.pointer.take() {
+                    if state.return_edge.focused.take().is_some() {
+                        state.ungrab();
+                    }
                     p.release();
                 }
                 state.pointer.replace(seat.get_pointer(qh, ()));
@@ -782,22 +866,36 @@ impl Dispatch<WlPointer, ()> for State {
                 };
                 let pos = window.pos;
                 let t = cross_axis_position(pos, window.size, surface_x, surface_y);
-                input_event::diagnostics::control(
-                    input_event::diagnostics::Stage::Native,
-                    pos,
-                    input_event::diagnostics::Control::Edge,
-                    t,
-                );
                 app.focused = Some(window);
                 // Incoming-only return edges notify the sender without hiding
                 // or locking the local cursor. Otherwise release leaves an
                 // invisible cursor on the one-pixel surface until it moves out.
-                if !app.passthrough_positions.contains(&pos) {
+                if app.passthrough_positions.contains(&pos) {
+                    // Relative motion still arrives when the compositor clamps
+                    // the cursor at the physical edge, without locking it.
+                    app.observe_return_motion(pointer);
+                    if let Some((pos, t)) = app.return_edge.enter(pos, t) {
+                        app.notify_return(pos, t);
+                    }
+                } else {
+                    app.return_edge.focused = None;
                     app.grab(&surface, pointer, serial, qh);
+                    app.notify_return(pos, t);
                 }
-                app.pending_events.push_back((pos, CaptureEvent::Begin(t)));
+            }
+            wl_pointer::Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => {
+                if let Some((pos, t)) = &mut app.return_edge.focused {
+                    if let Some(window) = &app.focused {
+                        *t = cross_axis_position(*pos, window.size, surface_x, surface_y);
+                    }
+                }
             }
             wl_pointer::Event::Leave { .. } => {
+                app.return_edge.focused = None;
                 /* There are rare cases, where when a window is opened in
                  * just the wrong moment, the pointer is released, while
                  * still grabbed.
@@ -934,6 +1032,13 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
             ..
         } = event
         {
+            if app.return_edge.focused.is_some() {
+                if let Some((pos, t)) = app.return_edge.motion(dx, dy) {
+                    log::info!("return edge detected from outward motion at {pos}");
+                    app.notify_return(pos, t);
+                }
+                return;
+            }
             if let Some(window) = &app.focused {
                 let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
                 app.pending_events.push_back((
@@ -1107,6 +1212,42 @@ delegate_noop!(State:ignore ZwlrDataControlManagerV1);
 #[cfg(test)]
 mod edge_position_tests {
     use super::*;
+
+    #[test]
+    fn return_edge_rearms_while_pointer_stays_on_surface() {
+        let mut edge = ReturnEdge::default();
+        edge.arm();
+        assert_eq!(edge.enter(Position::Left, 0.4), Some((Position::Left, 0.4)));
+        assert_eq!(edge.motion(-1., 0.), None);
+        // A new remote session starts without another wl_pointer.enter.
+        edge.arm();
+        assert_eq!(edge.motion(1., 0.), None);
+        assert_eq!(edge.motion(-1., 0.), Some((Position::Left, 0.4)));
+        for _ in 0..100 {
+            assert_eq!(edge.motion(-1., 0.), None);
+        }
+    }
+
+    #[test]
+    fn return_edge_requires_active_session_focus_and_outward_motion() {
+        for (pos, dx, dy) in [
+            (Position::Left, -1., 0.),
+            (Position::Right, 1., 0.),
+            (Position::Top, 0., -1.),
+            (Position::Bottom, 0., 1.),
+        ] {
+            let mut edge = ReturnEdge::default();
+            assert_eq!(edge.enter(pos, 0.5), None);
+            assert_eq!(edge.motion(dx, dy), None);
+            edge.arm();
+            assert_eq!(edge.motion(-dx, -dy), None);
+            assert_eq!(edge.motion(0., 0.), None);
+            assert_eq!(edge.motion(dx, dy), Some((pos, 0.5)));
+            edge.arm();
+            edge.focused = None;
+            assert_eq!(edge.motion(dx, dy), None);
+        }
+    }
 
     #[test]
     fn return_position_uses_logical_output_size_and_actual_crossing() {

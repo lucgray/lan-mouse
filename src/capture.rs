@@ -553,7 +553,10 @@ impl CaptureTask {
                     // task can shut down in run()
                     None => return Ok(()),
                     Some(CaptureRequest::Reenable) => { /* already active */ },
-                    Some(CaptureRequest::Release) => self.release_capture(capture, None).await?,
+                    Some(CaptureRequest::Release) => {
+                        self.release_capture(capture, None).await?;
+                        capture.remote_enter()?;
+                    },
                     Some(CaptureRequest::Create(h, p, t)) => {
                         self.add_capture(h, p, t);
                         Self::create_backend_capture(capture, h, p, t).await?;
