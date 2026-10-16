@@ -265,6 +265,11 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Arm passive return edges for a newly entered remote-control session.
+    pub fn remote_enter(&mut self) -> Result<(), CaptureError> {
+        self.capture.remote_enter()
+    }
+
     /// release mouse, first warping the cursor to the normalized
     /// (`0.0..=1.0`) cross-axis position `t` along the edge it's
     /// currently captured at — so a peer that detected its own local
@@ -421,6 +426,11 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// A regular outgoing handle at the same edge must retain normal capture.
     /// Backends without a separate passive edge need no additional state.
     fn set_passthrough(&mut self, _pos: Position, _enabled: bool) {}
+
+    /// Backends with passive return edges may need to rearm without a new enter.
+    fn remote_enter(&mut self) -> Result<(), CaptureError> {
+        Ok(())
+    }
 
     /// Whether the most recently yielded event must go only to enter-only handles.
     fn last_event_requires_enter_only(&self) -> bool {
