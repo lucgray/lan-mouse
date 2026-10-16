@@ -104,6 +104,15 @@ receiving cursor. An outgoing handle at the same edge retains normal capture.
 Return messages carry the actual position along the logical screen edge
 instead of always returning to its midpoint.
 
+### Clipboard replies and input responsiveness
+
+Replies to incoming peers send one clipboard payload at a time, preserving
+copy order. Fragment pacing and network waits are polled alongside mouse,
+keyboard, return-edge and keepalive events instead of pausing their handler.
+Connection-list locks are released before network operations. Each completed
+reply retains its batch success or failure report; listener shutdown cancels
+active and queued replies before closing connections.
+
 ### Windows clipboard access
 
 `input_event::clipboard_access()` provides a process-wide guard for native

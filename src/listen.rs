@@ -277,92 +277,87 @@ impl LanMouseListener {
 
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
-        let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
-            let _ = conn.close().await;
+        let conns = self.conns.lock().await.clone();
+        for (addr, conn) in conns {
+            if let Err(e) = conn.close().await {
+                log::warn!("failed to close connection to {addr}: {e}");
+            }
         }
         self.listen_tx.close();
+    }
+
+    async fn connection(&self, addr: SocketAddr) -> Option<ArcConn> {
+        self.conns
+            .lock()
+            .await
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, conn)| conn.clone())
     }
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let event_str = format!("{event}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                if let Err(e) = conn.send(&buf[..len]).await {
-                    log::warn!("reply {event_str} to {addr} failed: {e}");
+        if let Some(conn) = self.connection(addr).await {
+            if let Err(e) = conn.send(&buf[..len]).await {
+                log::warn!("reply {event_str} to {addr} failed: {e}");
+            }
+        }
+    }
+
+    /// Own the send future so the input loop can keep polling other events.
+    /// Resolve the connection when polled, without holding the connection-list
+    /// lock during encoding, network writes or fragment pacing.
+    pub(crate) fn reply_clipboard(
+        &self,
+        addr: SocketAddr,
+        event: ProtoEvent,
+        progress: Option<Sender<(u64, u64)>>,
+    ) -> impl std::future::Future<Output = bool> + 'static {
+        let conns = self.conns.clone();
+        async move {
+            let conn = {
+                let conns = conns.lock().await;
+                conns
+                    .iter()
+                    .find(|(a, _)| *a == addr)
+                    .map(|(_, conn)| conn.clone())
+            };
+            let Some(conn) = conn else {
+                log::warn!("cannot reply clipboard to {addr}: peer not connected");
+                return false;
+            };
+            let buf = match lan_mouse_proto::encode_clipboard_event(&event) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    log::error!("failed to encode clipboard event for {addr}: {e}");
+                    return false;
+                }
+            };
+            log::info!("sending clipboard ({} bytes) >=>=>=>=>=> {addr}", buf.len());
+            match crate::connect::send_clipboard_datagrams(&conn, &buf, progress.as_ref()).await {
+                Ok(()) => {
+                    log::debug!("clipboard sent successfully to {addr}");
+                    true
+                }
+                Err(e) => {
+                    log::error!("failed to send clipboard to {addr}: {e}");
+                    false
                 }
             }
         }
     }
 
-    /// Reply to an incoming peer's clipboard share. Returns `true` when
-    /// the payload was handed to the connection, `false` when the send
-    /// failed (encode error, peer not connected or a datagram write
-    /// error) so the service can surface it to the user.
-    pub(crate) async fn reply_clipboard(
-        &self,
-        addr: SocketAddr,
-        event: ProtoEvent,
-        progress: Option<&Sender<(u64, u64)>>,
-    ) -> bool {
-        use lan_mouse_proto::encode_clipboard_event;
-
-        let buf = match encode_clipboard_event(&event) {
-            Ok(b) => b,
-            Err(e) => {
-                log::error!("Failed to encode clipboard event: {}", e);
-                return false;
-            }
-        };
-
-        log::info!(
-            "Sending clipboard ({} bytes) >=>=>=>=>=> {}",
-            buf.len(),
-            addr
-        );
-
-        let conns = self.conns.lock().await;
-        for (a, conn) in conns.iter() {
-            if *a == addr {
-                return match crate::connect::send_clipboard_datagrams(conn, &buf, progress).await {
-                    Ok(_) => {
-                        log::debug!("Clipboard sent successfully to {}", addr);
-                        true
-                    }
-                    Err(e) => {
-                        log::error!("Failed to send clipboard to {}: {:?}", addr, e);
-                        false
-                    }
-                };
-            }
-        }
-        log::warn!("cannot reply clipboard to {addr}: peer not connected");
-        false
-    }
-
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        if let Some(conn) = self
-            .conns
-            .lock()
-            .await
-            .iter()
-            .find(|(a, _)| *a == addr)
-            .map(|(_, c)| c.clone())
-        {
-            let Some(dtls_conn) = conn.as_any().downcast_ref::<DTLSConn>() else {
-                log::error!("connection for {addr} is not a DTLS conn");
-                return None;
-            };
-            let certs = dtls_conn.connection_state().await.peer_certificates;
-            let cert = certs.first()?;
-            let fingerprint = crypto::generate_fingerprint(cert);
-            Some(fingerprint)
-        } else {
-            None
-        }
+        let conn = self.connection(addr).await?;
+        let Some(dtls_conn) = conn.as_any().downcast_ref::<DTLSConn>() else {
+            log::error!("connection for {addr} is not a DTLS conn");
+            return None;
+        };
+        let certs = dtls_conn.connection_state().await.peer_certificates;
+        let cert = certs.first()?;
+        Some(crypto::generate_fingerprint(cert))
     }
 }
 
@@ -609,8 +604,61 @@ fn peer_cert_fingerprint(certs: &[Vec<u8>]) -> Result<String, webrtc_dtls::Error
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_wait_releases_connections_and_allows_control_replies() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:4242".parse().unwrap();
+                let conn = Arc::new(test_support::PausedClipboardConn::default());
+                let (mut listener, _) = test_support::listener_with_conn(addr, conn.clone());
+                let event = ProtoEvent::Input(input_event::Event::Clipboard(
+                    input_event::ClipboardEvent::Text("pending".into()),
+                ));
+                let mut send = Box::pin(listener.reply_clipboard(addr, event, None));
+                assert!(futures::poll!(&mut send).is_pending());
+                assert!(
+                    listener.conns.try_lock().is_ok(),
+                    "clipboard must not reserve the connection list"
+                );
+                let mut pong = Box::pin(listener.reply(addr, ProtoEvent::Pong(true)));
+                assert!(
+                    futures::poll!(&mut pong).is_ready(),
+                    "control reply must not wait for clipboard"
+                );
+                drop(pong);
+                conn.permits.add_permits(1);
+                assert!(send.await);
+                listener.terminate().await;
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_reply_reports_disconnected_peer() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let addr = "127.0.0.1:4242".parse().unwrap();
+                let conn = Arc::new(test_support::PausedClipboardConn::default());
+                let (mut listener, _) = test_support::listener_with_conn(addr, conn);
+                let event = ProtoEvent::Input(input_event::Event::Clipboard(
+                    input_event::ClipboardEvent::Text("unsent".into()),
+                ));
+                let send = listener.reply_clipboard(addr, event, None);
+                listener.conns.lock().await.clear();
+                assert!(
+                    !send.await,
+                    "resolve the current connection when the queued send starts"
+                );
+                listener.terminate().await;
+            })
+            .await;
+    }
 
     #[test]
     fn peer_cert_fingerprint_rejects_invalid_counts() {

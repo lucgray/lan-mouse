@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use input_emulation::{
     EmulationHandle, EmulationOptions, InputConfig, InputEmulation, InputEmulationError,
 };
@@ -19,6 +19,9 @@ use tokio::{
     select,
     task::{JoinHandle, spawn_local},
 };
+
+#[cfg(test)]
+mod tests;
 
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
@@ -262,6 +265,10 @@ impl ListenTask {
         let mut dormant: HashSet<SocketAddr> = HashSet::new();
         // addrs already reported as send_only-blocked (log once per conn)
         let mut send_only_logged: HashSet<SocketAddr> = HashSet::new();
+        // Poll one clipboard reply at a time, alongside input and control events.
+        // Concurrent clipboard payloads would reset the peer's reassembler.
+        let (clipboard_tx, clipboard_rx) = channel::<LocalBoxFuture<'static, (u64, bool)>>();
+        let mut clipboard_replies = Box::pin(clipboard_rx.then(|reply| reply));
         loop {
             select! {
                 e = self.listener.next() => {match e {
@@ -425,15 +432,9 @@ impl ListenTask {
                     // send clipboard to a specific address
                     Some(EmulationRequest::SendClipboard(addr, clipboard_event, progress, batch)) => {
                         let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
-                        let ok = self
-                            .listener
-                            .reply_clipboard(addr, proto_event, progress.as_ref())
-                            .await;
-                        if self.event_tx
-                            .send(EmulationEvent::ClipboardSendDone { batch, ok })
-                            .is_err()
-                        {
-                            log::error!("service channel closed, listen task exiting");
+                        let reply = self.listener.reply_clipboard(addr, proto_event, progress);
+                        if clipboard_tx.send(async move { (batch, reply.await) }.boxed_local()).is_err() {
+                            log::error!("clipboard reply queue closed, listen task exiting");
                             break;
                         }
                     }
@@ -449,6 +450,12 @@ impl ListenTask {
                         }
                     }
                     Some(EmulationRequest::Terminate) => break,
+                },
+                Some((batch, ok)) = clipboard_replies.next() => {
+                    if self.event_tx.send(EmulationEvent::ClipboardSendDone { batch, ok }).is_err() {
+                        log::error!("service channel closed, listen task exiting");
+                        break;
+                    }
                 },
                 _ = interval.tick() => {
                     // the DTLS accept task's death cannot propagate
@@ -488,6 +495,8 @@ impl ListenTask {
                 }
             }
         }
+        // Cancel active and queued transfers before closing their connections.
+        drop(clipboard_replies);
         self.listener.terminate().await;
         self.emulation_proxy.terminate().await;
     }
