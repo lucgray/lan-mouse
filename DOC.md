@@ -159,3 +159,79 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+# Optional input timing diagnostics
+
+To investigate intermittent repeated keys, stalls, or unexpected screen returns,
+place `input-diagnostics.json` beside the daemon's `config.toml` and restart it.
+Without this file, recording is disabled. All limits are explicitly configured:
+
+```json
+{
+  "path": "/absolute/private/directory/input-timing.log",
+  "max_file_bytes": 8388608,
+  "queue_capacity": 4096,
+  "sample_interval_ms": 1000
+}
+```
+
+The directory must already exist. The writer keeps the active file and one `.1`
+file, each limited to `max_file_bytes`. In this example the total is 16 MiB.
+Delete the configuration file and restart the daemon to stop recording.
+
+Keyboard records contain timestamps, down/up state and a random process-local
+token for pairing transitions. Tokens change on restart and differ across hosts.
+No characters, raw key codes, clipboard contents, raw mouse button codes or
+per-motion coordinates are recorded. Timing and repeated-key patterns are still
+private metadata; keep these files local. Do not enable full trace logging for
+this purpose, because existing trace messages can include input payloads.
+
+Stages are Native, Capture, Send, Sent, Receive, Apply, Applied and Suppressed.
+Sent means the local send operation completed, not that the other host received
+the event. Applied means the input backend accepted the event, not that an
+application displayed it. Edge markers record the normalized crossing position.
+The existing normal log provides connection failures and release reasons.
+Motion samples list counts in the stage order above, not individual movements;
+Windows coalesces motion, so Native and Capture counts may legitimately differ.
+
+Disk writes run on a separate thread. The input path never waits for that writer;
+a full diagnostic queue increments `dropped`, reported in the next sample and
+normal log. A nonzero value means the record is incomplete. Samples are flushed
+at the configured interval; a process crash may lose the unflushed tail. The
+sample duration also exposes delays in scheduling the writer. Invalid settings
+or an unwritable output path are reported at startup. These records help locate
+the failure but do not themselves change forwarding or key-repeat behavior.
+
+Schema 2 adds the executable SHA-256 and OS at daemon startup, modifier-key
+classification, anonymous mouse-button transitions, and original Windows key
+message timestamps with processing wait time and the injected-input flag.
+Each rotated file keeps the same process header so retained records identify
+their build even after the startup file has been replaced.
+The original message times are only logged; the network protocol is unchanged.
+Motion summaries additionally include the maximum gap, age of the last motion,
+maximum send/apply handling time and maximum Windows pointer-message wait.
+Gaps include intentional pauses; these metrics are evidence, not automatic
+fault verdicts. Per-motion data is still not written to disk.
+
+Release markers distinguish a remote return, release shortcut, stopped input
+backend, failed send, full input queue and closed input queue. Presses seen while
+waiting for the peer's acknowledgement are marked explicitly. These markers
+explain missing transitions without requiring a new reproduction.
+
+Inspect retained files directly after a report, oldest first:
+
+```sh
+python tools/input-diagnostics-report.py input-timing.log.1 input-timing.log --since 2026-10-15T13:36:00+08:00
+```
+
+Pass only files that exist. The report pairs anonymous transitions, excludes
+modifier holds from typing-repeat evidence, separates original Windows key-hold
+time from processing delays, and summarizes the release reasons and mouse stages.
+Paired hold durations use the process's monotonic clock, so wall-clock adjustments
+do not create false long holds. Injected messages are excluded from physical-key
+wait and hold summaries.
+Capture-end cleanup and suppressed repeat presses are not reported as held keys.
+Unmatched transitions can still cross a selected time/file boundary. No temporary
+keyboard hook, elevated input-device read or live reproduction is needed to read
+these fields. Unknown application behavior may still require additional evidence.
+The configured two-file size limit is unchanged; old data is eventually replaced.
+

@@ -273,24 +273,79 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        let diagnostic_started = input_event::diagnostics::enabled().then(std::time::Instant::now);
         let event = post_process_event(event, self.input_config);
+        input_event::diagnostics::event(input_event::diagnostics::Stage::Apply, handle, &event);
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // suppress duplicate presses and unmatched releases
                 if !self.track_key(handle, key, state) {
+                    input_event::diagnostics::event(
+                        input_event::diagnostics::Stage::Suppressed,
+                        handle,
+                        &event,
+                    );
                     return Ok(());
                 }
-                self.emulation.consume(event, handle).await?;
+                let timing_event = event.clone();
+                let result = self.emulation.consume(event, handle).await;
+                if let Some(started) = diagnostic_started {
+                    input_event::diagnostics::duration(
+                        input_event::diagnostics::Stage::Applied,
+                        started.elapsed(),
+                    );
+                }
+                result?;
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Applied,
+                    handle,
+                    &timing_event,
+                );
                 self.complete_key_transition(handle, key, state);
                 Ok(())
             }
             Event::Pointer(PointerEvent::Button { button, state, .. }) => {
                 // suppress duplicate presses and unmatched releases
                 if !self.track_button(handle, button, state) {
+                    input_event::diagnostics::event(
+                        input_event::diagnostics::Stage::Suppressed,
+                        handle,
+                        &event,
+                    );
                     return Ok(());
                 }
-                self.emulation.consume(event, handle).await?;
+                let timing_event = event.clone();
+                let result = self.emulation.consume(event, handle).await;
+                if let Some(started) = diagnostic_started {
+                    input_event::diagnostics::duration(
+                        input_event::diagnostics::Stage::Applied,
+                        started.elapsed(),
+                    );
+                }
+                result?;
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Applied,
+                    handle,
+                    &timing_event,
+                );
                 self.complete_button_transition(handle, button, state);
+                Ok(())
+            }
+            Event::Pointer(PointerEvent::Motion { .. }) => {
+                let timing_event = event.clone();
+                let result = self.emulation.consume(event, handle).await;
+                if let Some(started) = diagnostic_started {
+                    input_event::diagnostics::duration(
+                        input_event::diagnostics::Stage::Applied,
+                        started.elapsed(),
+                    );
+                }
+                result?;
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Applied,
+                    handle,
+                    &timing_event,
+                );
                 Ok(())
             }
             _ => self.emulation.consume(event, handle).await,
@@ -488,15 +543,26 @@ impl InputEmulation {
         buttons: &[u32],
     ) -> Result<(), EmulationError> {
         for &key in keys {
-            if let Ok(scancode) = input_event::scancode::Linux::try_from(key) {
-                log::warn!("releasing stuck key: {scancode:?}");
-            }
+            log::warn!("releasing stuck key for handle {handle}");
             let event = Event::Keyboard(KeyboardEvent::Key {
                 time: 0,
                 key,
                 state: 0,
             });
+            input_event::diagnostics::control(
+                input_event::diagnostics::Stage::Apply,
+                handle,
+                input_event::diagnostics::Control::Release,
+                0.0,
+            );
+            input_event::diagnostics::event(input_event::diagnostics::Stage::Apply, handle, &event);
+            let timing_event = event.clone();
             emulation.consume(event, handle).await?;
+            input_event::diagnostics::event(
+                input_event::diagnostics::Stage::Applied,
+                handle,
+                &timing_event,
+            );
         }
 
         for &button in buttons {
@@ -506,7 +572,14 @@ impl InputEmulation {
                 button,
                 state: 0,
             });
+            input_event::diagnostics::event(input_event::diagnostics::Stage::Apply, handle, &event);
+            let timing_event = event.clone();
             emulation.consume(event, handle).await?;
+            input_event::diagnostics::event(
+                input_event::diagnostics::Stage::Applied,
+                handle,
+                &timing_event,
+            );
         }
 
         let event = Event::Keyboard(KeyboardEvent::Modifiers {

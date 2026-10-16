@@ -13,6 +13,7 @@ use lan_mouse_cli::CliError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+use sha2::Digest;
 #[cfg(feature = "gtk")]
 use std::process::Child;
 use std::{
@@ -58,6 +59,24 @@ fn main() {
 
     let command = config.command();
     init_logging(&command);
+
+    if matches!(command, Some(Command::Daemon)) {
+        let path = config
+            .config_path()
+            .with_file_name("input-diagnostics.json");
+        if path.exists() {
+            let result = std::fs::read(path).and_then(|bytes| {
+                let settings = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                let executable = std::fs::read(std::env::current_exe()?)?;
+                let digest = format!("{:x}", sha2::Sha256::digest(executable));
+                input_event::diagnostics::init(settings, &digest)
+            });
+            if let Err(error) = result {
+                log::error!("failed to initialize requested input diagnostics: {error}");
+                process::exit(1);
+            }
+        }
+    }
 
     if let Err(e) = run(config, command) {
         log::error!("{e}");

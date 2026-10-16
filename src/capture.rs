@@ -527,6 +527,7 @@ impl CaptureTask {
                         }
                         // client disconnected
                         ProtoEvent::Leave(_, t) => {
+                            input_event::diagnostics::control(input_event::diagnostics::Stage::Capture, handle, input_event::diagnostics::Control::RemoteReturn, t);
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture, Some(t)).await?;
                         },
@@ -607,9 +608,30 @@ impl CaptureTask {
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
         let (handle, event) = event;
+        if let CaptureEvent::Input(ref input) = event {
+            input_event::diagnostics::event(
+                input_event::diagnostics::Stage::Capture,
+                handle,
+                input,
+            );
+        }
+        if let CaptureEvent::Begin(t) = event {
+            input_event::diagnostics::control(
+                input_event::diagnostics::Stage::Capture,
+                handle,
+                input_event::diagnostics::Control::Edge,
+                t,
+            );
+        }
         log::trace!("({handle}): {event:?}");
         if matches!(event, CaptureEvent::End) {
             if self.active_client == Some(handle) {
+                input_event::diagnostics::control(
+                    input_event::diagnostics::Stage::Capture,
+                    handle,
+                    input_event::diagnostics::Control::BackendStopped,
+                    0.0,
+                );
                 log::warn!("releasing capture: input backend stopped forwarding");
                 return self.release_capture(capture, None).await;
             }
@@ -617,6 +639,12 @@ impl CaptureTask {
         }
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
+            input_event::diagnostics::control(
+                input_event::diagnostics::Stage::Capture,
+                handle,
+                input_event::diagnostics::Control::ReleaseBind,
+                0.0,
+            );
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture, None).await;
         }
@@ -695,6 +723,14 @@ impl CaptureTask {
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => {
+                    if matches!(e, Event::Keyboard(KeyboardEvent::Key { .. })) {
+                        input_event::diagnostics::control(
+                            input_event::diagnostics::Stage::Capture,
+                            handle,
+                            input_event::diagnostics::Control::WaitingForAck,
+                            0.0,
+                        );
+                    }
                     if let Event::Keyboard(mods @ KeyboardEvent::Modifiers { .. }) = e {
                         self.pending_modifiers = Some(mods);
                     }
@@ -713,7 +749,33 @@ impl CaptureTask {
         };
 
         for event in events {
-            if let Err(e) = self.conn.send(event, handle).await {
+            let timing_event = match &event {
+                ProtoEvent::Input(Event::Keyboard(key)) => Some(Event::Keyboard(*key)),
+                ProtoEvent::Input(Event::Pointer(pointer)) => Some(Event::Pointer(*pointer)),
+                _ => None,
+            };
+            if let Some(ref input) = timing_event {
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Send,
+                    handle,
+                    input,
+                );
+            }
+            let diagnostic_started = input_event::diagnostics::enabled().then(Instant::now);
+            let result = self.conn.send(event, handle).await;
+            if let Some(started) = diagnostic_started {
+                input_event::diagnostics::duration(
+                    input_event::diagnostics::Stage::Sent,
+                    started.elapsed(),
+                );
+            }
+            if let Err(e) = result {
+                input_event::diagnostics::control(
+                    input_event::diagnostics::Stage::Capture,
+                    handle,
+                    input_event::diagnostics::Control::SendFailed,
+                    0.0,
+                );
                 const DUR: Duration = Duration::from_millis(500);
                 debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
                 // Funnel through release_capture so the leave_hook
@@ -724,6 +786,13 @@ impl CaptureTask {
                 // each logs a warning on every edge crossing.
                 self.release_capture_with(capture, false, None).await?;
                 break;
+            }
+            if let Some(ref input) = timing_event {
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Sent,
+                    handle,
+                    input,
+                );
             }
         }
         Ok(())
@@ -749,6 +818,12 @@ impl CaptureTask {
         warp_to: Option<f64>,
     ) -> Result<(), CaptureError> {
         self.pending_modifiers = None;
+        input_event::diagnostics::control(
+            input_event::diagnostics::Stage::Capture,
+            self.active_client,
+            input_event::diagnostics::Control::Release,
+            warp_to.unwrap_or(-1.0),
+        );
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
@@ -791,13 +866,28 @@ impl CaptureTask {
                 let Some(target) = self.remap.release_key(key) else {
                     continue;
                 };
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                let key_up = Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: target as u32,
                     state: 0,
-                }));
-                if let Err(e) = self.conn.send(key_up, handle).await {
+                });
+                input_event::diagnostics::event(
+                    input_event::diagnostics::Stage::Send,
+                    handle,
+                    &key_up,
+                );
+                if let Err(e) = self
+                    .conn
+                    .send(ProtoEvent::Input(key_up.clone()), handle)
+                    .await
+                {
                     log::warn!("failed to send key-up to client {handle}: {e}");
+                } else {
+                    input_event::diagnostics::event(
+                        input_event::diagnostics::Stage::Sent,
+                        handle,
+                        &key_up,
+                    );
                 }
             }
             // Reset the modifier mask too. The peer's input-emulation
