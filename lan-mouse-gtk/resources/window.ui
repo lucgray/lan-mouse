@@ -61,7 +61,6 @@
             </property>
           </object>
         </child>
-        <child><object class="GtkBox" id="file_transfers_box"><property name="orientation">vertical</property></object></child>
         <child>
           <object class="AdwToastOverlay" id="toast_overlay">
             <child>
