@@ -63,7 +63,7 @@ travel as regular UDP datagrams: `[u8 type][u32 len][payload]`.
 `ClipboardFile` carries `[u32 count]{[u32 name_len][name][u64 data_len]
 [data]}` per file.
 
-A payload that fits in one datagram (≤ 65,507 bytes) is sent directly
+A payload that fits the fragment-sized datagram budget is sent directly
 for compatibility with older peers. Larger payloads up to 256MB are
 split by `ClipboardFragmenter` into `ClipboardFragment` datagrams:
 
@@ -88,6 +88,16 @@ fragmented payload for 30s and answers with another burst of
 `ClipboardFragment` datagrams; requests arriving for an expired or
 unknown `transfer_id` are ignored. Old peers never send requests — for
 them the transfer just never completes, same as before.
+
+Both receive paths check missing fragments and stalled transfers every 500ms.
+These checks keep their deadline while mouse or other datagrams arrive; they
+do not require the connection to become idle. Missed checks are skipped rather
+than replayed in a burst when the runtime resumes.
+
+The retransmit cache is reclaimed after 30s without a valid retransmit request,
+even when no new clipboard content is sent. One worker per local runtime thread
+sleeps until the next expiry and exits when the cache is empty. Expired requests
+cannot revive a payload, and empty or invalid requests do not extend its life.
 
 ## Problems
 ### Pointer capture under load and return edges
@@ -120,6 +130,11 @@ clipboard access on Windows. Capture and emulation must retain it while reading
 or writing the clipboard, and release it before sending events or waiting on a
 channel. This prevents one clipboard handle from closing another thread's native
 clipboard session. It does not reserve the clipboard against other applications.
+
+The clipboard monitor also releases its signature and timestamp guards before
+waiting for space in the event queue. A received clipboard update may need those
+guards before the service can drain the queue; retaining them while waiting
+would prevent progress. A closed event receiver stops the monitor with a log.
 
 The general Idea is to have a bidirectional connection by default, meaning
 any connected device can not only receive events but also send events back.

@@ -389,6 +389,10 @@ async fn read_loop(
     let mut b = vec![0u8; MAX_CLIPBOARD_SIZE + 5];
     let mut reassembler = ClipboardReassembler::new();
     let mut last_reported = 0u64;
+    // Incoming motion must not restart the fragment-maintenance deadline.
+    let period = Duration::from_millis(500);
+    let mut maintenance = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Read first byte to determine event type
@@ -400,16 +404,19 @@ async fn read_loop(
                     break;
                 }
             },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+            _ = maintenance.tick() => {
                 if reassembler.wants_request() {
                     let id = reassembler.transfer_id();
                     let missing = reassembler
                         .missing_seqs(lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS * 20);
                     for chunk in missing.chunks(lan_mouse_proto::FRAGMENT_REQUEST_MAX_SEQS)
                     {
-                        let _ = conn
+                        if let Err(e) = conn
                             .send(&lan_mouse_proto::encode_fragment_request(id, chunk))
-                            .await;
+                            .await
+                        {
+                            log::warn!("failed to request clipboard fragments from {addr}: {e}");
+                        }
                     }
                 }
                 if reassembler.stalled() {
@@ -609,6 +616,25 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn regression_listener_retries_missing_fragments_during_motion() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (conn, peer) = test_support::datagram_pair().await;
+                let addr = peer.local_addr().unwrap();
+                let (tx, _rx) = channel();
+                let conns = Rc::new(AsyncMutex::new(vec![(addr, conn.clone())]));
+                let task = spawn_local(read_loop(conns, addr, conn, tx));
+                let requested = test_support::missing_fragment_during_motion(&peer).await;
+                task.abort();
+                assert!(
+                    requested,
+                    "continuous input starved the listener's retransmit check"
+                );
+            })
+            .await;
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn clipboard_wait_releases_connections_and_allows_control_replies() {

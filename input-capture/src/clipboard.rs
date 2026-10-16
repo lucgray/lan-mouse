@@ -47,6 +47,53 @@ impl ClipboardSigRecorder {
         *last_sig = Some(sig_of(content));
         *last_change = Some(Instant::now());
     }
+    /// Inspect and publish one observation. Closures keep native clipboard access
+    /// on its owning thread and let tests exercise backpressure without OS writes.
+    fn capture_change(
+        &self,
+        sig: ContentSig,
+        read_content: impl FnOnce(&ContentSig) -> Option<ClipboardEvent>,
+        send_event: impl FnOnce(CaptureEvent),
+    ) {
+        // Check if content changed
+        let mut last_sig = self.last_sig.lock().unwrap();
+        let mut last_change = self.last_change.lock().unwrap();
+
+        let content_changed = match last_sig.as_ref() {
+            None => true,
+            Some(last) => last != &sig,
+        };
+
+        if content_changed {
+            // Debounce: ignore changes within 200ms of last change
+            // This prevents infinite loops when both sides update clipboard
+            let should_emit = match *last_change {
+                None => true,
+                Some(instant) => instant.elapsed() > Duration::from_millis(200),
+            };
+
+            if should_emit {
+                let Some(current_content) = read_content(&sig) else {
+                    return;
+                };
+                log::info!(
+                    "Clipboard changed: {} ({} bytes)",
+                    current_content,
+                    current_content.content_len()
+                );
+                *last_sig = Some(sig);
+                *last_change = Some(Instant::now());
+
+                // The consumer may update this state before it can drain the
+                // queue. Never hold either guard across a blocking send.
+                drop(last_change);
+                drop(last_sig);
+                send_event(CaptureEvent::Input(Event::Clipboard(current_content)));
+            } else {
+                log::trace!("Clipboard changed but debounced (too recent)");
+            }
+        }
+    }
 }
 
 /// minimum gap between automatic re-emits of a signature whose share
@@ -190,8 +237,7 @@ impl ClipboardMonitor {
         let failed_sig: Arc<Mutex<Option<(ContentSig, Instant)>>> = Arc::new(Mutex::new(None));
         let enabled = Arc::new(Mutex::new(true));
 
-        let last_sig_clone = recorder.last_sig.clone();
-        let last_change_clone = recorder.last_change.clone();
+        let recorder_clone = recorder.clone();
         let failed_sig_clone = failed_sig.clone();
         let enabled_clone = enabled.clone();
         let event_tx_clone = event_tx.clone();
@@ -243,43 +289,21 @@ impl ClipboardMonitor {
                     continue;
                 }
 
-                // Check if content changed
-                let mut last_sig = last_sig_clone.lock().unwrap();
-                let mut last_change = last_change_clone.lock().unwrap();
-
-                let content_changed = match last_sig.as_ref() {
-                    None => true,
-                    Some(last) => last != &sig,
-                };
-
-                if content_changed {
-                    // Debounce: ignore changes within 200ms of last change
-                    // This prevents infinite loops when both sides update clipboard
-                    let should_emit = match *last_change {
-                        None => true,
-                        Some(instant) => instant.elapsed() > Duration::from_millis(200),
-                    };
-
-                    if should_emit {
-                        let Some(current_content) = event_from_sig(cb, &sig) else {
-                            continue;
-                        };
-                        log::info!(
-                            "Clipboard changed: {} ({} bytes)",
-                            current_content,
-                            current_content.content_len()
-                        );
-                        *last_sig = Some(sig);
-                        *last_change = Some(Instant::now());
-
-                        // Send event
-                        let event = CaptureEvent::Input(Event::Clipboard(current_content));
+                let mut channel_closed = false;
+                recorder_clone.capture_change(
+                    sig,
+                    |sig| event_from_sig(cb, sig),
+                    |event| {
                         #[cfg(windows)]
                         drop(clipboard_access);
-                        let _ = event_tx_clone.blocking_send(event);
-                    } else {
-                        log::trace!("Clipboard changed but debounced (too recent)");
-                    }
+                        if event_tx_clone.blocking_send(event).is_err() {
+                            log::error!("clipboard event receiver closed, stopping monitor");
+                            channel_closed = true;
+                        }
+                    },
+                );
+                if channel_closed {
+                    break;
                 }
             }
         });
@@ -341,6 +365,43 @@ impl ClipboardMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_full_queue_does_not_hold_clipboard_state() {
+        let recorder = ClipboardSigRecorder {
+            last_sig: Arc::new(Mutex::new(None)),
+            last_change: Arc::new(Mutex::new(None)),
+        };
+        // A full queue reproduces the consumer falling behind. The test drains
+        // it before asserting, so even the broken version cannot hang the suite.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.blocking_send(CaptureEvent::Input(Event::Clipboard(ClipboardEvent::Text(
+            "queued".into(),
+        ))))
+        .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let worker_recorder = recorder.clone();
+        let worker = std::thread::spawn(move || {
+            worker_recorder.capture_change(
+                ContentSig::Text("next".into()),
+                |_| Some(ClipboardEvent::Text("next".into())),
+                |event| {
+                    entered_tx.send(()).unwrap();
+                    tx.blocking_send(event).unwrap();
+                },
+            );
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let signature_available = recorder.last_sig.try_lock().is_ok();
+        let timestamp_available = recorder.last_change.try_lock().is_ok();
+        rx.blocking_recv().unwrap();
+        worker.join().unwrap();
+        rx.blocking_recv().unwrap();
+        assert!(
+            signature_available && timestamp_available,
+            "a full clipboard queue holds the state needed by remote clipboard updates"
+        );
+    }
 
     #[test]
     fn unchanged_image_has_stable_signature() {
