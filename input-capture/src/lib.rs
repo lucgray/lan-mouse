@@ -210,7 +210,18 @@ impl InputCapture {
             self.enter_only_handles.insert(id);
             *self.enter_only_positions.entry(pos).or_default() += 1;
         }
+        self.update_passthrough(pos);
         Ok(())
+    }
+
+    fn update_passthrough(&mut self, pos: Position) {
+        let passive = self.position_map.get(&pos).is_some_and(|handles| {
+            !handles.is_empty()
+                && handles
+                    .iter()
+                    .all(|id| self.enter_only_handles.contains(id))
+        });
+        self.capture.set_passthrough(pos, passive);
     }
 
     /// destroy the client with the given id, if it exists
@@ -244,6 +255,7 @@ impl InputCapture {
             self.position_map.remove(&pos);
             self.capture.destroy(pos).await?;
         }
+        self.update_passthrough(pos);
         Ok(())
     }
 
@@ -405,6 +417,11 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// Mark a position as an incoming-pointer return edge.
     async fn set_enter_only(&mut self, pos: Position, enabled: bool) -> Result<(), CaptureError>;
 
+    /// Set whether future crossings only notify an incoming peer to return.
+    /// A regular outgoing handle at the same edge must retain normal capture.
+    /// Backends without a separate passive edge need no additional state.
+    fn set_passthrough(&mut self, _pos: Position, _enabled: bool) {}
+
     /// Whether the most recently yielded event must go only to enter-only handles.
     fn last_event_requires_enter_only(&self) -> bool {
         false
@@ -532,6 +549,7 @@ mod tests {
     struct QueuedCapture {
         events: VecDeque<(Position, CaptureEvent, bool)>,
         last_event_requires_enter_only: bool,
+        passthrough: std::sync::Arc<std::sync::Mutex<Vec<(Position, bool)>>>,
     }
 
     impl Stream for QueuedCapture {
@@ -570,6 +588,10 @@ mod tests {
             self.last_event_requires_enter_only
         }
 
+        fn set_passthrough(&mut self, pos: Position, enabled: bool) {
+            self.passthrough.lock().unwrap().push((pos, enabled));
+        }
+
         async fn release(&mut self) -> Result<(), CaptureError> {
             Ok(())
         }
@@ -606,6 +628,7 @@ mod tests {
             capture: Box::new(QueuedCapture {
                 events: VecDeque::new(),
                 last_event_requires_enter_only: false,
+                passthrough: Default::default(),
             }),
             enter_only_handles: HashSet::new(),
             enter_only_positions: HashMap::new(),
@@ -647,6 +670,35 @@ mod tests {
         assert_eq!(capture.position_map[&Position::Left], vec![7]);
     }
 
+    #[tokio::test]
+    async fn passive_return_edge_does_not_disable_bidirectional_capture() {
+        let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut capture = empty_capture();
+        capture.capture = Box::new(QueuedCapture {
+            events: VecDeque::new(),
+            last_event_requires_enter_only: false,
+            passthrough: updates.clone(),
+        });
+        capture.create_enter_only(1, Position::Left).await.unwrap();
+        capture.create(2, Position::Left).await.unwrap();
+        capture.destroy(2).await.unwrap();
+        capture.destroy(1).await.unwrap();
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec![
+                (Position::Left, true),
+                (Position::Left, false),
+                (Position::Left, true),
+                (Position::Left, false),
+            ]
+        );
+        updates.lock().unwrap().clear();
+        capture.create(2, Position::Left).await.unwrap();
+        capture.create_enter_only(1, Position::Left).await.unwrap();
+        capture.destroy(1).await.unwrap();
+        assert!(updates.lock().unwrap().iter().all(|(_, passive)| !passive));
+    }
+
     #[test]
     fn unroutable_event_does_not_stall_the_next_ready_event() {
         let backend = QueuedCapture {
@@ -655,6 +707,7 @@ mod tests {
                 (Position::Left, CaptureEvent::Begin(0.5), false),
             ]),
             last_event_requires_enter_only: false,
+            passthrough: Default::default(),
         };
         let mut capture = InputCapture {
             capture: Box::new(backend),

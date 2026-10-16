@@ -7,16 +7,17 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use event_queue::{Receiver, channel};
 use std::task::ready;
-use tokio::sync::mpsc::{Receiver, channel};
 
 use super::{Capture, CaptureError, CaptureEvent, Position};
 
 mod display_util;
+mod event_queue;
 mod event_thread;
 
 pub struct WindowsInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    event_rx: Receiver,
     event_thread: EventThread,
     stopped: Arc<Mutex<Option<Position>>>,
 }
