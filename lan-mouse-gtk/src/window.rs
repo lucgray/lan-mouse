@@ -578,25 +578,23 @@ impl Window {
         self.imp().fingerprint_row.set_subtitle(fingerprint);
     }
 
-    /// show / update / hide the clipboard transfer progress bar
+    /// Update tray status; the daemon owns transfer notifications and history.
     pub(super) fn reset_file_transfers(&self, records: Vec<lan_mouse_ipc::FileTransfer>) {
         self.ensure_file_transfers();
         if let Some(view) = self.imp().file_transfers.borrow_mut().as_mut() {
-            view.reset(records, self);
+            view.reset(records);
         }
     }
     pub(super) fn update_file_transfer(&self, record: lan_mouse_ipc::FileTransfer) {
         self.ensure_file_transfers();
         if let Some(view) = self.imp().file_transfers.borrow_mut().as_mut() {
-            view.update(record, self);
+            view.update(record);
         }
     }
     fn ensure_file_transfers(&self) {
         let mut state = self.imp().file_transfers.borrow_mut();
         if state.is_none() {
-            let view = crate::file_transfers::FileTransfers::new(self);
-            self.imp().file_transfers_box.append(&view.widget);
-            *state = Some(view);
+            *state = Some(crate::file_transfers::FileTransfers::default());
         }
     }
 

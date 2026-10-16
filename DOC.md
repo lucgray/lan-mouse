@@ -37,11 +37,12 @@ clipboard contents or credentials.
 
 ### Transfer records and repeated copy
 
-The main window retains one row per peer and captured file selection, with file
-names, waiting/queued/connecting/transfer/verification/completion/failure states,
-byte progress, cancellation and clearing of finished records. Repeated copies
-move the same row to the top. Tray text reflects active progress. The daemon
-owns persistent history and system notifications, independently of the GTK window.
+Transfer cards use system notifications and disappear according to the desktop's
+notification settings. The main window does not display a duplicate transfer
+history or a clear-history button. Tray text reflects active progress and returns
+to `Lan Mouse` when no transfers remain. Finished records are kept by the daemon
+in `file-transfers.json` and completion/failure logs, independently of the GTK
+window. Repeated copies still merge into the same task and update its order.
 Windows uses a per-user Lan Mouse notification identity and one tagged native
 notification per task; Linux replaces the same freedesktop notification ID.
 Progress updates replace the existing notice, while completion or failure shows
