@@ -700,30 +700,6 @@ fn process_request(request: ThreadRequest) {
     }
 }
 
-#[cfg(test)]
-mod overload_tests {
-    use super::*;
-
-    #[test]
-    fn full_critical_queue_releases_local_input_and_notifies_consumer() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send((Position::Right, CaptureEvent::Begin(0.5)))
-            .unwrap();
-        let stopped = Arc::new(Mutex::new(None));
-        EVENT_TX.replace(Some(tx));
-        STOPPED.replace(Some(stopped.clone()));
-        ACTIVE_CLIENT.set(Some(Position::Right));
-        PENDING_MOTION.set((3.0, 4.0));
-        send_critical_event(Position::Right, CaptureEvent::Begin(0.5));
-        assert_eq!(ACTIVE_CLIENT.get(), None);
-        assert_eq!(*stopped.lock().unwrap(), Some(Position::Right));
-        assert_eq!(PENDING_MOTION.get(), (0.0, 0.0));
-        assert!(rx.try_recv().is_ok());
-        EVENT_TX.take();
-        STOPPED.take();
-    }
-}
-
 fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     let kybrdllhookstruct: KBDLLHOOKSTRUCT = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
     let mut scan_code = kybrdllhookstruct.scanCode;
@@ -851,5 +827,29 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             log::warn!("unknown mouse event: {w:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod overload_tests {
+    use super::*;
+
+    #[test]
+    fn full_critical_queue_releases_local_input_and_notifies_consumer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send((Position::Right, CaptureEvent::Begin(0.5)))
+            .unwrap();
+        let stopped = Arc::new(Mutex::new(None));
+        EVENT_TX.replace(Some(tx));
+        STOPPED.replace(Some(stopped.clone()));
+        ACTIVE_CLIENT.set(Some(Position::Right));
+        PENDING_MOTION.set((3.0, 4.0));
+        send_critical_event(Position::Right, CaptureEvent::Begin(0.5));
+        assert_eq!(ACTIVE_CLIENT.get(), None);
+        assert_eq!(*stopped.lock().unwrap(), Some(Position::Right));
+        assert_eq!(PENDING_MOTION.get(), (0.0, 0.0));
+        assert!(rx.try_recv().is_ok());
+        EVENT_TX.take();
+        STOPPED.take();
     }
 }
