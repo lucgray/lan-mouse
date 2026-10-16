@@ -1,5 +1,16 @@
 # General Software Architecture
 
+## Clipboard file size
+
+File selections share the existing 256 MiB encoded clipboard payload limit.
+Capture checks the complete selection, including file names and headers, before
+reading file contents. An oversized selection stays available in the local
+clipboard but is not shared; the rejection is logged once for that selection.
+This avoids loading large files merely because the user pressed Copy. Files
+growing during a read are bounded by the same limit. The encoder also checks
+the limit and writes directly into one output buffer, without a second payload
+copy. The wire format is unchanged.
+
 ## Events
 
 Each instance of lan-mouse can emit and receive events, where

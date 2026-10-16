@@ -75,6 +75,19 @@ pub struct ClipboardFile {
     pub data: Vec<u8>,
 }
 
+/// Maximum encoded clipboard payload, shared by capture and the wire format.
+pub const MAX_CLIPBOARD_TRANSFER_SIZE: usize = 256 * 1024 * 1024;
+
+/// Count plus each UTF-8 name length, name, data length and file contents.
+pub fn clipboard_files_payload_size(files: impl IntoIterator<Item = (usize, u64)>) -> u64 {
+    files.into_iter().fold(4u64, |total, (name_len, data_len)| {
+        total
+            .saturating_add(12)
+            .saturating_add(name_len as u64)
+            .saturating_add(data_len)
+    })
+}
+
 /// the kind of payload a [`ClipboardEvent`] carries
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ClipboardContentKind {
@@ -237,6 +250,23 @@ impl Display for Event {
 #[cfg(test)]
 mod tests {
     use super::ClipboardEvent;
+
+    #[test]
+    fn regression_file_payload_size_counts_utf8_and_limit_boundary() {
+        use super::{MAX_CLIPBOARD_TRANSFER_SIZE, clipboard_files_payload_size};
+        let name = "文件.zip";
+        let overhead = 4 + 12 + name.len() as u64;
+        let data = MAX_CLIPBOARD_TRANSFER_SIZE as u64 - overhead;
+        assert_eq!(
+            clipboard_files_payload_size([(name.len(), data)]),
+            MAX_CLIPBOARD_TRANSFER_SIZE as u64
+        );
+        assert!(
+            clipboard_files_payload_size([(name.len(), data + 1)])
+                > MAX_CLIPBOARD_TRANSFER_SIZE as u64
+        );
+        assert_eq!(clipboard_files_payload_size([(1, u64::MAX)]), u64::MAX);
+    }
 
     #[test]
     fn display_truncates_long_ascii_text() {
