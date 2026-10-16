@@ -98,6 +98,8 @@ impl ClipboardEmulation {
                 let clipboard_arc = self.clipboard.clone();
 
                 spawn_blocking(move || {
+                    #[cfg(windows)]
+                    let _clipboard_access = input_event::clipboard_access();
                     let mut clipboard_guard = clipboard_arc.lock().unwrap();
 
                     // Try to get or create clipboard
@@ -134,6 +136,9 @@ impl ClipboardEmulation {
                 spawn_blocking(move || {
                     let (width, height, rgba) = decode_image_rgba(&png)
                         .ok_or_else(|| ClipboardError::Set("invalid PNG data".into()))?;
+
+                    #[cfg(windows)]
+                    let _clipboard_access = input_event::clipboard_access();
 
                     let mut clipboard_guard = clipboard_arc.lock().unwrap();
 
@@ -195,6 +200,8 @@ impl ClipboardEmulation {
                     // so they can be pasted straight into a file manager.
                     // Best-effort: on a headless host there is no clipboard,
                     // but the files landed on disk either way
+                    #[cfg(windows)]
+                    let _clipboard_access = input_event::clipboard_access();
                     let mut clipboard_guard = clipboard_arc.lock().unwrap();
                     if let Some(clipboard) = match clipboard_guard.as_mut() {
                         Some(c) => Some(c),
@@ -244,6 +251,8 @@ impl ClipboardEmulation {
         let clipboard_arc = self.clipboard.clone();
 
         spawn_blocking(move || {
+            #[cfg(windows)]
+            let _clipboard_access = input_event::clipboard_access();
             let mut clipboard_guard = clipboard_arc.lock().unwrap();
 
             let clipboard = match clipboard_guard.as_mut() {

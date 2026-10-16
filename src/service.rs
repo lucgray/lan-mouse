@@ -1179,9 +1179,11 @@ impl Service {
 
     fn deactivate_client(&mut self, handle: ClientHandle) {
         log::debug!("deactivating client {handle}");
-        self.conn_disarmed.remove(&handle);
+        let was_disarmed = self.conn_disarmed.remove(&handle).is_some();
         if self.client_manager.deactivate_client(handle) {
-            self.capture.destroy(handle);
+            if !was_disarmed {
+                self.capture.destroy(handle);
+            }
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
@@ -1216,6 +1218,14 @@ impl Service {
     /// live again
     fn rearm_client(&mut self, handle: ClientHandle) {
         if self.conn_disarmed.remove(&handle).is_none() {
+            return;
+        }
+        if self
+            .client_manager
+            .get_state(handle)
+            .is_none_or(|(_, state)| !state.active)
+        {
+            log::debug!("ignoring reconnect for inactive client {handle}");
             return;
         }
         let Some(pos) = self.client_manager.get_pos(handle) else {
@@ -1284,12 +1294,13 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
-        self.conn_disarmed.remove(&handle);
+        let was_disarmed = self.conn_disarmed.remove(&handle).is_some();
         if self
             .client_manager
             .remove_client(handle)
             .map(|(_, s)| s.active)
             .unwrap_or(false)
+            && !was_disarmed
         {
             self.capture.destroy(handle);
         }

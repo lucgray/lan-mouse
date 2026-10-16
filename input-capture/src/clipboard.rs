@@ -70,8 +70,9 @@ enum ContentSig {
 }
 
 fn image_sig(width: usize, height: usize, rgba: &[u8]) -> ContentSig {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    use std::hash::Hasher;
+    // Compare identical pixels consistently across polls and received transfers.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hasher.write_usize(width);
     hasher.write_usize(height);
     hasher.write(rgba);
@@ -220,6 +221,9 @@ impl ClipboardMonitor {
                 }
                 let cb = clipboard.as_mut().unwrap();
 
+                #[cfg(windows)]
+                let clipboard_access = input_event::clipboard_access();
+
                 // Get current clipboard signature (files compare by
                 // name — contents are read only on real changes)
                 let Some(sig) = read_clipboard_sig(cb) else {
@@ -270,6 +274,8 @@ impl ClipboardMonitor {
 
                         // Send event
                         let event = CaptureEvent::Input(Event::Clipboard(current_content));
+                        #[cfg(windows)]
+                        drop(clipboard_access);
                         let _ = event_tx_clone.blocking_send(event);
                     } else {
                         log::trace!("Clipboard changed but debounced (too recent)");
@@ -335,6 +341,36 @@ impl ClipboardMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_image_has_stable_signature() {
+        let pixels = [20, 40, 60, 255, 80, 100, 120, 255];
+        let expected = image_sig(2, 1, &pixels);
+        for _ in 0..32 {
+            assert_eq!(image_sig(2, 1, &pixels), expected);
+        }
+        assert_ne!(image_sig(1, 2, &pixels), expected);
+        let mut changed = pixels;
+        changed[0] += 1;
+        assert_ne!(image_sig(2, 1, &changed), expected);
+    }
+
+    #[test]
+    fn received_image_matches_monitor_signature() {
+        let pixels = [20, 40, 60, 255, 80, 100, 120, 255];
+        let png = encode_image_rgba(2, 1, &pixels).expect("valid test image");
+        let event = ClipboardEvent::Image(png);
+        assert_eq!(sig_of(&event), image_sig(2, 1, &pixels));
+        let recorder = ClipboardSigRecorder {
+            last_sig: Arc::new(Mutex::new(None)),
+            last_change: Arc::new(Mutex::new(None)),
+        };
+        recorder.update(&event);
+        assert_eq!(
+            *recorder.last_sig.lock().unwrap(),
+            Some(image_sig(2, 1, &pixels))
+        );
+    }
 
     /// Regression: a failed share used to clear the signature every
     /// time, so the very next poll re-emitted the same content —
