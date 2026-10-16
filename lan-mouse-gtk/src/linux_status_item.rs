@@ -39,6 +39,7 @@ thread_local! {
 struct LanMouseTray {
     tx: async_channel::Sender<TrayEvent>,
     icons: Vec<ksni::Icon>,
+    status: String,
 }
 
 impl LanMouseTray {
@@ -57,7 +58,13 @@ impl ksni::Tray for LanMouseTray {
     }
 
     fn title(&self) -> String {
-        "Lan Mouse".into()
+        self.status.clone()
+    }
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: self.status.clone(),
+            ..Default::default()
+        }
     }
 
     fn icon_name(&self) -> String {
@@ -105,6 +112,7 @@ pub fn setup(app: &adw::Application, window: &Window) -> bool {
 
     let (tx, rx) = async_channel::bounded(4);
     let tray = LanMouseTray {
+        status: "Lan Mouse".into(),
         tx,
         icons: render_icon_pixmaps(),
     };
@@ -187,4 +195,13 @@ fn render_icon_pixmap(size: i32) -> Option<ksni::Icon> {
         height,
         data,
     })
+}
+
+pub(crate) fn set_status(text: &str) {
+    STATUS_ITEM.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            let text = text.to_owned();
+            state._handle.update(move |tray| tray.status = text);
+        }
+    });
 }

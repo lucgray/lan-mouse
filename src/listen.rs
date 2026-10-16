@@ -77,6 +77,7 @@ async fn accept_any(
 }
 
 pub(crate) enum ListenEvent {
+    FileOffer(crate::file_transfer::Offer, SocketAddr),
     Msg {
         event: ProtoEvent,
         addr: SocketAddr,
@@ -286,7 +287,7 @@ impl LanMouseListener {
         self.listen_tx.close();
     }
 
-    async fn connection(&self, addr: SocketAddr) -> Option<ArcConn> {
+    pub(crate) async fn connection(&self, addr: SocketAddr) -> Option<ArcConn> {
         self.conns
             .lock()
             .await
@@ -436,6 +437,17 @@ async fn read_loop(
 
         if n == 0 {
             break;
+        }
+        if b[0] == crate::file_transfer::OFFER_TYPE {
+            match crate::file_transfer::Offer::decode(&b[..n]) {
+                Ok(offer) => {
+                    if dtls_tx.send(ListenEvent::FileOffer(offer, addr)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(error) => log::warn!("invalid file offer from {addr}: {error}"),
+            }
+            continue;
         }
 
         log::trace!("Received {} bytes from {}", n, addr);

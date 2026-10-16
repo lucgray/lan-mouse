@@ -1,6 +1,7 @@
 mod authorization_window;
 mod client_object;
 mod client_row;
+mod file_transfers;
 mod fingerprint_window;
 mod i18n;
 mod key_object;
@@ -437,6 +438,8 @@ fn build_ui(app: &Application) {
                 let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
                 log::trace!("frontend event: {notify:?}");
                 match notify {
+                    FrontendEvent::FileTransfers(records) => window.reset_file_transfers(records),
+                    FrontendEvent::FileTransfer(record) => window.update_file_transfer(record),
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)
                     }

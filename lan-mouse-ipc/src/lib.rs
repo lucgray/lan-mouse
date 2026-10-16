@@ -24,6 +24,33 @@ pub use connect::{FrontendEventReader, FrontendRequestWriter, connect, try_conne
 pub use connect_async::{AsyncFrontendEventReader, AsyncFrontendRequestWriter, connect_async};
 pub use listen::AsyncFrontendListener;
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum FilePhase {
+    Waiting,
+    Queued,
+    Connecting,
+    Transferring,
+    Verifying,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileTransfer {
+    pub id: String,
+    pub incoming: bool,
+    pub names: Vec<String>,
+    pub count: u32,
+    pub total: u64,
+    pub done: u64,
+    pub phase: FilePhase,
+    pub order: u64,
+    pub reused: bool,
+    pub advertised: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum ConnectionError {
     #[error(transparent)]
@@ -197,6 +224,8 @@ pub struct ClientState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FrontendEvent {
+    FileTransfers(Vec<FileTransfer>),
+    FileTransfer(FileTransfer),
     /// a client was created
     Created(ClientHandle, ClientConfig, ClientState),
     /// no such client
@@ -233,7 +262,9 @@ pub enum FrontendEvent {
     /// incoming disconnected
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
-    ConnectionAttempt { fingerprint: String },
+    ConnectionAttempt {
+        fingerprint: String,
+    },
     /// current daemon settings — sent on sync and whenever they change
     Settings {
         clipboard_enabled: bool,
@@ -261,7 +292,10 @@ pub enum FrontendEvent {
         bytes: usize,
     },
     /// local clipboard content was dropped because it exceeds the wire limit
-    ClipboardTooLarge { bytes: usize, limit: usize },
+    ClipboardTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     /// progress of a fragmented clipboard transfer (large images / files)
     ClipboardProgress {
         /// true when receiving from a peer, false when sending to one
@@ -275,6 +309,8 @@ pub enum FrontendEvent {
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum FrontendRequest {
+    CancelFileTransfer(String),
+    ClearFileTransfers,
     /// activate/deactivate client
     Activate(ClientHandle, bool),
     /// add a new client

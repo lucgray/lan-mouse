@@ -1,15 +1,106 @@
 # General Software Architecture
 
-## Clipboard file size
+## Streaming clipboard files
 
-File selections share the existing 256 MiB encoded clipboard payload limit.
-Capture checks the complete selection, including file names and headers, before
-reading file contents. An oversized selection stays available in the local
-clipboard but is not shared; the rejection is logged once for that selection.
-This avoids loading large files merely because the user pressed Copy. Files
-growing during a read are bounded by the same limit. The encoder also checks
-the limit and writes directly into one output buffer, without a second payload
-copy. The wire format is unchanged.
+Copying files captures names, local paths and 64-bit sizes only. It does not read
+file contents or change the source clipboard. A completed device switch starts
+sharing the pending selection with that peer. File contents use a separate TLS
+1.3 TCP stream on the configured Lan Mouse port; allow TCP from authorized peers
+in addition to the existing UDP rule. Mouse and keyboard traffic stays on DTLS.
+Both peers must support file stream version 2. Legacy whole-buffer file messages
+are rejected; files never fall back to the text/image fragment transport.
+
+The authenticated DTLS connection carries `FileStreamOffer`, type 17, version 2:
+`[u8 type][u8 version][u16 TCP port][u64 total bytes][u32 file count]`
+`[32-byte one-use capability][32-byte selection version][DER certificate]`. The receiver pins this exact
+certificate and presents the capability over TLS. The sender accepts the input
+peer's IP only. Private keys, capabilities and certificates are not logged.
+
+Each file is streamed as `[u32 UTF-8 name length][name][u64 size][contents]`
+`[32-byte SHA-256]`. Local paths never leave the source. Bounded copy buffers and
+incremental checksums keep memory independent of file size. Disk and TLS work
+run outside the input event loop. Transfer pacing reuses the existing clipboard
+burst budget. There is no 256 MiB file limit; text and image limits are unchanged.
+
+The receiver stages files in its configured download directory, checks every
+length and checksum, and exposes the batch only after all files validate.
+Existing names receive a numbered suffix and are never overwritten. Interrupted
+or invalid transfers remove their temporary files. A final TLS acknowledgement follows native clipboard publication and reports
+whether the files are ready to paste or a newer clipboard was preserved.
+Cancelling a task or shutting down closes its socket. File errors are reported
+without disconnecting input.
+
+If the receiving computer's clipboard changed during a download, the completed
+files remain in the download directory and the newer clipboard is preserved.
+Progress and completion logs contain file counts and byte totals, without
+clipboard contents or credentials.
+
+### Transfer records and repeated copy
+
+The main window retains one row per peer and captured file selection, with file
+names, waiting/queued/connecting/transfer/verification/completion/failure states,
+byte progress, cancellation and clearing of finished records. Repeated copies
+move the same row to the top. Tray text reflects active progress. The daemon
+owns persistent history and system notifications, independently of the GTK window.
+Windows uses a per-user Lan Mouse notification identity and one tagged native
+notification per task; Linux replaces the same freedesktop notification ID.
+Progress updates replace the existing notice, while completion or failure shows
+the final result. The OS notification settings still determine visibility.
+`file-transfers.json` beside the active configuration retains records across
+restarts. Unfinished records become interrupted failures on restart; transfers
+are not automatically resumed. A dedicated worker saves history atomically and
+calls the desktop notification service outside the input loop. Slow notification
+delivery retains only the newest pending snapshot, not a growing progress queue.
+
+Distinct requested selections run serially. Repeating an active or queued
+selection does not append another job or abort the running transfer. An older
+selection that has not yet been requested by crossing is superseded when the
+clipboard changes. A fresh file observation is requested on every crossing and
+consumed before scheduling, so the 500 ms monitor interval cannot make the first
+crossing miss a newly copied file. An unchanged observation is not a new copy:
+crossing alone does not enqueue another transfer, republish the receiver's
+clipboard, move a completed record, or replay its completion notification.
+Windows clipboard sequence numbers and the
+Wayland data-control selection notifications recognize repeated copies. Received
+file publication and signature recording share the monitor's access guard to
+avoid treating an incoming file list as a fresh local copy.
+
+`cargo run --release --example switch_refresh_probe` checks the current native
+file selection with 100 immediate refreshes. It reads only, never sends files or
+writes the clipboard, and expects no extra clipboard event after the initial one.
+
+The selection version hashes local paths, sizes and modification times without
+reading payload bytes. Local paths are not sent. The receiver stores small
+receipts in `.lan-mouse-receipts` under the download directory, after successful
+stream validation. Repeating the same version checks that each completed local
+file still exists with its recorded size and modification time, then advertises
+those paths without another payload transfer or duplicate file write. Modified
+or missing downloaded files are not reused; a new download preserves any existing
+file. Both receipts and the task history survive restart. Clearing finished
+records does not remove downloaded files or their reuse receipts.
+
+Version 2 adds the selection version, a reuse decision before file contents and
+the clipboard disposition in the final acknowledgement. Both peers must be
+updated together. A clipboard-write error is a failure even when the file reached
+disk; the completed receipt lets a subsequent user request reuse that file.
+
+### Isolated two-host verification
+
+`cargo run --release --example stream_probe -- probe.json` runs the same file
+transport while exchanging synthetic mouse/key packets on a separate DTLS
+connection. It never opens the native clipboard or injects input into desktop
+applications. Its JSON report includes file hashes, event counts and input
+round-trip times. Run `init` once per test host with `certificate`, `report` and
+`timeout_secs`; exchange the reported public `fingerprint` values. Use distinct
+temporary test certificates, never production keys.
+
+For `send` and `receive`, set `mode`, `certificate`, `peer_fingerprint`,
+`control_addr`, `file_port`, `report` and `timeout_secs`. `receive` binds
+`control_addr` and writes into `output`; `send` connects to that address and
+streams the paths in `files`. Allow the test port over UDP and TCP only between
+the test hosts, and remove those temporary rules afterwards. Separately verify
+native clipboard publication and device switching in the installed application;
+the isolated probe does not substitute for those desktop checks.
 
 ## Events
 
@@ -69,10 +160,9 @@ sequenceDiagram
 
 ## Clipboard events
 
-Clipboard events (`ClipboardText`, `ClipboardImage`, `ClipboardFile`)
-travel as regular UDP datagrams: `[u8 type][u32 len][payload]`.
-`ClipboardFile` carries `[u32 count]{[u32 name_len][name][u64 data_len]
-[data]}` per file.
+Text and image clipboard events (`ClipboardText`, `ClipboardImage`)
+travel as regular DTLS datagrams: `[u8 type][u32 len][payload]`.
+File selections use the separate versioned stream described above.
 
 A payload that fits the fragment-sized datagram budget is sent directly
 for compatibility with older peers. Larger payloads up to 256MB are

@@ -3,10 +3,16 @@ use std::fmt::{self, Display};
 pub mod diagnostics;
 pub mod error;
 pub mod scancode;
+static CLIPBOARD_SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub fn clipboard_selection_changed() {
+    CLIPBOARD_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn clipboard_selection_sequence() -> u32 {
+    CLIPBOARD_SEQUENCE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Windows permits separate clipboard handles to interfere within one process.
 /// Share one guard between the monitor and incoming clipboard writer.
-#[cfg(windows)]
 pub fn clipboard_access() -> std::sync::MutexGuard<'static, ()> {
     static ACCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
     ACCESS.lock().unwrap_or_else(|error| {
@@ -71,22 +77,40 @@ pub enum ClipboardEvent {
 pub struct ClipboardFile {
     /// bare file name, no directory components
     pub name: String,
-    /// file contents
-    pub data: Vec<u8>,
+    /// Local source or completed download; never included in network messages.
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    pub modified_ns: u128,
 }
 
-/// Maximum encoded clipboard payload, shared by capture and the wire format.
+impl ClipboardFile {
+    /// Snapshot a file version without reading its contents.
+    pub fn from_path(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let metadata = path.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::other("clipboard entry is not a file"));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| std::io::Error::other("invalid clipboard file name"))?
+            .to_owned();
+        let modified_ns = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        Ok(Self {
+            name,
+            path,
+            size: metadata.len(),
+            modified_ns,
+        })
+    }
+}
+
+/// Maximum encoded text/image payload. Files use a separate stream.
 pub const MAX_CLIPBOARD_TRANSFER_SIZE: usize = 256 * 1024 * 1024;
-
-/// Count plus each UTF-8 name length, name, data length and file contents.
-pub fn clipboard_files_payload_size(files: impl IntoIterator<Item = (usize, u64)>) -> u64 {
-    files.into_iter().fold(4u64, |total, (name_len, data_len)| {
-        total
-            .saturating_add(12)
-            .saturating_add(name_len as u64)
-            .saturating_add(data_len)
-    })
-}
 
 /// the kind of payload a [`ClipboardEvent`] carries
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -110,7 +134,7 @@ impl ClipboardEvent {
         match self {
             ClipboardEvent::Text(t) => t.len(),
             ClipboardEvent::Image(png) => png.len(),
-            ClipboardEvent::Files(files) => files.iter().map(|f| f.data.len()).sum(),
+            ClipboardEvent::Files(files) => files.iter().map(|f| f.size as usize).sum(),
         }
     }
 }
@@ -250,23 +274,6 @@ impl Display for Event {
 #[cfg(test)]
 mod tests {
     use super::ClipboardEvent;
-
-    #[test]
-    fn regression_file_payload_size_counts_utf8_and_limit_boundary() {
-        use super::{MAX_CLIPBOARD_TRANSFER_SIZE, clipboard_files_payload_size};
-        let name = "文件.zip";
-        let overhead = 4 + 12 + name.len() as u64;
-        let data = MAX_CLIPBOARD_TRANSFER_SIZE as u64 - overhead;
-        assert_eq!(
-            clipboard_files_payload_size([(name.len(), data)]),
-            MAX_CLIPBOARD_TRANSFER_SIZE as u64
-        );
-        assert!(
-            clipboard_files_payload_size([(name.len(), data + 1)])
-                > MAX_CLIPBOARD_TRANSFER_SIZE as u64
-        );
-        assert_eq!(clipboard_files_payload_size([(1, u64::MAX)]), u64::MAX);
-    }
 
     #[test]
     fn display_truncates_long_ascii_text() {

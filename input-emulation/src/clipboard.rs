@@ -1,5 +1,5 @@
 use arboard::{Clipboard, ImageData};
-use input_event::{ClipboardEvent, ClipboardFile, decode_image_rgba};
+use input_event::{ClipboardEvent, decode_image_rgba};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -13,6 +13,38 @@ pub enum ClipboardError {
     Set(String),
 }
 
+#[cfg(windows)]
+fn clipboard_signature(_clipboard: &mut Clipboard) -> Result<u64, ClipboardError> {
+    Ok(unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() } as u64)
+}
+
+#[cfg(not(windows))]
+fn clipboard_signature(clipboard: &mut Clipboard) -> Result<u64, ClipboardError> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(paths) = clipboard.get().file_list() {
+        1u8.hash(&mut hash);
+        paths.hash(&mut hash);
+    } else if let Ok(image) = clipboard.get_image() {
+        2u8.hash(&mut hash);
+        image.width.hash(&mut hash);
+        image.height.hash(&mut hash);
+        image.bytes.hash(&mut hash);
+    } else {
+        match clipboard.get_text() {
+            Ok(text) => {
+                3u8.hash(&mut hash);
+                text.hash(&mut hash);
+            }
+            Err(arboard::Error::ContentNotAvailable) => {
+                0u8.hash(&mut hash);
+            }
+            Err(error) => return Err(ClipboardError::Access(error.to_string())),
+        }
+    }
+    Ok(hash.finish())
+}
+
 /// Clipboard emulation that sets clipboard content
 #[derive(Clone)]
 pub struct ClipboardEmulation {
@@ -23,23 +55,8 @@ pub struct ClipboardEmulation {
     download_dir: Arc<Mutex<Option<PathBuf>>>,
 }
 
-/// strip any directory components / weirdness from a wire-supplied
-/// file name so it can only ever land inside the downloads dir
-fn safe_file_name(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .trim_matches('.');
-    if base.is_empty() {
-        "lan-mouse-file".to_string()
-    } else {
-        base.to_string()
-    }
-}
-
 /// `dir/name`, falling back to `dir/name (N).ext` on conflicts
-fn unique_download_path(dir: &Path, name: &str) -> PathBuf {
+pub fn unique_download_path(dir: &Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
         return candidate;
@@ -63,6 +80,53 @@ pub fn download_dir() -> Option<PathBuf> {
 }
 
 impl ClipboardEmulation {
+    pub async fn snapshot(&self) -> Result<u64, ClipboardError> {
+        let clipboard = self.clipboard.clone();
+        spawn_blocking(move || {
+            #[cfg(windows)]
+            let _access = input_event::clipboard_access();
+            let mut guard = clipboard.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(
+                    Clipboard::new().map_err(|error| ClipboardError::Access(error.to_string()))?,
+                );
+            }
+            clipboard_signature(guard.as_mut().unwrap())
+        })
+        .await
+        .map_err(|error| ClipboardError::Access(error.to_string()))?
+    }
+
+    pub async fn set_files_if_unchanged(
+        &self,
+        event: ClipboardEvent,
+        expected: u64,
+        record: impl FnOnce(&ClipboardEvent) + Send + 'static,
+    ) -> Result<bool, ClipboardError> {
+        let ClipboardEvent::Files(files) = event else {
+            return Err(ClipboardError::Set("expected completed files".into()));
+        };
+        let clipboard = self.clipboard.clone();
+        spawn_blocking(move || {
+            let _access = input_event::clipboard_access();
+            let mut guard = clipboard.lock().unwrap();
+            let clipboard = guard
+                .as_mut()
+                .ok_or_else(|| ClipboardError::Access("clipboard unavailable".into()))?;
+            if clipboard_signature(clipboard)? != expected {
+                return Ok(false);
+            }
+            let paths: Vec<_> = files.iter().map(|file| file.path.clone()).collect();
+            clipboard
+                .set()
+                .file_list(&paths)
+                .map_err(|error| ClipboardError::Set(error.to_string()))?;
+            record(&ClipboardEvent::Files(files));
+            Ok(true)
+        })
+        .await
+        .map_err(|error| ClipboardError::Access(error.to_string()))?
+    }
     pub fn new() -> Result<Self, ClipboardError> {
         // Try to create initial clipboard instance
         let clipboard = match Clipboard::new() {
@@ -171,30 +235,10 @@ impl ClipboardEmulation {
             }
             ClipboardEvent::Files(files) => {
                 let clipboard_arc = self.clipboard.clone();
-                let dir_override = self.download_dir.lock().unwrap().clone();
                 spawn_blocking(move || {
-                    let dir = match dir_override {
-                        Some(dir) => {
-                            // the configured directory may not exist yet
-                            std::fs::create_dir_all(&dir).map_err(|e| {
-                                ClipboardError::Set(format!("cannot create {}: {e}", dir.display()))
-                            })?;
-                            dir
-                        }
-                        None => download_dir()
-                            .ok_or_else(|| ClipboardError::Set("no downloads directory".into()))?,
-                    };
-                    let mut written = Vec::with_capacity(files.len());
-                    for ClipboardFile { name, data } in &files {
-                        let path = unique_download_path(&dir, &safe_file_name(name));
-                        std::fs::write(&path, data).map_err(|e| {
-                            ClipboardError::Set(format!("cannot write {}: {e}", path.display()))
-                        })?;
-                        log::info!("wrote clipboard file {}", path.display());
-                        written.push(path);
-                    }
+                    let written: Vec<_> = files.iter().map(|file| file.path.clone()).collect();
                     if written.is_empty() {
-                        return Err(ClipboardError::Set("no files to write".into()));
+                        return Err(ClipboardError::Set("no received files".into()));
                     }
                     // advertise the written files on our own clipboard
                     // so they can be pasted straight into a file manager.
@@ -217,33 +261,22 @@ impl ClipboardEmulation {
                             log::warn!("could not set clipboard file list: {e}");
                         }
                     }
-                    log::debug!(
-                        "Clipboard file list set: {} file(s) in {}",
-                        written.len(),
-                        dir.display()
-                    );
-                    // report the names actually advertised — a
-                    // (N)-renamed file shows on the clipboard under
-                    // its new name, and the clipboard monitor must
-                    // compare against that or it echoes the event
-                    // back to the peer
-                    let applied = written
-                        .iter()
-                        .filter_map(|p| {
-                            p.file_name()
-                                .and_then(|n| n.to_str())
-                                .map(|n| ClipboardFile {
-                                    name: n.to_string(),
-                                    data: Vec::new(),
-                                })
-                        })
-                        .collect();
+                    let applied = files;
                     Ok(ClipboardEvent::Files(applied))
                 })
                 .await
                 .map_err(|e| ClipboardError::Access(format!("Task join error: {}", e)))?
             }
         }
+    }
+
+    pub fn destination_directory(&self) -> Result<PathBuf, ClipboardError> {
+        self.download_dir
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(download_dir)
+            .ok_or_else(|| ClipboardError::Set("no downloads directory".into()))
     }
 
     /// Get current clipboard content (for testing/verification)
@@ -274,56 +307,5 @@ impl ClipboardEmulation {
         })
         .await
         .map_err(|e| ClipboardError::Access(format!("Task join error: {}", e)))?
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression: the receiver used to record the *wire* file names
-    /// as the local clipboard signature while `set` wrote conflicting
-    /// files under `name (N)` — the clipboard monitor then read the
-    /// renamed list back as a fresh local change and echoed the whole
-    /// transfer back to the peer. `set` must report the names it
-    /// actually advertised, so the monitor records the right sig.
-    #[tokio::test(flavor = "current_thread")]
-    async fn files_set_reports_the_names_it_wrote() {
-        let dir = std::env::temp_dir().join(format!("lan-mouse-clip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // same-name file already on disk -> the write lands renamed
-        std::fs::write(dir.join("app.exe"), b"old").unwrap();
-
-        let emu = ClipboardEmulation::new().unwrap();
-        emu.set_download_dir(Some(dir.clone()));
-        let applied = emu
-            .set(ClipboardEvent::Files(vec![ClipboardFile {
-                name: "app.exe".into(),
-                data: b"new".to_vec(),
-            }]))
-            .await
-            .unwrap();
-
-        let ClipboardEvent::Files(files) = applied else {
-            panic!("expected a Files event");
-        };
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, "app (1).exe");
-        assert!(files[0].data.is_empty());
-        assert_eq!(std::fs::read(dir.join("app (1).exe")).unwrap(), b"new");
-        // untouched names pass through unchanged
-        let applied = emu
-            .set(ClipboardEvent::Files(vec![ClipboardFile {
-                name: "other.txt".into(),
-                data: b"x".to_vec(),
-            }]))
-            .await
-            .unwrap();
-        let ClipboardEvent::Files(files) = applied else {
-            panic!("expected a Files event");
-        };
-        assert_eq!(files[0].name, "other.txt");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

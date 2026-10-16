@@ -1,6 +1,4 @@
-use input_event::{
-    ClipboardEvent, ClipboardFile, Event as InputEvent, KeyboardEvent, PointerEvent,
-};
+use input_event::{ClipboardEvent, Event as InputEvent, KeyboardEvent, PointerEvent};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
 use std::{
@@ -54,6 +52,8 @@ pub enum ProtocolError {
     /// clipboard data too large
     #[error("clipboard data exceeds maximum size: {0} bytes")]
     ClipboardTooLarge(usize),
+    #[error("files require the streaming transfer protocol")]
+    FileStreamRequired,
     /// invalid UTF-8 in clipboard text
     #[error("invalid UTF-8 in clipboard text")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
@@ -179,6 +179,8 @@ pub enum EventType {
     /// with another burst of [`ClipboardFragment`] datagrams.
     /// Payload: `[u32 transfer_id][u16 count]{u32 seq}*`
     ClipboardFragmentRequest,
+    /// Versioned file stream offer over authenticated DTLS.
+    FileStreamOffer,
 }
 
 impl ProtoEvent {
@@ -275,7 +277,8 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             | EventType::ClipboardImage
             | EventType::ClipboardFile
             | EventType::ClipboardFragment
-            | EventType::ClipboardFragmentRequest => {
+            | EventType::ClipboardFragmentRequest
+            | EventType::FileStreamOffer => {
                 // Clipboard events use variable-length encoding
                 // This path should not be reached for fixed-size buffer decoding
                 Err(ProtocolError::BufferTooSmall)
@@ -411,25 +414,8 @@ pub fn encode_clipboard_event(event: &ProtoEvent) -> Result<Vec<u8>, ProtocolErr
         ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Image(png))) => {
             (EventType::ClipboardImage, png.as_slice())
         }
-        ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(files))) => {
-            let size = input_event::clipboard_files_payload_size(
-                files.iter().map(|f| (f.name.len(), f.data.len() as u64)),
-            );
-            if size > MAX_CLIPBOARD_TRANSFER_SIZE as u64 {
-                return Err(ProtocolError::ClipboardTooLarge(size as usize));
-            }
-            let mut buf = Vec::with_capacity(5 + size as usize);
-            buf.push(EventType::ClipboardFile as u8);
-            buf.extend_from_slice(&(size as u32).to_be_bytes());
-            buf.extend_from_slice(&(files.len() as u32).to_be_bytes());
-            for file in files {
-                let name = file.name.as_bytes();
-                buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
-                buf.extend_from_slice(name);
-                buf.extend_from_slice(&(file.data.len() as u64).to_be_bytes());
-                buf.extend_from_slice(&file.data);
-            }
-            return Ok(buf);
+        ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(_))) => {
+            return Err(ProtocolError::FileStreamRequired);
         }
         _ => panic!("encode_clipboard_event called on non-clipboard event"),
     };
@@ -584,7 +570,7 @@ pub struct ClipboardReassembler {
 }
 
 /// drop an incomplete reassembly after this much silence
-const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// no new fragment for this long mid-transfer → request retransmits
 const REQUEST_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
@@ -765,7 +751,7 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     }
     let data = &buf[5..5 + length];
     let clipboard_event = if is_file {
-        ClipboardEvent::Files(decode_clipboard_files(data)?)
+        return Err(ProtocolError::FileStreamRequired);
     } else if is_image {
         ClipboardEvent::Image(data.to_vec())
     } else {
@@ -774,42 +760,7 @@ pub fn decode_clipboard_event(buf: &[u8]) -> Result<ProtoEvent, ProtocolError> {
     Ok(ProtoEvent::Input(InputEvent::Clipboard(clipboard_event)))
 }
 
-/// decode the `[u32 count]{[u32 name_len][name][u64 data_len][data]}`
-/// payload of a [`EventType::ClipboardFile`] event
-fn decode_clipboard_files(mut data: &[u8]) -> Result<Vec<ClipboardFile>, ProtocolError> {
-    if data.len() < 4 {
-        return Err(ProtocolError::BufferTooSmall);
-    }
-    let count = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
-    data = &data[4..];
-    let mut files = Vec::with_capacity(count.min(1024));
-    for _ in 0..count {
-        if data.len() < 4 {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        let name_len = u32::from_be_bytes(data[..4].try_into().unwrap()) as usize;
-        data = &data[4..];
-        if data.len() < name_len + 8 {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        let name = String::from_utf8(data[..name_len].to_vec())?;
-        data = &data[name_len..];
-        let data_len = u64::from_be_bytes(data[..8].try_into().unwrap()) as usize;
-        data = &data[8..];
-        if data.len() < data_len {
-            return Err(ProtocolError::BufferTooSmall);
-        }
-        let file_data = data[..data_len].to_vec();
-        data = &data[data_len..];
-        files.push(ClipboardFile {
-            name,
-            data: file_data,
-        });
-    }
-    Ok(files)
-}
-
-/// whether an event type byte is one of the variable-length clipboard types
+/// Files using the old whole-payload type are rejected by the decoder.
 pub fn is_clipboard_event_type(event_type: u8) -> bool {
     event_type == EventType::ClipboardText as u8
         || event_type == EventType::ClipboardImage as u8
@@ -1056,45 +1007,11 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_files_roundtrip() {
-        let event = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(vec![
-            ClipboardFile {
-                name: "报告.txt".to_string(),
-                data: b"hello".to_vec(),
-            },
-            ClipboardFile {
-                name: "a.bin".to_string(),
-                data: vec![0u8; 3000],
-            },
-        ])));
-        let buf = encode_clipboard_event(&event).expect("encode");
-        assert_eq!(buf[0], EventType::ClipboardFile as u8);
-        assert!(is_clipboard_event_type(buf[0]));
-        match decode_clipboard_event(&buf).expect("decode") {
-            ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(files))) => {
-                assert_eq!(files.len(), 2);
-                assert_eq!(files[0].name, "报告.txt");
-                assert_eq!(files[0].data, b"hello");
-                assert_eq!(files[1].name, "a.bin");
-                assert_eq!(files[1].data.len(), 3000);
-            }
-            other => panic!("expected clipboard files, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn clipboard_files_reject_truncated() {
-        // count=1 then a name_len that overruns the payload
-        let mut data = vec![];
-        data.extend_from_slice(&1u32.to_be_bytes());
-        data.extend_from_slice(&100u32.to_be_bytes());
-        data.extend_from_slice(b"x");
-        let mut buf = vec![EventType::ClipboardFile as u8];
-        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&data);
+    fn streaming_files_cannot_use_whole_payload_encoding() {
+        let event = ProtoEvent::Input(InputEvent::Clipboard(ClipboardEvent::Files(vec![])));
         assert!(matches!(
-            decode_clipboard_event(&buf),
-            Err(ProtocolError::BufferTooSmall)
+            encode_clipboard_event(&event),
+            Err(ProtocolError::FileStreamRequired)
         ));
     }
 

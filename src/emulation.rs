@@ -13,6 +13,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -31,6 +32,7 @@ pub(crate) struct Emulation {
 }
 
 pub(crate) enum EmulationEvent {
+    FileOffer(crate::file_transfer::Offer, SocketAddr),
     Connected {
         addr: SocketAddr,
         fingerprint: String,
@@ -87,6 +89,10 @@ pub(crate) enum EmulationEvent {
 }
 
 enum EmulationRequest {
+    FileConnection(
+        SocketAddr,
+        tokio::sync::oneshot::Sender<Option<Arc<dyn webrtc_util::Conn + Send + Sync>>>,
+    ),
     Reenable,
     /// release the peer's capture, handing the cursor back at the
     /// given normalized cross-axis position
@@ -143,6 +149,21 @@ impl Emulation {
         {
             log::error!("emulation task gone, dropping Release({addr})");
         }
+    }
+
+    pub(crate) fn file_connection(
+        &self,
+        addr: SocketAddr,
+    ) -> tokio::sync::oneshot::Receiver<Option<Arc<dyn webrtc_util::Conn + Send + Sync>>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .request_tx
+            .send(EmulationRequest::FileConnection(addr, tx))
+            .is_err()
+        {
+            log::error!("file connection request receiver closed");
+        }
+        rx
     }
 
     pub(crate) fn send_clipboard(
@@ -272,6 +293,9 @@ impl ListenTask {
         loop {
             select! {
                 e = self.listener.next() => {match e {
+                    Some(ListenEvent::FileOffer(offer,addr)) => {
+                        if self.event_tx.send(EmulationEvent::FileOffer(offer,addr)).is_err() { break; }
+                    }
                     Some(ListenEvent::Msg { event, addr }) => {
                         match &event {
                             ProtoEvent::Input(input) => input_event::diagnostics::event(input_event::diagnostics::Stage::Receive, addr, input),
@@ -436,6 +460,9 @@ impl ListenTask {
                         self.emulation_proxy.set_key_repeat(delay, interval);
                     }
                     // send clipboard to a specific address
+                    Some(EmulationRequest::FileConnection(addr,tx)) => {
+                        if tx.send(self.listener.connection(addr).await).is_err() { log::debug!("file connection requester cancelled"); }
+                    }
                     Some(EmulationRequest::SendClipboard(addr, clipboard_event, progress, batch)) => {
                         let proto_event = ProtoEvent::Input(input_event::Event::Clipboard(clipboard_event));
                         let reply = self.listener.reply_clipboard(addr, proto_event, progress);

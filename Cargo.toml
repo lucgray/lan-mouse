@@ -73,6 +73,7 @@ rustls = { version = "0.23.12", default-features = false, features = [
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+tempfile = "3.25.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
@@ -88,6 +89,8 @@ mac-notification-sys = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 windows-service = "0.7.0"
 windows = { version = "0.61.2", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
     "Win32_Security",
     "Win32_System_Services",
     "Win32_System_Registry",

@@ -208,3 +208,13 @@ fn render_resource_rgba(resource: &str, size: i32) -> Option<Icon> {
         }
     }
 }
+
+pub(crate) fn set_status(text: &str) {
+    STATUS_ITEM.with(|state| {
+        if let Some(state) = state.borrow().as_ref() {
+            if let Err(error) = state._tray_icon.set_tooltip(Some(text)) {
+                log::debug!("could not update transfer tray status: {error}");
+            }
+        }
+    });
+}
