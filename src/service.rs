@@ -1300,10 +1300,9 @@ impl Service {
             .remove_client(handle)
             .map(|(_, s)| s.active)
             .unwrap_or(false)
+            && !was_disarmed
         {
-            if !was_disarmed {
-                self.capture.destroy(handle);
-            }
+            self.capture.destroy(handle);
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));
     }
